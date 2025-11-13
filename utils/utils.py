@@ -1,5 +1,7 @@
 from ete3 import Tree
 import numpy as np
+import random
+import math
 
 def get_splits(newick, leaf_set=None):
     """
@@ -56,6 +58,36 @@ def tree_to_bhv_vector(newick, global_splits, leaf_set=None):
             vec[idx] = length
     return vec
 
+def random_topology(leaves):
+    """
+    Generate a random binary tree topology over given leaf labels.
+    """
+    nodes = [Tree(name=leaf) for leaf in leaves]
+
+    while len(nodes) > 1:
+        # pick two nodes to merge
+        a = nodes.pop(random.randrange(len(nodes)))
+        b = nodes.pop(random.randrange(len(nodes)))
+
+        parent = Tree()
+        parent.add_child(a)
+        parent.add_child(b)
+
+        nodes.append(parent)
+
+    return nodes[0]
+
+def random_bhv_tree(leaves, length_scale=0.1):
+    t = random_topology(leaves)
+
+    for node in t.traverse():
+        if not node.is_root():
+            node.dist = math.exp(length_scale * random.gauss(0, 1))
+    
+    return t
+
+
+
 def test():
     trees = [
         "(A:0.1,B:0.2,(C:0.3,D:0.4):0.5);",
@@ -70,5 +102,3 @@ def test():
     print("dim =", len(global_splits))
     print(vec1)
     print(vec2)
-
-# test()
