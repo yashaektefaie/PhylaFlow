@@ -68,13 +68,15 @@ class TreeDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:  # Required for torch Dataset
         meta = self._index[index]
 
+        seqs, taxa_order = self.parse_nexus(meta['nexus_path'])
 
         sample = {
             "id": meta["id"],
             "nexus_path": meta["nexus_path"],
             "tree_paths": meta["tree_paths"],  # list of .t files, may be 1
             # Placeholders for parsed content:
-            "sequences": self.parse_nexus(meta['nexus_path']), 
+            "sequences": seqs,
+            "taxa_order": taxa_order, 
             "trees": self.load_posterior_trees_from_tfiles(meta["tree_paths"]), 
         }
 
@@ -147,7 +149,7 @@ class TreeDataset(Dataset):
 
         return all_trees
 
-    def parse_nexus(self, path: str) -> Dict[str, str]:
+    def parse_nexus(self, path: str) -> tuple[Dict[str, str], List[str]]:
         """Parse sequences from a NEXUS alignment file.
 
         Returns a dict mapping taxon/sequence ID to its sequence string.
@@ -158,6 +160,7 @@ class TreeDataset(Dataset):
 
         Note: For complex/edge-case NEXUS dialects, consider using Biopython.
         """
+        taxa_order = []
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
 
@@ -188,6 +191,8 @@ class TreeDataset(Dataset):
                     tokens = remainder.split()
                     if len(tokens) >= 2:
                         name = tokens[0]
+                        if name not in taxa_order:
+                            taxa_order.append(name)
                         seq = "".join(tokens[1:])
                         seqs[name] = seqs.get(name, "") + seq
                     if term:
@@ -212,6 +217,8 @@ class TreeDataset(Dataset):
             tokens = line.split()
             if len(tokens) >= 2:
                 name = tokens[0]
+                if name not in taxa_order:
+                    taxa_order.append(name)
                 seq = "".join(tokens[1:])
                 seqs[name] = seqs.get(name, "") + seq
             # Lines with fewer than 2 tokens are ignored
@@ -223,7 +230,7 @@ class TreeDataset(Dataset):
         for i in seqs:
             unaligned_seqs[i] = seqs[i].replace('-', '')
 
-        return unaligned_seqs
+        return unaligned_seqs, taxa_order
 
     def build_index(self) -> None:
         """Scan nexus_root and mrbayes_root to build ID->paths mapping.
