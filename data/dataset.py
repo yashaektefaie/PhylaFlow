@@ -16,6 +16,7 @@ data_root/
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -59,7 +60,6 @@ class TreeDataset(Dataset):
 
         # Build index immediately; optionally preload
         self.build_index()
-        import pdb; pdb.set_trace()
 
 
     def __len__(self) -> int:  # Required for torch Dataset
@@ -74,26 +74,156 @@ class TreeDataset(Dataset):
             "nexus_path": meta["nexus_path"],
             "tree_paths": meta["tree_paths"],  # list of .t files, may be 1
             # Placeholders for parsed content:
-            "sequences": None,  # TODO: call self.parse_nexus(meta["nexus_path"]) if needed
-            "trees": None,      # TODO: call self.parse_tree_file(path) for each tree file
+            "sequences": self.parse_nexus(meta['nexus_path']), 
+            "trees": self.load_posterior_trees_from_tfiles(meta["tree_paths"]), 
         }
 
         return sample
 
-    # --- Additional helper / domain-specific methods (placeholders) ---
-    def parse_tree_file(self, path: str) -> Any:
-        """Parse a tree file (e.g., Newick) and return structured object.
-        TODO: implement actual parsing logic.
+    def extract_newick_from_line(self, line: str) -> str:
         """
-        # TODO: open path and parse content
-        raise NotImplementedError("parse_tree_file not implemented")
+        Given a line from a .t/.trees file, extract the Newick string.
+        Handles BEAST-style 'tree STATE_... = [&R] (..);' or raw '(..);'.
+        Returns '' if no Newick found.
+        """
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return ""
+        
+        # Find first '(' and last ')' or ';'
+        start = line.find("(")
+        if start == -1:
+            return ""
+        
+        # Newick typically ends at ';', but sometimes there's stuff after.
+        # We'll go to the last ';' if it exists, else end of line.
+        end = line.rfind(";")
+        if end == -1:
+            end = len(line)
+        else:
+            end = end + 1  # include ';'
+        
+        newick = line[start:end].strip()
+        return newick if newick else ""
 
-    def parse_nexus(self, path: str) -> Any:
-        """Parse sequences from a Nexus file at path.
-        TODO: implement using, e.g., BioPython (Bio.Nexus or AlignIO).
+
+    def load_posterior_trees_from_tfiles(self,
+        tree_files: List[str],
+        burn_in_fraction: float = 0.25,
+    ) -> List[str]:
         """
-        # TODO: open path and parse sequences/taxa
-        raise NotImplementedError("parse_nexus not implemented")
+        Given a list of .t/.trees files, extract posterior Newick trees
+        applying a per-file burn-in and thinning.
+
+        Args
+        ----
+        tree_files : list of paths to .t files
+        burn_in_fraction : fraction of samples per file to discard as burn-in
+
+        Returns
+        -------
+        trees : list of Newick strings (posterior samples)
+        """
+        
+        all_trees = []
+
+        for path in tree_files:
+            file_trees = []
+
+            with open(path, "r") as f:
+                for line in f:
+                    newick = self.extract_newick_from_line(line)
+                    if newick:
+                        file_trees.append(newick)
+
+            if not file_trees:
+                continue
+
+            # Apply burn-in per file
+            burn = int(len(file_trees) * burn_in_fraction)
+            kept = file_trees[burn:]
+
+            all_trees.extend(kept)
+
+        return all_trees
+
+    def parse_nexus(self, path: str) -> Dict[str, str]:
+        """Parse sequences from a NEXUS alignment file.
+
+        Returns a dict mapping taxon/sequence ID to its sequence string.
+        This lightweight parser targets common cases:
+        - MATRIX block under BEGIN DATA/CHARACTERS
+        - Interleaved or non-interleaved; sequence chunks are concatenated
+        - Comments in square brackets are stripped
+
+        Note: For complex/edge-case NEXUS dialects, consider using Biopython.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        # Remove NEXUS comments [ ... ] (non-nested) across lines
+        text = re.sub(r"\[.*?\]", "", text, flags=re.DOTALL)
+
+        lines = [ln.strip() for ln in text.splitlines()]
+        seqs: Dict[str, str] = {}
+        in_matrix = False
+
+        for raw in lines:
+            line = raw
+            if not in_matrix:
+                # Look for the 'MATRIX' keyword (case-insensitive)
+                idx = line.lower().find("matrix")
+                if idx == -1:
+                    continue
+
+                # Switch to matrix mode; process any remainder on the same line
+                in_matrix = True
+                remainder = line[idx + len("matrix"):].strip()
+                if remainder:
+                    # Process potential inline first entry after MATRIX
+                    term = False
+                    if ";" in remainder:
+                        remainder, _sep, _after = remainder.partition(";")
+                        term = True
+                    tokens = remainder.split()
+                    if len(tokens) >= 2:
+                        name = tokens[0]
+                        seq = "".join(tokens[1:])
+                        seqs[name] = seqs.get(name, "") + seq
+                    if term:
+                        break
+                continue
+
+            # In MATRIX: accumulate lines until a ';'
+            if not line:
+                continue
+
+            terminated = False
+            if ";" in line:
+                line, _sep, _after = line.partition(";")
+                terminated = True
+
+            line = line.strip()
+            if not line:
+                if terminated:
+                    break
+                continue
+
+            tokens = line.split()
+            if len(tokens) >= 2:
+                name = tokens[0]
+                seq = "".join(tokens[1:])
+                seqs[name] = seqs.get(name, "") + seq
+            # Lines with fewer than 2 tokens are ignored
+
+            if terminated:
+                break
+
+        unaligned_seqs = {}
+        for i in seqs:
+            unaligned_seqs[i] = seqs[i].replace('-', '')
+
+        return unaligned_seqs
 
     def build_index(self) -> None:
         """Scan nexus_root and mrbayes_root to build ID->paths mapping.
@@ -102,8 +232,7 @@ class TreeDataset(Dataset):
         - Accept .nex or .nexus as nexus files.
         - ID := basename without extension.
         - For each ID, look for mrbayes_root/ID directory and collect .t files.
-        - If prefer_run is set to "run1" or "run2", prefer matching .t file.
-        - Otherwise include all .t files.
+        - Include all .t files.
         """
         nexus_exts = {".nex", ".nexus"}
         if not os.path.isdir(self.nexus_root):
@@ -139,13 +268,6 @@ class TreeDataset(Dataset):
         self._ids = ids
         self._index = index
         self._id_to_idx = {id_: i for i, id_ in enumerate(self._ids)}
-
-    def preload(self) -> None:
-        """Preload all trees and sequences into memory if caching.
-        TODO: iterate over index and call parse helpers.
-        """
-        # TODO: implement preload logic
-        pass
 
 
 class PhylaDataModule(pl.LightningDataModule):
@@ -197,16 +319,16 @@ class PhylaDataModule(pl.LightningDataModule):
         # TODO: perform real split logic
         if stage in ("fit", None):
             # TODO: build train & val datasets
-            self.dataset_train = TreeDataset(nexus_dir, runs_dir, transform=None, cache=False)
-            self.dataset_val = TreeDataset(nexus_dir, runs_dir, transform=None, cache=False)
+            self.dataset_train = TreeDataset(nexus_dir, runs_dir)
+            self.dataset_val = TreeDataset(nexus_dir, runs_dir)
 
         if stage in ("test", None):
             # TODO: build test dataset
-            self.dataset_test = TreeDataset(nexus_dir, runs_dir, transform=None, cache=False)
+            self.dataset_test = TreeDataset(nexus_dir, runs_dir)
 
         if stage in ("predict", None):
             # TODO: build predict/inference dataset
-            self.dataset_predict = TreeDataset(nexus_dir, runs_dir, transform=None, cache=False)
+            self.dataset_predict = TreeDataset(nexus_dir, runs_dir)
 
     def train_dataloader(self) -> DataLoader:
         # TODO: customize collate_fn if needed
@@ -276,7 +398,8 @@ class PhylaDataModule(pl.LightningDataModule):
 def test():
     dm = TreeDataset(nexus_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/nexus/",
                      mrbayes_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/runs/")
-
+    res = dm[0]
+    import pdb; pdb.set_trace()
 
 test()
 
