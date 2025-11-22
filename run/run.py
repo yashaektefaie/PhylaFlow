@@ -3,6 +3,7 @@ from data.dataset import PhylaDataModule
 import yaml
 import sys
 from utils.utils import get_possible_ids
+from run.TrainingModule import TrainingModule
 import random
 
 
@@ -16,13 +17,27 @@ def main():
 
     ids = get_possible_ids(config['data']['nexus_root'])
     #Random 80-20 train-test split for now
-    random.shuffle(ids)
+    ran = random.Random(42)
+    ran.shuffle(ids)
     train_ids = ids[:int(0.8*len(ids))]
     test_ids = ids[int(0.8*len(ids)):]
 
     dataset = PhylaDataModule(config, train_ids=train_ids, test_ids=test_ids)
     
     phyla_flow = return_model(config)
+
+    model = TrainingModule(
+        model=phyla_flow,
+        lr=config['trainer']['lr'],
+        record=config['trainer']['record'],
+        epochs=config['trainer']['epochs'],
+        dataset=dataset,
+        lr_scheduler = 'default',
+        num_annealing_steps = 10000,
+        num_warmup_steps = 1000,
+        deepspeed = False,
+        logger = None
+    )
 
 
 
@@ -49,7 +64,7 @@ def main():
 
     trainer_args['accelerator'] = "gpu"
     trainer = Trainer(**trainer_args)
-    #trainer.fit(phyla_flow, train_dataloaders=dataset.train_dataloader(), val_dataloaders=dataset.val_dataloader())
+    #trainer.fit(model, train_dataloaders=dataset.train_dataloader(), val_dataloaders=dataset.val_dataloader())
 
 
 if __name__ == "__main__":
