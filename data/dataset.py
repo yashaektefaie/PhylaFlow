@@ -46,9 +46,11 @@ class TreeDataset(Dataset):
         self,
         nexus_root: str,
         mrbayes_root: str,
+        filter_ids: Optional[List[str]] = None,
     ) -> None:
         self.nexus_root = nexus_root
         self.mrbayes_root = mrbayes_root
+        self.filter_ids = filter_ids
 
 
         # Internal containers
@@ -250,6 +252,8 @@ class TreeDataset(Dataset):
 
         for name in os.listdir(self.nexus_root):
             base, ext = os.path.splitext(name)
+            if self.filter_ids is not None and base not in self.filter_ids:
+                continue
             if ext.lower() in nexus_exts:
                 ids.append(base)
                 id_to_nexus[base] = os.path.join(self.nexus_root, name)
@@ -288,11 +292,10 @@ class PhylaDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        data_root: str,
-        nexus_subdir: str = "nexus",
-        mrbayes_subdir: str = "runs",
+        nexus_dir: str = "nexus",
+        mrbayes_dir: str = "runs",
         batch_size: int = 32,
-        num_workers: int = 4,
+        num_workers: int = 0,
         pin_memory: bool = True,
     ) -> None:
         super().__init__()
@@ -309,34 +312,21 @@ class PhylaDataModule(pl.LightningDataModule):
         self.dataset_test: Optional[TreeDataset] = None
         self.dataset_predict: Optional[TreeDataset] = None
 
-    def prepare_data(self) -> None:
-        """Download or generate data if needed.
-        TODO: implement data acquisition (only called on 1 process).
-        """
-        # TODO: e.g., download archives, verify checksums
-        pass
-
     def setup(self, stage: Optional[str] = None) -> None:
-        """Create datasets for different stages.
-        TODO: instantiate TreeDataset objects and perform splits.
-        """
-        nexus_dir = os.path.join(self.data_root, self.nexus_subdir)
-        runs_dir = os.path.join(self.data_root, self.mrbayes_subdir)
 
         # TODO: perform real split logic
         if stage in ("fit", None):
             # TODO: build train & val datasets
-            self.dataset_train = TreeDataset(nexus_dir, runs_dir)
-            self.dataset_val = TreeDataset(nexus_dir, runs_dir)
+            self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir)
+            self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir)
 
         if stage in ("test", None):
             # TODO: build test dataset
-            self.dataset_test = TreeDataset(nexus_dir, runs_dir)
+            self.dataset_test = TreeDataset(self.nexus_dir, self.mrbayes_dir)
 
         if stage in ("predict", None):
             # TODO: build predict/inference dataset
-            self.dataset_predict = TreeDataset(nexus_dir, runs_dir)
-
+            self.dataset_predict = TreeDataset(self.nexus_dir, self.mrbayes_dir)
     def train_dataloader(self) -> DataLoader:
         # TODO: customize collate_fn if needed
         return DataLoader(
@@ -374,13 +364,6 @@ class PhylaDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
         )
 
-    # --- Optional utility hooks / helpers ---
-    def teardown(self, stage: Optional[str] = None) -> None:
-        """Release resources after training/testing.
-        TODO: clear caches or close file handles.
-        """
-        pass
-
     def size(self) -> Tuple[int, int, int]:
         """Return sizes of (train, val, test) datasets.
         TODO: implement with actual lengths.
@@ -389,17 +372,6 @@ class PhylaDataModule(pl.LightningDataModule):
         val = len(self.dataset_val) if self.dataset_val else 0
         test = len(self.dataset_test) if self.dataset_test else 0
         return train, val, test
-
-    def describe(self) -> Dict[str, Any]:
-        """Return a summary dictionary for logging/debugging.
-        TODO: enrich with domain-specific metadata.
-        """
-        return {
-            "root": self.data_root,
-            "batch_size": self.batch_size,
-            "num_workers": self.num_workers,
-            "sizes": self.size(),
-        }
 
 
 def test():

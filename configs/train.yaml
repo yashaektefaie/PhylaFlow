@@ -1,0 +1,23 @@
+model:
+  num_node_types: 3
+  num_edge_types: 2
+  embed_dim: 256
+  output_dim: 256
+  n_layers: 6
+  n_heads: 8
+  dropout: 0.1
+  attention_dropout: 0.1
+  activation_dropout: 0.1
+  drop_path_rate: 0.0
+  use_performer: true
+  performer_nb_features: 64
+  performer_generalized_attention: true
+  layernorm_style: prenorm
+  tokenizer_lap_dim: 16
+  tokenizer_lap_dropout: 0.2
+  tokenizer_n_layers: 6
+  phyla_dim: 256
+
+data:
+  nexus_root: 
+  mrbayes_root:
