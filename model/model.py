@@ -4,12 +4,12 @@ from math import log, sqrt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tree_transformer_layers import (
+from model.tree_transformer_layers import (
     DropPath,
     MultiheadAttention,
     MultiheadPerformerAttention,
 )
-from treeTokenizer import TreeFeatureTokenizer
+from model.treeTokenizer import TreeFeatureTokenizer
 
 
 # TokenGT parameter initialization

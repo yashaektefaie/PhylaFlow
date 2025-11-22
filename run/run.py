@@ -1,8 +1,9 @@
 from model.model import return_model
-from dataset.dataset import PhylaDataModule
+from data.dataset import PhylaDataModule
 import yaml
 import sys
 from utils.utils import get_possible_ids
+import random
 
 
 
@@ -20,8 +21,37 @@ def main():
     test_ids = ids[int(0.8*len(ids)):]
 
     dataset = PhylaDataModule(config, train_ids=train_ids, test_ids=test_ids)
-
+    
     phyla_flow = return_model(config)
+
+
+
+    save_callback2 = ModelCheckpoint(
+        dirpath=save_path,
+        filename="{epoch:02d}-{step:06d}",  # Include metric value in the filename
+        every_n_train_steps=config.trainer.steps_callback,  # Save every N steps
+        save_top_k=-1  # Save all checkpoints
+        )
+
+
+    trainer_args = {}
+    if config.trainer.record:
+
+        wandb.init(project = 'phylaflow', 
+        group = f'{run_name}')
+        wandb.watch(model, log_freq=100)
+
+    
+    trainer_args['max_epochs'] = config.trainer.epochs
+    trainer_args['callbacks'] = [save_callback] # For validation callback runs
+    if config.trainer.val_callback_freq != 0:
+        trainer_args['val_check_interval'] = config.trainer.val_callback_freq
+
+    trainer_args['accelerator'] = "gpu"
+    trainer = Trainer(**trainer_args)
+    trainer.fit(phyla_flow, datamodule=dataset)
+
+
 
 
 

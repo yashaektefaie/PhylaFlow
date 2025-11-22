@@ -3,7 +3,7 @@ from math import sqrt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from performer_pytorch import FastAttention
+from model.performer_pytorch import FastAttention
 
 
 class DropPath(nn.Module):

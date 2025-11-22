@@ -2,13 +2,13 @@ from ete3 import Tree
 import numpy as np
 import random
 import math
+import os
 
-def get_possible_ids(nexus_root,):
+def get_possible_ids(nexus_root):
     ids = []
     for name in os.listdir(nexus_root):
         base, ext = os.path.splitext(name)
-        if ext.lower() in nexus_exts:
-            ids.append(base)
+        ids.append(base)
     ids.sort()
     return ids
 

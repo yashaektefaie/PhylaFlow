@@ -292,9 +292,9 @@ class PhylaDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        config
-        train_ids: List[str] = "train_ids.txt",
-        test_ids: List[str] = "test_ids.txt",
+        config,
+        train_ids: List[str],
+        test_ids: List[str],
     ) -> None:
         super().__init__()
         self.nexus_dir = config['data']['nexus_root']
@@ -303,8 +303,8 @@ class PhylaDataModule(pl.LightningDataModule):
         self.num_workers = config['data']['num_workers']
         self.pin_memory = config['data']['pin_memory']
 
-        self.train_ids = [i.rstrip() for i in open(train_ids, "r").readlines()]
-        self.test_ids = [i.rstrip() for i in open(test_ids, "r").readlines()]
+        self.train_ids = train_ids
+        self.test_ids = test_ids
 
         self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids)
         self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids)
