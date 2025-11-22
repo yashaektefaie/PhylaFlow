@@ -26,12 +26,12 @@ def main():
 
 
 
-    save_callback2 = ModelCheckpoint(
-        dirpath=save_path,
+    save_callback = ModelCheckpoint(
+        dirpath=config.trainer.checkpoint_dir,
         filename="{epoch:02d}-{step:06d}",  # Include metric value in the filename
         every_n_train_steps=config.trainer.steps_callback,  # Save every N steps
         save_top_k=-1  # Save all checkpoints
-        )
+    )
 
 
     trainer_args = {}
@@ -49,12 +49,7 @@ def main():
 
     trainer_args['accelerator'] = "gpu"
     trainer = Trainer(**trainer_args)
-    trainer.fit(phyla_flow, datamodule=dataset)
-
-
-
-
-
+    #trainer.fit(phyla_flow, train_dataloaders=dataset.train_dataloader(), val_dataloaders=dataset.val_dataloader())
 
 
 if __name__ == "__main__":

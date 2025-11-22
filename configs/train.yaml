@@ -18,6 +18,16 @@ model:
   tokenizer_n_layers: 6
   phyla_dim: 256
 
+trainer:
+  record: False
+  epochs: 10000
+  val_callback_frequency: 10
+  checkpoint_dir: /n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/checkpoint_dir/
+
+
+
+
+
 data:
   nexus_root: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow_datasets/nexus
   mrbayes_root: /n/netscratch/mzitnik_lab/Lab/yektefaie/runs
