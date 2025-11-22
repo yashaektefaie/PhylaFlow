@@ -292,43 +292,26 @@ class PhylaDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        nexus_dir: str = "nexus",
-        mrbayes_dir: str = "runs",
-        batch_size: int = 32,
-        num_workers: int = 0,
-        pin_memory: bool = True,
+        config
+        train_ids: List[str] = "train_ids.txt",
+        test_ids: List[str] = "test_ids.txt",
     ) -> None:
         super().__init__()
-        self.data_root = data_root
-        self.nexus_subdir = nexus_subdir
-        self.mrbayes_subdir = mrbayes_subdir
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
+        self.nexus_dir = config['data']['nexus_root']
+        self.mrbayes_dir = config['data']['mrbayes_root']
+        self.batch_size = config['data']['batch_size']
+        self.num_workers = config['data']['num_workers']
+        self.pin_memory = config['data']['pin_memory']
 
-        # Placeholders for datasets
-        self.dataset_train: Optional[TreeDataset] = None
-        self.dataset_val: Optional[TreeDataset] = None
-        self.dataset_test: Optional[TreeDataset] = None
-        self.dataset_predict: Optional[TreeDataset] = None
+        self.train_ids = [i.rstrip() for i in open(train_ids, "r").readlines()]
+        self.test_ids = [i.rstrip() for i in open(test_ids, "r").readlines()]
 
-    def setup(self, stage: Optional[str] = None) -> None:
+        self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids)
+        self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids)
 
-        # TODO: perform real split logic
-        if stage in ("fit", None):
-            # TODO: build train & val datasets
-            self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir)
-            self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir)
 
-        if stage in ("test", None):
-            # TODO: build test dataset
-            self.dataset_test = TreeDataset(self.nexus_dir, self.mrbayes_dir)
-
-        if stage in ("predict", None):
-            # TODO: build predict/inference dataset
-            self.dataset_predict = TreeDataset(self.nexus_dir, self.mrbayes_dir)
     def train_dataloader(self) -> DataLoader:
-        # TODO: customize collate_fn if needed
+
         return DataLoader(
             self.dataset_train,
             batch_size=self.batch_size,
@@ -364,15 +347,6 @@ class PhylaDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
         )
 
-    def size(self) -> Tuple[int, int, int]:
-        """Return sizes of (train, val, test) datasets.
-        TODO: implement with actual lengths.
-        """
-        train = len(self.dataset_train) if self.dataset_train else 0
-        val = len(self.dataset_val) if self.dataset_val else 0
-        test = len(self.dataset_test) if self.dataset_test else 0
-        return train, val, test
-
 
 def test():
     dm = TreeDataset(nexus_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/nexus/",
@@ -380,6 +354,6 @@ def test():
     res = dm[0]
     import pdb; pdb.set_trace()
 
-test()
+# test()
 
 

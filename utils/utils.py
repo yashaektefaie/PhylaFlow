@@ -3,6 +3,15 @@ import numpy as np
 import random
 import math
 
+def get_possible_ids(nexus_root,):
+    ids = []
+    for name in os.listdir(nexus_root):
+        base, ext = os.path.splitext(name)
+        if ext.lower() in nexus_exts:
+            ids.append(base)
+    ids.sort()
+    return ids
+
 def get_splits(newick, leaf_set=None):
     """
     Extract nontrivial splits from a Newick tree and return a dict:
