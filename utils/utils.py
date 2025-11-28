@@ -22,8 +22,6 @@ def get_splits(newick, leaf_set=None):
 
     # Get all leaf names
     leaves = leaf_set if leaf_set is not None else sorted(tree.get_leaf_names())
-    leaf_index = {leaf: i for i, leaf in enumerate(leaves)}
-    n = len(leaves)
     
     splits = {}
 

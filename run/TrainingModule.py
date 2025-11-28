@@ -1,28 +1,16 @@
-import torch, torch.nn as nn, torch.optim as optim, numpy as np
-import torch.nn.functional as F
+import torch, torch.optim as optim
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities import grad_norm
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 from deepspeed.ops.adam import FusedAdam
 import wandb
-import signal
 import logging
 import gc
 import torch.distributed
-from utils.utils import reconstruct_tree, rf_distance
-from skbio import DistanceMatrix
-from skbio.tree import nj
-from utils.utils import shuffle_tensors_by_chunks, delete_random_tensors, torch_rankdata_2d_ties, torch_soft_rank
-from eval import mod_tree_builder
-from utils.constants import *
-import random
 import gc
-from scipy.stats import rankdata
-import torchsort
 import torch
+from utils.utils import random_bhv_tree, tree_to_bhv_vector, build_global_split_index
 import random
-import math
-from itertools import combinations
 
 class TrainingModule(LightningModule):
 	def __init__(
@@ -37,6 +25,7 @@ class TrainingModule(LightningModule):
 		dataset = None,
 		deepspeed = False,
 		logger = None,
+		max_num_timesteps = None
 	):
 		super().__init__()
 		self.model = model
@@ -45,11 +34,11 @@ class TrainingModule(LightningModule):
 		self.epochs = epochs
 		self.warmup_steps = 400
 		self.current_step_value = 0
-		self.calculation_method = calculation_method
 		self.lr_scheduler = lr_scheduler
 		self.num_annealing_steps = num_annealing_steps
 		self.num_warmup_steps = num_warmup_steps
 		self.dataset = dataset
+		self.max_num_timesteps = max_num_timesteps
 
 		# Important: This property activates manual optimization.
 		# Turning off automatic optimization so I can catch out of memory errors!
@@ -66,11 +55,20 @@ class TrainingModule(LightningModule):
 		position_ids = None,
 		sequence_mask = None
 	):
+		
 
         #How do I run forward what do my batches look like?
+		return
 
 	def step(self, batch, eval = False):
         logs = {}
+		random_trees = [random_bhv_tree(leaves) for leaves in batch['leaves']]
+		global_splits = build_global_split_index(batch['newick_trees'] + random_trees)
+		random_trees_bhv_vector = [tree_to_bhv_vector(i, global_splits) for i in random_trees]
+		real_trees_bhv_vector = [tree_to_bhv_vector(i, global_splits) for i in batch['newick_trees']]
+		random_time_sampled = random.random(0, self.max_num_timesteps)
+
+
         #This is where the majority of the work happens
         return logs
 			
