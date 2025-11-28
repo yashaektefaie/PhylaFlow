@@ -93,7 +93,17 @@ def random_bhv_tree(leaves, length_scale=0.1):
     
     return t
 
+def calculate_bhv_geodesic(start_tree, end_tree, time):
+    difference = end_tree - start_tree 
+    
 
+    #From here to here, this one shrinks, then expands
+    #From here to here, this one shrinks, then expands
+    #Then given a time point between 0 and 1, I would add up all the distances then each quadrant represents like conditional positions where these things are
+    #Return sampled tree
+    #Can also return the velocity here since that is just the difference between the BHV vectors in the orthant that the time-point finds itself in
+
+    return tree_position, target_velocity
 
 def test():
     trees = [

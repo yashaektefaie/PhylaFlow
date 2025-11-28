@@ -9,23 +9,26 @@ import gc
 import torch.distributed
 import gc
 import torch
-from utils.utils import random_bhv_tree, tree_to_bhv_vector, build_global_split_index
+from utils.utils import random_bhv_tree, tree_to_bhv_vector, build_global_split_index, calculate_bhv_geodesic
 import random
 
 class TrainingModule(LightningModule):
 	def __init__(
 		self,
 		model =  None,
-		lr = 1e-4,
+		lr: float = 1e-4,
 		record = False,
-		epochs = 5000,
+		epochs: int = 5000,
 		lr_scheduler = 'default',
 		num_annealing_steps = 10000,
 		num_warmup_steps = 1000,
 		dataset = None,
 		deepspeed = False,
 		logger = None,
-		max_num_timesteps = None
+		max_num_timesteps: int = 20,
+		#Figure out how to do typing here
+		global_splits = None,
+		random_trees = None
 	):
 		super().__init__()
 		self.model = model
@@ -39,6 +42,8 @@ class TrainingModule(LightningModule):
 		self.num_warmup_steps = num_warmup_steps
 		self.dataset = dataset
 		self.max_num_timesteps = max_num_timesteps
+		self.global_splits = global_splits
+		self.random_trees = random_trees
 
 		# Important: This property activates manual optimization.
 		# Turning off automatic optimization so I can catch out of memory errors!
@@ -61,16 +66,20 @@ class TrainingModule(LightningModule):
 		return
 
 	def step(self, batch, eval = False):
-        logs = {}
-		random_trees = [random_bhv_tree(leaves) for leaves in batch['leaves']]
-		global_splits = build_global_split_index(batch['newick_trees'] + random_trees)
-		random_trees_bhv_vector = [tree_to_bhv_vector(i, global_splits) for i in random_trees]
-		real_trees_bhv_vector = [tree_to_bhv_vector(i, global_splits) for i in batch['newick_trees']]
-		random_time_sampled = random.random(0, self.max_num_timesteps)
-
+		logs = {}
+		batch_size = len(batch['newick_trees'])
+		random_trees = random.sample(self.random_trees, batch_size)
+		random_trees_bhv_vector = torch.tensor([tree_to_bhv_vector(i, self.global_splits) for i in random_trees])
+		real_trees_bhv_vector = torch.tensor([tree_to_bhv_vector(i, self.global_splits) for i in batch['newick_trees']])
+		t = torch.randint(0, self.max_num_timesteps, batch_size)
+		#Need the geodesic here, then get a point on the geodesic
+		x_t, v_target = calculate_bhv_geodesic(random_trees_bhv_vector, real_trees_bhv_vector, t)
+		v_pred = self.forward(x_t, t, batch['phyla_embeddings'])
+		loss = ((v_pred - v_target)**2).mean()
+		logs['loss'] = loss
 
         #This is where the majority of the work happens
-        return logs
+		return logs
 			
 		
 	def training_step(self, batch, _):
