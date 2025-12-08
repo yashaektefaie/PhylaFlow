@@ -1,10 +1,12 @@
 from collections import defaultdict, deque
+from utils.bhv_distance import bhv_geodesic_with_support
+from utils.random_tree import RandomTree
 
 class BHVEncoder():
     def __init__(self, n_leaves):
         self.n_leaves = n_leaves 
     
-    def compute_edge_masks(tree, root=0):
+    def compute_edge_masks(self, tree, root=0):
         """
         Returns:
         edge_masks: dict[(u,v)] -> mask over leaves below v, for directed edges u->v
@@ -69,12 +71,61 @@ class BHVEncoder():
         edge_mask_1, edge_length_1 = one 
         edge_mask_2, edge_length_2 = two 
 
-        edge_mask_1 = set(edge_mask_1)
-        edge_mask_2 = set(edge_mask_2)
+        t1 = {x:y for x,y in zip(edge_mask_1, edge_length_1)}
+        t2 = {x:y for x,y in zip(edge_mask_2, edge_length_2)}
+        result = bhv_geodesic_with_support(t1, t2, n_leaves=self.n_leaves)
 
-        C = S1&S2
-        X = S1 - C
-        Y = S2 - C
+        print("BHV distance:", result["distance"])
+        for i, seg in enumerate(result["segments"]):
+            print(f"Segment {i}:")
+            print("  Ai (collapsed):", seg["Ai"])
+            print("  Bi (grown):    ", seg["Bi"])
+            print("  ratio:", seg["ratio"])
+            # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
+
+
+def test_bhv_on_two_random_20_leaf_trees():
+    n = 20
+    print("Generating random trees...")
+    T1 = RandomTree(n)
+    T2 = RandomTree(n)
+
+    enc = BHVEncoder(n)
+
+    print("Encoding trees into bitmask form...")
+    edge_masks_1, edge_lengths_1 = enc.compute_edge_masks(T1)
+    edge_masks_2, edge_lengths_2 = enc.compute_edge_masks(T2)
+
+    print("Computing BHV geodesic with support pairs...")
+    result = bhv_geodesic_with_support([edge_masks_1, edge_lengths_1], [edge_masks_2, edge_lengths_2], n_leaves=n)
+
+    print("\n======================")
+    print("BHV DISTANCE =", result["distance"])
+    print("======================\n")
+
+    print("Common-edge contribution squared =", result["common_sq"])
+    print("Disjoint-edge contribution squared =", result["disjoint_sq"])
+    print("Number of support pairs =", len(result["A_support"]))
+    print()
+
+    for i, seg in enumerate(result["segments"]):
+        print(f"--- Segment {i} ---")
+        print("Ai (collapse):", seg["Ai"])
+        print("Bi (grow):    ", seg["Bi"])
+        print("||A||=", seg["normA"], "||B||=", seg["normB"], "ratio=", seg["ratio"])
+        print("#start splits =", len(seg["start_splits"]))
+        print("#end splits   =", len(seg["end_splits"]))
+        print()
+
+    print("Test completed.")
+
+
+##############################################################################
+# Run the test
+##############################################################################
+
+if __name__ == "__main__":
+    test_bhv_on_two_random_20_leaf_trees()
 
         
        
