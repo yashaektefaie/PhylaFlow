@@ -4,7 +4,7 @@ class BHVEncoder():
     def __init__(self, n_leaves):
         self.n_leaves = n_leaves 
     
-    def compute_edge_masks(tree: Tree, root=0):
+    def compute_edge_masks(tree, root=0):
         """
         Returns:
         edge_masks: dict[(u,v)] -> mask over leaves below v, for directed edges u->v
@@ -64,3 +64,21 @@ class BHVEncoder():
     def return_BHV_encoding(self, tree):
         edge_masks, edge_lengths = self.compute_edge_masks(tree)
         return edge_masks, edge_lengths
+    
+    def BHV_length(self, one, two):
+        edge_mask_1, edge_length_1 = one 
+        edge_mask_2, edge_length_2 = two 
+
+        edge_mask_1 = set(edge_mask_1)
+        edge_mask_2 = set(edge_mask_2)
+
+        C = S1&S2
+        X = S1 - C
+        Y = S2 - C
+
+        
+       
+        
+
+
+
