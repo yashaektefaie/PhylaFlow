@@ -419,24 +419,11 @@ class TreeFeatureTokenizer(nn.Module):
             sin_embed_edge,
         )
 
-    def tree_to_graph(self, node_list):
+    def tree_to_graph(self, tree):
         """Node list is the tree in preorder"""
         node_list = list(tree.traverse("preorder"))
-
-        # Check if all node names can be converted to integers
-        try:
-            node_list = sorted(node_list, key=lambda n: int(n.name))
-        except ValueError as e:
-            raise ValueError(
-                f"Tree nodes must have numeric names, but found non-numeric name. "
-                f"This usually means you need to call tree_numbering() function from treeVector.py first. "
-                f"Original error: {e}"
-            ) from e
-
-        try:
-            device = next(self.parameters()).device
-        except StopIteration:
-            device = torch.device("cpu")
+        node_list = sorted(node_list, key=lambda n: int(n.name))
+        device = torch.device('cpu')
 
         name_to_type = {
             int(node.name): (1 if node.is_leaf() else 2) for node in node_list

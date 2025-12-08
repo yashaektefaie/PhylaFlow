@@ -65,6 +65,10 @@ def tree_to_bhv_vector(newick, global_splits, leaf_set=None):
             vec[idx] = length
     return vec
 
+def bhv_vector_to_tree(bhv_vector, global_splits):
+
+    return newick_trees
+
 def random_topology(leaves):
     """
     Generate a random binary tree topology over given leaf labels.
@@ -95,7 +99,7 @@ def random_bhv_tree(leaves, length_scale=0.1):
 
 def calculate_bhv_geodesic(start_tree, end_tree, time):
     difference = end_tree - start_tree 
-    
+
 
     #From here to here, this one shrinks, then expands
     #From here to here, this one shrinks, then expands
