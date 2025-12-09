@@ -1,6 +1,7 @@
 from collections import defaultdict, deque
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.random_tree import RandomTree
+from utils.bhv_movie import make_bhv_topology_movie
 
 class BHVEncoder():
     def __init__(self, n_leaves):
@@ -82,7 +83,6 @@ class BHVEncoder():
             print("  ratio:", seg["ratio"])
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
 
-
 def test_bhv_on_two_random_20_leaf_trees():
     n = 20
     print("Generating random trees...")
@@ -121,6 +121,15 @@ def test_bhv_on_two_random_20_leaf_trees():
         print()
 
     print("Test completed.")
+
+    make_bhv_topology_movie(
+        tree1,
+        tree2,
+        result,
+        n_leaves=n,
+        filename="bhv_topology_20leaf.gif",
+        fps=1,   # 1 frame per second (one per step)
+    )
 
 
 ##############################################################################
