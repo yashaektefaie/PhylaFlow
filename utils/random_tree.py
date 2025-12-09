@@ -61,3 +61,14 @@ class RandomTree:
     def length(self, u, v):
         # symmetric
         return self.lengths.get((u, v), self.lengths.get((v, u)))
+
+    def __str__(self):
+        #Build newick representation
+        def build_newick(node, parent):
+            children = [n for n in self.adj[node] if n != parent]
+            if not children:
+                return str(node)
+            else:
+                subtrees = [build_newick(c, node) + f":{self.length(node,c):.4f}" for c in children]
+                return "(" + ",".join(subtrees) + ")"
+        return build_newick(1, None) + ";"

@@ -44,7 +44,6 @@ class BHVEncoder():
                     if parent.get(v) == u:  # child
                         m |= node_mask[v]
                 node_mask[u] = m
-        
 
         # build edge masks for internal edges
         # For each internal edge take the sort of anti-not somehow like if both 1 then 0, this represents the split of the tree
@@ -61,7 +60,7 @@ class BHVEncoder():
                     edge_masks.append(canon)
                     edge_lengths.append(tree.length(p,v))
 
-        return edge_masks
+        return edge_masks, edge_lengths
 
     def return_BHV_encoding(self, tree):
         edge_masks, edge_lengths = self.compute_edge_masks(tree)
@@ -93,11 +92,15 @@ def test_bhv_on_two_random_20_leaf_trees():
     enc = BHVEncoder(n)
 
     print("Encoding trees into bitmask form...")
-    edge_masks_1, edge_lengths_1 = enc.compute_edge_masks(T1)
-    edge_masks_2, edge_lengths_2 = enc.compute_edge_masks(T2)
+    root = 11
+    edge_masks_1, edge_lengths_1 = enc.compute_edge_masks(T1, root = root)
+    edge_masks_2, edge_lengths_2 = enc.compute_edge_masks(T2, root = root)
+
+    tree1 = {m: l for m, l in zip(edge_masks_1, edge_lengths_1)}
+    tree2 = {m: l for m, l in zip(edge_masks_2, edge_lengths_2)}
 
     print("Computing BHV geodesic with support pairs...")
-    result = bhv_geodesic_with_support([edge_masks_1, edge_lengths_1], [edge_masks_2, edge_lengths_2], n_leaves=n)
+    result = bhv_geodesic_with_support(tree1, tree2, n_leaves=n)
 
     print("\n======================")
     print("BHV DISTANCE =", result["distance"])
