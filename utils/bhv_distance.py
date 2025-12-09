@@ -398,8 +398,6 @@ def bhv_geodesic_with_support(
     # Segment-wise orthant info for visualization
     segments = compute_orthant_segments(
         common,
-        E1_only,
-        E2_only,
         A_support,
         B_support,
         lengths1,
@@ -415,51 +413,175 @@ def bhv_geodesic_with_support(
         "segments": segments,
     }
 
-def compute_orthant_segments(
+def lengths_at_lambda(
+    lam: float,
     common: Set[Bitmask],
-    E1_only: Set[Bitmask],
-    E2_only: Set[Bitmask],
     A_support: List[Set[Bitmask]],
     B_support: List[Set[Bitmask]],
-    lengths1: Dict[Bitmask, Length],
-    lengths2: Dict[Bitmask, Length],
+    lengths1: Dict[Bitmask, float],
+    lengths2: Dict[Bitmask, float],
+    normsA: List[float],
+    normsB: List[float],
+) -> Dict[Bitmask, float]:
+    """
+    Compute edge lengths at parameter λ along the BHV geodesic,
+    using Owen–Provan formulas.
+    """
+
+    # Precompute mapping: which support pair and which side does edge belong to?
+    edge_to_pair = {}
+    for j, A in enumerate(A_support):
+        for e in A:
+            edge_to_pair[e] = (j, "A")
+    for j, B in enumerate(B_support):
+        for e in B:
+            edge_to_pair[e] = (j, "B")
+
+    all_edges = set(lengths1.keys()) | set(lengths2.keys())
+    L = {}
+
+    for e in all_edges:
+        in1 = e in lengths1
+        in2 = e in lengths2
+
+        if in1 and in2 and (e in common):
+            # common edge: linear interpolation
+            L[e] = (1.0 - lam) * lengths1[e] + lam * lengths2[e]
+            continue
+
+        # if it's in support pairs, use the piecewise formula
+        if e in edge_to_pair:
+            j, side = edge_to_pair[e]
+            normA = normsA[j]
+            normB = normsB[j]
+
+            if side == "A":
+                if normA == 0.0:
+                    L[e] = 0.0
+                else:
+                    coeff = ((1.0 - lam) * normA - lam * normB) / normA
+                    L[e] = max(0.0, coeff * lengths1[e])  # clip tiny negatives
+            else:  # side == "B"
+                if normB == 0.0:
+                    L[e] = 0.0
+                else:
+                    coeff = (lam * normB - (1.0 - lam) * normA) / normB
+                    L[e] = max(0.0, coeff * lengths2[e])
+        else:
+            # edge only in T1 or T2 but not in support (rare if you've already
+            # done the standard preprocessing). Treat missing length as 0.
+            if in1 and not in2:
+                # shrinks from lenghts1 -> 0
+                L[e] = max(0.0, (1.0 - lam) * lengths1[e])
+            elif in2 and not in1:
+                # grows from 0 -> lengths2
+                L[e] = max(0.0, lam * lengths2[e])
+            else:
+                L[e] = 0.0
+
+    return L
+
+def compute_orthant_segments(
+    common: Set[Bitmask],
+    A_support: List[Set[Bitmask]],
+    B_support: List[Set[Bitmask]],
+    lengths1: Dict[Bitmask, float],
+    lengths2: Dict[Bitmask, float],
 ):
     """
-    Build a per-segment description of the geodesic in terms of:
-      - which splits are present at segment start and end
-      - which splits are collapsed / grown in that segment
-      - norms ||A_i||, ||B_i|| and ratio r_i
+    Build a per-segment description of the BHV geodesic using Owen–Provan.
+
+    Returns a list of segments, each with:
+        - Ai, Bi
+        - start_splits, end_splits
+        - normA, normB, ratio
+        - start_lengths, end_lengths
+        - length   (true BHV length of that segment)
     """
 
-    # At t=0 (start): we are at tree1
-    remaining_from_t1 = set(E1_only)  # disjoint edges still present from T1
-    grown_from_t2 = set()             # disjoint edges already "turned on" from T2
+    k = len(A_support)
+    assert k == len(B_support)
 
-    segments = []
+    # Norms and ratios
+    normsA = []
+    normsB = []
+    ratios = []
+
     for Ai, Bi in zip(A_support, B_support):
-        # active splits at start of this segment
-        start_splits = common | remaining_from_t1 | grown_from_t2
-
-        # norms and ratio for this support pair
         normA = math.sqrt(sum(lengths1[e] ** 2 for e in Ai)) if Ai else 0.0
         normB = math.sqrt(sum(lengths2[f] ** 2 for f in Bi)) if Bi else 0.0
-        ratio = normA / normB if normB > 0 else float("inf") if normA > 0 else 0.0
+        normsA.append(normA)
+        normsB.append(normB)
 
-        # update which splits are present at end of segment:
-        # collapse Ai, grow Bi
-        remaining_from_t1 = remaining_from_t1 - Ai
-        grown_from_t2 = grown_from_t2 | Bi
+        if normB > 0:
+            ratios.append(normA / normB)
+        elif normA > 0:
+            ratios.append(float("inf"))
+        else:
+            ratios.append(0.0)
 
-        end_splits = common | remaining_from_t1 | grown_from_t2
+    # Build λ-boundaries: λ0=0, λ_{i} = r_i/(1+r_i), λ_{k+1}=1
+    lambdas = [0.0]
+    for r in ratios:
+        if math.isinf(r) and r > 0:
+            lambdas.append(1.0)
+        elif r <= -1e10:  # if you ever have negative ratios for common edges
+            lambdas.append(0.0)
+        else:
+            lambdas.append(r / (1.0 + r))
+    lambdas.append(1.0)
+
+    # All edges we track for Euclidean norms
+    all_edges = set(lengths1.keys()) | set(lengths2.keys())
+
+    segments = []
+
+    # We’ll define k+1 legs as in Owen–Provan; typically the first/last may be short.
+    for i in range(k + 1):
+        lam_start = lambdas[i]
+        lam_end = lambdas[i + 1]
+
+        # Edge lengths at the two endpoints of this leg
+        L_start = lengths_at_lambda(
+            lam_start, common, A_support, B_support, lengths1, lengths2, normsA, normsB
+        )
+        L_end = lengths_at_lambda(
+            lam_end, common, A_support, B_support, lengths1, lengths2, normsA, normsB
+        )
+
+        # Euclidean segment length
+        seg_len_sq = 0.0
+        for e in all_edges:
+            d = L_end[e] - L_start[e]
+            seg_len_sq += d * d
+        seg_len = math.sqrt(seg_len_sq)
+
+        # Which splits are nonzero at start/end
+        eps = 1e-8
+        start_splits = {e for e in all_edges if L_start[e] > eps}
+        end_splits = {e for e in all_edges if L_end[e] > eps}
+
+        # For bookkeeping, we can associate this leg with the pair (A_i, B_i),
+        # where for i==0 or i==k we just use empty sets.
+        Ai = A_support[i] if 0 <= i < k else set()
+        Bi = B_support[i] if 0 <= i < k else set()
+        normA = normsA[i] if 0 <= i < k else 0.0
+        normB = normsB[i] if 0 <= i < k else 0.0
+        ratio = ratios[i] if 0 <= i < k else None
 
         segments.append({
             "Ai": set(Ai),
             "Bi": set(Bi),
-            "start_splits": set(start_splits),
-            "end_splits": set(end_splits),
+            "start_splits": start_splits,
+            "end_splits": end_splits,
             "normA": normA,
             "normB": normB,
             "ratio": ratio,
+            "lambda_start": lam_start,
+            "lambda_end": lam_end,
+            "start_lengths": L_start,
+            "end_lengths": L_end,
+            "length": seg_len,
         })
 
     return segments

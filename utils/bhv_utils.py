@@ -82,6 +82,8 @@ class BHVEncoder():
             print("  Bi (grown):    ", seg["Bi"])
             print("  ratio:", seg["ratio"])
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
+    
+
 
 def test_bhv_on_two_random_20_leaf_trees():
     n = 20

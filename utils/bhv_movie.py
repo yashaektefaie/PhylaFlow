@@ -4,6 +4,7 @@ import io
 import matplotlib.pyplot as plt
 from matplotlib import animation
 from Bio import Phylo
+import random
 
 def popcount(x: int) -> int:
     return x.bit_count()  # Python 3.8+: or bin(x).count("1")
@@ -157,76 +158,13 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
 
     return G, tree_to_newick(G, root=None)
 
-def build_geodesic_snapshots(tree1, tree2, geodesic_result, n_leaves):
-    """
-    Build a list of (G, description) pairs, one per topological "step" along the
-    BHV geodesic, where G is a NetworkX tree for that step.
-
-    Returns:
-        snapshots: list of dicts with keys:
-            - 'graph': NetworkX Graph
-            - 'desc': str description (e.g. "start", "after segment 0", ...)
-    """
-    segments = geodesic_result["segments"]
-
-    E1 = set(tree1.keys())
-    E2 = set(tree2.keys())
-    common = E1 & E2
-    X = E1 - common
-    Y = E2 - common
-
-    snapshots = []
-
-    if not segments:
-        # just a single topology
-        split_set = E1  # == E2 if common-only
-        length_map = {}
-        for m in split_set:
-            if m in X:
-                length_map[m] = tree1[m]
-            elif m in Y:
-                length_map[m] = tree2[m]
-            else:
-                length_map[m] = 0.5 * (tree1[m] + tree2[m])
-        G, newick = build_tree_from_splits(split_set, length_map, n_leaves)
-        snapshots.append({"graph": G, "desc": "single topology", "newick": newick})
-        return snapshots
-
-    # Snapshot 0: start_splits of first segment (this is tree1 topology)
-    first_splits = segments[0]["start_splits"]
-    length_map0 = {}
-    for m in first_splits:
-        if m in X:
-            length_map0[m] = tree1[m]
-        elif m in Y:
-            length_map0[m] = tree2[m]
-        else:  # common
-            length_map0[m] = 0.5 * (tree1[m] + tree2[m])
-    G0, newick0 = build_tree_from_splits(first_splits, length_map0, n_leaves)
-    snapshots.append({"graph": G0, "desc": "start (tree1 topology)", "newick": newick0})
-
-    # Snapshots after each segment: use end_splits
-    for i, seg in enumerate(segments):
-        split_set = seg["end_splits"]
-        length_map = {}
-        for m in split_set:
-            if m in X:
-                length_map[m] = tree1[m]
-            elif m in Y:
-                length_map[m] = tree2[m]
-            else:  # common
-                length_map[m] = 0.5 * (tree1[m] + tree2[m])
-        G, newick = build_tree_from_splits(split_set, length_map, n_leaves)
-        snapshots.append({"graph": G, "desc": f"after segment {i}", "newick": newick})
-
-    return snapshots
-
 def make_bhv_topology_movie(
     tree1,
     tree2,
     geodesic_result,
     n_leaves,
     filename="bhv_topology.mp4",
+    F=10,
     fps=1,
     dpi=150,
 ):
@@ -238,7 +176,13 @@ def make_bhv_topology_movie(
       - frame 0: start topology (tree1-like)
       - frame i>0: topology after segment i-1
     """
-    snapshots = build_geodesic_snapshots(tree1, tree2, geodesic_result, n_leaves)
+    snapshots = []
+    for k in range(F):
+        u = k / (F - 1)
+        G, newick, info = sample_tree_along_geodesic(geodesic_result, n_leaves, u=u)
+        snapshots.append(newick)
+
+    # snapshots = build_geodesic_snapshots(tree1, tree2, geodesic_result, n_leaves)
 
     fig, ax = plt.subplots(figsize=(6, 6))
 
@@ -251,8 +195,8 @@ def make_bhv_topology_movie(
         ax.clear()
         ax.axis("off")
         snap = snapshots[idx]
-        newick = snap["newick"]
-        desc = snap["desc"]
+        newick = snap
+        desc = f"Frame {idx} (u={idx/(len(snapshots)-1):.2f})"
         print(newick)
 
         # Render the Newick tree with Biopython
@@ -285,3 +229,77 @@ def make_bhv_topology_movie(
 
     plt.close(fig)
     print(f"Saved BHV topology movie to {filename}")
+
+def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None):
+    """
+    Sample a tree at a *continuous* position along a BHV geodesic.
+
+    geodesic_result["segments"] must be a list of dicts with keys:
+        - "length": float BHV length of the segment
+        - "splits": set of split bitmasks present in this orthant
+        - "start_lengths": dict[split -> length at start of segment]
+        - "end_lengths":   dict[split -> length at end of segment]
+
+    n_leaves: number of leaves in the tree
+    u: scalar in [0,1]; if None, sampled uniformly
+
+    Returns:
+        G: NetworkX tree at that point
+        newick: Newick string for that tree
+        info: dict with where we are along the path
+    """
+    segments = geodesic_result["segments"]
+    if u is None:
+        u = random.random()
+
+    # 1) total BHV length
+    total_L = sum(seg["length"] for seg in segments)
+    if total_L == 0:
+        # degenerate: return start topology
+        seg0 = segments[0]
+        split_set = set(seg0["splits"])
+        length_map = dict(seg0["start_lengths"])
+        G, newick = build_tree_from_splits(split_set, length_map, n_leaves)
+        return G, newick, {"u": u, "segment_index": 0, "alpha": 0.0}
+
+    # 2) convert u -> arc length
+    s = u * total_L
+
+    # 3) find segment
+    cum = 0.0
+    seg_idx = None
+    offset = 0.0
+    for i, seg in enumerate(segments):
+        if s <= cum + seg["length"] or i == len(segments) - 1:
+            seg_idx = i
+            offset = s - cum
+            break
+        cum += seg["length"]
+
+    seg = segments[seg_idx]
+    L_seg = seg["length"]
+    alpha = 0.0 if L_seg == 0 else offset / L_seg
+
+    # 4) interpolate lengths for splits in this orthant
+    curr_lengths = {}
+    for m in list(seg["start_lengths"].keys()):
+        l0 = seg["start_lengths"][m]
+        l1 = seg["end_lengths"][m]
+        curr_lengths[m] = (1.0 - alpha) * l0 + alpha * l1
+
+    # 5) drop ~zero edges
+    eps = 1e-8
+    split_set = {m for m, L in curr_lengths.items() if L > eps}
+    length_map = {m: L for m, L in curr_lengths.items() if L > eps}
+
+    # 6) build tree
+    G, newick = build_tree_from_splits(split_set, length_map, n_leaves)
+
+    info = {
+        "u": u,
+        "s": s,
+        "segment_index": seg_idx,
+        "alpha": alpha,
+        "total_length": total_L,
+    }
+    return G, newick, info
