@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
+from utils.bhv_utils import return_sampled_tree_velocity
+import random
 
 
 class TreeDataset(Dataset):
@@ -71,6 +73,13 @@ class TreeDataset(Dataset):
         meta = self._index[index]
 
         seqs, taxa_order = self.parse_nexus(meta['nexus_path'])
+        real_tree = random.sample(self.load_posterior_trees_from_tfiles(meta["tree_paths"]), 1)[0]
+        #HAVE TO IMPELEMENT THIS RANDOM FUNCTION BELOW
+        random_tree = self.sample_random_tree(real_tree)
+        timepoint = random.uniform(0, 1)
+        newick, velocity = return_sampled_tree_velocity(random_tree, real_tree, timepoint)
+
+        ###TOKENIZE THE NEWICK TREE NEXT####
 
         sample = {
             "id": meta["id"],
@@ -79,7 +88,8 @@ class TreeDataset(Dataset):
             # Placeholders for parsed content:
             "sequences": seqs,
             "taxa_order": taxa_order, 
-            "trees": self.load_posterior_trees_from_tfiles(meta["tree_paths"]), 
+            "newick_tree": newick,
+            "velocity": velocity 
         }
 
         return sample

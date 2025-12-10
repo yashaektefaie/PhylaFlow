@@ -582,6 +582,10 @@ def compute_orthant_segments(
             "start_lengths": L_start,
             "end_lengths": L_end,
             "length": seg_len,
+            "velocity": {
+                e: (L_end[e] - L_start[e]) / seg_len if seg_len > 0 else 0.0
+                for e in all_edges
+            },
         })
 
     return segments

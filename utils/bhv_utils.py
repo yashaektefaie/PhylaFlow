@@ -1,11 +1,9 @@
 from collections import defaultdict, deque
 from utils.bhv_distance import bhv_geodesic_with_support
-from utils.random_tree import RandomTree
-from utils.bhv_movie import make_bhv_topology_movie
+from utils.random_tree import RandomTree, Tree
+from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic
 
 class BHVEncoder():
-    def __init__(self, n_leaves):
-        self.n_leaves = n_leaves 
     
     def compute_edge_masks(self, tree, root=0):
         """
@@ -83,6 +81,18 @@ class BHVEncoder():
             print("  ratio:", seg["ratio"])
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
     
+def return_sampled_tree_velocity(newick_tree_one, newick_tree_two, time_point):
+    t1 = Tree()._build_from_newick(newick_tree_one)
+    t2 = Tree()._build_from_newick(newick_tree_two)
+
+    enc = BHVEncoder()
+    one = enc.return_BHV_encoding(t1)
+    two = enc.return_BHV_encoding(t2)
+
+    geodesic_result = bhv_geodesic_with_support(t1, t2, n_leaves=t1.n_leaves)
+    G, newick, info = sample_tree_along_geodesic(geodesic_result, t1.n_leaves, u=time_point)
+
+    return newick, info['velocity']
 
 
 def test_bhv_on_two_random_20_leaf_trees():
@@ -91,7 +101,7 @@ def test_bhv_on_two_random_20_leaf_trees():
     T1 = RandomTree(n)
     T2 = RandomTree(n)
 
-    enc = BHVEncoder(n)
+    enc = BHVEncoder()
 
     print("Encoding trees into bitmask form...")
     root = 11
@@ -125,8 +135,6 @@ def test_bhv_on_two_random_20_leaf_trees():
     print("Test completed.")
 
     make_bhv_topology_movie(
-        tree1,
-        tree2,
         result,
         n_leaves=n,
         filename="bhv_topology_20leaf.gif",

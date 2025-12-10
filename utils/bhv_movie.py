@@ -159,8 +159,6 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
     return G, tree_to_newick(G, root=None)
 
 def make_bhv_topology_movie(
-    tree1,
-    tree2,
     geodesic_result,
     n_leaves,
     filename="bhv_topology.mp4",
@@ -301,5 +299,7 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None):
         "segment_index": seg_idx,
         "alpha": alpha,
         "total_length": total_L,
+        "velocity": seg['velocity']
     }
+
     return G, newick, info
