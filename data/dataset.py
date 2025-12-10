@@ -24,6 +24,8 @@ import pytorch_lightning as pl
 from utils.bhv_utils import return_sampled_tree_velocity
 import random
 from model.treeTokenizer import TreeFeatureTokenizer
+from utils.random_tree import RandomTree
+from ete3 import Tree as EteTree
 
 
 class TreeDataset(Dataset):
@@ -75,12 +77,9 @@ class TreeDataset(Dataset):
 
         seqs, taxa_order = self.parse_nexus(meta['nexus_path'])
         real_tree = random.sample(self.load_posterior_trees_from_tfiles(meta["tree_paths"]), 1)[0]
-        #HAVE TO IMPELEMENT THIS RANDOM FUNCTION BELOW
         random_tree = self.sample_random_tree(real_tree)
         timepoint = random.uniform(0, 1)
         newick, velocity = return_sampled_tree_velocity(random_tree, real_tree, timepoint)
-
-        ###TOKENIZE THE NEWICK TREE NEXT####
 
         sample = {
             "id": meta["id"],
@@ -95,6 +94,32 @@ class TreeDataset(Dataset):
         }
 
         return sample
+    
+    def sample_random_tree(self, real_tree):
+        """
+        real_tree: Newick string or an ETE Tree.
+        Returns: Newick string for a random tree with the same leaf names.
+        """
+        # Parse to ETE
+        if isinstance(real_tree, str):
+            t = EteTree(real_tree, format=1)
+        else:
+            t = real_tree
+
+        # Collect leaf names; order however you like (here: sorted for determinism)
+        leaves = t.get_leaves()
+        leaves_sorted = sorted(leaves, key=lambda x: x.name)
+        n_leaves = len(leaves_sorted)
+
+        # Build a random unrooted binary tree on {1,...,n_leaves}
+        rt = RandomTree(n_leaves)
+
+        # Map 1..n -> leaf names
+        name_map = {i + 1: leaves_sorted[i].name for i in range(n_leaves)}
+
+        # Produce Newick with the same taxa names but random topology/lengths
+        random_newick = rt.to_newick(name_map=name_map)
+        return random_newick
 
     def extract_newick_from_line(self, line: str) -> str:
         """
@@ -320,7 +345,7 @@ class PhylaDataModule(pl.LightningDataModule):
 
         self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids, configs=config)
         self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, configs=config)
-        self.tree_tokenizer = TreeFeatureTokenizer(configs=configs)
+        self.tree_tokenizer = TreeFeatureTokenizer(config['model']['num_node_types'], config['model']['num_edge_types'], config['model']['hidden_dim'],)
 
 
     def train_dataloader(self) -> DataLoader:
@@ -385,6 +410,6 @@ def test():
     res = dm[0]
     import pdb; pdb.set_trace()
 
-# test()
-
+if __name__ == "__main__":
+    test()
 

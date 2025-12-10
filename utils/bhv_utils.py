@@ -5,7 +5,7 @@ from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic
 
 class BHVEncoder():
     
-    def compute_edge_masks(self, tree, root=0):
+    def compute_edge_masks(self, tree, root=1):
         """
         Returns:
         edge_masks: dict[(u,v)] -> mask over leaves below v, for directed edges u->v
@@ -82,14 +82,18 @@ class BHVEncoder():
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
     
 def return_sampled_tree_velocity(newick_tree_one, newick_tree_two, time_point):
-    t1 = Tree()._build_from_newick(newick_tree_one)
-    t2 = Tree()._build_from_newick(newick_tree_two)
+    t1 = Tree(newick_tree_one)
+    t2 = Tree(newick_tree_two)
 
     enc = BHVEncoder()
-    one = enc.return_BHV_encoding(t1)
-    two = enc.return_BHV_encoding(t2)
+    t1_edge_mask, t1_edge_length = enc.return_BHV_encoding(t1)
+    t2_edge_mask, t2_edge_length = enc.return_BHV_encoding(t2)
 
-    geodesic_result = bhv_geodesic_with_support(t1, t2, n_leaves=t1.n_leaves)
+    tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
+    tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
+
+    geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
+    import pdb; pdb.set_trace()
     G, newick, info = sample_tree_along_geodesic(geodesic_result, t1.n_leaves, u=time_point)
 
     return newick, info['velocity']

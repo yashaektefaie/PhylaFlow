@@ -337,6 +337,7 @@ class TrainingModule(LightningModule):
 
 	def validation_step(self, batch, batch_idx):
         print("Wow congrats you made it here!")
+		raise Exception("NOW FACE THE FOLLY OF YOUR EFFORTS!")
 
 	def on_before_optimizer_step(self, optimizer):
 		# Compute the 2-norm for each layer

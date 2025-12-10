@@ -61,17 +61,35 @@ class RandomTree:
     def length(self, u, v):
         # symmetric
         return self.lengths.get((u, v), self.lengths.get((v, u)))
-
-    def __str__(self):
-        #Build newick representation
+    
+    def to_newick(self, name_map=None):
+        """
+        Return Newick string.
+        If name_map is provided, it should map integer leaf IDs to string labels.
+        Internal nodes keep integer IDs (or you can omit labels).
+        """
         def build_newick(node, parent):
             children = [n for n in self.adj[node] if n != parent]
             if not children:
-                return str(node)
+                # leaf
+                if name_map is not None and node in name_map:
+                    label = name_map[node]
+                else:
+                    label = str(node)
+                return label
             else:
-                subtrees = [build_newick(c, node) + f":{self.length(node,c):.4f}" for c in children]
+                subtrees = [
+                    build_newick(c, node) + f":{self.length(node, c):.4f}"
+                    for c in children
+                ]
                 return "(" + ",".join(subtrees) + ")"
+
+        # Arbitrarily root at leaf 1 just for Newick representation
         return build_newick(1, None) + ";"
+
+    def __str__(self):
+        return self.to_newick()
+
 
 
 class Tree:
