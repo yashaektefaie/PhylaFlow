@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from ete3 import Tree as EteTree
 
 
 class TreeFeatureTokenizer(nn.Module):
@@ -523,6 +524,15 @@ class TreeFeatureTokenizer(nn.Module):
         )
 
     def forward(self, trees):
+
+        if isinstance(trees, (str, EteTree)):
+            trees = [trees]
+
+        # List of Newick strings / ETE3 Trees
+        if isinstance(trees, list) and len(trees) > 0:
+            if all(isinstance(t, (str, EteTree)) for t in trees):
+                trees = [self._newick_to_structural(t) for t in trees]
+
         # We take in a list of trees where each entry is this format (children, root_idx[, branch_lengths][, edge_types])
         if self.is_structural_pack(trees):
             children_BK = trees[0]
@@ -804,3 +814,99 @@ class TreeFeatureTokenizer(nn.Module):
             leaf_mask,
             leaf_idx,
         )
+    
+    def _newick_to_structural(
+        self,
+        tree_or_str,
+        default_edge_type: int = 1,
+    ):
+        """
+        Convert a Newick string or an ETE3 Tree into the structural format:
+        (children[N,2], root_idx, branch_lengths[E+1], edge_types[E+1])
+
+        - children[i, :] = [child0, child1] with -1 for missing.
+        - root_idx is the index of the root node.
+        - branch_lengths & edge_types are aligned to the edge_index that
+          tree_to_graph_from_children will construct (i.e., sorted by child id),
+          plus a final entry for the root self-edge.
+        """
+        # Parse if needed
+        if isinstance(tree_or_str, str):
+            t = EteTree(tree_or_str, format=1)
+        else:
+            # assume already an ETE3 Tree-like object
+            t = tree_or_str
+
+        # Preorder traversal and index assignment
+        nodes = list(t.traverse("preorder"))
+        idx_map = {node: i for i, node in enumerate(nodes)}
+        N = len(nodes)
+
+        device = next(self.parameters()).device
+
+        # children[N,2] initialized to -1
+        children = torch.full(
+            (N, 2),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+
+        parent_list = []
+        child_list = []
+        branch_list = []
+        edge_type_list = []
+
+        for parent in nodes:
+            p_idx = idx_map[parent]
+            child_nodes = list(parent.children)
+
+            if len(child_nodes) > 2:
+                raise ValueError(
+                    "Non-binary tree encountered in _newick_to_structural; "
+                    "children tensor only supports up to 2 children per node."
+                )
+
+            for slot, child in enumerate(child_nodes):
+                c_idx = idx_map[child]
+                children[p_idx, slot] = c_idx
+
+                parent_list.append(p_idx)
+                child_list.append(c_idx)
+
+                # branch length stored on child in ETE
+                bl = getattr(child, "dist", 1.0)
+                branch_list.append(float(bl))
+
+                et = getattr(child, "edge_type_id", default_edge_type)
+                edge_type_list.append(int(et))
+
+        # Now match the exact edge ordering used in tree_to_graph_from_children:
+        # sort by child id.
+        if len(child_list) > 0:
+            child_arr = np.array(child_list, dtype=np.int64)
+            order = np.argsort(child_arr)
+
+            branch_arr = np.array(branch_list, dtype=np.float32)[order]
+            edge_type_arr = np.array(edge_type_list, dtype=np.int64)[order]
+        else:
+            branch_arr = np.zeros((0,), dtype=np.float32)
+            edge_type_arr = np.zeros((0,), dtype=np.int64)
+
+        # Add root self-edge as the last entry, matching tree_to_graph_from_children
+        root_idx = idx_map[t]
+        branch_arr = np.concatenate([branch_arr, np.array([0.0], dtype=np.float32)])
+        edge_type_arr = np.concatenate([edge_type_arr, np.array([0], dtype=np.int64)])
+
+        branch_lengths = torch.tensor(
+            branch_arr,
+            dtype=torch.float32,
+            device=device,
+        )
+        edge_types = torch.tensor(
+            edge_type_arr,
+            dtype=torch.long,
+            device=device,
+        )
+
+        return (children, root_idx, branch_lengths, edge_types)

@@ -23,6 +23,7 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from utils.bhv_utils import return_sampled_tree_velocity
 import random
+from model.treeTokenizer import TreeFeatureTokenizer
 
 
 class TreeDataset(Dataset):
@@ -316,8 +317,9 @@ class PhylaDataModule(pl.LightningDataModule):
         self.train_ids = train_ids
         self.test_ids = test_ids
 
-        self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids)
-        self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids)
+        self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids, configs=config)
+        self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, configs=config)
+        self.tree_tokenizer = TreeFeatureTokenizer(configs=configs)
 
 
     def train_dataloader(self) -> DataLoader:
@@ -328,6 +330,7 @@ class PhylaDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -337,6 +340,7 @@ class PhylaDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -346,6 +350,7 @@ class PhylaDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
         )
 
     def predict_dataloader(self) -> DataLoader:
@@ -355,7 +360,19 @@ class PhylaDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
         )
+
+    def collate_fn(self, batch):
+        """Custom collate function if needed."""
+        trees_to_tokenize = [item['newick_tree'] for item in batch]
+        tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
+        to_run = {
+            "tokenized_trees": tokenized_trees,
+            "batched_velocity": torch.tensor([item['velocity'] for item in batch], dtype=torch.float32)
+        }
+
+        return to_run
 
 
 def test():
