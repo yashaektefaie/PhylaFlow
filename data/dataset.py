@@ -343,8 +343,8 @@ class PhylaDataModule(pl.LightningDataModule):
         self.train_ids = train_ids
         self.test_ids = test_ids
 
-        self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids, configs=config)
-        self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, configs=config)
+        self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids)
+        self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids)
         self.tree_tokenizer = TreeFeatureTokenizer(config['model']['num_node_types'], config['model']['num_edge_types'], config['model']['hidden_dim'],)
 
 
@@ -407,7 +407,7 @@ class PhylaDataModule(pl.LightningDataModule):
 def test():
     dm = TreeDataset(nexus_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/nexus/",
                      mrbayes_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/runs/")
-    res = dm[0]
+    res_one = dm[0]
     import pdb; pdb.set_trace()
 
 if __name__ == "__main__":

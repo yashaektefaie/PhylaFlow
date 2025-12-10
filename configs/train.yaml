@@ -27,8 +27,10 @@ trainer:
 
 
 data:
-  nexus_root: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow_datasets/nexus
-  mrbayes_root: /n/netscratch/mzitnik_lab/Lab/yektefaie/runs
+  # nexus_root: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow_datasets/nexus
+  # mrbayes_root: /n/netscratch/mzitnik_lab/Lab/yektefaie/runs
+  nexus_root: /Users/yashaektefaie/Desktop/PhylaFlow/example_data/nexus/
+  mrbayes_root: /Users/yashaektefaie/Desktop/PhylaFlow/example_data/runs/
   batch_size: 16
   num_workers: 4
   pin_memory: False

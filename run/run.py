@@ -7,6 +7,26 @@ from run.TrainingModule import TrainingModule
 import random
 import wandb
 
+def run_test():
+    config_file = sys.argv[1]
+
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    ids = get_possible_ids(config['data']['nexus_root'])
+    #Random 80-20 train-test split for now
+    ran = random.Random(42)
+    ran.shuffle(ids)
+    train_ids = ids[:int(0.8*len(ids))]
+    test_ids = ids[int(0.8*len(ids)):]
+    ###TEMPORARY FOR DEBUGGING
+    train_ids = test_ids
+
+    dataset = PhylaDataModule(config, train_ids=train_ids, test_ids=test_ids)
+    one = dataset.dataset_train[0]
+    two = dataset.dataset_train[0]
+    batch = dataset.collate_fn([one, two])
+    import pdb; pdb.set_trace()
 
 
 def main():
@@ -40,8 +60,6 @@ def main():
         logger = None
     )
 
-
-
     save_callback = ModelCheckpoint(
         dirpath=config.trainer.checkpoint_dir,
         filename="{epoch:02d}-{step:06d}",  # Include metric value in the filename
@@ -69,4 +87,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    run_test()
