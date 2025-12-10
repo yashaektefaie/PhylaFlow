@@ -9,8 +9,7 @@ import gc
 import torch.distributed
 import gc
 import torch
-from utils.utils import random_bhv_tree, tree_to_bhv_vector, build_global_split_index, calculate_bhv_geodesic, bhv_vector_to_tree
-import random
+
 
 class TrainingModule(LightningModule):
 	def __init__(
@@ -43,7 +42,6 @@ class TrainingModule(LightningModule):
 		self.dataset = dataset
 		self.max_num_timesteps = max_num_timesteps
 		self.global_splits = global_splits
-		self.random_trees = random_trees
 
 		# Important: This property activates manual optimization.
 		# Turning off automatic optimization so I can catch out of memory errors!
@@ -53,26 +51,17 @@ class TrainingModule(LightningModule):
 
 	def forward(
 		self,
-		x_t,
+		batched_tokenized_trees,
 		t,
 		phyla_embeddings
 	):
-		#First must go from BHV space to newick tree
-		#Have to do some weird tree representation here for the tokenizer I rewrote, need to dive in here and fix that
-		trees = tree_representation(bhv_vector_to_tree(x_t))
-		velocity = self.model(trees, t = t, phyla_embeddings = phyla_embeddings)
+		velocity = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings)
 		return velocity
 
 	def step(self, batch, eval = False):
 		logs = {}
-		batch_size = len(batch['newick_trees'])
-		random_trees = random.sample(self.random_trees, batch_size)
-		random_trees_bhv_vector = torch.tensor([tree_to_bhv_vector(i, self.global_splits) for i in random_trees])
-		real_trees_bhv_vector = torch.tensor([tree_to_bhv_vector(i, self.global_splits) for i in batch['newick_trees']])
-		t = torch.rand(batch_size, 1, device = self.device)
-		x_t, v_target = calculate_bhv_geodesic(random_trees_bhv_vector, real_trees_bhv_vector, t)
-		v_pred = self.forward(x_t, t, batch['phyla_embeddings'])
-		loss = ((v_pred - v_target)**2).mean()
+		v_pred = self.forward(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
+		loss = ((v_pred - batch['batched_velocity'])**2).mean()
 		logs['loss'] = loss
 		return logs
 			

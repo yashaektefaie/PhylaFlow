@@ -221,7 +221,7 @@ class TreeDenoiserTokenGT(nn.Module):
 
     def forward(
         self,
-        tree,
+        tokenized_tree_batch,
         t = None,
         phyla_embedding=None,
         return_all_tokens=True,
@@ -233,23 +233,7 @@ class TreeDenoiserTokenGT(nn.Module):
         # if is_single_tree:
         #     tree = [tree]
 
-        tokenizer_output = self.tokenizer(tree)
-
-        # Handle both old format (single tree) and new format (batch)
-        if len(tokenizer_output) == 5 and isinstance(tokenizer_output[4], list):
-            # New batch format
-            padded_feature, padding_mask, padded_index, leaf_mask, leaf_idx_list = (
-                tokenizer_output
-            )
-        else:
-            # Old single tree format - convert to batch format
-            padded_feature, padding_mask, padded_index, leaf_mask, leaf_idx = (
-                tokenizer_output
-            )
-            leaf_idx_list = [leaf_idx]
-            # Ensure leaf_mask has batch dimension
-            if leaf_mask.dim() == 1:
-                leaf_mask = leaf_mask.unsqueeze(0)
+        padded_feature, padding_mask, padded_index, leaf_mask, leaf_idx = (tokenized_tree_batch)
 
         x = padded_feature
         B, T_raw, D = x.shape
@@ -436,3 +420,5 @@ def return_model(config):
             tokenizer_n_layers=config["model"]["tokenizer_n_layers"],
             phyla_dim=config["model"]["phyla_dim"],
         )
+    
+    return model 
