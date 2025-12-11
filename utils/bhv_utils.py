@@ -1,7 +1,7 @@
 from collections import defaultdict, deque
 import random
 from utils.bhv_distance import bhv_geodesic_with_support
-from utils.random_tree import RandomTree, Tree
+from utils.random_tree import Tree
 from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic
 
 class BHVEncoder():
@@ -123,21 +123,24 @@ def return_sampled_tree_velocity(newick_tree_one, newick_tree_two, time_point):
 def test_bhv_on_two_random_20_leaf_trees():
     n = 20
     print("Generating random trees...")
-    T1 = RandomTree(n)
-    T2 = RandomTree(n)
+    T1 = Tree(num_leaves=n, random=True)
+    T2 = Tree(num_leaves=n, random=True)
+
+    print("Tree 1 Newick:", T1)
+    print("Tree 2 Newick:", T2)
 
     enc = BHVEncoder()
 
     print("Encoding trees into bitmask form...")
     root = 11
-    edge_masks_1, edge_lengths_1 = enc.compute_edge_masks(T1, root = root)
-    edge_masks_2, edge_lengths_2 = enc.compute_edge_masks(T2, root = root)
+    edge_masks_1, edge_lengths_1 = enc.return_BHV_encoding(T1)
+    edge_masks_2, edge_lengths_2 = enc.return_BHV_encoding(T2)
 
     tree1 = {m: l for m, l in zip(edge_masks_1, edge_lengths_1)}
     tree2 = {m: l for m, l in zip(edge_masks_2, edge_lengths_2)}
 
     print("Computing BHV geodesic with support pairs...")
-    result = bhv_geodesic_with_support(tree1, tree2, n_leaves=n)
+    result = bhv_geodesic_with_support(tree1, tree2, n_leaves=T1.n_leaves)
 
     print("\n======================")
     print("BHV DISTANCE =", result["distance"])
@@ -161,8 +164,11 @@ def test_bhv_on_two_random_20_leaf_trees():
 
     make_bhv_topology_movie(
         result,
-        n_leaves=n,
+        n_leaves=T1.n_leaves,
+        root = T1.n_leaves-1,
         filename="bhv_topology_20leaf.gif",
+        mapping=T1.id_to_name,
+        F=20,
         fps=1,   # 1 frame per second (one per step)
     )
 

@@ -10,7 +10,7 @@ import random
 def popcount(x: int) -> int:
     return x.bit_count()  # Python 3.8+: or bin(x).count("1")
 
-def tree_to_newick(G: nx.Graph, root=None, leaf_label_attr="label") -> str:
+def tree_to_newick(G: nx.Graph, root=None, leaf_label_attr="label", dummy_node=None, mapping=None) -> str:
     """
     Convert a NetworkX tree into a Newick string.
 
@@ -25,15 +25,41 @@ def tree_to_newick(G: nx.Graph, root=None, leaf_label_attr="label") -> str:
       Newick string ending with a semicolon.
     """
 
-    if root is None:
-        # Prefer the node labeled 'root' (like your C_root)
-        for n, data in G.nodes(data=True):
-            if data.get(leaf_label_attr, None) == "root":
-                root = n
-                break
-        else:
-            # fallback: arbitrary node
-            root = next(iter(G.nodes))
+    if dummy_node is not None and G.has_node(dummy_node):
+        # 1. If the current root IS the dummy we are about to delete...
+        if root == dummy_node:
+            # Find the neighbor (the "Original Root" of the MrBayes tree)
+            neighbors = list(G.neighbors(dummy_node))
+            if neighbors:
+                # Shift the root pointer to the valid internal node
+                root = neighbors[0]
+            else:
+                # Edge case: Graph was just (Dummy)-(Node), now it's just (Node)
+                # or empty. We'll handle empty later.
+                root = None 
+
+        # 2. NOW it is safe to remove the dummy
+        G.remove_node(dummy_node)
+
+    if mapping is not None:
+        # Filter mapping to only nodes that exist (dummy is gone now)
+        mapping = {node: name for node, name in mapping.items() if node in G}
+        
+        # Update attributes for Newick label usage
+        for nid, name in mapping.items():
+            if G.has_node(nid):
+                G.nodes[nid]['label'] = name
+        
+        # Relabel the keys in the graph itself
+        G = nx.relabel_nodes(G, mapping, copy=False)
+        
+        # CRITICAL: If we relabeled the nodes, we must update our 'root' variable 
+        # because the old ID (e.g., 0) might now be a string (e.g., "73")
+        # However, typically 'root' is an internal node (like "C_root") which 
+        # isn't in the leaf mapping. But if root WAS a mapped leaf (edge case), 
+        # we need to update it.
+        if root in mapping:
+            root = mapping[root]
 
     # Recursive DFS to build Newick
     def build_subtree(node, parent):
@@ -56,7 +82,7 @@ def tree_to_newick(G: nx.Graph, root=None, leaf_label_attr="label") -> str:
     newick_body = build_subtree(root, parent=None)
     return newick_body + ";"
 
-def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
+def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1, mapping=None):
     """
     Build a NetworkX tree from a compatible set of splits (bitmasks).
 
@@ -72,6 +98,7 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
           and edges have 'length' attribute.
         newick: string
     """
+    dummy_node = n_leaves - 1
     full_mask = (1 << n_leaves) - 1
     root_bit = 1 << root_leaf
 
@@ -199,12 +226,14 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
         parent_node = cluster_nodes[parent_cluster]
         length = float(leaf_lengths.get(leaf, 0.0))
         G.add_edge(parent_node, leaf, length=length)
-    return G, tree_to_newick(G, root=root_leaf)
+    return G, tree_to_newick(G, root=root_leaf, dummy_node=dummy_node, mapping=mapping)
 
 def make_bhv_topology_movie(
     geodesic_result,
     n_leaves,
     filename="bhv_topology.mp4",
+    root = None,
+    mapping =None,
     F=10,
     fps=1,
     dpi=150,
@@ -220,7 +249,7 @@ def make_bhv_topology_movie(
     snapshots = []
     for k in range(F):
         u = k / (F - 1)
-        G, newick, info = sample_tree_along_geodesic(geodesic_result, n_leaves, u=u)
+        G, newick, info = sample_tree_along_geodesic(geodesic_result, n_leaves, u=u, root=root, mapping=mapping)
         snapshots.append(newick)
 
     # snapshots = build_geodesic_snapshots(tree1, tree2, geodesic_result, n_leaves)
@@ -271,7 +300,7 @@ def make_bhv_topology_movie(
     plt.close(fig)
     print(f"Saved BHV topology movie to {filename}")
 
-def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None):
+def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None, root=None, mapping=None):
     """
     Sample a tree at a *continuous* position along a BHV geodesic.
 
@@ -300,7 +329,8 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None):
         seg0 = segments[0]
         split_set = set(seg0["splits"])
         length_map = dict(seg0["start_lengths"])
-        G, newick = build_tree_from_splits(split_set, length_map, n_leaves)
+        G, newick = build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=root, mapping=mapping)
+        ####ADD IN SPECIAL STUFF####
         return G, newick, {"u": u, "segment_index": 0, "alpha": 0.0}
 
     # 2) convert u -> arc length
@@ -334,7 +364,7 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None):
     length_map = {m: L for m, L in curr_lengths.items() if L > eps}
 
     # 6) build tree
-    G, newick = build_tree_from_splits(split_set, length_map, n_leaves)
+    G, newick = build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=root, mapping=mapping)
 
     info = {
         "u": u,
@@ -391,23 +421,23 @@ if __name__ == "__main__":
 
     tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
     # tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
-    G_rec, recovered_newick_1 = build_tree_from_splits(t1_edge_mask, tree1, T1.n_leaves, root_leaf = T1.n_leaves-1)
-    # recovered_newick_2 = build_tree_from_splits(t2_edge_mask, tree2, n_leaves)[1]
-    print("Recovered Tree 1 Newick from BHV:", recovered_newick_1)
-    dummy_id = T1.n_leaves - 1
-    if G_rec.has_node(dummy_id):
-        G_rec.remove_node(dummy_id)
-        mapping = {node: name for node, name in T1.id_to_name.items() if node in G_rec}
+    G_rec, recovered_newick_1 = build_tree_from_splits(t1_edge_mask, tree1, T1.n_leaves, root_leaf = T1.n_leaves-1, mapping=T1.id_to_name)
+    # # recovered_newick_2 = build_tree_from_splits(t2_edge_mask, tree2, n_leaves)[1]
+    # print("Recovered Tree 1 Newick from BHV:", recovered_newick_1)
+    # dummy_id = T1.n_leaves - 1
+    # if G_rec.has_node(dummy_id):
+    #     G_rec.remove_node(dummy_id)
+    #     mapping = {node: name for node, name in T1.id_to_name.items() if node in G_rec}
 
-        # Step A: Update the internal attributes
-        for nid, name in mapping.items():
-            G_rec.nodes[nid]['label'] = name
-        #Get name of one node in graph
-        print(mapping)
-        G_rec = nx.relabel_nodes(G_rec, mapping, copy=False)
-        final_newick = tree_to_newick(G_rec, root=None)
-        print("Final Match:", final_newick)
+    #     # Step A: Update the internal attributes
+    #     for nid, name in mapping.items():
+    #         G_rec.nodes[nid]['label'] = name
+    #     #Get name of one node in graph
+    #     print(mapping)
+    #     G_rec = nx.relabel_nodes(G_rec, mapping, copy=False)
+    #     final_newick = tree_to_newick(G_rec, root=None)
+    #     print("Final Match:", final_newick)
 
-        print("RF distance between original and recovered tree 1:", normalized_rf(newick1, final_newick))
+    print("RF distance between original and recovered tree 1:", normalized_rf(newick1, recovered_newick_1))
     
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()

@@ -4,97 +4,6 @@ import networkx as nx
 from ete3 import Tree as eteTree
 from utils.bhv_movie import tree_to_newick
 
-class RandomTree:
-    """
-    Build a random unrooted binary tree with n_leaves numbered 1..n.
-    Internal nodes numbered n+1, n+2, ...
-    """
-    def __init__(self, n_leaves):
-        self.n_leaves = n_leaves
-        self.adj = defaultdict(list)
-        self.lengths = {}   # store edge lengths: key=(u,v) in sorted order
-
-        # Build random unrooted binary tree via random split growth.
-        # (This is not Yule or coalescent, just a simple binary random shape.)
-        #
-        # Start with a cherry: 1 -- (n+1) -- 2
-        internal_id = n_leaves + 1
-
-        # adjacency for starting structure
-        self._add_edge(1, internal_id)
-        self._add_edge(2, internal_id)
-
-        # Internal nodes used so far
-        current_internal = [internal_id]
-
-        # Add leaf 3..n
-        for leaf in range(3, n_leaves + 1):
-            # Pick a random existing edge to subdivide
-            # Choose a random internal or leaf, then one of its neighbors
-            u = random.choice(list(self.adj.keys()))
-            v = random.choice(self.adj[u])
-
-            # Remove edge u--v
-            self._remove_edge(u, v)
-
-            # Create new internal node
-            internal_id += 1
-            w = internal_id
-
-            # New edges u--w, v--w, w--leaf
-            self._add_edge(u, w)
-            self._add_edge(v, w)
-            self._add_edge(w, leaf)
-
-        # Randomize lengths
-        for u in self.adj:
-            for v in self.adj[u]:
-                if (u,v) not in self.lengths and (v,u) not in self.lengths:
-                    L = random.uniform(0.1, 1.0)
-                    self.lengths[(u,v)] = self.lengths[(v,u)] = L
-
-    def _add_edge(self, u, v):
-        self.adj[u].append(v)
-        self.adj[v].append(u)
-
-    def _remove_edge(self, u, v):
-        self.adj[u].remove(v)
-        self.adj[v].remove(u)
-
-    def length(self, u, v):
-        # symmetric
-        return self.lengths.get((u, v), self.lengths.get((v, u)))
-    
-    def to_newick(self, name_map=None):
-        """
-        Return Newick string.
-        If name_map is provided, it should map integer leaf IDs to string labels.
-        Internal nodes keep integer IDs (or you can omit labels).
-        """
-        def build_newick(node, parent):
-            children = [n for n in self.adj[node] if n != parent]
-            if not children:
-                # leaf
-                if name_map is not None and node in name_map:
-                    label = name_map[node]
-                else:
-                    label = str(node)
-                return label
-            else:
-                subtrees = [
-                    build_newick(c, node) + f":{self.length(node, c):.4f}"
-                    for c in children
-                ]
-                return "(" + ",".join(subtrees) + ")"
-
-        # Arbitrarily root at leaf 1 just for Newick representation
-        return build_newick(1, None) + ";"
-
-    def __str__(self):
-        return self.to_newick()
-
-
-
 class Tree:
     """Build a tree object from a Newick string.
 
@@ -104,13 +13,105 @@ class Tree:
     used.
     """
 
-    def __init__(self, newick: str):
+    def __init__(self, newick: str = None, num_leaves: int = None, random: bool = False):
         self.adj = defaultdict(list)
         self.lengths = {}  # symmetric edge lengths: key=(u,v) or (v,u)
         self.n_leaves = 0
         self.id_to_name = {}
 
-        self._build_from_newick(newick)
+        if random and num_leaves is not None:
+            self._build_random_tree(num_leaves)
+        elif newick is not None:
+            self._build_from_newick(newick)
+    
+    def _add_edge(self, u, v, length=None):
+        self.adj[u].append(v)
+        self.adj[v].append(u)
+        if length is not None:
+            self.lengths[(u, v)] = self.lengths[(v, u)] = length
+
+    def _remove_edge(self, u, v):
+        if v in self.adj[u]: self.adj[u].remove(v)
+        if u in self.adj[v]: self.adj[v].remove(u)
+    
+    def _build_random_tree(self, num_leaves: int):
+        """
+        Generates a random tree with 'num_leaves' biological leaves (0..N-1),
+        plus 1 Dummy leaf (N).
+        """
+        # 1. Setup IDs
+        # Biological leaves: 0 to num_leaves-1
+        # Dummy leaf: num_leaves
+        dummy_leaf_id = num_leaves
+        
+        self.n_leaves = num_leaves + 1
+        
+        # Populate Names
+        for i in range(num_leaves):
+            self.id_to_name[i] = str(i) # Name is string of int
+        self.id_to_name[dummy_leaf_id] = "ROOT_DUMMY"
+
+        # Internal IDs start after the leaves
+        next_internal_id = self.n_leaves
+        
+        # 2. Build the Biological Tree (Unrooted Start)
+        # We start with a central node connecting 3 leaves (0, 1, 2)
+        # This guarantees we have a valid internal structure to grow from.
+        if num_leaves < 3:
+            raise ValueError("Random generation requires at least 3 leaves to be interesting.")
+
+        bio_root = next_internal_id
+        next_internal_id += 1
+        
+        self._add_edge(0, bio_root)
+        self._add_edge(1, bio_root)
+        self._add_edge(2, bio_root)
+        
+        # Add remaining biological leaves (3..N-1)
+        for leaf in range(3, num_leaves):
+            # Pick a random existing edge to subdivide
+            edges = []
+            seen = set()
+            for u in self.adj:
+                for v in self.adj[u]:
+                    # Only split biological edges (don't have dummy yet, so all are valid)
+                    if (u,v) not in seen and (v,u) not in seen:
+                        edges.append((u,v))
+                        seen.add((u,v))
+                        seen.add((v,u))
+            
+            u, v = random.choice(edges)
+            
+            # Remove old edge
+            self._remove_edge(u, v)
+            
+            # Create new internal node
+            w = next_internal_id
+            next_internal_id += 1
+
+            # Connect u-w, v-w, w-leaf
+            self._add_edge(u, w)
+            self._add_edge(v, w)
+            self._add_edge(w, leaf)
+
+        # 3. Inject the Super Root and Dummy
+        # We attach the Super Root to the 'bio_root' we created earlier.
+        super_root_id = next_internal_id
+        self.root = super_root_id # Set the class root property!
+        
+        # Edge: SuperRoot -- Dummy (Length 0)
+        self._add_edge(super_root_id, dummy_leaf_id, length=0.0)
+        
+        # Edge: SuperRoot -- BioRoot (Length 0)
+        self._add_edge(super_root_id, bio_root, length=0.0)
+
+        # 4. Randomize lengths for all other edges
+        for u in list(self.adj):
+            for v in self.adj[u]:
+                if (u,v) not in self.lengths:
+                    # Biological branch length
+                    L = random.uniform(0.1, 1.0)
+                    self.lengths[(u,v)] = self.lengths[(v,u)] = L
 
     def _build_from_newick(self, newick: str):
         t = eteTree(newick)
@@ -192,4 +193,4 @@ class Tree:
                 if not G.has_edge(u, v):
                     G.add_edge(u, v, length=self.length(u, v))
 
-        return tree_to_newick(G, root=None)
+        return tree_to_newick(G, root=self.root, dummy_node=self.n_leaves - 1, mapping=self.id_to_name)
