@@ -4,6 +4,7 @@ import io
 import matplotlib.pyplot as plt
 from matplotlib import animation
 from Bio import Phylo
+from ete3 import Tree as eteTree
 import random
 
 def popcount(x: int) -> int:
@@ -72,28 +73,28 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
         newick: string
     """
     full_mask = (1 << n_leaves) - 1
-    root_bit = 1 << (root_leaf - 1)
+    root_bit = 1 << root_leaf
 
     G = nx.Graph()
 
     # Add leaf nodes
-    for i in range(1, n_leaves + 1):
+    for i in range(n_leaves):
         G.add_node(i, is_leaf=True, label=str(i))
 
     # Special case: no splits => star tree; use leaf-lengths if present
     if not split_set:
         root_node = "R"
         G.add_node(root_node, is_leaf=False, label="R")
-        for i in range(1, n_leaves + 1):
-            m_leaf = 1 << (i - 1)
+        for i in range(n_leaves):
+            m_leaf = 1 << i
             length = float(length_map.get(m_leaf, 0.1))
             G.add_edge(root_node, i, length=length)
-        return G, tree_to_newick(G, root=None)
+        return G, tree_to_newick(G, root=root_leaf)
 
     # ------------------------------------------------------------------
     # STEP 0: separate internal splits from pendant (leaf) splits
     # ------------------------------------------------------------------
-    leaf_lengths = {i: 0.0 for i in range(1, n_leaves + 1)}
+    leaf_lengths = {i: 0.0 for i in range(0, n_leaves)}
     internal_splits = []
 
     for m in split_set:
@@ -109,7 +110,7 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
                 leaf_mask = A
             else:
                 leaf_mask = B
-            leaf_index = (leaf_mask.bit_length() - 1) + 1  # 1-based index
+            leaf_index = (leaf_mask.bit_length() - 1)  # 1-based index
             leaf_lengths[leaf_index] = length
             # Do NOT include this in internal split system
         else:
@@ -119,9 +120,9 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
     if not internal_splits:
         root_node = "R"
         G.add_node(root_node, is_leaf=False, label="R")
-        for i in range(1, n_leaves + 1):
+        for i in range(n_leaves):
             G.add_edge(root_node, i, length=leaf_lengths.get(i, 0.0))
-        return G, tree_to_newick(G, root=None)
+        return G, tree_to_newick(G, root=root_leaf)
 
     # ------------------------------------------------------------------
     # STEP 1: convert internal splits -> oriented clusters (away from root)
@@ -188,8 +189,8 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
     #         using the *pendant* lengths
     # ------------------------------------------------------------------
     all_clusters_with_root = [root_cluster] + cluster_list
-    for leaf in range(1, n_leaves + 1):
-        leaf_bit = 1 << (leaf - 1)
+    for leaf in range(n_leaves):
+        leaf_bit = 1 << leaf
         candidates = [C for C in all_clusters_with_root if (C & leaf_bit) != 0]
         if not candidates:
             parent_cluster = root_cluster
@@ -198,8 +199,7 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
         parent_node = cluster_nodes[parent_cluster]
         length = float(leaf_lengths.get(leaf, 0.0))
         G.add_edge(parent_node, leaf, length=length)
-
-    return G, tree_to_newick(G, root=None)
+    return G, tree_to_newick(G, root=root_leaf)
 
 def make_bhv_topology_movie(
     geodesic_result,
@@ -348,6 +348,22 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None):
     return G, newick, info
 
 
+# ---------------------------------------------------------------------------
+# Robinson-Foulds (RF) distance utilities
+# ---------------------------------------------------------------------------
+def normalized_rf(newick_a: str, newick_b: str, unrooted: bool = True):
+    """Compute Robinson-Foulds distance between two Newick trees.
+
+    Returns (rf, max_rf, normalized_rf) where normalized_rf = rf / max_rf.
+    If max_rf is zero (degenerate), normalized_rf is 0.0.
+    """
+    t1 = eteTree(newick_a)
+    t2 = eteTree(newick_b)
+    rf, max_rf, *_ = t1.robinson_foulds(t2, unrooted_trees=unrooted)
+    norm = 0.0 if max_rf == 0 else rf / max_rf
+    return rf, max_rf, norm
+
+
 if __name__ == "__main__":
     # Simple test with two random trees
     n_leaves = 5
@@ -356,12 +372,14 @@ if __name__ == "__main__":
 
     rt1 = RandomTree(n_leaves)
     newick1 = rt1.to_newick()
+    newick1 = "((73:2.000000e-02,(17:2.000000e-02,(144:2.000000e-02,(47:2.000000e-02,16:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,((152:2.000000e-02,(60:2.000000e-02,(97:2.000000e-02,((141:2.000000e-02,88:2.000000e-02):2.000000e-02,((133:2.000000e-02,(92:2.000000e-02,(117:2.000000e-02,19:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,14:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(((39:2.000000e-02,23:2.000000e-02):2.000000e-02,(72:2.000000e-02,13:2.000000e-02):2.000000e-02):2.000000e-02,((22:2.000000e-02,(((119:2.000000e-02,116:2.000000e-02):2.000000e-02,((140:2.000000e-02,56:2.000000e-02):2.000000e-02,51:2.000000e-02):2.000000e-02):2.000000e-02,(127:2.000000e-02,((91:2.000000e-02,((145:2.000000e-02,(135:2.000000e-02,(106:2.000000e-02,(101:2.000000e-02,(122:2.000000e-02,52:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(((89:2.000000e-02,42:2.000000e-02):2.000000e-02,41:2.000000e-02):2.000000e-02,12:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(95:2.000000e-02,((104:2.000000e-02,((137:2.000000e-02,(136:2.000000e-02,130:2.000000e-02):2.000000e-02):2.000000e-02,98:2.000000e-02):2.000000e-02):2.000000e-02,(115:2.000000e-02,((28:2.000000e-02,20:2.000000e-02):2.000000e-02,(81:2.000000e-02,(96:2.000000e-02,(111:2.000000e-02,11:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(65:2.000000e-02,(149:2.000000e-02,(68:2.000000e-02,(63:2.000000e-02,(82:2.000000e-02,((146:2.000000e-02,124:2.000000e-02):2.000000e-02,(77:2.000000e-02,(85:2.000000e-02,((((50:2.000000e-02,32:2.000000e-02):2.000000e-02,((71:2.000000e-02,(109:2.000000e-02,(46:2.000000e-02,((143:2.000000e-02,(48:2.000000e-02,((79:2.000000e-02,(121:2.000000e-02,(114:2.000000e-02,58:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(84:2.000000e-02,(67:2.000000e-02,((123:2.000000e-02,(142:2.000000e-02,44:2.000000e-02):2.000000e-02):2.000000e-02,26:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(((54:2.000000e-02,34:2.000000e-02):2.000000e-02,(53:2.000000e-02,24:2.000000e-02):2.000000e-02):2.000000e-02,(18:2.000000e-02,(107:2.000000e-02,9:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,4:2.000000e-02):2.000000e-02):2.000000e-02,((150:2.000000e-02,120:2.000000e-02):2.000000e-02,(40:2.000000e-02,(5:2.000000e-02,((59:2.000000e-02,(55:2.000000e-02,(80:2.000000e-02,(132:2.000000e-02,(94:2.000000e-02,(110:2.000000e-02,8:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(83:2.000000e-02,(86:2.000000e-02,((118:2.000000e-02,49:2.000000e-02):2.000000e-02,((61:2.000000e-02,((128:2.000000e-02,74:2.000000e-02):2.000000e-02,(113:2.000000e-02,(105:2.000000e-02,(108:2.000000e-02,(125:2.000000e-02,((151:2.000000e-02,33:2.000000e-02):2.000000e-02,((147:2.000000e-02,57:2.000000e-02):2.000000e-02,((36:2.000000e-02,(25:2.000000e-02,(102:2.000000e-02,7:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(((153:2.000000e-02,78:2.000000e-02):2.000000e-02,43:2.000000e-02):2.000000e-02,(103:2.000000e-02,(134:2.000000e-02,(99:2.000000e-02,(38:2.000000e-02,(10:2.000000e-02,((64:2.000000e-02,(66:2.000000e-02,27:2.000000e-02):2.000000e-02):2.000000e-02,(((126:2.000000e-02,75:2.000000e-02):2.000000e-02,(139:2.000000e-02,45:2.000000e-02):2.000000e-02):2.000000e-02,((87:2.000000e-02,((148:2.000000e-02,(129:2.000000e-02,37:2.000000e-02):2.000000e-02):2.000000e-02,21:2.000000e-02):2.000000e-02):2.000000e-02,(35:2.000000e-02,6:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(30:2.000000e-02,((90:2.000000e-02,(62:2.000000e-02,15:2.000000e-02):2.000000e-02):2.000000e-02,(131:2.000000e-02,(155:2.000000e-02,(76:2.000000e-02,((100:2.000000e-02,29:2.000000e-02):2.000000e-02,(93:2.000000e-02,(69:2.000000e-02,(112:2.000000e-02,2:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,(138:2.000000e-02,(154:2.000000e-02,(70:2.000000e-02,(31:2.000000e-02,3:2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02):2.000000e-02,1:2.000000e-02);"
     print("Generated random tree 1:", newick1)
     # rt2 = RandomTree(n_leaves)
     # newick2 = rt2.to_newick()
 
     T1 = Tree(newick1)
     print("Parsed tree 1 now see it as:", T1)
+    print("Number of leaves:", T1.n_leaves)
     # T2 = Tree(newick2)
 
     # print("Tree 1 Newick:", newick1)
@@ -373,8 +391,23 @@ if __name__ == "__main__":
 
     tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
     # tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
-
-    recovered_newick_1 = build_tree_from_splits(t1_edge_mask, tree1, n_leaves)[1]
+    G_rec, recovered_newick_1 = build_tree_from_splits(t1_edge_mask, tree1, T1.n_leaves, root_leaf = T1.n_leaves-1)
     # recovered_newick_2 = build_tree_from_splits(t2_edge_mask, tree2, n_leaves)[1]
     print("Recovered Tree 1 Newick from BHV:", recovered_newick_1)
+    dummy_id = T1.n_leaves - 1
+    if G_rec.has_node(dummy_id):
+        G_rec.remove_node(dummy_id)
+        mapping = {node: name for node, name in T1.id_to_name.items() if node in G_rec}
+
+        # Step A: Update the internal attributes
+        for nid, name in mapping.items():
+            G_rec.nodes[nid]['label'] = name
+        #Get name of one node in graph
+        print(mapping)
+        G_rec = nx.relabel_nodes(G_rec, mapping, copy=False)
+        final_newick = tree_to_newick(G_rec, root=None)
+        print("Final Match:", final_newick)
+
+        print("RF distance between original and recovered tree 1:", normalized_rf(newick1, final_newick))
+    
     import pdb; pdb.set_trace()

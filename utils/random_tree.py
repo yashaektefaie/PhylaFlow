@@ -108,15 +108,39 @@ class Tree:
         self.adj = defaultdict(list)
         self.lengths = {}  # symmetric edge lengths: key=(u,v) or (v,u)
         self.n_leaves = 0
+        self.id_to_name = {}
 
         self._build_from_newick(newick)
 
     def _build_from_newick(self, newick: str):
         t = eteTree(newick)
 
+        current_leaves = list(t.iter_leaves())
+        max_id = 0
+        for l in current_leaves:
+            try:
+                val = int(l.name)
+                if val > max_id:
+                    max_id = val
+            except ValueError:
+                pass # Ignore non-integer names if any
+
+        # Create the ID for the new leaf (e.g., if leaves are 1..4, this is 5)
+        dummy_id = max_id + 1
+
+        # Create a new "Super Root"
+        # We move the original tree to be a child of this new node, 
+        # and add the dummy leaf as the second child.
+        new_root = eteTree()
+        new_root.add_child(t, dist=0.0) # Original tree attached here
+        new_root.add_child(name=dummy_id, dist=0.0) # Dummy anchor attached here
+        
+        # Point our tree reference to this new super structure
+        t = new_root
+
         # 1) Collect leaves and assume their names are integers 1..n
         leaf_nodes = list(t.iter_leaves())
-        self.n_leaves = len(leaf_nodes)
+        self.n_leaves = len(leaf_nodes)+1  # +1 for dummy leaf
 
         # 2) Map ete3 nodes -> integer IDs
         mapping = {}
@@ -128,6 +152,7 @@ class Tree:
             lid = int(n.name)
             mapping[n] = lid
             mapping_to_rename[n] = num
+            self.id_to_name[num] = n.name
             num += 1
 
         next_internal_id = self.n_leaves

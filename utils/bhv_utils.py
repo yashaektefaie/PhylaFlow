@@ -16,12 +16,12 @@ class BHVEncoder():
             return root
 
         # Prefer a random leaf among 1..n_leaves
-        leaves = [u for u in tree.adj if 1 <= u <= getattr(tree, "n_leaves", 0)]
-        if leaves:
-            return random.choice(leaves)
-
-        # Fallback: arbitrary node
-        return next(iter(tree.adj))
+        leaves = [u for u in tree.adj if len(tree.adj[u]) == 2]
+        if len(leaves) > 1:
+            #THIS SHOULD NOT HAPPEN
+            import pdb; pdb.set_trace()
+        else:
+            return leaves[0]
 
     def compute_edge_masks(self, tree, root=None):
         """
@@ -30,7 +30,8 @@ class BHVEncoder():
                     Only for edges that correspond to nontrivial splits.
         Assumes leaves are labeled 1..n_leaves, internal nodes >= n_leaves.
         """
-        root = self._choose_root(tree, root)
+        #root = self._choose_root(tree, root)
+        root = tree.root
         n = tree.n_leaves
         full = (1 << n) - 1
 
@@ -54,8 +55,8 @@ class BHVEncoder():
 
         node_mask = {u: 0 for u in tree.adj}
         for u in reversed(order):
-            if 1 <= u <= n:  # leaf
-                node_mask[u] = (1 << (u - 1))
+            if 0 <= u < n:  # leaf
+                node_mask[u] = (1 << u)
             else:
                 m = 0
                 for v in tree.adj[u]:
