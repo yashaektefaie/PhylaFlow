@@ -59,8 +59,8 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
     """
     Build a NetworkX tree from a compatible set of splits (bitmasks).
 
-    split_set: iterable of bitmasks (each is one side of unrooted split)
-    length_map: dict[bitmask -> branch_length] for *those* splits
+    split_set: iterable of bitmasks (each is one side of an unrooted split)
+    length_map: dict[bitmask -> branch_length] for those splits
     n_leaves: number of leaves (labels 1..n_leaves)
     root_leaf: leaf index used as "outgroup" to orient clusters
 
@@ -69,6 +69,7 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
             - 1..n_leaves are leaves (attr is_leaf=True)
             - internal nodes (cluster nodes) (attr is_leaf=False)
           and edges have 'length' attribute.
+        newick: string
     """
     full_mask = (1 << n_leaves) - 1
     root_bit = 1 << (root_leaf - 1)
@@ -79,38 +80,77 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
     for i in range(1, n_leaves + 1):
         G.add_node(i, is_leaf=True, label=str(i))
 
+    # Special case: no splits => star tree; use leaf-lengths if present
     if not split_set:
-        # Star tree: root node connected to all leaves
-        root_node = f"R"
+        root_node = "R"
         G.add_node(root_node, is_leaf=False, label="R")
         for i in range(1, n_leaves + 1):
-            G.add_edge(root_node, i, length=0.1)
-        return G
+            m_leaf = 1 << (i - 1)
+            length = float(length_map.get(m_leaf, 0.1))
+            G.add_edge(root_node, i, length=length)
+        return G, tree_to_newick(G, root=None)
 
-    # Step 1: convert splits -> oriented clusters that do not contain root_leaf
-    cluster_masks = set()
-    cluster_to_split = {}  # cluster_mask -> original split mask
+    # ------------------------------------------------------------------
+    # STEP 0: separate internal splits from pendant (leaf) splits
+    # ------------------------------------------------------------------
+    leaf_lengths = {i: 0.0 for i in range(1, n_leaves + 1)}
+    internal_splits = []
+
     for m in split_set:
+        A = m
+        B = full_mask ^ m
+        sizeA = popcount(A)
+        sizeB = popcount(B)
+        length = float(length_map.get(m, 0.5))
+
+        if sizeA == 1 or sizeB == 1:
+            # Pendant edge: one side is a single leaf
+            if sizeA == 1:
+                leaf_mask = A
+            else:
+                leaf_mask = B
+            leaf_index = (leaf_mask.bit_length() - 1) + 1  # 1-based index
+            leaf_lengths[leaf_index] = length
+            # Do NOT include this in internal split system
+        else:
+            internal_splits.append(m)
+
+    # If there are no internal splits, just connect leaves to a root
+    if not internal_splits:
+        root_node = "R"
+        G.add_node(root_node, is_leaf=False, label="R")
+        for i in range(1, n_leaves + 1):
+            G.add_edge(root_node, i, length=leaf_lengths.get(i, 0.0))
+        return G, tree_to_newick(G, root=None)
+
+    # ------------------------------------------------------------------
+    # STEP 1: convert internal splits -> oriented clusters (away from root)
+    # ------------------------------------------------------------------
+    cluster_masks = set()
+    cluster_to_split = {}
+
+    for m in internal_splits:
         if m & root_bit:
-            cluster = full_mask ^ m  # choose side not containing root
+            # take side that does NOT contain root_leaf
+            cluster = full_mask ^ m
         else:
             cluster = m
         cluster_masks.add(cluster)
-        cluster_to_split[cluster] = m  # remember which split gave this cluster
+        cluster_to_split[cluster] = m
 
     # Include full cluster (all leaves) as root cluster
     root_cluster = full_mask
     all_clusters = list(cluster_masks)
     all_clusters.append(root_cluster)
 
-    # Step 2: sort clusters (excluding root) by size (descending)
+    # STEP 2: sort clusters (excluding root) by size (descending)
     cluster_list = sorted(cluster_masks, key=lambda c: popcount(c), reverse=True)
 
-    # Step 3: create nodes for clusters & connect to parent cluster
+    # STEP 3: create nodes for clusters & connect to parent cluster
     cluster_nodes = {}
 
     # Root node
-    root_node = f"C_root"
+    root_node = "C_root"
     G.add_node(root_node, is_leaf=False, label="root")
     cluster_nodes[root_cluster] = root_node
 
@@ -143,8 +183,10 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
         length = float(length_map.get(split_mask, 0.5))
         G.add_edge(nodeP, nodeC, length=length)
 
-    # Step 4: connect leaves to smallest cluster that contains them
-    # For each leaf ℓ, find minimal cluster C (or root_cluster) with ℓ ∈ C
+    # ------------------------------------------------------------------
+    # STEP 4: connect leaves to smallest cluster that contains them
+    #         using the *pendant* lengths
+    # ------------------------------------------------------------------
     all_clusters_with_root = [root_cluster] + cluster_list
     for leaf in range(1, n_leaves + 1):
         leaf_bit = 1 << (leaf - 1)
@@ -154,7 +196,8 @@ def build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=1):
         else:
             parent_cluster = min(candidates, key=lambda c: popcount(c))
         parent_node = cluster_nodes[parent_cluster]
-        G.add_edge(parent_node, leaf, length=0.0)
+        length = float(leaf_lengths.get(leaf, 0.0))
+        G.add_edge(parent_node, leaf, length=length)
 
     return G, tree_to_newick(G, root=None)
 
@@ -303,3 +346,35 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None):
     }
 
     return G, newick, info
+
+
+if __name__ == "__main__":
+    # Simple test with two random trees
+    n_leaves = 5
+    from utils.random_tree import RandomTree, Tree
+    from utils.bhv_utils import BHVEncoder
+
+    rt1 = RandomTree(n_leaves)
+    newick1 = rt1.to_newick()
+    print("Generated random tree 1:", newick1)
+    # rt2 = RandomTree(n_leaves)
+    # newick2 = rt2.to_newick()
+
+    T1 = Tree(newick1)
+    print("Parsed tree 1 now see it as:", T1)
+    # T2 = Tree(newick2)
+
+    # print("Tree 1 Newick:", newick1)
+    # print("Tree 2 Newick:", newick2)
+
+    enc = BHVEncoder()
+    t1_edge_mask, t1_edge_length = enc.return_BHV_encoding(T1)
+    # t2_edge_mask, t2_edge_length = enc.return_BHV_encoding(T2)
+
+    tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
+    # tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
+
+    recovered_newick_1 = build_tree_from_splits(t1_edge_mask, tree1, n_leaves)[1]
+    # recovered_newick_2 = build_tree_from_splits(t2_edge_mask, tree2, n_leaves)[1]
+    print("Recovered Tree 1 Newick from BHV:", recovered_newick_1)
+    import pdb; pdb.set_trace()

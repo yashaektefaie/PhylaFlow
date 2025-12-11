@@ -832,7 +832,9 @@ class TreeFeatureTokenizer(nn.Module):
         """
         # Parse if needed
         if isinstance(tree_or_str, str):
-            t = EteTree(tree_or_str, format=1)
+            if 'C(0)' in tree_or_str:
+                tree_or_str = tree_or_str.replace('C(0)', '"C"')
+            t = EteTree(tree_or_str, format=1, quoted_node_names=True)
         else:
             # assume already an ETE3 Tree-like object
             t = tree_or_str

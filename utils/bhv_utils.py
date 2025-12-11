@@ -1,17 +1,36 @@
 from collections import defaultdict, deque
+import random
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.random_tree import RandomTree, Tree
 from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic
 
 class BHVEncoder():
-    
-    def compute_edge_masks(self, tree, root=1):
+
+    def _choose_root(self, tree, root=None):
+        """Choose a root for an (unrooted) tree.
+
+        If `root` is provided, use it. Otherwise, pick a random leaf in 1..n.
+        Falls back to the smallest node id if no leaves are found.
+        """
+        if root is not None:
+            return root
+
+        # Prefer a random leaf among 1..n_leaves
+        leaves = [u for u in tree.adj if 1 <= u <= getattr(tree, "n_leaves", 0)]
+        if leaves:
+            return random.choice(leaves)
+
+        # Fallback: arbitrary node
+        return next(iter(tree.adj))
+
+    def compute_edge_masks(self, tree, root=None):
         """
         Returns:
         edge_masks: dict[(u,v)] -> mask over leaves below v, for directed edges u->v
                     Only for edges that correspond to nontrivial splits.
         Assumes leaves are labeled 1..n_leaves, internal nodes >= n_leaves.
         """
+        root = self._choose_root(tree, root)
         n = tree.n_leaves
         full = (1 << n) - 1
 
@@ -62,6 +81,8 @@ class BHVEncoder():
         return edge_masks, edge_lengths
 
     def return_BHV_encoding(self, tree):
+        #Find root of the tree
+        
         edge_masks, edge_lengths = self.compute_edge_masks(tree)
         return edge_masks, edge_lengths
     
