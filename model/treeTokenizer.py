@@ -842,17 +842,8 @@ class TreeFeatureTokenizer(nn.Module):
         # Preorder traversal and index assignment
         nodes = list(t.traverse("preorder"))
         idx_map = {node: i for i, node in enumerate(nodes)}
-        N = len(nodes)
 
         device = next(self.parameters()).device
-
-        # children[N,2] initialized to -1
-        children = torch.full(
-            (N, 2),
-            -1,
-            dtype=torch.long,
-            device=device,
-        )
 
         parent_list = []
         child_list = []
@@ -861,54 +852,67 @@ class TreeFeatureTokenizer(nn.Module):
 
         for parent in nodes:
             p_idx = idx_map[parent]
-            child_nodes = list(parent.children)
-
-            if len(child_nodes) > 2:
-                raise ValueError(
-                    "Non-binary tree encountered in _newick_to_structural; "
-                    "children tensor only supports up to 2 children per node."
-                )
-
-            for slot, child in enumerate(child_nodes):
+            for child in parent.children:  # can be 0,1,2,... children
                 c_idx = idx_map[child]
-                children[p_idx, slot] = c_idx
-
                 parent_list.append(p_idx)
                 child_list.append(c_idx)
 
-                # branch length stored on child in ETE
                 bl = getattr(child, "dist", 1.0)
                 branch_list.append(float(bl))
 
                 et = getattr(child, "edge_type_id", default_edge_type)
                 edge_type_list.append(int(et))
 
-        # Now match the exact edge ordering used in tree_to_graph_from_children:
-        # sort by child id.
-        if len(child_list) > 0:
-            child_arr = np.array(child_list, dtype=np.int64)
+        E = len(child_list)
+        if E > 0:
+            child_arr = np.asarray(child_list, dtype=np.int64)
             order = np.argsort(child_arr)
 
-            branch_arr = np.array(branch_list, dtype=np.float32)[order]
-            edge_type_arr = np.array(edge_type_list, dtype=np.int64)[order]
+            parent_arr = np.asarray(parent_list, dtype=np.int64)[order]
+            child_arr  = child_arr[order]
+            branch_arr = np.asarray(branch_list, dtype=np.float32)[order]
+            etype_arr  = np.asarray(edge_type_list, dtype=np.int64)[order]
         else:
+            parent_arr = np.zeros((0,), dtype=np.int64)
+            child_arr  = np.zeros((0,), dtype=np.int64)
             branch_arr = np.zeros((0,), dtype=np.float32)
-            edge_type_arr = np.zeros((0,), dtype=np.int64)
+            etype_arr  = np.zeros((0,), dtype=np.int64)
 
-        # Add root self-edge as the last entry, matching tree_to_graph_from_children
+        N = len(nodes)
+        # Build CSR (child_ptr / child_ids) from the *sorted* edges
+        # Note: CSR groups by parent, so we need to count per-parent on parent_arr.
+        counts = np.bincount(parent_arr, minlength=N) if E > 0 else np.zeros((N,), dtype=np.int64)
+        child_ptr_arr = np.zeros((N + 1,), dtype=np.int64)
+        np.cumsum(counts, out=child_ptr_arr[1:])
+
+        # Because edges are sorted by child id (global), parent groups are not contiguous.
+        # So we must scatter child ids into CSR slots.
+        child_ids_arr = np.empty((E,), dtype=np.int64)
+        parent_ids_arr = parent_arr.copy()
+
+        write_pos = child_ptr_arr[:-1].copy()  # current write offset per parent
+        for p, c in zip(parent_arr, child_arr):
+            j = write_pos[p]
+            child_ids_arr[j] = c
+            write_pos[p] += 1
+
+        # Root index
         root_idx = idx_map[t]
+
+        # Add root self-edge last (as you did)
         branch_arr = np.concatenate([branch_arr, np.array([0.0], dtype=np.float32)])
-        edge_type_arr = np.concatenate([edge_type_arr, np.array([0], dtype=np.int64)])
+        etype_arr  = np.concatenate([etype_arr,  np.array([0],   dtype=np.int64)])
 
-        branch_lengths = torch.tensor(
-            branch_arr,
-            dtype=torch.float32,
-            device=device,
-        )
-        edge_types = torch.tensor(
-            edge_type_arr,
-            dtype=torch.long,
-            device=device,
-        )
+        # To torch
+        child_ptr = torch.tensor(child_ptr_arr, dtype=torch.long, device=device)
+        child_ids = torch.tensor(child_ids_arr, dtype=torch.long, device=device)
+        parent_ids = torch.tensor(parent_ids_arr, dtype=torch.long, device=device)
 
-        return (children, root_idx, branch_lengths, edge_types)
+        branch_lengths = torch.tensor(branch_arr, dtype=torch.float32, device=device)
+        edge_types     = torch.tensor(etype_arr,  dtype=torch.long,   device=device)
+        import pdb; pdb.set_trace()
+
+        return (child_ptr, child_ids, parent_ids, root_idx, branch_lengths, edge_types)        
+
+
+        # return (children, root_idx, branch_lengths, edge_types)

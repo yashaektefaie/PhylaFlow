@@ -364,7 +364,7 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None, root=None, map
     length_map = {m: L for m, L in curr_lengths.items() if L > eps}
 
     # 6) build tree
-    G, newick = build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=root, mapping=mapping)
+    G, newick = build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=n_leaves-1, mapping=mapping)
 
     info = {
         "u": u,

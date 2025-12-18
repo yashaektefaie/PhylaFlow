@@ -24,7 +24,7 @@ import pytorch_lightning as pl
 from utils.bhv_utils import return_sampled_tree_velocity
 import random
 from model.treeTokenizer import TreeFeatureTokenizer
-from utils.random_tree import RandomTree
+from utils.random_tree import Tree
 from ete3 import Tree as EteTree
 
 
@@ -112,13 +112,10 @@ class TreeDataset(Dataset):
         n_leaves = len(leaves_sorted)
 
         # Build a random unrooted binary tree on {1,...,n_leaves}
-        rt = RandomTree(n_leaves)
-
-        # Map 1..n -> leaf names
-        name_map = {i + 1: leaves_sorted[i].name for i in range(n_leaves)}
+        rt = Tree(num_leaves=n_leaves, random=True)
 
         # Produce Newick with the same taxa names but random topology/lengths
-        random_newick = rt.to_newick(name_map=name_map)
+        random_newick = str(rt)
         return random_newick
 
     def extract_newick_from_line(self, line: str) -> str:
