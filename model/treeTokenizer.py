@@ -294,13 +294,6 @@ class TreeFeatureTokenizer(nn.Module):
                 vecs_k = vecs_k * (torch.rand_like(vecs_k) > self.lap_dropout)
 
         return vecs_k.to(torch.float32)
-    
-    def is_structural_tree(self, x):
-        # Single structural tree: (children[N,2], root_idx[, ...])
-        if not isinstance(x, (tuple, list)) or len(x) < 2:
-            return False
-        ch = x[0]
-        return isinstance(ch, torch.Tensor) and ch.dim() == 2 and ch.size(-1) == 2
 
     def is_structural_pack(self, x):
         # Batched structural pack: (children[BK,Nmax,2], root_BK[BK][, ...])
@@ -314,7 +307,9 @@ class TreeFeatureTokenizer(nn.Module):
     
     def tree_to_graph_from_children(
         self,
-        children: torch.Tensor,
+        child_ptr: torch.Tensor,
+        child_ids: torch.Tensor,
+        parent_ids: torch.Tensor,
         root_idx: int,
         branch_lengths: torch.Tensor | None = None,
         edge_types: torch.Tensor | None = None,
@@ -322,6 +317,7 @@ class TreeFeatureTokenizer(nn.Module):
         """
         Inputs:
         children      : Long[N,2] with -1 for missing
+        parent_ids    : Long[N] parent indices for each node
         root_idx      : int
         branch_lengths: Optional Float[E] aligned with edge_index after creation; if None, set 1.0; root self-edge 0.0
         edge_types    : Optional Long[E]; default 1; root self-edge 0
@@ -330,35 +326,34 @@ class TreeFeatureTokenizer(nn.Module):
         node_data, edge_index, edge_data, branch_lengths, node_num, edge_num,
         lap_eigvecs, leaf_mask, leaf_idx, sin_embed_node, sin_embed_edge
         """
-        device = next(self.parameters()).device
-        children = children.to(device)
-        N = children.size(0)
+        N = child_ptr.numel() - 1
+        device = child_ptr.device
 
-        # Node types: 1 leaf, 2 internal (your convention), but zero out 0 and 1 later in leaf_mask
-        is_leaf = (children[:, 0] < 0) & (children[:, 1] < 0)
-        node_data = torch.where(is_leaf, torch.ones(N, device=device, dtype=torch.long), torch.full((N,), 2, device=device, dtype=torch.long))
+        deg_out = child_ptr[1:] - child_ptr[:-1]
+        is_leaf = deg_out == 0
+        node_data = torch.where(
+            is_leaf,
+            torch.ones(N, dtype=torch.long),
+            torch.full((N,), 2, dtype=torch.long),
+        )
 
-        # Build edges (parent -> child), order by child id
         parents = []
-        childs = []
-        for slot in (0, 1):
-            c = children[:, slot]
-            mask = c >= 0
-            if mask.any():
-                u = torch.nonzero(mask, as_tuple=True)[0]
-                v = c[mask]
-                parents.append(u)
-                childs.append(v)
-        if parents:
-            parent_cat = torch.cat(parents)
-            child_cat  = torch.cat(childs)
-            # order by child id
-            order = torch.argsort(child_cat)
-            parent_cat = parent_cat[order]
-            child_cat  = child_cat[order]
-            edge_index = torch.stack([parent_cat, child_cat], dim=0)  # [2, E]
-        else:
-            edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+        children = []
+        for p in range(child_ptr.numel()-1):
+            start = child_ptr[p].item()
+            end = child_ptr[p+1].item()
+            if end > start:
+                c_ids = child_ids[start:end]
+                for c in c_ids:
+                    parents.append(parent_ids[p].unsqueeze(0))
+                    children.append(c.unsqueeze(0))
+        
+        parent_cat = torch.cat(parents)
+        child_cat  = torch.cat(children)
+        order = torch.argsort(child_cat)
+        parent_cat = parent_cat[order]
+        child_cat  = child_cat[order]
+        edge_index = torch.stack([parent_cat, child_cat], dim=0)  #
 
         # Root self-edge
         edge_index = torch.cat([edge_index, torch.tensor([[root_idx],[root_idx]], device=device, dtype=torch.long)], dim=1)
@@ -368,15 +363,13 @@ class TreeFeatureTokenizer(nn.Module):
         # Edge data / branch lengths
         if edge_types is None:
             edge_data = torch.ones(E, dtype=torch.long, device=device)
-            if E > 0:
-                edge_data[-1] = 0  # root self-edge
+            edge_data[-1] = 0  # root self-edge
         else:
             edge_data = edge_types.to(device)
 
         if branch_lengths is None:
             branch_lengths = torch.ones(E, dtype=torch.float32, device=device)
-            if E > 0:
-                branch_lengths[-1] = 0.0
+            branch_lengths[-1] = 0.0
         else:
             branch_lengths = branch_lengths.to(device)
 
@@ -386,6 +379,21 @@ class TreeFeatureTokenizer(nn.Module):
         # Positional encodings
         sin_embed_node = self.sinusoidal_pos_enc(N, self.encoder_embed_dim, device)
         sin_embed_edge = self.sinusoidal_pos_enc(E, self.encoder_embed_dim, device)
+
+        children = torch.full((N, 2), -1, dtype=torch.long, device=device)
+
+        # Fill from CSR in parent order (NOT sorted-by-child order; Laplacian doesn’t care about edge order)
+        for p in range(N):
+            s = child_ptr[p].item()
+            t = child_ptr[p+1].item()
+            c = child_ids[s:t]
+            if c.numel() > 0:
+                children[p, 0] = c[0]
+            if c.numel() > 1:
+                children[p, 1] = c[1]
+            if c.numel() > 2: 
+                #non-binary node; we decide for purposes of laplacian to only keep first two children
+                children[p, 1] = c[1]
 
         # Laplacian PE (N x lap_dim) from children
         #lap_eigvecs = self.compute_laplacian_eigvecs_from_children(children, k=self.lap_dim, device=device)
@@ -411,8 +419,8 @@ class TreeFeatureTokenizer(nn.Module):
             edge_index,
             edge_data,
             branch_lengths,
-            node_num,
-            edge_num,
+            N,
+            E,
             lap_eigvecs,
             leaf_mask,
             leaf_idx,
@@ -533,56 +541,9 @@ class TreeFeatureTokenizer(nn.Module):
             if all(isinstance(t, (str, EteTree)) for t in trees):
                 trees = [self._newick_to_structural(t) for t in trees]
 
-        # We take in a list of trees where each entry is this format (children, root_idx[, branch_lengths][, edge_types])
-        if self.is_structural_pack(trees):
-            children_BK = trees[0]
-            root_BK     = trees[1]
-            branch_BK   = trees[2] if len(trees) >= 3 else None
-            edge_BK     = trees[3] if len(trees) >= 4 else None
-
-            BK, Nmax, _ = children_BK.shape
-            # Expand the packed tensors into a Python list of per-item tuples.
-            # (Keeping the simple loop here is fine—heavy work is still tensorized inside.)
-            trees = []
-            for i in range(BK):
-                ch = children_BK[i]              # [Nmax, 2] with padding rows at bottom as [-1, -1]
-                rt = int(root_BK[i].item())
-
-                # Infer actual N: any row that has a child, or is referenced as a child, or is the root.
-                used = (ch[:,0] >= 0) | (ch[:,1] >= 0)  # rows that parent at least one child
-                kids0 = ch[ch[:,0] >= 0, 0]
-                kids1 = ch[ch[:,1] >= 0, 1]
-                child_refs = torch.zeros(ch.size(0), dtype=torch.bool, device=ch.device)
-                if kids0.numel(): child_refs[kids0] = True
-                if kids1.numel(): child_refs[kids1] = True
-                used = used | child_refs
-                used[rt] = True
-
-                if used.any():
-                    N_i = int(used.nonzero(as_tuple=True)[0].max().item()) + 1
-                else:
-                    N_i = 0  # degenerate (shouldn’t happen for trees)
-
-                ch = ch[:N_i]                     # <-- CRITICAL: drop padded rows
-                tup = [ch, rt]
-                if branch_BK is not None: tup.append(branch_BK[i][:, :])  # keep aligned if you carry per-edge BLs
-                if edge_BK   is not None: tup.append(edge_BK[i][:])
-                trees.append(tuple(tup))
-        elif not isinstance(trees, list):
-            trees = [trees]
+        #Output is: (child_ptr, child_ids, parent_ids, root_idx, branch_lengths, edge_types)  
 
         batch_size = len(trees)
-        if batch_size == 0:
-            device = next(self.parameters()).device
-            return (
-                torch.zeros(
-                    (0, 0, self.encoder_embed_dim), device=device, dtype=torch.float
-                ),
-                torch.zeros((0, 0), device=device, dtype=torch.bool),
-                torch.zeros((0, 0, 2), device=device, dtype=torch.long),
-                torch.zeros((0, 0), device=device, dtype=torch.bool),
-                [],
-            )
 
         if batch_size == 1:
             return self._forward_single_tree(trees[0])
@@ -657,32 +618,22 @@ class TreeFeatureTokenizer(nn.Module):
             batch_leaf_indices,
         )
 
-    def _forward_single_tree(self, tree_or_tuple):
-        device = next(self.parameters()).device
-        if self.is_structural_tree(tree_or_tuple):
-            # (children, root_idx[, branch_lengths][, edge_types])
-            children = tree_or_tuple[0].to(device)
-            root_idx = int(tree_or_tuple[1])
-            branch_lengths = tree_or_tuple[2].to(device) if len(tree_or_tuple) >= 3 and tree_or_tuple[2] is not None else None
-            edge_types     = tree_or_tuple[3].to(device) if len(tree_or_tuple) >= 4 and tree_or_tuple[3] is not None else None
-            (node_data, edge_index, edge_data, branch_lengths, node_num, edge_num,
-            lap_pe, leaf_mask, leaf_idx, sin_embed_node, sin_embed_edge) = \
-                self.tree_to_graph_from_children(children, root_idx, branch_lengths, edge_types)
-        else:
-            # Legacy: ETE3 tree (kept for compatibility)
-            # Convert once using your new fast builders:
-            #   Use tau_to_arrays if you have τ, or write a small extractor from ETE3 to children.
-            # If you *must* support ETE3, add a tiny adapter here. Otherwise, raise:
-            raise TypeError("Pass structural trees: (children, root_idx[, branch_lengths][, edge_types])")
+    def _forward_single_tree(self, tree_info):
 
-        if not node_num[0]:
-            return (
-                torch.zeros((1, 0, self.encoder_embed_dim), device=device, dtype=torch.float),
-                torch.zeros((1, 0), device=device, dtype=torch.bool),
-                torch.zeros((1, 0, 2), device=device, dtype=torch.long),
-                torch.zeros((0,), device=device, dtype=torch.bool),
-                torch.zeros((0,), device=device, dtype=torch.long),
-            )
+        #Output from newick to structure is: (child_ptr, child_ids, parent_ids, root_idx, branch_lengths, edge_types)  
+
+        child_ptr = tree_info[0]
+        child_ids = tree_info[1]
+        parent_ids = tree_info[2]
+        root_idx = tree_info[3]
+        branch_lengths = tree_info[4]
+        edge_types = tree_info[5]
+        device = child_ptr.device
+
+        (node_data, edge_index, edge_data, branch_lengths, node_num, edge_num,
+        lap_pe, leaf_mask, leaf_idx, sin_embed_node, sin_embed_edge) = \
+            self.tree_to_graph_from_children(child_ptr, child_ids, parent_ids, root_idx, branch_lengths, edge_types)
+
 
         return self._process_and_pack_single(
             node_data, edge_index, edge_data, branch_lengths,
@@ -694,8 +645,8 @@ class TreeFeatureTokenizer(nn.Module):
         self, node_data, edge_index, edge_data, branch_lengths,
         node_num, edge_num, lap_pe, leaf_mask, leaf_idx, sin_embed_node, sin_embed_edge, device
     ):
-        # --- (identical to your _process_single_tree, with the vectorized LapPE) ---
-        node_indices = torch.arange(node_num[0], device=device)
+
+        node_indices = torch.arange(node_num, device=device)
         node_attr_embedding = self.node_encoder(node_data) + sin_embed_node
         node_pairs = torch.stack([node_indices, node_indices], dim=1)
 
@@ -709,8 +660,8 @@ class TreeFeatureTokenizer(nn.Module):
         full_padded_index   = torch.cat([node_pairs, edge_pairs], dim=0)
 
         type_ids = torch.cat([
-            torch.zeros(node_num[0], dtype=torch.long, device=device),
-            torch.ones(edge_num[0], dtype=torch.long, device=device),
+            torch.zeros(node_num, dtype=torch.long, device=device),
+            torch.ones(edge_num, dtype=torch.long, device=device),
         ])
         type_embedding = self.type_encoder(type_ids)
 
@@ -910,9 +861,5 @@ class TreeFeatureTokenizer(nn.Module):
 
         branch_lengths = torch.tensor(branch_arr, dtype=torch.float32, device=device)
         edge_types     = torch.tensor(etype_arr,  dtype=torch.long,   device=device)
-        import pdb; pdb.set_trace()
 
         return (child_ptr, child_ids, parent_ids, root_idx, branch_lengths, edge_types)        
-
-
-        # return (children, root_idx, branch_lengths, edge_types)
