@@ -55,7 +55,7 @@ class TrainingModule(LightningModule):
 		t,
 		phyla_embeddings
 	):
-		velocity = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings)
+		velocity, mask = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings, return_leafs_only = False, return_edges_only = True)
 		return velocity
 
 	def step(self, batch, eval = False):

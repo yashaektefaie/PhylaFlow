@@ -223,9 +223,10 @@ class TreeDenoiserTokenGT(nn.Module):
         self,
         tokenized_tree_batch,
         t = None,
-        phyla_embedding=None,
+        phyla_embeddings=None,
         return_all_tokens=True,
         return_leafs_only=False,
+        return_edges_only=False,
     ):
         # Tree is this format now: (children, root_idx[, branch_lengths][, edge_types])
         # Handle both single tree and batch of trees
@@ -233,21 +234,21 @@ class TreeDenoiserTokenGT(nn.Module):
         # if is_single_tree:
         #     tree = [tree]
 
-        padded_feature, padding_mask, padded_index, leaf_mask, leaf_idx = (tokenized_tree_batch)
+        padded_feature, padding_mask, padded_index, leaf_mask, leaf_idx, edge_mask = (tokenized_tree_batch)
 
         x = padded_feature
         B, T_raw, D = x.shape
 
         # Add phyla embedding to leaf nodes only
-        if phyla_embedding is not None:
+        if phyla_embeddings is not None:
             # Handle list of embeddings with different shapes
-            if isinstance(phyla_embedding, list):
+            if isinstance(phyla_embeddings, list):
                 # Find max length across all embeddings in the list
-                max_len = max(emb.shape[0] for emb in phyla_embedding)
+                max_len = max(emb.shape[0] for emb in phyla_embeddings)
                 
                 padded_embeddings = []
                 
-                for emb in phyla_embedding:
+                for emb in phyla_embeddings:
                     # Pad each embedding to max_len
                     if emb.shape[0] < max_len:
                         padding = torch.zeros(max_len - emb.shape[0], emb.shape[1], 
@@ -258,21 +259,21 @@ class TreeDenoiserTokenGT(nn.Module):
                     padded_embeddings.append(padded_emb)
                 
                 # Stack into tensor (B, max_len, embed_dim)
-                phyla_embedding = torch.stack(padded_embeddings, dim=0)
+                phyla_embeddings = torch.stack(padded_embeddings, dim=0)
             # Expected shapes:
             #   phyla_embedding: (B, N_leaves_max, phyla_dim) OR (1, N_leaves, phyla_dim)
-            elif phyla_embedding.dim() == 2:  # (N,D) -> treat as (1,N,D) and broadcast
-                phyla_embedding = phyla_embedding.unsqueeze(0)
+            elif phyla_embeddings.dim() == 2:  # (N,D) -> treat as (1,N,D) and broadcast
+                phyla_embeddings = phyla_embeddings.unsqueeze(0)
 
-            if phyla_embedding.size(0) == 1 and B > 1:
+            if phyla_embeddings.size(0) == 1 and B > 1:
                 # Broadcast same embedding set across batch
-                phyla_embedding = phyla_embedding.expand(B, -1, -1)
-                if phyla_embedding.size(0) != B:
+                phyla_embeddings = phyla_embeddings.expand(B, -1, -1)
+                if phyla_embeddings.size(0) != B:
                     raise ValueError(
-                        f"phyla_embedding batch mismatch: got {phyla_embedding.size(0)} expected {B}"
+                        f"phyla_embeddings batch mismatch: got {phyla_embeddings.size(0)} expected {B}"
                     )
             # Project all embeddings once: (B, N, D_model)
-            phyla_proj_full = self.phyla_proj(phyla_embedding)  # (B,N,D)
+            phyla_proj_full = self.phyla_proj(phyla_embeddings)  # (B,N,D)
 
             # We'll store phyla_proj_full and leaf_idx_list for use post-concat
             phyla_info = (phyla_proj_full, leaf_idx_list)
@@ -391,6 +392,33 @@ class TreeDenoiserTokenGT(nn.Module):
                         return torch.zeros(B, 0, D, device=x.device)
                 else:
                     return torch.zeros(B, 0, D, device=x.device)
+        elif return_edges_only:
+            # Remove graph token; edge_mask assumed shape [B, T_raw]
+            x_no_graph = x[:, 1:, :]
+
+            # Collect per-batch edge embeddings using the provided mask
+            edge_mask_bool = edge_mask.bool()
+            edge_lists = [x_no_graph[b][edge_mask_bool[b]] for b in range(B)]
+            max_edges = max((e.size(0) for e in edge_lists), default=0)
+
+            # Pad to max_edges so outputs can be batched
+            if max_edges == 0:
+                padded_edges = torch.zeros(B, 0, D, device=x.device, dtype=x.dtype)
+                edge_pad_mask = torch.ones(B, 0, device=x.device, dtype=torch.bool)
+            else:
+                padded_edges = torch.zeros(B, max_edges, D, device=x.device, dtype=x.dtype)
+                edge_pad_mask = torch.ones(B, max_edges, device=x.device, dtype=torch.bool)
+                for b, edges_b in enumerate(edge_lists):
+                    n_b = edges_b.size(0)
+                    if n_b == 0:
+                        continue
+                    padded_edges[b, :n_b] = edges_b
+                    edge_pad_mask[b, :n_b] = False  # False = real, True = pad
+
+            # Optional: pass through output layer before returning
+            edge_outputs = self.output_layer(padded_edges)  # [B, max_edges, output_dim]
+
+            return edge_outputs, edge_pad_mask  # return mask so caller can ignore padding
         elif return_all_tokens:
             return x  # [B, T, D]
         else:

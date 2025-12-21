@@ -392,12 +392,11 @@ class PhylaDataModule(pl.LightningDataModule):
         tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
         to_run = {
             "tokenized_trees": tokenized_trees,
-            "batched_velocity": torch.tensor([item['velocity'] for item in batch], dtype=torch.float32),
+            "batched_velocity": [item['velocity'] for item in batch],
             "batched_time": torch.tensor([item['timepoint'] for item in batch], dtype=torch.float32),
             #"phyla_embeddings": torch.tensor([item['phyla_embedding'] for item in batch], dtype=torch.float32),
             "phyla_embeddings": None,
         }
-
         return to_run
 
 

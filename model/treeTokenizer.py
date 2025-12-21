@@ -554,10 +554,11 @@ class TreeFeatureTokenizer(nn.Module):
         batch_padded_indices = []
         batch_leaf_masks = []
         batch_leaf_indices = []
+        batch_edge_masks = []
         max_tokens = 0
 
         for tree in trees:
-            features, padding_mask, padded_index, leaf_mask_single, leaf_idx_single = (
+            features, padding_mask, padded_index, leaf_mask_single, leaf_idx_single, edge_mask = (
                 self._forward_single_tree(tree)
             )
             # Remove batch dimension from single tree output
@@ -570,6 +571,7 @@ class TreeFeatureTokenizer(nn.Module):
             batch_padded_indices.append(padded_index)
             batch_leaf_masks.append(leaf_mask_single)
             batch_leaf_indices.append(leaf_idx_single)
+            batch_edge_masks.append(edge_mask)
             max_tokens = max(max_tokens, features.size(0))
 
         device = batch_features[0].device
@@ -588,12 +590,17 @@ class TreeFeatureTokenizer(nn.Module):
             (batch_size, max_tokens), device=device, dtype=torch.bool
         )
 
+        padded_edge_masks = torch.zeros(
+            (batch_size, max_tokens), device=device, dtype=torch.bool
+        )
+
         for i, (
             features,
             mask,
             indices,
             leaf_mask_single,
             leaf_idx_single,
+            edge_mask,
         ) in enumerate(
             zip(
                 batch_features,
@@ -601,6 +608,7 @@ class TreeFeatureTokenizer(nn.Module):
                 batch_padded_indices,
                 batch_leaf_masks,
                 batch_leaf_indices,
+                batch_edge_masks,
             )
         ):
             seq_len = features.size(0)
@@ -609,6 +617,7 @@ class TreeFeatureTokenizer(nn.Module):
                 padded_masks[i, :seq_len] = mask
                 padded_indices[i, :seq_len] = indices
                 padded_leaf_masks[i, :seq_len] = leaf_mask_single
+                padded_edge_masks[i, :seq_len] = edge_mask
 
         return (
             padded_features,
@@ -616,6 +625,7 @@ class TreeFeatureTokenizer(nn.Module):
             padded_indices,
             padded_leaf_masks,
             batch_leaf_indices,
+            padded_edge_masks,
         )
 
     def _forward_single_tree(self, tree_info):
@@ -672,8 +682,18 @@ class TreeFeatureTokenizer(nn.Module):
 
         if self.concat_features:
             final_token_features = self.feature_combiner(torch.cat([full_attr_embedding, type_embedding, pos_embedding], dim=1))
+            edge_mask = torch.cat([
+                torch.zeros(node_num, dtype=torch.bool, device=device),
+                torch.ones(edge_num, dtype=torch.bool, device=device),
+                torch.zeros(type_embedding.size(0), dtype=torch.bool, device=device),
+                torch.zeros(pos_embedding.size(0), dtype=torch.bool, device=device),
+                ])
         else:
             final_token_features = full_attr_embedding + type_embedding + pos_embedding
+            edge_mask = torch.cat([
+                torch.zeros(node_num, dtype=torch.bool, device=device),
+                torch.ones(edge_num, dtype=torch.bool, device=device),
+                ])
 
         padding_mask = torch.zeros(final_token_features.size(0), dtype=torch.bool, device=device)
 
@@ -684,6 +704,7 @@ class TreeFeatureTokenizer(nn.Module):
             full_padded_index.unsqueeze(0),
             leaf_mask,
             leaf_idx,
+            edge_mask
         )
 
     def _process_single_tree(

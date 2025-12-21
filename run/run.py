@@ -26,6 +26,22 @@ def run_test():
     one = dataset.dataset_train[0]
     two = dataset.dataset_train[0]
     batch = dataset.collate_fn([one, two])
+
+    phyla_flow = return_model(config)
+
+    model = TrainingModule(
+        model=phyla_flow,
+        lr=config['trainer']['lr'],
+        record=config['trainer']['record'],
+        epochs=config['trainer']['epochs'],
+        dataset=dataset,
+        lr_scheduler = 'default',
+        num_annealing_steps = 10000,
+        num_warmup_steps = 1000,
+        deepspeed = False,
+        logger = None
+    )
+    res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
     import pdb; pdb.set_trace()
 
 
