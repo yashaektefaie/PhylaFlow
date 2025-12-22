@@ -811,9 +811,29 @@ class TreeFeatureTokenizer(nn.Module):
             # assume already an ETE3 Tree-like object
             t = tree_or_str
 
-        # Preorder traversal and index assignment
-        nodes = list(t.traverse("preorder"))
+        # Postorder traversal and index assignment
+        nodes = list(t.traverse("postorder"))
         idx_map = {node: i for i, node in enumerate(nodes)}
+
+        node_bit = np.zeros((len(nodes),), dtype=np.uint64)
+
+        for node in nodes:
+            i = idx_map[node]
+            if node.is_leaf():
+                lb = int(node.name)  
+                node_bit[i] = (1 << lb)
+
+        # Postorder accumulate subtree masks
+        for node in t.traverse("postorder"):
+            i = idx_map[node]
+            if not node.is_leaf():
+                m = 0
+                for ch in node.children:
+                    m |= int(node_bit[idx_map[ch]])
+                node_bit[i] = m
+
+        n_bio = max(int(n.name) for n in t.iter_leaves()) + 1
+        full = (1 << n_bio) - 1
 
         device = next(self.parameters()).device
 
@@ -822,6 +842,7 @@ class TreeFeatureTokenizer(nn.Module):
         branch_list = []
         edge_type_list = []
 
+        split_mask_list = []
         for parent in nodes:
             p_idx = idx_map[parent]
             for child in parent.children:  # can be 0,1,2,... children
@@ -834,6 +855,13 @@ class TreeFeatureTokenizer(nn.Module):
 
                 et = getattr(child, "edge_type_id", default_edge_type)
                 edge_type_list.append(int(et))
+
+                c_idx = idx_map[child]
+                A = int(node_bit[c_idx])
+                if A == 0 or A == full:
+                    split_mask_list.append(0)  # trivial / ignore
+                else:
+                    split_mask_list.append(min(A, full ^ A))
 
         E = len(child_list)
         if E > 0:

@@ -141,7 +141,7 @@ class Tree:
 
         # 1) Collect leaves and assume their names are integers 1..n
         leaf_nodes = list(t.iter_leaves())
-        self.n_leaves = len(leaf_nodes)+1  # +1 for dummy leaf
+        self.n_leaves = len(leaf_nodes)
 
         # 2) Map ete3 nodes -> integer IDs
         mapping = {}
