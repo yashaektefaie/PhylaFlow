@@ -574,16 +574,13 @@ class TreeFeatureTokenizer(nn.Module):
             (batch_size, max_tokens), device=device, dtype=torch.bool
         )
 
-        padded_edge_split_masks = torch.zeros((batch_size, max_tokens), dtype=torch.long, device=device)
-
         for i, (
             features,
             mask,
             indices,
             leaf_mask_single,
             leaf_idx_single,
-            edge_mask,
-            edge_split_masks
+            edge_mask
         ) in enumerate(
             zip(
                 batch_features,
@@ -592,7 +589,6 @@ class TreeFeatureTokenizer(nn.Module):
                 batch_leaf_masks,
                 batch_leaf_indices,
                 batch_edge_masks,
-                batch_edge_split_masks
             )
         ):
             seq_len = features.size(0)
@@ -602,7 +598,6 @@ class TreeFeatureTokenizer(nn.Module):
                 padded_indices[i, :seq_len] = indices
                 padded_leaf_masks[i, :seq_len] = leaf_mask_single
                 padded_edge_masks[i, :seq_len] = edge_mask
-                padded_edge_split_masks[i, :seq_len] = edge_split_masks
 
         return (
             padded_features,
@@ -611,7 +606,7 @@ class TreeFeatureTokenizer(nn.Module):
             padded_leaf_masks,
             batch_leaf_indices,
             padded_edge_masks,
-            padded_edge_split_masks,
+            batch_edge_split_masks,
         )
 
     def _forward_single_tree(self, tree_info):
@@ -695,86 +690,6 @@ class TreeFeatureTokenizer(nn.Module):
             edge_mask,
             edge_split_masks
         )
-
-    def _process_single_tree(
-        self,
-        node_data,
-        edge_index,
-        edge_data,
-        branch_lengths,
-        node_num,
-        edge_num,
-        lap_pe,
-        leaf_mask,
-        leaf_idx,
-        sin_embed_node,
-        sin_embed_edge,
-        device,
-    ):
-        """Process a single tree and return token features"""
-        # Node tokens
-        node_indices = torch.arange(node_num[0], device=device)  # 0 … N-1
-        node_attr_embedding = self.node_encoder(node_data) + sin_embed_node
-        node_pairs = torch.stack([node_indices, node_indices], dim=1)  # [N,2]
-
-        # Edge tokens
-        edge_attr_embedding = self.edge_encoder(edge_data)
-        if edge_attr_embedding.size(0) > 0:
-            branch_length_feat = self.branch_length_encoder(
-                branch_lengths.unsqueeze(1).to(device)
-            )
-            edge_attr_embedding = (
-                edge_attr_embedding + branch_length_feat + sin_embed_edge
-            )
-        edge_pairs = edge_index.t()  # shape [num_edges, 2]
-
-        full_attr_embedding = torch.cat(
-            [node_attr_embedding, edge_attr_embedding], dim=0
-        )
-        full_padded_index = torch.cat(
-            [node_pairs, edge_pairs], dim=0
-        )  # [num_tokens, 2]
-
-        # Type encoding: 0 for node, 1 for edge
-        type_ids = torch.cat(
-            [
-                torch.zeros(node_num[0], dtype=torch.long, device=device),
-                torch.ones(edge_num[0], dtype=torch.long, device=device),
-            ]
-        )
-        type_embedding = self.type_encoder(type_ids)
-
-        # LapPE encoding for each token (projected to hidden_dim)
-        u = full_padded_index[:, 0]
-        v = full_padded_index[:, 1]
-        pos_pe_concat = torch.cat([lap_pe[u], lap_pe[v]], dim=1)  # [num_tokens, 2*lap_dim]
-        pos_embedding = self.lap_encoder(pos_pe_concat)
-
-        if self.concat_features:
-            final_token_features = self.feature_combiner(
-                torch.cat([full_attr_embedding, type_embedding, pos_embedding], dim=1)
-            )
-        else:
-            final_token_features = self.feature_combiner(
-                full_attr_embedding + type_embedding + pos_embedding
-            )
-        #Don't need this line since laready done above...
-        # final_token_features = full_attr_embedding + type_embedding + pos_embedding
-
-        # Create padding mask (False = valid tokens, True = padding)
-        padding_mask = torch.zeros(
-            final_token_features.size(0),
-            dtype=torch.bool,
-            device=device,
-        )
-
-        return (
-            final_token_features,
-            padding_mask,
-            full_padded_index,
-            leaf_mask,
-            leaf_idx,
-        )
     
     def _newick_to_structural(
         self,
@@ -804,7 +719,7 @@ class TreeFeatureTokenizer(nn.Module):
         nodes = list(t.traverse("postorder"))
         idx_map = {node: i for i, node in enumerate(nodes)}
 
-        node_bit = np.zeros((len(nodes),))
+        node_bit = [0] * len(nodes)
 
         for node in nodes:
             i = idx_map[node]
@@ -861,7 +776,10 @@ class TreeFeatureTokenizer(nn.Module):
         child_arr  = child_arr[order]
         branch_arr = np.asarray(branch_list, dtype=np.float32)[order]
         etype_arr  = np.asarray(edge_type_list, dtype=np.int64)[order]
-        split_arr = np.asarray(split_mask_list, dtype=np.uint64)[order]
+        ordered_split_mask = []
+        for i in order:
+            ordered_split_mask.append(split_mask_list[i])
+        split_arr = ordered_split_mask
 
         # Root index
         root_idx = idx_map[t]
@@ -888,18 +806,16 @@ class TreeFeatureTokenizer(nn.Module):
         etype_arr  = np.concatenate([etype_arr,  np.array([0],   dtype=np.int64)])
         parent_arr = np.concatenate([parent_arr, np.array([root_idx], np.int64)])
         child_arr  = np.concatenate([child_arr,  np.array([root_idx], np.int64)])
-        branch_arr = np.concatenate([branch_arr, np.array([0.0], np.float32)])
-        etype_arr  = np.concatenate([etype_arr,  np.array([0],   np.int64)])
-        split_arr  = np.concatenate([split_arr,  np.array([0],   np.uint64)])
+        split_arr.append(0)
         
         # To torch
         child_ptr = torch.tensor(child_ptr_arr, dtype=torch.long, device=device)
         child_ids = torch.tensor(child_ids_arr, dtype=torch.long, device=device)
-        edge_split_masks = torch.tensor(split_arr, device=device)
+        # edge_split_masks = torch.tensor(split_arr, device=device)
 
         branch_lengths = torch.tensor(branch_arr, dtype=torch.float32, device=device)
         edge_types     = torch.tensor(etype_arr,  dtype=torch.long,   device=device)
         
         return (child_ptr, child_ids,  torch.tensor(parent_arr, dtype=torch.long, device=device),   # edge_parent
                 torch.tensor(child_arr,  dtype=torch.long, device=device),   # edge_child
-                root_idx, branch_lengths, edge_types, edge_split_masks)        
+                root_idx, branch_lengths, edge_types, split_arr)        

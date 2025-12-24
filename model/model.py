@@ -234,7 +234,7 @@ class TreeDenoiserTokenGT(nn.Module):
         # if is_single_tree:
         #     tree = [tree]
 
-        padded_feature, padding_mask, padded_index, leaf_mask, leaf_idx, edge_mask = (tokenized_tree_batch)
+        padded_feature, padding_mask, padded_index, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (tokenized_tree_batch)
 
         x = padded_feature
         B, T_raw, D = x.shape

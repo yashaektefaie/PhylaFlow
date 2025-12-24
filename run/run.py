@@ -42,6 +42,7 @@ def run_test():
         logger = None
     )
     res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
+    res = model.step(batch)
     import pdb; pdb.set_trace()
 
 

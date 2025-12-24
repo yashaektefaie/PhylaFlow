@@ -56,11 +56,26 @@ class TrainingModule(LightningModule):
 		phyla_embeddings
 	):
 		velocity, mask = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings, return_leafs_only = False, return_edges_only = True)
-		return velocity
+		edge_split_masks = batched_tokenized_trees[-1]
+		edge_mask = batched_tokenized_trees[-2]
+		return velocity, edge_split_masks, edge_mask
 
 	def step(self, batch, eval = False):
 		logs = {}
-		v_pred = self.forward(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
+		v_pred, edge_split_masks, edge_mask = self.forward(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
+		velocity_labels = batch['batched_velocity']
+
+		for num in range(len(velocity_labels)):
+			if len(velocity_labels[num]) != len(edge_split_masks[num]):
+				print("Mismatch between edge masks and velocity labels!")
+				import pdb; pdb.set_trace()
+			for i in velocity_labels[num]:
+				if i not in edge_split_masks[num]:
+					print("Mismatch between edge splits and velocity labels!")
+					import pdb; pdb.set_trace()
+		
+		print("Wow congrats")
+		import pdb; pdb.set_trace()
 		loss = ((v_pred - batch['batched_velocity'])**2).mean()
 		logs['loss'] = loss
 		return logs
