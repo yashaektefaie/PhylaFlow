@@ -80,7 +80,7 @@ class TreeDataset(Dataset):
         random_tree = self.sample_random_tree(real_tree)
         timepoint = random.uniform(0, 1)
         newick, velocity = return_sampled_tree_velocity(random_tree, real_tree, timepoint)
-
+        
         sample = {
             "id": meta["id"],
             "nexus_path": meta["nexus_path"],
@@ -390,12 +390,16 @@ class PhylaDataModule(pl.LightningDataModule):
         """Custom collate function if needed."""
         trees_to_tokenize = [item['newick_tree'] for item in batch]
         tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
+        num_leaves = [len(batch[i]['sequences']) for i in range(len(batch))]
+        
         to_run = {
             "tokenized_trees": tokenized_trees,
+            "original_trees": [item['newick_tree'] for item in batch],
             "batched_velocity": [item['velocity'] for item in batch],
             "batched_time": torch.tensor([item['timepoint'] for item in batch], dtype=torch.float32),
             #"phyla_embeddings": torch.tensor([item['phyla_embedding'] for item in batch], dtype=torch.float32),
             "phyla_embeddings": None,
+            "num_leaves": num_leaves,
         }
         return to_run
 

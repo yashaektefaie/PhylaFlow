@@ -9,6 +9,7 @@ import gc
 import torch.distributed
 import gc
 import torch
+from utils.utils import remove_bit
 
 
 class TrainingModule(LightningModule):
@@ -64,15 +65,27 @@ class TrainingModule(LightningModule):
 		logs = {}
 		v_pred, edge_split_masks, edge_mask = self.forward(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
 		velocity_labels = batch['batched_velocity']
+		num_leaves = batch['num_leaves'] 
 
 		for num in range(len(velocity_labels)):
-			if len(velocity_labels[num]) != len(edge_split_masks[num]):
-				print("Mismatch between edge masks and velocity labels!")
-				import pdb; pdb.set_trace()
+			# if len(velocity_labels[num]) != len(edge_split_masks[num]):
+			# 	#This is fine since velocity is defined on internal splits while edge split masks includes frivolous internal edges
+			# 	print(f"Mismatch between edge masks length {len(edge_split_masks[num])} and velocity labels {len(velocity_labels[num])}!")
+			num_leave = num_leaves[num]
 			for i in velocity_labels[num]:
-				if i not in edge_split_masks[num]:
-					print("Mismatch between edge splits and velocity labels!")
+				real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
+				vel = i
+				if vel.bit_length() == real_max_bit+1:
+					vel = remove_bit(vel, num_leave+1)
+				elif vel.bit_length() > real_max_bit+1:
+					print(f"Whoa there is a big problem with this split mask {i} vs real max {real_max_bit}!")
 					import pdb; pdb.set_trace()
+
+				if vel not in edge_split_masks[num]:
+					print(f"This split {vel} from velocity labels is not in edge splits {edge_split_masks[num]}!")
+					import pdb; pdb.set_trace()
+				else:
+					print("WOOO ONE FOUND")
 		
 		print("Wow congrats")
 		import pdb; pdb.set_trace()

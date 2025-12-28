@@ -717,24 +717,32 @@ class TreeFeatureTokenizer(nn.Module):
 
         # Postorder traversal and index assignment
         nodes = list(t.traverse("postorder"))
-        idx_map = {node: i for i, node in enumerate(nodes)}
+        #This was a mistake this line renames the nodes when this renaming is already done in dataset
+        # idx_map = {node: i for i, node in enumerate(nodes)}
+        idx_map = {}
 
-        node_bit = [0] * len(nodes)
-
+        leaf_masks = {}
         for node in nodes:
-            i = idx_map[node]
+            # i = idx_map[node]
             if node.is_leaf():
                 lb = int(node.name)  
-                node_bit[i] = (1 << lb)
+                leaf_masks[node] = (1 << lb)
+                idx_map[node] = int(node.name)
 
+        leaf_ordering = len(leaf_masks)
         # Postorder accumulate subtree masks
         for node in t.traverse("postorder"):
-            i = idx_map[node]
+            # i = idx_map[node]
             if not node.is_leaf():
                 m = 0
                 for ch in node.children:
-                    m |= int(node_bit[idx_map[ch]])
-                node_bit[i] = m
+                    if ch not in leaf_masks:
+                        leaf_masks[ch] = 0
+                    m |= int(leaf_masks[ch])
+                leaf_masks[node] = m
+                if node not in idx_map:
+                    idx_map[node] = leaf_ordering
+                    leaf_ordering += 1
 
         n_bio = max(int(n.name) for n in t.iter_leaves()) + 1
         full = (1 << n_bio) - 1
@@ -760,8 +768,8 @@ class TreeFeatureTokenizer(nn.Module):
                 et = getattr(child, "edge_type_id", default_edge_type)
                 edge_type_list.append(int(et))
 
-                c_idx = idx_map[child]
-                A = int(node_bit[c_idx])
+                # c_idx = int(child.name)
+                A = int(leaf_masks[child])
                 if A == 0 or A == full:
                     split_mask_list.append(0)  # trivial / ignore
                 else:

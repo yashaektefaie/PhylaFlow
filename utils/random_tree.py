@@ -143,36 +143,26 @@ class Tree:
         leaf_nodes = list(t.iter_leaves())
         self.n_leaves = len(leaf_nodes)
 
-        # 2) Map ete3 nodes -> integer IDs
-        mapping = {}
-        mapping_to_rename = {}
-
-        num = 0
         # leaves keep their numeric labels
         for n in leaf_nodes:
-            lid = int(n.name)
-            mapping[n] = lid
-            mapping_to_rename[n] = num
-            self.id_to_name[num] = n.name
-            num += 1
+            n.add_feature("uid", int(n.name))
+            self.id_to_name[int(n.name)] = n.name
 
         next_internal_id = self.n_leaves
 
         # internal nodes get new IDs
         for n in t.traverse("postorder"):
             if not n.is_leaf():
-                if n not in mapping:
-                    mapping[n] = next_internal_id
-                    mapping_to_rename[n] = next_internal_id
+                if "uid" not in n.features:
+                    n.add_feature("uid", next_internal_id)
                     next_internal_id += 1
 
-        self.root = mapping_to_rename[t]
-
+        self.root = t.uid
         # 3) Build adjacency and lengths
         for parent in t.traverse():
-            u = mapping_to_rename[parent]
+            u = parent.uid
             for child in parent.children:
-                v = mapping_to_rename[child]
+                v = child.uid
                 L = child.dist if child.dist is not None else 0.1
                 self.adj[u].append(v)
                 self.adj[v].append(u)
