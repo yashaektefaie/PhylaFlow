@@ -717,34 +717,32 @@ class TreeFeatureTokenizer(nn.Module):
 
         # Postorder traversal and index assignment
         nodes = list(t.traverse("postorder"))
-        #This was a mistake this line renames the nodes when this renaming is already done in dataset
-        # idx_map = {node: i for i, node in enumerate(nodes)}
-        idx_map = {}
 
         leaf_masks = {}
         for node in nodes:
-            # i = idx_map[node]
             if node.is_leaf():
-                lb = int(node.name)  
-                leaf_masks[node] = (1 << lb)
-                idx_map[node] = int(node.name)
+                node.add_feature("uid", int(node.name))
+                lb = int(node.uid)  
+                leaf_masks[node.uid] = (1 << lb)
+        
+        next_internal_id = max(leaf_masks.keys()) + 1
+        for n in t.traverse("postorder"):
+            if not n.is_leaf():
+                if "uid" not in n.features:
+                    n.add_feature("uid", next_internal_id)
+                    next_internal_id += 1
 
-        leaf_ordering = len(leaf_masks)
         # Postorder accumulate subtree masks
         for node in t.traverse("postorder"):
-            # i = idx_map[node]
             if not node.is_leaf():
                 m = 0
                 for ch in node.children:
-                    if ch not in leaf_masks:
-                        leaf_masks[ch] = 0
-                    m |= int(leaf_masks[ch])
-                leaf_masks[node] = m
-                if node not in idx_map:
-                    idx_map[node] = leaf_ordering
-                    leaf_ordering += 1
+                    if ch.uid not in leaf_masks:
+                        leaf_masks[ch.uid] = 0
+                    m |= int(leaf_masks[ch.uid])
+                leaf_masks[node.uid] = m
 
-        n_bio = max(int(n.name) for n in t.iter_leaves()) + 1
+        n_bio = max(int(n.uid) for n in t.iter_leaves()) + 2
         full = (1 << n_bio) - 1
 
         device = next(self.parameters()).device
@@ -756,9 +754,9 @@ class TreeFeatureTokenizer(nn.Module):
 
         split_mask_list = []
         for parent in nodes:
-            p_idx = idx_map[parent]
+            p_idx = parent.uid
             for child in parent.children:  # can be 0,1,2,... children
-                c_idx = idx_map[child]
+                c_idx = child.uid
                 parent_list.append(p_idx)
                 child_list.append(c_idx)
 
@@ -768,8 +766,7 @@ class TreeFeatureTokenizer(nn.Module):
                 et = getattr(child, "edge_type_id", default_edge_type)
                 edge_type_list.append(int(et))
 
-                # c_idx = int(child.name)
-                A = int(leaf_masks[child])
+                A = int(leaf_masks[child.uid])
                 if A == 0 or A == full:
                     split_mask_list.append(0)  # trivial / ignore
                 else:
@@ -790,7 +787,7 @@ class TreeFeatureTokenizer(nn.Module):
         split_arr = ordered_split_mask
 
         # Root index
-        root_idx = idx_map[t]
+        root_idx = t.uid
 
         N = len(nodes)
         # Build CSR (child_ptr / child_ids) from the *sorted* edges
