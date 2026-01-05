@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
-from utils.bhv_utils import return_sampled_tree_velocity
+from utils.bhv_utils import return_sampled_tree_orthant_velocity, return_sampled_tree_boundary_decisions
 import random
 from model.treeTokenizer import TreeFeatureTokenizer
 from utils.random_tree import Tree
@@ -79,7 +79,8 @@ class TreeDataset(Dataset):
         real_tree = random.sample(self.load_posterior_trees_from_tfiles(meta["tree_paths"]), 1)[0]
         random_tree = self.sample_random_tree(real_tree)
         timepoint = random.uniform(0, 1)
-        newick, velocity = return_sampled_tree_velocity(random_tree, real_tree, timepoint)
+        newick, velocity = return_sampled_tree_orthant_velocity(random_tree, real_tree, timepoint)
+        not_sure = return_sampled_tree_boundary_decisions(random_tree, real_tree)
         
         sample = {
             "id": meta["id"],

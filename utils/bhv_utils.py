@@ -1,9 +1,9 @@
-from collections import defaultdict, deque
-import random
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.random_tree import Tree
-from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic
+from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic, build_tree_from_splits
 from utils.utils import remove_bit
+from typing import List
+import random
 
 class BHVEncoder():
 
@@ -103,8 +103,68 @@ class BHVEncoder():
             print("  Bi (grown):    ", seg["Bi"])
             print("  ratio:", seg["ratio"])
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
-    
-def return_sampled_tree_velocity(newick_tree_one, newick_tree_two, time_point):
+
+def geodesic_boundaries(segments: List[dict]) -> List[float]:
+    """
+    Return cumulative arc-length boundaries: end of each segment.
+    boundaries[i] = sum_{j<=i} seg[j]["length"]
+    """
+    out = []
+    cum = 0.0
+    for seg in segments:
+        cum += float(seg["length"])
+        out.append(cum)
+    return out
+
+def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two):
+    t1 = Tree(newick_tree_one)
+    t2 = Tree(newick_tree_two)
+
+    enc = BHVEncoder()
+    t1_edge_mask, t1_edge_length = enc.return_BHV_encoding(t1)
+    t2_edge_mask, t2_edge_length = enc.return_BHV_encoding(t2)
+
+    tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
+    tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
+    geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
+    segments = geodesic_result['segments']
+
+    boundaries = geodesic_boundaries(segments)
+    idxs = [random.randrange(0, len(segments)-1)]
+
+    out = []
+    for bi in idxs:
+        lengths = segments[bi]['end_lengths']
+        lengths = {m:L for m, L in lengths.items() if L > 1e-8}
+        G, newick = build_tree_from_splits(list(lengths.keys()), lengths, t1.n_leaves, root_leaf=t1.n_leaves-1, mapping=t1.id_to_name)
+        import pdb; pdb.set_trace()
+
+    #     # Find polytomies and extract components + teacher merges
+    #     polys = []
+    #     for node in find_polytomy_nodes(G, n_leaves, min_degree=4):
+    #         comps = polytomy_components_at_node(G, node, n_leaves)
+    #         # If comps is small, no discrete decision needed
+    #         if len(comps) <= 3:
+    #             merge_labels = []
+    #         else:
+    #             merge_labels = teacher_force_merge_sequence(comps, target_canon, full_mask)
+
+    #         polys.append({
+    #             "node": node,
+    #             "components": comps,           # list of leaf-set bitmasks
+    #             "merge_labels": merge_labels,  # list of (i,j) merges in component-index space
+    #         })
+
+    #     out.append({
+    #         "boundary_index": bi,
+    #         "border_newick": border_newick,
+    #         "polytomies": polys,
+    #         "border_split_set": split_set,
+    #     })
+
+    # return out
+
+def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_point):
     t1 = Tree(newick_tree_one)
     t2 = Tree(newick_tree_two)
 

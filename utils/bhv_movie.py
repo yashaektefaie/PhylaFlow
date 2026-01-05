@@ -324,14 +324,6 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None, root=None, map
 
     # 1) total BHV length
     total_L = sum(seg["length"] for seg in segments)
-    if total_L == 0:
-        # degenerate: return start topology
-        seg0 = segments[0]
-        split_set = set(seg0["splits"])
-        length_map = dict(seg0["start_lengths"])
-        G, newick = build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=root, mapping=mapping)
-        ####ADD IN SPECIAL STUFF####
-        return G, newick, {"u": u, "segment_index": 0, "alpha": 0.0}
 
     # 2) convert u -> arc length
     s = u * total_L
