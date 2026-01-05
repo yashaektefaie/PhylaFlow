@@ -80,7 +80,7 @@ class TreeDataset(Dataset):
         random_tree = self.sample_random_tree(real_tree)
         timepoint = random.uniform(0, 1)
         newick, velocity = return_sampled_tree_orthant_velocity(random_tree, real_tree, timepoint)
-        not_sure = return_sampled_tree_boundary_decisions(random_tree, real_tree)
+        # not_sure = return_sampled_tree_boundary_decisions(random_tree, real_tree)
         
         sample = {
             "id": meta["id"],

@@ -1,7 +1,7 @@
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.random_tree import Tree
 from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic, build_tree_from_splits
-from utils.utils import geodesic_boundaries, find_polytomy_nodes, polytomy_components_at_node
+from utils.utils import find_polytomy_nodes, polytomy_components_at_node, teacher_force_merge_sequence
 from typing import List
 import random
 
@@ -114,11 +114,13 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two):
 
     tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
     tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
+    
     geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
     segments = geodesic_result['segments']
-
-    boundaries = geodesic_boundaries(segments)
     idxs = [random.randrange(0, len(segments)-1)]
+
+    full_mask = (1 << t1.n_leaves) - 1
+    target_canon = list(tree2.keys())
 
     out = []
     for bi in idxs:
@@ -135,6 +137,8 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two):
             comps = polytomy_components_at_node(G, node, t1.n_leaves)
             for comp in comps:
                 print(f"Component: {[i for i in range(comp.bit_length()) if (comp >> i) & 1]}")
+
+            labels = teacher_force_merge_sequence(comps, target_canon, full_mask)
             import pdb; pdb.set_trace()
         
 
