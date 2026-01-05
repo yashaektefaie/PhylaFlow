@@ -1,7 +1,7 @@
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.random_tree import Tree
 from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic, build_tree_from_splits
-from utils.utils import remove_bit
+from utils.utils import geodesic_boundaries, find_polytomy_nodes, polytomy_components_at_node
 from typing import List
 import random
 
@@ -104,18 +104,6 @@ class BHVEncoder():
             print("  ratio:", seg["ratio"])
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
 
-def geodesic_boundaries(segments: List[dict]) -> List[float]:
-    """
-    Return cumulative arc-length boundaries: end of each segment.
-    boundaries[i] = sum_{j<=i} seg[j]["length"]
-    """
-    out = []
-    cum = 0.0
-    for seg in segments:
-        cum += float(seg["length"])
-        out.append(cum)
-    return out
-
 def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two):
     t1 = Tree(newick_tree_one)
     t2 = Tree(newick_tree_two)
@@ -137,7 +125,18 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two):
         lengths = segments[bi]['end_lengths']
         lengths = {m:L for m, L in lengths.items() if L > 1e-8}
         G, newick = build_tree_from_splits(list(lengths.keys()), lengths, t1.n_leaves, root_leaf=t1.n_leaves-1, mapping=t1.id_to_name)
-        import pdb; pdb.set_trace()
+        nodes_to_explore = find_polytomy_nodes(G, min_degree=4)
+        for node in nodes_to_explore:
+            if 'root' in node:
+                print("Hit the root which means everything is up for reconstruction")
+            else:
+                mask = int(node[2:])
+                print([i for i in range(mask.bit_length()) if (mask >> i) & 1])
+            comps = polytomy_components_at_node(G, node, t1.n_leaves)
+            for comp in comps:
+                print(f"Component: {[i for i in range(comp.bit_length()) if (comp >> i) & 1]}")
+            import pdb; pdb.set_trace()
+        
 
     #     # Find polytomies and extract components + teacher merges
     #     polys = []
