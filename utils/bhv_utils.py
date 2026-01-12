@@ -105,6 +105,39 @@ class BHVEncoder():
             print("  ratio:", seg["ratio"])
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
 
+def best_decomposition_for_any_orientation(split, sorted_components, full):
+    best = None
+    best_split = None
+
+    for cand in (split, full ^ split):
+        for comps in sorted_components:
+            region_mask = 0
+            for comp in comps:
+                region_mask |= comp
+
+            if cand & ~region_mask:
+                continue
+
+            relevant = []
+            ok = True
+            for comp in comps:
+                inter = comp & cand
+                if inter == 0:
+                    continue
+                if inter == comp:
+                    relevant.append(comp)
+                else:
+                    ok = False
+                    break
+
+            if ok and (best is None or len(relevant) < len(best)):
+                best = relevant
+                best_split = cand
+
+    return best_split, best
+
+
+
 def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, verbose = False):
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
@@ -125,11 +158,17 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
     idxs = [rm.randrange(0, len(segments)-1)]
 
     final_labels = []
+    full = (1 << t1.n_leaves) - 1
 
     for bi in idxs:
         lengths = {m:L for m, L in segments[bi]['end_lengths'].items() if L > 1e-8}
         Bi_splits = segments[bi]['Bi'].copy()
+
+        #canonicalize Bi_splits 
+        Bi_splits = [min(split, full ^ split) for split in Bi_splits]
+
         clustered_buckets = bucket_by_overlap(Bi_splits)
+        num_iter = 0    
 
         while clustered_buckets:
             G, newick = build_tree_from_splits(list(lengths.keys()), lengths, t1.n_leaves, root_leaf=t1.n_leaves-1, mapping=t1.id_to_name)
@@ -141,76 +180,96 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
             Bi_split_component = {}
 
             for split in Bi_splits:
+                logger.debug(f"Looking for relevant components found for {split}:")
                 if split not in Bi_split_component:
                     Bi_split_component[split] = []
-                found = False
-                logger.debug(f"Bi split: {[i for i in range(split.bit_length()) if (split >> i) & 1]}")
-                for comps in sorted_components:
-                    region_mask = 0
-                    for comp in comps:
-                        region_mask |= comp
-                    
-                    if split & ~region_mask != 0:
-                        logger.debug("  Not relevant to this region")
-                        continue
-                
-                    relevant_components = []
-                    ok = True
-                    for comp in comps:
-                        inter = comp & split 
-                        if inter == 0:
-                            continue 
-                        elif inter == comp:
-                            relevant_components.append(comp)
-                        else:
-                            ok = False
-                            break
-                    
-                    if ok:
-                        logger.debug("  Relevant components found:")
-                        for comp in relevant_components:
-                            logger.debug(f"  Relevant component: {[i for i in range(comp.bit_length()) if (comp >> i) & 1]}")
-                            Bi_split_component[split].append(comp)
-                        logger.debug("\n\n\n\n\n\n\n")
-                        found = True
-                        break
-                    else:
-                        logger.debug("  Split does not cleanly map to components, trying another polytomy")
-                if not found:
-                    raise Exception("Could not find relevant components for split!")
 
-            #Okay for each two-component level merge make those possible labels for the tree
+                use_split, best = best_decomposition_for_any_orientation(split, sorted_components, full)
+
+                if best is None:
+                    if len(final_labels) > 10:
+                        logger.debug(" Could not find relevant components for split, but have previous labels, skipping this split")
+                        return final_labels
+                    else:
+                        raise Exception("Could not find relevant components for split and no final labels so this is a huge error!")
+               
+                logger.debug(f" BEST RELEVANT component found for {split}:")
+                for comp in best:
+                    logger.debug(f"BEST RELEVANT component: {[i for i in range(comp.bit_length()) if (comp >> i) & 1]}")
+                logger.debug("\n\n\n\n\n\n\n")
+
+                if use_split != split:
+                    logger.debug(f"Using complementary orientation for split {split} -> {use_split}")
+                    if use_split != split:
+                        Bi_splits.remove(split)
+                        Bi_splits.append(use_split)  # or manage as a set (recommended)
+
+                        # also fix clustered_buckets if you keep them:
+                        for cluster in clustered_buckets:
+                            if split in cluster:
+                                cluster.remove(split)
+                                cluster.add(use_split)
+                
+                Bi_split_component[use_split] = best
+
+            #Okay for each clustered bucket, find the smallest group we need to merge, and add that to the merge
             initial_labels = []
             for cluster in clustered_buckets:
+                to_add = None 
+                smallest_num = None
+
                 for potential_split in cluster:
                     sub_split = Bi_split_component[potential_split]
-                    if len(sub_split) == 2:
-                        initial_labels.append(sub_split)
+                    if smallest_num is None or len(sub_split) < smallest_num:
+                        smallest_num = len(sub_split)
+                        to_add = (potential_split, sub_split)
+
+                if to_add is not None:
+                    initial_labels.append(to_add)
+                else:
+                    raise Exception("Could not find any merges for this cluster, something is wrong!")
 
             final_labels.append({'newick': newick, 'labels': initial_labels})
 
-            #Now merge those components 
-            for to_merge in initial_labels:
-                del lengths[to_merge[0]]
-                del lengths[to_merge[1]]
-                merged_mask = to_merge[0] | to_merge[1]
-                lengths[merged_mask] = 0.1  #length really does not matter
+            #Now merge those components but only do 1 at a time so we keep the labels but just do 1 to avoid weird errors 
+            for split_merge, comps in initial_labels:
+
+                check = comps[0]
+                for c in comps[1:]:
+                    check |= c
+                if check != split_merge:
+                    raise Exception("Merged components do not equal original split, something is wrong!")
+
+                lengths[split_merge] = 0.1  #length really does not matter
 
                 found = False
                 #Remove this merged mask from clustered_buckets
                 for cluster in clustered_buckets:
-                    if merged_mask in cluster:
-                        cluster.remove(merged_mask)
+                    if split_merge in cluster:
+                        cluster.remove(split_merge)
                         found = True
                 
-                Bi_splits.remove(merged_mask)
+                Bi_splits.remove(split_merge)
+                logger.debug(f"Removed {split_merge} from Bi_splits")
                 
                 if not found:
                     raise Exception("Could not find merged mask in clustered buckets which should not be possible")
             
             #Remove any empty clusters from clustered buckets
             clustered_buckets = [cluster for cluster in clustered_buckets if cluster]
-            
+            num_iter += 1
+            if not initial_labels:
+                print("Nothing happened this iteration??")
+                import pdb; pdb.set_trace()
+            if num_iter > 20 and not initial_labels:
+                import pdb; pdb.set_trace()
+                raise Exception("Too many iterations trying to resolve boundary decisions, something is wrong")
+            if clustered_buckets and not initial_labels:
+                for original_births in segments[bi]['Bi']:
+                    logger.debug(f"Original Bi split: {[i for i in range(original_births.bit_length()) if (original_births >> i) & 1]} or {original_births}")
+                import pdb; pdb.set_trace()
+                raise Exception("Stuck with unresolved clustered buckets but no possible merges, something is wrong")
+        
     return final_labels
     
 

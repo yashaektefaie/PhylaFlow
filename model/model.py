@@ -10,6 +10,7 @@ from model.tree_transformer_layers import (
     MultiheadPerformerAttention,
 )
 from model.treeTokenizer import TreeFeatureTokenizer
+from utils.utils import get_batch_polytomy_indices
 
 
 # TokenGT parameter initialization
@@ -22,6 +23,35 @@ def init_params(module, n_layers):
         nn.init.normal_(module.weight, mean=0.0, std=0.02)
         if hasattr(module, "padding_idx") and module.padding_idx is not None:
             nn.init.zeros_(module.weight[module.padding_idx])
+
+class PairwiseMergeHead(nn.Module):
+    def __init__(self, d_model: int, hidden: int = 256, dropout: float = 0.1):
+        super().__init__()
+        in_dim = 4 * d_model  # [hi, hj, |hi-hj|, hi*hj]
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),  # logit
+        )
+
+    def forward(self, H: torch.Tensor) -> torch.Tensor:
+        """
+        H: [G, D]
+        returns logits: [G, G] with -inf on diagonal (no self-merge)
+        """
+        G, D = H.shape
+        hi = H.unsqueeze(1).expand(G, G, D)  # [G, G, D]
+        hj = H.unsqueeze(0).expand(G, G, D)  # [G, G, D]
+        feats = torch.cat([hi, hj, (hi - hj).abs(), hi * hj], dim=-1)  # [G, G, 4D]
+        logits = self.mlp(feats).squeeze(-1)  # [G, G]
+
+        # disallow i==j
+        logits = logits.masked_fill(torch.eye(G, device=H.device, dtype=torch.bool), float("-inf"))
+        return logits
 
 
 class TreeGraphEncoderLayer(nn.Module):
@@ -186,6 +216,7 @@ class TreeDenoiserTokenGT(nn.Module):
         self.final_layer_norm = nn.LayerNorm(embed_dim)
         self.output_layer = nn.Linear(embed_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
+        self.pairwise_head = PairwiseMergeHead(d_model=embed_dim, hidden=embed_dim, dropout=dropout)
         self.apply(lambda m: init_params(m, n_layers))
 
     def create_sinusoidal_embedding(self, t, dim):
@@ -227,6 +258,7 @@ class TreeDenoiserTokenGT(nn.Module):
         return_all_tokens=True,
         return_leafs_only=False,
         return_edges_only=False,
+        autoregressive=False
     ):
         # Tree is this format now: (children, root_idx[, branch_lengths][, edge_types])
         # Handle both single tree and batch of trees
@@ -392,6 +424,28 @@ class TreeDenoiserTokenGT(nn.Module):
                         return torch.zeros(B, 0, D, device=x.device)
                 else:
                     return torch.zeros(B, 0, D, device=x.device)
+        elif autoregressive:
+            # Remove graph token; edge_mask assumed shape [B, T_raw]
+            x_no_graph = x[:, 1:, :]
+
+            all_group_logits = []
+
+            batch_polytomy_index = get_batch_polytomy_indices(edge_split_masks, edge_mask)
+            for b, groups in enumerate(batch_polytomy_index):
+                for group in groups:
+                    if group.size(0) <= 1:
+                        continue
+                    # Get the embeddings for this group
+                    group_embeddings = x_no_graph[b, group, :]  # [G, D]
+                    logits = self.pairwise_head(group_embeddings)  # [G, G]
+                    
+                    all_group_logits.append({
+                        "batch_index": b,
+                        "group_indices": group,
+                        "logits": logits,
+                    })
+            return all_group_logits
+
         elif return_edges_only:
             # Remove graph token; edge_mask assumed shape [B, T_raw]
             x_no_graph = x[:, 1:, :]

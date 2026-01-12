@@ -1,11 +1,8 @@
-from ete3 import Tree
-import numpy as np
-import random
-import math
 import os
 import networkx as nx
 from typing import List, Set, Tuple, Optional, Iterable, Dict
-from collections import deque
+from collections import defaultdict, deque
+import torch
 
 def get_possible_ids(nexus_root):
     ids = []
@@ -101,3 +98,106 @@ def bucket_by_overlap(splits: Iterable[int]) -> List[Set[int]]:
     # sort buckets (largest "max split" first) just for nicer printing
     buckets.sort(key=lambda B: max(x.bit_count() for x in B), reverse=True)
     return buckets
+
+def get_batch_polytomy_indices(
+    edge_split_masks: List[torch.Tensor],  # [B, T_raw] int64 (bitmask per edge-token)
+    edge_mask: torch.Tensor,         # [B, T_raw] bool or {0,1} (valid edge-token positions)
+    min_children: int = 3,
+) -> List[List[torch.LongTensor]]:
+    """
+    Groups edge-token indices into overlap-buckets (polytomy "regions") per batch element.
+
+    Returns:
+      batch_polytomy_index:
+        List over b, each is a List of 1D LongTensors of token indices (positions in [0..T_raw-1]).
+        Each tensor corresponds to one "polytomy group" bucket.
+    """
+
+    # if edge_split_masks.dim() != 2:
+    #     raise ValueError(f"edge_split_masks must be [B,T], got {tuple(edge_split_masks.shape)}")
+    if edge_mask.dim() != 2:
+        raise ValueError(f"edge_mask must be [B,T], got {tuple(edge_mask.shape)}")
+
+    B = len(edge_split_masks)
+    device = edge_mask.device
+
+    batch_polytomy_index: List[List[torch.LongTensor]] = []
+
+    for b in range(B):
+        valid_pos = torch.nonzero(edge_mask[b], as_tuple=False).squeeze(1)  # positions in [0..T-1]
+
+        # splits for valid edge tokens
+        splits_b = edge_split_masks[b] #This only contains the valid splits it is not indexed for the full lenght of input 
+        if len(splits_b) != edge_mask[b].sum().item():
+            raise ValueError("Length mismatch between splits and valid edge mask. This SHOULD NOT HAPPEN.")
+
+        # Map split_mask -> list of token positions that have that split.
+        # (Important: keep duplicates! don't lose indices.)
+        split_to_positions: Dict[int, List[int]] = defaultdict(list)
+        for pos, sm in zip(valid_pos.tolist(), splits_b):
+            # You can choose to ignore 0 masks if those mean "no split"
+            # (often 0 is padding or placeholder)
+            if sm == 0:
+                continue
+            split_to_positions[int(sm)].append(int(pos))
+
+        unique_splits = list(split_to_positions.keys())
+        polytomy_groups: List[torch.LongTensor] = []
+
+        def is_subset(sub: int, sup: int) -> bool:
+            return (sub & ~sup) == 0
+
+        n = len(unique_splits)
+        for pi in range(n):
+            p = unique_splits[pi]
+
+            # Proper subsets of p (exclude p)
+            subs = [s for s in unique_splits[:pi] if is_subset(s, p)]
+            if len(subs) < min_children:
+                continue
+
+            # Maximal proper subsets within p:
+            # s is maximal if there is NO t in subs such that s ⊂ t ⊂ p
+            maximal_subs = []
+            for s in subs:
+                dominated = False
+                for t in subs:
+                    if s != t and is_subset(s, t):  # s ⊆ t
+                        # if t strictly larger than s, s is not maximal
+                        if t.bit_count() > s.bit_count():
+                            dominated = True
+                            break
+                if not dominated:
+                    maximal_subs.append(s)
+
+            if len(maximal_subs) >= min_children:
+                # Collect token positions for this polytomy region
+                idxs: List[int] = []
+                for s in maximal_subs:
+                    idxs.extend(split_to_positions[int(s)])
+
+                # Dedup + sort for stable indexing
+                idxs = sorted(set(idxs))
+                polytomy_groups.append(torch.tensor(idxs, dtype=torch.long, device=device))
+
+        batch_polytomy_index.append(polytomy_groups)
+
+    # padded = None
+    # if return_padded:
+    #     Pmax = max((len(g) for g in batch_polytomy_index), default=0)
+    #     Kmax = 0
+    #     for groups in batch_polytomy_index:
+    #         for g in groups:
+    #             Kmax = max(Kmax, int(g.numel()))
+
+    #     if Pmax == 0 or Kmax == 0:
+    #         padded = torch.empty((B, 0, 0), dtype=torch.long, device=device)
+    #     else:
+    #         padded = torch.full((B, Pmax, Kmax), pad_value, dtype=torch.long, device=device)
+    #         for b in range(B):
+    #             for p, g in enumerate(batch_polytomy_index[b]):
+    #                 n = g.numel()
+    #                 padded[b, p, :n] = g
+
+    # return batch_polytomy_index, padded
+    return batch_polytomy_index

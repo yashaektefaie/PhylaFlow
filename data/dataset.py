@@ -80,7 +80,8 @@ class TreeDataset(Dataset):
         random_tree = self.sample_random_tree(real_tree)
         timepoint = random.uniform(0, 1)
         newick, velocity = return_sampled_tree_orthant_velocity(random_tree, real_tree, timepoint)
-        not_sure = return_sampled_tree_boundary_decisions(random_tree, real_tree)
+        final_labels = return_sampled_tree_boundary_decisions(random_tree, real_tree)
+        chosen_autoregressive_event = random.choice(final_labels)
         
         sample = {
             "id": meta["id"],
@@ -92,6 +93,8 @@ class TreeDataset(Dataset):
             "newick_tree": newick,
             "velocity": velocity,
             "timepoint": timepoint,
+            "autoregressive_newick": chosen_autoregressive_event['newick'],
+            "autoregressive_labels": chosen_autoregressive_event['labels'],
         }
 
         return sample
@@ -392,11 +395,16 @@ class PhylaDataModule(pl.LightningDataModule):
         trees_to_tokenize = [item['newick_tree'] for item in batch]
         tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
         num_leaves = [len(batch[i]['sequences']) for i in range(len(batch))]
+
+        autoregressive_trees_to_tokenize = [item['autoregressive_newick'] for item in batch]
+        autoregressive_tokenized_trees = self.tree_tokenizer(autoregressive_trees_to_tokenize)
         
         to_run = {
             "tokenized_trees": tokenized_trees,
+            "tokenized_autoregressive_trees": autoregressive_tokenized_trees,
             "original_trees": [item['newick_tree'] for item in batch],
             "batched_velocity": [item['velocity'] for item in batch],
+            "batched_autoregressive_labels": [item['autoregressive_labels'] for item in batch],
             "batched_time": torch.tensor([item['timepoint'] for item in batch], dtype=torch.float32),
             #"phyla_embeddings": torch.tensor([item['phyla_embedding'] for item in batch], dtype=torch.float32),
             "phyla_embeddings": None,

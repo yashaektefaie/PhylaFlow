@@ -54,54 +54,63 @@ class TrainingModule(LightningModule):
 		self,
 		batched_tokenized_trees,
 		t,
-		phyla_embeddings
+		phyla_embeddings,
+		autoregressive = False
 	):
-		velocity, mask = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings, return_leafs_only = False, return_edges_only = True)
-		edge_split_masks = batched_tokenized_trees[-1]
-		edge_mask = batched_tokenized_trees[-2]
-		return velocity, edge_split_masks, edge_mask
+		if not autoregressive:
+			velocity, mask = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings, return_leafs_only = False, return_edges_only = True)
+			edge_split_masks = batched_tokenized_trees[-1]
+			edge_mask = batched_tokenized_trees[-2]
+			return velocity, edge_split_masks, edge_mask
+		else:
+			all_group_logits = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings, return_leafs_only = False, return_edges_only = True, autoregressive = True)
+			return all_group_logits
 
-	def step(self, batch, eval = False):
+	def step(self, batch, eval = False, autoregressive = False):
 		logs = {}
-		v_pred, edge_split_masks, edge_mask = self.forward(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
-		velocity_labels = batch['batched_velocity']
-		num_leaves = batch['num_leaves'] 
-		gathered_velocity_labels = []
-		v_pred_indices = []
+		if not autoregressive:
+			v_pred, edge_split_masks, edge_mask = self.forward(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
+			velocity_labels = batch['batched_velocity']
+			num_leaves = batch['num_leaves'] 
+			gathered_velocity_labels = []
+			v_pred_indices = []
 
-		for num in range(len(velocity_labels)):
-			sub_gathered_velocity_labels = []
-			sub_v_pred_indices = []
+			for num in range(len(velocity_labels)):
+				sub_gathered_velocity_labels = []
+				sub_v_pred_indices = []
 
-			num_leave = num_leaves[num]
-			real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
-			for vel in velocity_labels[num]:
-				if vel.bit_length() == real_max_bit+1:
-					print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
-					print("About to remove!")
-					vel = remove_bit(vel, num_leave-1)
-				elif vel.bit_length() > real_max_bit+1:
-					raise Exception(f"Whoa there is a big problem with this split mask {vel} vs real max {real_max_bit}!")
+				num_leave = num_leaves[num]
+				real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
+				for vel in velocity_labels[num]:
+					if vel.bit_length() == real_max_bit+1:
+						print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
+						print("About to remove!")
+						vel = remove_bit(vel, num_leave-1)
+					elif vel.bit_length() > real_max_bit+1:
+						raise Exception(f"Whoa there is a big problem with this split mask {vel} vs real max {real_max_bit}!")
 
-				if vel not in edge_split_masks[num]:
-					print(f"This split {vel} from velocity labels is not in edge splits {edge_split_masks[num]}!")
-					print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
-					raise Exception("Split not found in edge splits")
-				else:
-					print("WOOO ONE FOUND")
-				sub_gathered_velocity_labels.append(velocity_labels[num][vel])
-				sub_v_pred_indices.append(edge_split_masks[num].index(vel))
-			
-			gathered_velocity_labels.append(torch.tensor(sub_gathered_velocity_labels))	
-			v_pred_indices.append(torch.tensor(sub_v_pred_indices))
-	
-		gathered_velocity_labels = torch.stack(gathered_velocity_labels)
-		v_pred_indices = torch.stack(v_pred_indices)
-		v_pred_gathered = torch.gather(v_pred, 1, v_pred_indices.unsqueeze(-1).expand(-1, -1, v_pred.size(-1))).squeeze(-1)
-		loss = ((v_pred_gathered - gathered_velocity_labels.to(v_pred_gathered.device))**2).mean()
-		print("Wow congrats")
-		logs['loss'] = loss
-		import pdb; pdb.set_trace()
+					if vel not in edge_split_masks[num]:
+						print(f"This split {vel} from velocity labels is not in edge splits {edge_split_masks[num]}!")
+						print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
+						raise Exception("Split not found in edge splits")
+					else:
+						print("WOOO ONE FOUND")
+					sub_gathered_velocity_labels.append(velocity_labels[num][vel])
+					sub_v_pred_indices.append(edge_split_masks[num].index(vel))
+				
+				gathered_velocity_labels.append(torch.tensor(sub_gathered_velocity_labels))	
+				v_pred_indices.append(torch.tensor(sub_v_pred_indices))
+		
+			gathered_velocity_labels = torch.stack(gathered_velocity_labels)
+			v_pred_indices = torch.stack(v_pred_indices)
+			v_pred_gathered = torch.gather(v_pred, 1, v_pred_indices.unsqueeze(-1).expand(-1, -1, v_pred.size(-1))).squeeze(-1)
+			loss = ((v_pred_gathered - gathered_velocity_labels.to(v_pred_gathered.device))**2).mean()
+			print("Wow congrats")
+			logs['loss'] = loss
+			import pdb; pdb.set_trace()
+		else:
+			all_group_logits = self.forward(batch['tokenized_autoregressive_trees'], None, batch['phyla_embeddings'], autoregressive=True)
+			import pdb; pdb.set_trace()
 		return logs
 			
 		
@@ -285,7 +294,8 @@ class TrainingModule(LightningModule):
 					print(f"Memory allocated before step: {torch.cuda.memory_allocated() / 1024 ** 2} MB")
 					print(f"Memory reserved before step: {torch.cuda.memory_reserved() / 1024 ** 2} MB")
 
-					logs = self.step(batch)
+					#Doing this for now to test autoregressive mode
+					logs = self.step(batch, autoregressive=True)
 					loss = logs['loss']
 
 					print(f"Memory allocated before backward: {torch.cuda.memory_allocated() / 1024 ** 2} MB")
