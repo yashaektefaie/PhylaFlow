@@ -430,19 +430,21 @@ class TreeDenoiserTokenGT(nn.Module):
 
             all_group_logits = []
 
-            batch_polytomy_index = get_batch_polytomy_indices(edge_split_masks, edge_mask)
+            batch_polytomy_index, batch_polytomy_splits = get_batch_polytomy_indices(edge_split_masks, edge_mask)
             for b, groups in enumerate(batch_polytomy_index):
-                for group in groups:
+                for num, group in enumerate(groups):
                     if group.size(0) <= 1:
                         continue
                     # Get the embeddings for this group
                     group_embeddings = x_no_graph[b, group, :]  # [G, D]
                     logits = self.pairwise_head(group_embeddings)  # [G, G]
+                    splits_represented = batch_polytomy_splits[b][num]  # [G]
                     
                     all_group_logits.append({
                         "batch_index": b,
                         "group_indices": group,
                         "logits": logits,
+                        "splits_represented": splits_represented
                     })
             return all_group_logits
 

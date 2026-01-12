@@ -10,6 +10,7 @@ import torch.distributed
 import gc
 import torch
 from utils.utils import remove_bit
+import torch.nn.functional as F
 
 
 class TrainingModule(LightningModule):
@@ -110,7 +111,57 @@ class TrainingModule(LightningModule):
 			import pdb; pdb.set_trace()
 		else:
 			all_group_logits = self.forward(batch['tokenized_autoregressive_trees'], None, batch['phyla_embeddings'], autoregressive=True)
-			import pdb; pdb.set_trace()
+			for group in all_group_logits:
+				logits = group['logits']
+				labels = batch['batched_autoregressive_labels']
+				splits_in_polytomy = group['splits_represented']
+
+				y = torch.zeros(logits.size(0), logits.size(1), dtype=torch.long).to(logits.device)
+				
+
+				for labeled_merge_cluster in labels:
+					idxs = None
+					for resulting_split, components in labeled_merge_cluster:
+						res = all([i in splits_in_polytomy for i in components])
+						if not res and idxs:
+							import pdb; pdb.set_trace()
+							raise Exception("We already found indices which means this merge cluster should all be within the polytomy, it is not!")
+						
+						if res:
+							idxs = [splits_in_polytomy.index(i) for i in components]
+
+							for i in idxs:
+								for j in idxs:
+									if i != j:
+										y[i, j] = 1.0
+				
+				y = y.float()
+
+				G = logits.size(0)
+				mask = ~torch.eye(G, dtype=torch.bool, device=logits.device)   # off-diagonal only
+
+				# optionally only use one triangle (avoid double-counting symmetric pairs)
+				tri = torch.triu(mask, diagonal=1)
+
+				logits_vec = logits[tri]
+				y_vec      = y[tri]
+
+				# ignore any -inf (if any sneak in beyond diagonal)
+				finite = torch.isfinite(logits_vec)
+				logits_vec = logits_vec[finite]
+				y_vec      = y_vec[finite]
+
+				# class imbalance weighting
+				pos = y_vec.sum().clamp(min=1.0)
+				neg = (y_vec.numel() - y_vec.sum()).clamp(min=1.0)
+				pos_weight = (neg / pos).detach()
+
+				loss = F.binary_cross_entropy_with_logits(
+					logits_vec, y_vec, pos_weight=pos_weight
+				)
+									
+				logs['loss'] = loss
+
 		return logs
 			
 		

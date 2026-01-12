@@ -122,6 +122,7 @@ def get_batch_polytomy_indices(
     device = edge_mask.device
 
     batch_polytomy_index: List[List[torch.LongTensor]] = []
+    batch_polytomy_splits: List[List[List[int]]] = []
 
     for b in range(B):
         valid_pos = torch.nonzero(edge_mask[b], as_tuple=False).squeeze(1)  # positions in [0..T-1]
@@ -143,6 +144,7 @@ def get_batch_polytomy_indices(
 
         unique_splits = list(split_to_positions.keys())
         polytomy_groups: List[torch.LongTensor] = []
+        polytomy_splits: List[List[int]] = []
 
         def is_subset(sub: int, sup: int) -> bool:
             return (sub & ~sup) == 0
@@ -179,8 +181,10 @@ def get_batch_polytomy_indices(
                 # Dedup + sort for stable indexing
                 idxs = sorted(set(idxs))
                 polytomy_groups.append(torch.tensor(idxs, dtype=torch.long, device=device))
+                polytomy_splits.append(maximal_subs)
 
         batch_polytomy_index.append(polytomy_groups)
+        batch_polytomy_splits.append(polytomy_splits)
 
     # padded = None
     # if return_padded:
@@ -200,4 +204,4 @@ def get_batch_polytomy_indices(
     #                 padded[b, p, :n] = g
 
     # return batch_polytomy_index, padded
-    return batch_polytomy_index
+    return batch_polytomy_index, batch_polytomy_splits
