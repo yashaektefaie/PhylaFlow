@@ -11,6 +11,10 @@ import gc
 import torch
 from utils.utils import remove_bit
 import torch.nn.functional as F
+from utils.random_tree import Tree 
+from utils.bhv_utils import BHVEncoder
+from utils.bhv_movie import build_tree_from_splits
+import numpy as np
 
 
 class TrainingModule(LightningModule):
@@ -163,6 +167,92 @@ class TrainingModule(LightningModule):
 				logs['loss'] = loss
 
 		return logs
+	
+	def sample(self, newick_starting_trees, phyla_embeddings, num_samples=1,
+           T=1.0, dt_base=0.02, eps_len=1e-8, hit_tol=1e-10,
+           max_events=1000, max_steps=20000):
+
+		# 1) init: parse tree -> {mask: length}
+		trees = []
+		num_leaves = []
+		mapping = []
+		for nw in newick_starting_trees:
+			t = Tree(nw)
+			enc = BHVEncoder()
+			masks, lens = enc.return_BHV_encoding(t)
+			trees.append({m: float(l) for m, l in zip(masks, lens) if l is not None})
+			num_leaves.append(t.n_leaves)
+			mapping.append(t.id_to_name)
+
+		t = 0.0
+		n_events = 0
+		n_steps = 0
+
+		while t < T and n_steps < max_steps and n_events < max_events:
+			n_steps += 1
+
+			# --- encode/tokenize current trees for the model ---
+			tokenized = self.model.tokenizer([build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves-1, mapping=m) for td, n_leaves, m in zip(trees, num_leaves, mapping)])  # you need this helper
+			velocity, edge_splits, edge_split_mask = self.forward(tokenized, t, phyla_embeddings)
+
+			# Assume velocity is aligned to *active* edges for each tree.
+			new_trees = []
+			did_boundary = False
+
+			for td, v in zip(trees, velocity):
+				active_masks = list(td.keys())
+				L = np.array([td[m] for m in active_masks], dtype=np.float64)
+				V = np.array(v[:len(active_masks)], dtype=np.float64)  # adjust to your alignment
+
+				# --- compute dt_hit ---
+				neg = V < 0
+				if np.any(neg):
+					dt_candidates = L[neg] / (-V[neg])
+					dt_hit = float(np.min(dt_candidates))
+				else:
+					dt_hit = float("inf")
+
+				dt = min(dt_base, dt_hit, T - t)
+
+				# --- advance ---
+				L_new = L + dt * V
+
+				# Did we hit boundary this step?
+				hit = np.zeros_like(L_new, dtype=bool)
+				if dt_hit != float("inf") and abs(dt - dt_hit) <= hit_tol:
+					# All edges that reach ~0 at this dt are "hit"
+					hit = (L_new <= eps_len)
+					L_new[hit] = 0.0
+					did_boundary = np.any(hit)
+
+				# update dict
+				td2 = {m: float(l) for m, l in zip(active_masks, L_new) if l > eps_len}
+
+				if np.any(hit):
+					# contract hit edges in your topology representation
+					# (this is where you rebuild the graph/tree with those splits removed)
+					td2 = contract_splits(td2, [active_masks[i] for i in np.where(hit)[0]])
+
+					# resolve any polytomies autoregressively using edge_splits logits
+					td2 = resolve_polytomies_autoregressive(
+						td2,
+						edge_splits=edge_splits,          # your logits object
+						n_leaves=enc.n_leaves,            # or however you track this
+						eps_len=eps_len,
+						max_merges=1000
+					)
+
+				new_trees.append(td2)
+
+			trees = new_trees
+			t += dt
+
+			if did_boundary:
+				n_events += 1
+
+		return [build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves-1, mapping=m) for td, n_leaves, m in zip(trees, num_leaves, mapping)]
+
+			
 			
 		
 	def training_step(self, batch, _):

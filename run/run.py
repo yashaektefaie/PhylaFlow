@@ -4,6 +4,7 @@ import yaml
 import sys
 from utils.utils import get_possible_ids
 from run.TrainingModule import TrainingModule
+from utils.random_tree import Tree
 import random
 import wandb
 
@@ -41,10 +42,14 @@ def run_test():
         deepspeed = False,
         logger = None
     )
-    res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
-    #This fails now btw non-autoregressive LOL
+    #res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
+    #This fails now btw non-autoregressive LOL NEED TO FIX!
     # res = model.step(batch)
-    res = model.step(batch, autoregressive=True)
+
+    #This works below 
+    #res = model.step(batch, autoregressive=True)
+    rt = Tree(num_leaves=50, random=True)
+    final_tree = model.sample([str(rt), str(Tree(num_leaves=50, random=True))], None, num_samples=1)
     import pdb; pdb.set_trace()
 
 
