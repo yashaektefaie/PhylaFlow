@@ -510,7 +510,6 @@ class TreeFeatureTokenizer(nn.Module):
         )
 
     def forward(self, trees):
-
         if isinstance(trees, (str, EteTree)):
             trees = [trees]
 
@@ -523,8 +522,8 @@ class TreeFeatureTokenizer(nn.Module):
 
         batch_size = len(trees)
 
-        if batch_size == 1:
-            return self._forward_single_tree(trees[0])
+        # if batch_size == 1:
+        #     return self._forward_single_tree(trees[0])
 
         # Process each tree and collect results
         batch_features = []
@@ -612,7 +611,6 @@ class TreeFeatureTokenizer(nn.Module):
     def _forward_single_tree(self, tree_info):
 
         #Output from newick to structure is (child_ptr, child_ids, parent_arr, child_arr, root_idx, branch_lengths, edge_types, split_mask_list)
-
         child_ptr = tree_info[0]
         child_ids = tree_info[1]
         parent_arr= tree_info[2]

@@ -189,23 +189,25 @@ class TrainingModule(LightningModule):
 		n_steps = 0
 
 		while t < T and n_steps < max_steps and n_events < max_events:
+			print("One two three step!")
 			n_steps += 1
 
 			# --- encode/tokenize current trees for the model ---
-			tokenized = self.model.tokenizer([build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves-1, mapping=m) for td, n_leaves, m in zip(trees, num_leaves, mapping)])  # you need this helper
-			velocity, edge_splits, edge_split_mask = self.forward(tokenized, t, phyla_embeddings)
+			tokenized = self.model.tokenizer([build_tree_from_splits(list(td.keys()), td, n_leaves, root_leaf=n_leaves-1, mapping=m)[1] for td, n_leaves, m in zip(trees, num_leaves, mapping)])  # you need this helper
+			with torch.no_grad():
+				velocity, edge_splits, edge_split_mask = self.forward(tokenized, t, phyla_embeddings)
 
 			# Assume velocity is aligned to *active* edges for each tree.
 			new_trees = []
 			did_boundary = False
 
-			for td, v in zip(trees, velocity):
+			for td, v, n_leaves, m in zip(trees, velocity, num_leaves, mapping):
 				active_masks = list(td.keys())
 				L = np.array([td[m] for m in active_masks], dtype=np.float64)
-				V = np.array(v[:len(active_masks)], dtype=np.float64)  # adjust to your alignment
+				V = np.array(v[:len(active_masks)], dtype=np.float64).squeeze(1)  # adjust to your alignment
 
 				# --- compute dt_hit ---
-				neg = V < 0
+				neg = (V < 0)
 				if np.any(neg):
 					dt_candidates = L[neg] / (-V[neg])
 					dt_hit = float(np.min(dt_candidates))
@@ -229,18 +231,19 @@ class TrainingModule(LightningModule):
 				td2 = {m: float(l) for m, l in zip(active_masks, L_new) if l > eps_len}
 
 				if np.any(hit):
-					# contract hit edges in your topology representation
-					# (this is where you rebuild the graph/tree with those splits removed)
-					td2 = contract_splits(td2, [active_masks[i] for i in np.where(hit)[0]])
+					td2 = build_tree_from_splits(list(td2.keys()), td2, n_leaves, root_leaf=n_leaves-1, mapping=m)[1]
+					tokenized_trees = self.model.tokenizer([td2])
 
-					# resolve any polytomies autoregressively using edge_splits logits
-					td2 = resolve_polytomies_autoregressive(
-						td2,
-						edge_splits=edge_splits,          # your logits object
-						n_leaves=enc.n_leaves,            # or however you track this
-						eps_len=eps_len,
-						max_merges=1000
+					logit_outputs = self.forward(
+						tokenized_trees,
+						t,
+						phyla_embeddings,
+						autoregressive = False
+
 					)
+
+					import pdb; pdb.set_trace()
+
 
 				new_trees.append(td2)
 
@@ -250,7 +253,7 @@ class TrainingModule(LightningModule):
 			if did_boundary:
 				n_events += 1
 
-		return [build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves-1, mapping=m) for td, n_leaves, m in zip(trees, num_leaves, mapping)]
+		return [build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves, root_leaf=n_leaves-1, mapping=m) for td, n_leaves, m in zip(trees, num_leaves, mapping)]
 
 			
 			
