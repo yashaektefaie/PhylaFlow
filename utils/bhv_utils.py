@@ -1,9 +1,10 @@
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.random_tree import Tree
 from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic, build_tree_from_splits
-from utils.utils import find_polytomy_nodes, polytomy_components_at_node, teacher_force_merge_sequence
-from typing import List
-import random
+from utils.utils import find_polytomy_nodes, polytomy_components_at_node, bucket_by_overlap
+import logging 
+logger = logging.getLogger(__name__)
+import random as rm
 
 class BHVEncoder():
 
@@ -104,7 +105,11 @@ class BHVEncoder():
             print("  ratio:", seg["ratio"])
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
 
-def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two):
+def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, verbose = False):
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.WARNING)
     t1 = Tree(newick_tree_one)
     t2 = Tree(newick_tree_two)
 
@@ -117,55 +122,107 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two):
     
     geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
     segments = geodesic_result['segments']
-    idxs = [random.randrange(0, len(segments)-1)]
+    idxs = [rm.randrange(0, len(segments)-1)]
 
-    full_mask = (1 << t1.n_leaves) - 1
-    target_canon = list(tree2.keys())
+    final_labels = []
 
-    out = []
     for bi in idxs:
-        lengths = segments[bi]['end_lengths']
-        lengths = {m:L for m, L in lengths.items() if L > 1e-8}
-        G, newick = build_tree_from_splits(list(lengths.keys()), lengths, t1.n_leaves, root_leaf=t1.n_leaves-1, mapping=t1.id_to_name)
-        nodes_to_explore = find_polytomy_nodes(G, min_degree=4)
-        for node in nodes_to_explore:
-            if 'root' in node:
-                print("Hit the root which means everything is up for reconstruction")
-            else:
-                mask = int(node[2:])
-                print([i for i in range(mask.bit_length()) if (mask >> i) & 1])
-            comps = polytomy_components_at_node(G, node, t1.n_leaves)
-            for comp in comps:
-                print(f"Component: {[i for i in range(comp.bit_length()) if (comp >> i) & 1]}")
+        lengths = {m:L for m, L in segments[bi]['end_lengths'].items() if L > 1e-8}
+        Bi_splits = segments[bi]['Bi'].copy()
+        clustered_buckets = bucket_by_overlap(Bi_splits)
 
-            labels = teacher_force_merge_sequence(comps, target_canon, full_mask)
-            import pdb; pdb.set_trace()
+        while clustered_buckets:
+            G, newick = build_tree_from_splits(list(lengths.keys()), lengths, t1.n_leaves, root_leaf=t1.n_leaves-1, mapping=t1.id_to_name)
+            nodes_to_explore = find_polytomy_nodes(G, min_degree=4)
+            components_to_fix = [polytomy_components_at_node(G, i, t1.n_leaves) for i in nodes_to_explore]
+            sorted_components = sorted(components_to_fix, key=lambda comps: min(c.bit_count() for c in comps))
+            logger.debug(f"Boundary index {bi}: exploring {len(nodes_to_explore)} polytomy nodes")
+
+            Bi_split_component = {}
+
+            for split in Bi_splits:
+                if split not in Bi_split_component:
+                    Bi_split_component[split] = []
+                found = False
+                logger.debug(f"Bi split: {[i for i in range(split.bit_length()) if (split >> i) & 1]}")
+                for comps in sorted_components:
+                    region_mask = 0
+                    for comp in comps:
+                        region_mask |= comp
+                    
+                    if split & ~region_mask != 0:
+                        logger.debug("  Not relevant to this region")
+                        continue
+                
+                    relevant_components = []
+                    ok = True
+                    for comp in comps:
+                        inter = comp & split 
+                        if inter == 0:
+                            continue 
+                        elif inter == comp:
+                            relevant_components.append(comp)
+                        else:
+                            ok = False
+                            break
+                    
+                    if ok:
+                        logger.debug("  Relevant components found:")
+                        for comp in relevant_components:
+                            logger.debug(f"  Relevant component: {[i for i in range(comp.bit_length()) if (comp >> i) & 1]}")
+                            Bi_split_component[split].append(comp)
+                        logger.debug("\n\n\n\n\n\n\n")
+                        found = True
+                        break
+                    else:
+                        logger.debug("  Split does not cleanly map to components, trying another polytomy")
+                if not found:
+                    raise Exception("Could not find relevant components for split!")
+
+            #Okay for each two-component level merge make those possible labels for the tree
+            initial_labels = []
+            for cluster in clustered_buckets:
+                for potential_split in cluster:
+                    sub_split = Bi_split_component[potential_split]
+                    if len(sub_split) == 2:
+                        initial_labels.append(sub_split)
+
+            final_labels.append({'newick': newick, 'labels': initial_labels})
+
+            #Now merge those components 
+            for to_merge in initial_labels:
+                del lengths[to_merge[0]]
+                del lengths[to_merge[1]]
+                merged_mask = to_merge[0] | to_merge[1]
+                lengths[merged_mask] = 0.1  #length really does not matter
+
+                found = False
+                #Remove this merged mask from clustered_buckets
+                for cluster in clustered_buckets:
+                    if merged_mask in cluster:
+                        cluster.remove(merged_mask)
+                        found = True
+                
+                Bi_splits.remove(merged_mask)
+                
+                if not found:
+                    raise Exception("Could not find merged mask in clustered buckets which should not be possible")
+            
+            #Remove any empty clusters from clustered buckets
+            clustered_buckets = [cluster for cluster in clustered_buckets if cluster]
+            
+    return final_labels
+    
+
         
 
-    #     # Find polytomies and extract components + teacher merges
-    #     polys = []
-    #     for node in find_polytomy_nodes(G, n_leaves, min_degree=4):
-    #         comps = polytomy_components_at_node(G, node, n_leaves)
-    #         # If comps is small, no discrete decision needed
-    #         if len(comps) <= 3:
-    #             merge_labels = []
-    #         else:
-    #             merge_labels = teacher_force_merge_sequence(comps, target_canon, full_mask)
+            
 
-    #         polys.append({
-    #             "node": node,
-    #             "components": comps,           # list of leaf-set bitmasks
-    #             "merge_labels": merge_labels,  # list of (i,j) merges in component-index space
-    #         })
+        
 
-    #     out.append({
-    #         "boundary_index": bi,
-    #         "border_newick": border_newick,
-    #         "polytomies": polys,
-    #         "border_split_set": split_set,
-    #     })
+        
 
-    # return out
+
 
 def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_point):
     t1 = Tree(newick_tree_one)

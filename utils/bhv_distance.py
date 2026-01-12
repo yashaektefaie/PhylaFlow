@@ -355,6 +355,9 @@ def bhv_geodesic_with_support(
     E1 = set(tree1.keys())
     E2 = set(tree2.keys())
 
+    tree1_all = dict(tree1)
+    tree2_all = dict(tree2)
+
     common = E1 & E2
     E1_only = E1 - common
     E2_only = E2 - common
@@ -402,6 +405,8 @@ def bhv_geodesic_with_support(
         B_support,
         lengths1,
         lengths2,
+        tree1_all,
+        tree2_all,
     )
 
     return {
@@ -418,6 +423,8 @@ def lengths_at_lambda(
     common: Set[Bitmask],
     A_support: List[Set[Bitmask]],
     B_support: List[Set[Bitmask]],
+    tree1_all: Dict[Bitmask, float],
+    tree2_all: Dict[Bitmask, float],
     lengths1: Dict[Bitmask, float],
     lengths2: Dict[Bitmask, float],
     normsA: List[float],
@@ -437,16 +444,13 @@ def lengths_at_lambda(
         for e in B:
             edge_to_pair[e] = (j, "B")
 
-    all_edges = set(lengths1.keys()) | set(lengths2.keys())
+    all_edges = set(lengths1.keys()) | set(lengths2.keys()) | common
     L = {}
 
     for e in all_edges:
-        in1 = e in lengths1
-        in2 = e in lengths2
-
-        if in1 and in2 and (e in common):
+        if e in common:
             # common edge: linear interpolation
-            L[e] = (1.0 - lam) * lengths1[e] + lam * lengths2[e]
+            L[e] = (1.0 - lam) * tree1_all[e] + lam * tree2_all[e]
             continue
 
         # if it's in support pairs, use the piecewise formula
@@ -487,6 +491,8 @@ def compute_orthant_segments(
     B_support: List[Set[Bitmask]],
     lengths1: Dict[Bitmask, float],
     lengths2: Dict[Bitmask, float],
+    tree1_all: Dict[Bitmask, float],
+    tree2_all: Dict[Bitmask, float],
 ):
     """
     Build a per-segment description of the BHV geodesic using Owen–Provan.
@@ -532,7 +538,7 @@ def compute_orthant_segments(
     lambdas.append(1.0)
 
     # All edges we track for Euclidean norms
-    all_edges = set(lengths1.keys()) | set(lengths2.keys())
+    all_edges = set(lengths1.keys()) | set(lengths2.keys()) | common
 
     segments = []
 
@@ -543,10 +549,10 @@ def compute_orthant_segments(
 
         # Edge lengths at the two endpoints of this leg
         L_start = lengths_at_lambda(
-            lam_start, common, A_support, B_support, lengths1, lengths2, normsA, normsB
+            lam_start, common, A_support, B_support, tree1_all, tree2_all, lengths1, lengths2, normsA, normsB
         )
         L_end = lengths_at_lambda(
-            lam_end, common, A_support, B_support, lengths1, lengths2, normsA, normsB
+            lam_end, common, A_support, B_support, tree1_all, tree2_all, lengths1, lengths2, normsA, normsB
         )
 
         # Euclidean segment length
