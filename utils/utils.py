@@ -208,7 +208,6 @@ def get_batch_polytomy_indices(
 
 def pick_group(W, tau=0.5):
     # W: symmetric, diag=-inf
-    import pdb; pdb.set_trace()
     G = W.size(0)
     i, j = divmod(torch.argmax(W).item(), G)
     if torch.sigmoid(W[i, j]) < tau:

@@ -1,3 +1,4 @@
+from linecache import cache
 import torch, torch.optim as optim
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities import grad_norm
@@ -16,6 +17,8 @@ from utils.bhv_utils import BHVEncoder
 from utils.bhv_movie import build_tree_from_splits
 from utils.utils import pick_group, find_polytomy_nodes
 import numpy as np
+import logging 
+logger = logging.getLogger(__name__)
 
 
 class TrainingModule(LightningModule):
@@ -34,7 +37,8 @@ class TrainingModule(LightningModule):
 		max_num_timesteps: int = 20,
 		#Figure out how to do typing here
 		global_splits = None,
-		random_trees = None
+		random_trees = None,
+		verbose = True
 	):
 		super().__init__()
 		self.model = model
@@ -49,12 +53,18 @@ class TrainingModule(LightningModule):
 		self.dataset = dataset
 		self.max_num_timesteps = max_num_timesteps
 		self.global_splits = global_splits
+		self.random_trees = random_trees
+		self.verbose = verbose
 
 		# Important: This property activates manual optimization.
 		# Turning off automatic optimization so I can catch out of memory errors!
 		self.automatic_optimization = False
 		self.deepspeed = deepspeed
 		self.logger_ = logger
+		if verbose:
+			logging.basicConfig(level=logging.DEBUG)
+		else:
+			logging.basicConfig(level=logging.WARNING)
 
 	def forward(
 		self,
@@ -197,31 +207,44 @@ class TrainingModule(LightningModule):
 			with torch.no_grad():
 				velocity, edge_splits, edge_split_mask = self.forward(tokenized, t, phyla_embeddings)
 
-			# Assume velocity is aligned to *active* edges for each tree.
-			new_trees = []
+			# ---- FIRST PASS: compute per-tree dt_hit, cache per-tree arrays ----
 
+			dt_hit_list = []
+			cache = []
 			for td, v, n_leaves, m in zip(trees, velocity, num_leaves, mapping):
 				active_masks = list(td.keys())
 				L = np.array([td[m] for m in active_masks], dtype=np.float64)
 				V = np.array(v[:len(active_masks)], dtype=np.float64).squeeze(1)  # adjust to your alignment
 
 				# --- compute dt_hit ---
-				neg = (V < 0)
+				neg = (V < 0) & (L > eps_len)
 				if np.any(neg):
 					dt_candidates = L[neg] / (-V[neg])
 					dt_hit = float(np.min(dt_candidates))
 				else:
 					dt_hit = float("inf")
+				
+				cache.append((td, active_masks, L, V, n_leaves, m, dt_hit))
+				dt_hit_list.append(dt_hit)
+			
+			# ---- GLOBAL dt across the batch ----
+			dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
+			dt = min(dt_base, dt_hit_global, T - t)
 
-				dt = min(dt_base, dt_hit, T - t)
+			if dt <= 0:
+				# defensive: prevent hard stall
+				dt = min(dt_base, T - t)
+			
+			# ---- SECOND PASS: advance everyone with the SAME dt ----
+			new_trees = []
+			for td, active_masks, L, V, n_leaves, m, dt_hit in cache:
 
 				# --- advance ---
 				L_new = L + dt * V
 
 				# Did we hit boundary this step?
-				hit = np.zeros_like(L_new, dtype=bool)
-				if dt_hit != float("inf") and abs(dt - dt_hit) <= hit_tol:
-					# All edges that reach ~0 at this dt are "hit"
+				hit_boundary = (dt_hit != float("inf")) and (abs(dt - dt_hit) <= hit_tol)
+				if hit_boundary:
 					hit = (L_new <= eps_len)
 					L_new[hit] = 0.0
 
@@ -234,26 +257,38 @@ class TrainingModule(LightningModule):
 				if polytomy_nodes:
 					tokenized_trees = self.model.tokenizer([td2_newick])
 					
-					logit_outputs = self.forward(
-						tokenized_trees,
-						t,
-						phyla_embeddings,
-						autoregressive = True
-					)
+					with torch.no_grad():
+						logit_outputs = self.forward(
+							tokenized_trees,
+							t,
+							phyla_embeddings,
+							autoregressive = True
+						)
 
 					for output in logit_outputs:
 						x = output['logits']
 						W = 0.5 * (x + x.T)          # [G,G]
 						W.fill_diagonal_(-float("inf"))
-						P = torch.sigmoid(W)                   # mergeability prob
-						res = pick_group(P)
-						import pdb; pdb.set_trace()
+						P = torch.sigmoid(W)                   # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
+						#Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
+						res = pick_group(W, tau=0.55)
+						if res is None:
+							logger.debug("No merges found!")
+						else:
+							logger.debug(f"Merges found: {res}")
+							split_masks = [output["splits_represented"][idx] for idx in res]
+							new_split = 0
+							for sm in split_masks:
+								new_split |= sm
 
+							if new_split in td2:
+								logger.debug("Whoa already in there!")
+							else:
+								# New length is average of merged splits
+								td2[new_split] = eps_len
 
-
-
-					import pdb; pdb.set_trace()
-
+					n_events += 1
+					logger.debug("Finished processing merges")
 
 				new_trees.append(td2)
 
