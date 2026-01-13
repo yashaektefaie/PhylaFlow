@@ -181,3 +181,52 @@ class TestAdaptiveBatching(unittest.TestCase):
         # Verification
         self.assertEqual(len(t_pruned.get_leaves()), preset_size)
         print(f"\nSuccessfully pruned to {len(t_pruned.get_leaves())} leaves.")
+
+    @patch("data.dataset.TreeDataset.build_index")
+    @patch("data.dataset.TreeDataset.parse_nexus")
+    @patch("data.dataset.TreeDataset.load_posterior_trees_from_tfiles")
+    @patch("data.dataset.TreeDataset.parse_translate_block")
+    def test_tree_pruning_indexing(
+        self, mock_translate, mock_load_trees, mock_parse_nexus, mock_build_index
+    ):
+        print("\n=== Testing Tree Pruning and Renaming Logic ===")
+        dataset = TreeDataset(nexus_root="mock", mrbayes_root="mock")
+
+        # Original tree with leaves "1", "2", "3"
+        original_newick = "((1:0.1,2:0.1):0.2,3:0.2);"
+        mock_load_trees.return_value = [original_newick]
+
+        # Nexus seqs
+        mock_parse_nexus.return_value = (
+            {"TaxonA": "AAAA", "TaxonB": "BBBB", "TaxonC": "CCCC"},
+            ["TaxonA", "TaxonB", "TaxonC"],
+        )
+
+        # Translation map
+        mock_translate.return_value = {"1": "TaxonA", "2": "TaxonB", "3": "TaxonC"}
+
+        # Mock index
+        dataset._index = [
+            {"id": "test", "nexus_path": "path.nex", "tree_paths": ["path.t"]}
+        ]
+
+        # Get Item with Pruning of size 3 (min size for random gen)
+        # Should pick 3 random leaves.
+        # Should rename them to "0", "1", "2".
+        # Should return sequences subset.
+
+        sample = dataset.__getitem__(0, preset_subtree_size=3)
+
+        print(f"Sample Sequences Keys: {sample['sequences'].keys()}")
+        print(f"Sample Newick: {sample['newick_tree']}")
+
+        # Check keys are "0", "1", "2"
+        self.assertEqual(sorted(list(sample["sequences"].keys())), ["0", "1", "2"])
+
+        # Check values correspond
+        # We don't know which original leaf maps to "0", but we can check values are from {AAAA, BBBB, CCCC}
+        valid_seqs = {"AAAA", "BBBB", "CCCC"}
+        for k, v in sample["sequences"].items():
+            self.assertIn(v, valid_seqs)
+
+        print("Test Pruning Renaming Passed")

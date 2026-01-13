@@ -97,9 +97,20 @@ class TreeDataset(Dataset):
         # Update name_to_seq cache (dumb update for now)
         self.name_to_seq = seqs
 
-        real_tree_newick = random.sample(
-            self.load_posterior_trees_from_tfiles(meta["tree_paths"]), 1
-        )[0]
+        # Attempt to parse translation block from the first tree file
+        translate_map = {}
+        if meta["tree_paths"]:
+            translate_map = self.parse_translate_block(meta["tree_paths"][0])
+
+        trees = self.load_posterior_trees_from_tfiles(meta["tree_paths"])
+        if not trees:
+            # Fallback: try to reload or skip. For now, raise informative error or return another item
+            print(
+                f"Dataset Warning: No trees found in {meta['tree_paths']}. Skipping/Replacing with index 0."
+            )
+            return self.__getitem__(0, preset_subtree_size)
+
+        real_tree_newick = random.sample(trees, 1)[0]
 
         # Pruning logic for adaptive batching
         t = EteTree(real_tree_newick, format=1)
@@ -108,18 +119,46 @@ class TreeDataset(Dataset):
         if preset_subtree_size is not None and len(leaves) > preset_subtree_size:
             kept_leaves = random.sample(leaves, preset_subtree_size)
             t.prune(kept_leaves, preserve_branch_length=True)
-            real_tree_newick = t.write(format=1)
+            # real_tree_newick = t.write(format=1) # Don't write yet, wait for re-indexing
             # Update leaves for size tracking
             leaves = t.get_leaves()
 
         current_size = len(leaves)
         self.chosen_tree = (index, current_size, 1)  # (index, size, num_subtrees)
 
+        # Normalize tree indices to 0..N-1 and subset sequences
+        # Sort leaves for deterministic indexing
+        leaves.sort(key=lambda x: x.name)
+
+        new_seqs = {}
+        original_names_map = {}
+
+        for i, leaf in enumerate(leaves):
+            original_node_name = leaf.name
+            # Resolve taxon name: check translate map, else use node name
+            taxon_name = translate_map.get(original_node_name, original_node_name)
+
+            # Map new index (0..N-1) to sequence
+            new_idx_str = str(i)
+            # Store sequences using the new index as key
+            new_seqs[new_idx_str] = seqs.get(taxon_name, "")
+
+            # Rename leaf in the tree
+            leaf.name = new_idx_str
+
+            # Record mapping if needed
+            original_names_map[new_idx_str] = taxon_name
+
+        # Serialize the normalized tree
+        real_tree_newick = t.write(format=1)
+
         # Re-parse purely to ensure we are passing consistent objects
         # (Though prune modifies in-place, let's keep it safe)
         t_pruned = EteTree(real_tree_newick, format=1)
         random_tree = self.sample_random_tree(t_pruned)
         timepoint = random.uniform(0, 1)
+
+        # Both trees now use "0".."N-1" names, so bhv utils will work happily
         newick, velocity = return_sampled_tree_orthant_velocity(
             random_tree, real_tree_newick, timepoint
         )
@@ -130,14 +169,61 @@ class TreeDataset(Dataset):
             "nexus_path": meta["nexus_path"],
             "tree_paths": meta["tree_paths"],  # list of .t files, may be 1
             # Placeholders for parsed content:
-            "sequences": seqs,
-            "taxa_order": taxa_order,
+            "sequences": new_seqs,
+            "taxa_order": list(new_seqs.keys()),  # e.g. ["0", "1", ...]
             "newick_tree": newick,
             "velocity": velocity,
             "timepoint": timepoint,
+            "original_names_map": original_names_map,
         }
 
         return sample
+
+    def parse_translate_block(self, path: str) -> Dict[str, str]:
+        """Extract 'translate' block from a Nexus/MrBayes file to map IDs to Taxon names."""
+        mapping = {}
+        in_translate = False
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Check for start of translate block
+                    if not in_translate:
+                        if line.lower().startswith("translate"):
+                            in_translate = True
+                            # Remove 'translate' keyword to process rest of line
+                            line = line[9:].strip()
+                            if not line:
+                                continue
+
+                    if in_translate:
+                        # Parsing entries like: 1 Marmota_marmota, 2 Jaculus, ...
+                        # Ends with ;
+                        term = False
+                        if ";" in line:
+                            term = True
+                            line = line.replace(";", "")
+
+                        # Split by comma
+                        tokens = line.split(",")
+                        for token in tokens:
+                            token = token.strip()
+                            if not token:
+                                continue
+                            parts = token.split()
+                            if len(parts) >= 2:
+                                # mapping ID -> Name
+                                mapping[parts[0]] = parts[1]
+
+                        if term:
+                            break
+        except Exception:
+            # If parsing fails or file not found, return empty dict
+            pass
+        return mapping
 
     def return_max_length(self, name_to_seq):
         if not name_to_seq:
@@ -475,7 +561,10 @@ class PhylaDataModule(pl.LightningDataModule):
         # Just ensuring signature matches call site
 
         trees_to_tokenize = [item["newick_tree"] for item in batch]
-        tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
+        # Tokenizer runs in worker if num_workers > 0, so must disable gradients
+        # to avoid pickling errors (grad_fn cannot be pickled).
+        with torch.no_grad():
+            tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
         num_leaves = [len(batch[i]["sequences"]) for i in range(len(batch))]
 
         to_run = {
