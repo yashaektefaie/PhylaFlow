@@ -144,7 +144,10 @@ class Tree:
         # We need to handle mixed types if necessary, but typically names are strings.
         # Ensure ROOT_DUMMY is at the end or handled specially.
         real_leaves = [l for l in leaf_nodes if l.name != "ROOT_DUMMY"]
-        real_leaves.sort(key=lambda x: x.name)
+        try:
+            real_leaves.sort(key=lambda x: int(x.name))
+        except:
+            real_leaves.sort(key=lambda x: x.name)
 
         self.n_leaves = len(real_leaves) + 1  # +1 for dummy
 
