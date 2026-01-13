@@ -21,11 +21,22 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
-from utils.bhv_utils import return_sampled_tree_orthant_velocity, return_sampled_tree_boundary_decisions
+from utils.bhv_utils import (
+    return_sampled_tree_orthant_velocity,
+    return_sampled_tree_boundary_decisions,
+)
 import random
 from model.treeTokenizer import TreeFeatureTokenizer
 from utils.random_tree import Tree
 from ete3 import Tree as EteTree
+
+
+class SizeDetector:
+    def __init__(self, max_aa=None):
+        self.max_aa = max_aa
+
+    def update_max_aa(self, new_max_aa):
+        self.max_aa = new_max_aa
 
 
 class TreeDataset(Dataset):
@@ -52,13 +63,18 @@ class TreeDataset(Dataset):
         nexus_root: str,
         mrbayes_root: str,
         filter_ids: Optional[List[str]] = None,
-        validation = False
+        validation=False,
     ) -> None:
         self.nexus_root = nexus_root
         self.mrbayes_root = mrbayes_root
         self.filter_ids = filter_ids
         self.validation = validation
+        self.size_detector = SizeDetector()
 
+        # State tracker for adaptive batching (index, subtree_size, num_subtrees)
+        # Default initialization
+        self.chosen_tree = (0, 100, 1)
+        self.name_to_seq = {}
 
         # Internal containers
         self._ids: List[str] = []  # populated by build_index()
@@ -70,10 +86,9 @@ class TreeDataset(Dataset):
         # Build index immediately; optionally preload
         self.build_index()
 
-
     def __len__(self) -> int:  # Required for torch Dataset
         return len(self._ids)
-    
+
     def return_posterior_trees(self, index: int) -> List[str]:
         """Return list of posterior Newick trees for the given index.
 
@@ -84,36 +99,160 @@ class TreeDataset(Dataset):
         trees = self.load_posterior_trees_from_tfiles(tree_paths)
         return trees
 
-    def __getitem__(self, index: int) -> Dict[str, Any]:  # Required for torch Dataset
+    def __getitem__(
+        self, index: int, preset_subtree_size: Optional[int] = None
+    ) -> Dict[str, Any]:  # Required for torch Dataset
         meta = self._index[index]
         if self.validation:
-            return {"id": meta["id"], "posterior_trees": self.return_posterior_trees(index)}
+            return {
+                "id": meta["id"],
+                "posterior_trees": self.return_posterior_trees(index),
+            }
 
-        seqs, taxa_order = self.parse_nexus(meta['nexus_path'])
-        real_tree = random.sample(self.return_posterior_trees(index), 1)[0]
-        random_tree = self.sample_random_tree(real_tree)
+        seqs, taxa_order = self.parse_nexus(meta["nexus_path"])
+
+        # Update name_to_seq cache (dumb update for now)
+        self.name_to_seq = seqs
+
+        # Attempt to parse translation block from the first tree file
+        translate_map = {}
+        if meta["tree_paths"]:
+            translate_map = self.parse_translate_block(meta["tree_paths"][0])
+
+        trees = self.load_posterior_trees_from_tfiles(meta["tree_paths"])
+        if not trees:
+            # Fallback: try to reload or skip. For now, raise informative error or return another item
+            print(
+                f"Dataset Warning: No trees found in {meta['tree_paths']}. Skipping/Replacing with index 0."
+            )
+            return self.__getitem__(0, preset_subtree_size)
+
+        real_tree_newick = random.sample(trees, 1)[0]
+
+        # Pruning logic for adaptive batching
+        t = EteTree(real_tree_newick, format=1)
+        leaves = t.get_leaves()
+
+        if preset_subtree_size is not None and len(leaves) > preset_subtree_size:
+            kept_leaves = random.sample(leaves, preset_subtree_size)
+            t.prune(kept_leaves, preserve_branch_length=True)
+            # real_tree_newick = t.write(format=1) # Don't write yet, wait for re-indexing
+            # Update leaves for size tracking
+            leaves = t.get_leaves()
+
+        current_size = len(leaves)
+        self.chosen_tree = (index, current_size, 1)  # (index, size, num_subtrees)
+
+        # Normalize tree indices to 0..N-1 and subset sequences
+        # Sort leaves for deterministic indexing
+        leaves.sort(key=lambda x: x.name)
+
+        new_seqs = {}
+        original_names_map = {}
+
+        for i, leaf in enumerate(leaves):
+            original_node_name = leaf.name
+            # Resolve taxon name: check translate map, else use node name
+            taxon_name = translate_map.get(original_node_name, original_node_name)
+
+            # Map new index (0..N-1) to sequence
+            new_idx_str = str(i)
+            # Store sequences using the new index as key
+            new_seqs[new_idx_str] = seqs.get(taxon_name, "")
+
+            # Rename leaf in the tree
+            leaf.name = new_idx_str
+
+            # Record mapping if needed
+            original_names_map[new_idx_str] = taxon_name
+
+        # Serialize the normalized tree
+        real_tree_newick = t.write(format=1)
+
+        # Re-parse purely to ensure we are passing consistent objects
+        # (Though prune modifies in-place, let's keep it safe)
+        t_pruned = EteTree(real_tree_newick, format=1)
+        random_tree = self.sample_random_tree(t_pruned)
         timepoint = random.uniform(0, 1)
-        newick, velocity = return_sampled_tree_orthant_velocity(random_tree, real_tree, timepoint)
-        final_labels = return_sampled_tree_boundary_decisions(random_tree, real_tree)
+
+        # Both trees now use "0".."N-1" names, so bhv utils will work happily
+        newick, velocity = return_sampled_tree_orthant_velocity(
+            random_tree, real_tree_newick, timepoint
+        )
+        final_labels = return_sampled_tree_boundary_decisions(
+            random_tree, real_tree_newick
+        )
         chosen_autoregressive_event = random.choice(final_labels)
-        
+
         sample = {
             "id": meta["id"],
             "nexus_path": meta["nexus_path"],
             "tree_paths": meta["tree_paths"],  # list of .t files, may be 1
             # Placeholders for parsed content:
-            "sequences": seqs,
-            "taxa_order": taxa_order, 
+            "sequences": new_seqs,
+            "taxa_order": list(new_seqs.keys()),  # e.g. ["0", "1", ...]
             "newick_tree": newick,
             "velocity": velocity,
             "timepoint": timepoint,
-            "autoregressive_newick": chosen_autoregressive_event['newick'],
-            "autoregressive_labels": chosen_autoregressive_event['labels'],
+            "autoregressive_newick": chosen_autoregressive_event["newick"],
+            "autoregressive_labels": chosen_autoregressive_event["labels"],
+            "original_names_map": original_names_map,
         }
 
         return sample
-    
-    def sample_random_tree(self, real_tree):
+
+    def parse_translate_block(self, path: str) -> Dict[str, str]:
+        """Extract 'translate' block from a Nexus/MrBayes file to map IDs to Taxon names."""
+        mapping = {}
+        in_translate = False
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Check for start of translate block
+                    if not in_translate:
+                        if line.lower().startswith("translate"):
+                            in_translate = True
+                            # Remove 'translate' keyword to process rest of line
+                            line = line[9:].strip()
+                            if not line:
+                                continue
+
+                    if in_translate:
+                        # Parsing entries like: 1 Marmota_marmota, 2 Jaculus, ...
+                        # Ends with ;
+                        term = False
+                        if ";" in line:
+                            term = True
+                            line = line.replace(";", "")
+
+                        # Split by comma
+                        tokens = line.split(",")
+                        for token in tokens:
+                            token = token.strip()
+                            if not token:
+                                continue
+                            parts = token.split()
+                            if len(parts) >= 2:
+                                # mapping ID -> Name
+                                mapping[parts[0]] = parts[1]
+
+                        if term:
+                            break
+        except Exception:
+            # If parsing fails or file not found, return empty dict
+            pass
+        return mapping
+
+    def return_max_length(self, name_to_seq):
+        if not name_to_seq:
+            return 0
+        return max(len(s) for s in name_to_seq.values())
+
+    def sample_random_tree(self, real_tree, subtree_size: Optional[int] = None):
         """
         real_tree: Newick string or an ETE Tree.
         Returns: Newick string for a random tree with the same leaf names.
@@ -130,7 +269,12 @@ class TreeDataset(Dataset):
         n_leaves = len(leaves_sorted)
 
         # Build a random unrooted binary tree on {1,...,n_leaves}
+        # Random tree creates leaves 0..n_leaves-1
         rt = Tree(num_leaves=n_leaves, random=True)
+
+        # Map 0..n_leaves-1 back to the sorted real leaf names
+        for i, real_leaf in enumerate(leaves_sorted):
+            rt.id_to_name[i] = real_leaf.name
 
         # Produce Newick with the same taxa names but random topology/lengths
         random_newick = str(rt)
@@ -145,12 +289,12 @@ class TreeDataset(Dataset):
         line = line.strip()
         if not line or line.startswith("#"):
             return ""
-        
+
         # Find first '(' and last ')' or ';'
         start = line.find("(")
         if start == -1:
             return ""
-        
+
         # Newick typically ends at ';', but sometimes there's stuff after.
         # We'll go to the last ';' if it exists, else end of line.
         end = line.rfind(";")
@@ -158,12 +302,12 @@ class TreeDataset(Dataset):
             end = len(line)
         else:
             end = end + 1  # include ';'
-        
+
         newick = line[start:end].strip()
         return newick if newick else ""
 
-
-    def load_posterior_trees_from_tfiles(self,
+    def load_posterior_trees_from_tfiles(
+        self,
         tree_files: List[str],
         burn_in_fraction: float = 0.25,
     ) -> List[str]:
@@ -180,7 +324,7 @@ class TreeDataset(Dataset):
         -------
         trees : list of Newick strings (posterior samples)
         """
-        
+
         all_trees = []
 
         for path in tree_files:
@@ -235,7 +379,7 @@ class TreeDataset(Dataset):
 
                 # Switch to matrix mode; process any remainder on the same line
                 in_matrix = True
-                remainder = line[idx + len("matrix"):].strip()
+                remainder = line[idx + len("matrix") :].strip()
                 if remainder:
                     # Process potential inline first entry after MATRIX
                     term = False
@@ -282,7 +426,7 @@ class TreeDataset(Dataset):
 
         unaligned_seqs = {}
         for i in seqs:
-            unaligned_seqs[i] = seqs[i].replace('-', '')
+            unaligned_seqs[i] = seqs[i].replace("-", "")
 
         return unaligned_seqs, taxa_order
 
@@ -349,22 +493,51 @@ class PhylaDataModule(pl.LightningDataModule):
         test_ids: List[str],
     ) -> None:
         super().__init__()
-        self.nexus_dir = config['data']['nexus_root']
-        self.mrbayes_dir = config['data']['mrbayes_root']
-        self.batch_size = config['data']['batch_size']
-        self.num_workers = config['data']['num_workers']
-        self.pin_memory = config['data']['pin_memory']
+        self.nexus_dir = config["data"]["nexus_root"]
+        self.mrbayes_dir = config["data"]["mrbayes_root"]
+        self.batch_size = config["data"]["batch_size"]
+        self.num_workers = config["data"]["num_workers"]
+        self.pin_memory = config["data"]["pin_memory"]
 
         self.train_ids = train_ids
         self.test_ids = test_ids
 
-        self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids)
-        self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, validation=True)
-        self.tree_tokenizer = TreeFeatureTokenizer(config['model']['num_node_types'], config['model']['num_edge_types'], config['model']['hidden_dim'],)
+        self.dataset_train = TreeDataset(
+            self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids
+        )
+        self.dataset_val = TreeDataset(
+            self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, validation=True
+        )
+        self.tree_tokenizer = TreeFeatureTokenizer(
+            config["model"]["num_node_types"],
+            config["model"]["num_edge_types"],
+            config["model"]["hidden_dim"],
+        )
+        self.msa_distance = True
 
+    @property
+    def chosen_tree(self):
+        return self.dataset_train.chosen_tree
+
+    @chosen_tree.setter
+    def chosen_tree(self, value):
+        self.dataset_train.chosen_tree = value
+
+    @property
+    def size_detector(self):
+        return self.dataset_train.size_detector
+
+    @property
+    def name_to_seq(self):
+        return self.dataset_train.name_to_seq
+
+    def return_max_length(self, name_to_seq):
+        return self.dataset_train.return_max_length(name_to_seq)
+
+    def __getitem__(self, *args, **kwargs):
+        return self.dataset_train.__getitem__(*args, **kwargs)
 
     def train_dataloader(self) -> DataLoader:
-
         return DataLoader(
             self.dataset_train,
             batch_size=self.batch_size,
@@ -404,34 +577,48 @@ class PhylaDataModule(pl.LightningDataModule):
             collate_fn=self.collate_fn,
         )
 
-    def collate_fn(self, batch):
+    def collate_fn(self, batch, preset_subtree_num=None):
         """Custom collate function if needed."""
         if [len(item) for item in batch][0] == 2:  # validation mode
-            ids = [item['id'] for item in batch]
-            posterior_trees = [item['posterior_trees'] for item in batch]
+            ids = [item["id"] for item in batch]
+            posterior_trees = [item["posterior_trees"] for item in batch]
             phyla_embeddings = None
-            
+
             return {
                 "ids": ids,
                 "posterior_trees": posterior_trees,
-                "phyla_embeddings": phyla_embeddings
+                "phyla_embeddings": phyla_embeddings,
             }
-        
-        trees_to_tokenize = [item['newick_tree'] for item in batch]
-        tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
-        num_leaves = [len(batch[i]['sequences']) for i in range(len(batch))]
 
-        autoregressive_trees_to_tokenize = [item['autoregressive_newick'] for item in batch]
-        autoregressive_tokenized_trees = self.tree_tokenizer(autoregressive_trees_to_tokenize)
-        
+        # preset_subtree_num is accepted but currently unused in logic below
+        # Just ensuring signature matches call site
+
+        trees_to_tokenize = [item["newick_tree"] for item in batch]
+        # Tokenizer runs in worker if num_workers > 0, so must disable gradients
+        # to avoid pickling errors (grad_fn cannot be pickled).
+        with torch.no_grad():
+            tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
+        num_leaves = [len(batch[i]["sequences"]) for i in range(len(batch))]
+
+        autoregressive_trees_to_tokenize = [
+            item["autoregressive_newick"] for item in batch
+        ]
+        autoregressive_tokenized_trees = self.tree_tokenizer(
+            autoregressive_trees_to_tokenize
+        )
+
         to_run = {
             "tokenized_trees": tokenized_trees,
             "tokenized_autoregressive_trees": autoregressive_tokenized_trees,
-            "original_trees": [item['newick_tree'] for item in batch],
-            "batched_velocity": [item['velocity'] for item in batch],
-            "batched_autoregressive_labels": [item['autoregressive_labels'] for item in batch],
-            "batched_time": torch.tensor([item['timepoint'] for item in batch], dtype=torch.float32),
-            #"phyla_embeddings": torch.tensor([item['phyla_embedding'] for item in batch], dtype=torch.float32),
+            "original_trees": [item["newick_tree"] for item in batch],
+            "batched_velocity": [item["velocity"] for item in batch],
+            "batched_autoregressive_labels": [
+                item["autoregressive_labels"] for item in batch
+            ],
+            "batched_time": torch.tensor(
+                [item["timepoint"] for item in batch], dtype=torch.float32
+            ),
+            # "phyla_embeddings": torch.tensor([item['phyla_embedding'] for item in batch], dtype=torch.float32),
             "phyla_embeddings": None,
             "num_leaves": num_leaves,
         }
@@ -439,11 +626,15 @@ class PhylaDataModule(pl.LightningDataModule):
 
 
 def test():
-    dm = TreeDataset(nexus_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/nexus/",
-                     mrbayes_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/runs/")
+    dm = TreeDataset(
+        nexus_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/nexus/",
+        mrbayes_root="/Users/yashaektefaie/Desktop/PhylaFlow/example_data/runs/",
+    )
     res_one = dm[0]
-    import pdb; pdb.set_trace()
+    import pdb
+
+    pdb.set_trace()
+
 
 if __name__ == "__main__":
     test()
-

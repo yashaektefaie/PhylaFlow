@@ -7,6 +7,8 @@ from run.TrainingModule import TrainingModule
 from utils.random_tree import Tree
 import random
 import wandb
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning import Trainer
 
 def run_test():
     config_file = sys.argv[1]
@@ -94,31 +96,31 @@ def main():
     )
 
     save_callback = ModelCheckpoint(
-        dirpath=config.trainer.checkpoint_dir,
+        dirpath=config['trainer']['checkpoint_dir'],
         filename="{epoch:02d}-{step:06d}",  # Include metric value in the filename
-        every_n_train_steps=config.trainer.steps_callback,  # Save every N steps
+        every_n_train_steps=config['trainer']['steps_callback'],  # Save every N steps
         save_top_k=-1  # Save all checkpoints
     )
 
 
     trainer_args = {}
-    if config.trainer.record:
-
+    if config['trainer']['record']:
+        run_name = "test_run"
         wandb.init(project = 'phylaflow', 
         group = f'{run_name}')
         wandb.watch(model, log_freq=100)
 
     
-    trainer_args['max_epochs'] = config.trainer.epochs
+    trainer_args['max_epochs'] = config['trainer']['epochs']
     trainer_args['callbacks'] = [save_callback] # For validation callback runs
-    if config.trainer.val_callback_freq != 0:
-        trainer_args['val_check_interval'] = config.trainer.val_callback_freq
+    if config['trainer']['val_callback_freq'] != 0:
+        trainer_args['val_check_interval'] = config['trainer']['val_callback_freq']
 
     trainer_args['accelerator'] = "gpu"
     trainer = Trainer(**trainer_args)
-    #trainer.fit(model, train_dataloaders=dataset.train_dataloader(), val_dataloaders=dataset.val_dataloader())
+    trainer.fit(model, train_dataloaders=dataset.train_dataloader(), val_dataloaders=dataset.val_dataloader())
 
 
 if __name__ == "__main__":
-    # main()
-    run_test()
+    main()
+    # run_test()
