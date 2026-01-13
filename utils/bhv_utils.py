@@ -338,7 +338,6 @@ def test_bhv_on_two_random_20_leaf_trees():
     enc = BHVEncoder()
 
     print("Encoding trees into bitmask form...")
-    root = 11
     edge_masks_1, edge_lengths_1 = enc.return_BHV_encoding(T1)
     edge_masks_2, edge_lengths_2 = enc.return_BHV_encoding(T2)
 

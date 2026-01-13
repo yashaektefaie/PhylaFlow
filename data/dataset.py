@@ -52,10 +52,12 @@ class TreeDataset(Dataset):
         nexus_root: str,
         mrbayes_root: str,
         filter_ids: Optional[List[str]] = None,
+        validation = False
     ) -> None:
         self.nexus_root = nexus_root
         self.mrbayes_root = mrbayes_root
         self.filter_ids = filter_ids
+        self.validation = validation
 
 
         # Internal containers
@@ -71,12 +73,24 @@ class TreeDataset(Dataset):
 
     def __len__(self) -> int:  # Required for torch Dataset
         return len(self._ids)
+    
+    def return_posterior_trees(self, index: int) -> List[str]:
+        """Return list of posterior Newick trees for the given index.
+
+        Applies burn-in and thinning as per load_posterior_trees_from_tfiles.
+        """
+        meta = self._index[index]
+        tree_paths = meta["tree_paths"]
+        trees = self.load_posterior_trees_from_tfiles(tree_paths)
+        return trees
 
     def __getitem__(self, index: int) -> Dict[str, Any]:  # Required for torch Dataset
         meta = self._index[index]
+        if self.validation:
+            return {"id": meta["id"], "posterior_trees": self.return_posterior_trees(index)}
 
         seqs, taxa_order = self.parse_nexus(meta['nexus_path'])
-        real_tree = random.sample(self.load_posterior_trees_from_tfiles(meta["tree_paths"]), 1)[0]
+        real_tree = random.sample(self.return_posterior_trees(index), 1)[0]
         random_tree = self.sample_random_tree(real_tree)
         timepoint = random.uniform(0, 1)
         newick, velocity = return_sampled_tree_orthant_velocity(random_tree, real_tree, timepoint)
@@ -345,7 +359,7 @@ class PhylaDataModule(pl.LightningDataModule):
         self.test_ids = test_ids
 
         self.dataset_train = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids)
-        self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids)
+        self.dataset_val = TreeDataset(self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, validation=True)
         self.tree_tokenizer = TreeFeatureTokenizer(config['model']['num_node_types'], config['model']['num_edge_types'], config['model']['hidden_dim'],)
 
 
@@ -392,6 +406,17 @@ class PhylaDataModule(pl.LightningDataModule):
 
     def collate_fn(self, batch):
         """Custom collate function if needed."""
+        if [len(item) for item in batch][0] == 2:  # validation mode
+            ids = [item['id'] for item in batch]
+            posterior_trees = [item['posterior_trees'] for item in batch]
+            phyla_embeddings = None
+            
+            return {
+                "ids": ids,
+                "posterior_trees": posterior_trees,
+                "phyla_embeddings": phyla_embeddings
+            }
+        
         trees_to_tokenize = [item['newick_tree'] for item in batch]
         tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
         num_leaves = [len(batch[i]['sequences']) for i in range(len(batch))]

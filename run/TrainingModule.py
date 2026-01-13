@@ -183,6 +183,7 @@ class TrainingModule(LightningModule):
            T=1.0, dt_base=0.02, eps_len=1e-8, hit_tol=1e-10,
            max_events=1000, max_steps=20000):
 
+		#SPEED UP SAMPLING
 		# 1) init: parse tree -> {mask: length}
 		trees = []
 		num_leaves = []
@@ -250,45 +251,47 @@ class TrainingModule(LightningModule):
 
 				# update dict
 				td2 = {m: float(l) for m, l in zip(active_masks, L_new) if l > eps_len}
+
 				graph, td2_newick = build_tree_from_splits(list(td2.keys()), td2, n_leaves, root_leaf=n_leaves-1, mapping=m)
-				polytomy_nodes = find_polytomy_nodes(graph)
-				#td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
+				if hit_boundary:
+					polytomy_nodes = find_polytomy_nodes(graph)
+					#td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
-				if polytomy_nodes:
-					tokenized_trees = self.model.tokenizer([td2_newick])
-					
-					with torch.no_grad():
-						logit_outputs = self.forward(
-							tokenized_trees,
-							t,
-							phyla_embeddings,
-							autoregressive = True
-						)
+					if polytomy_nodes:
+						tokenized_trees = self.model.tokenizer([td2_newick])
+						
+						with torch.no_grad():
+							logit_outputs = self.forward(
+								tokenized_trees,
+								t,
+								phyla_embeddings,
+								autoregressive = True
+							)
 
-					for output in logit_outputs:
-						x = output['logits']
-						W = 0.5 * (x + x.T)          # [G,G]
-						W.fill_diagonal_(-float("inf"))
-						P = torch.sigmoid(W)                   # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
-						#Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
-						res = pick_group(W, tau=0.55)
-						if res is None:
-							logger.debug("No merges found!")
-						else:
-							logger.debug(f"Merges found: {res}")
-							split_masks = [output["splits_represented"][idx] for idx in res]
-							new_split = 0
-							for sm in split_masks:
-								new_split |= sm
-
-							if new_split in td2:
-								logger.debug("Whoa already in there!")
+						for output in logit_outputs:
+							x = output['logits']
+							W = 0.5 * (x + x.T)          # [G,G]
+							W.fill_diagonal_(-float("inf"))
+							P = torch.sigmoid(W)                   # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
+							#Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
+							res = pick_group(W, tau=0.55)
+							if res is None:
+								logger.debug("No merges found!")
 							else:
-								# New length is average of merged splits
-								td2[new_split] = eps_len
+								logger.debug(f"Merges found: {res}")
+								split_masks = [output["splits_represented"][idx] for idx in res]
+								new_split = 0
+								for sm in split_masks:
+									new_split |= sm
 
-					n_events += 1
-					logger.debug("Finished processing merges")
+								if new_split in td2:
+									logger.debug("Whoa already in there!")
+								else:
+									# New length is average of merged splits
+									td2[new_split] = eps_len
+
+						n_events += 1
+						logger.debug("Finished processing merges")
 
 				new_trees.append(td2)
 
@@ -571,8 +574,22 @@ class TrainingModule(LightningModule):
 			return torch.tensor(0)
 
 	def validation_step(self, batch, batch_idx):
-		print("Wow congrats you made it here!")
-		#raise Exception("NOW FACE THE FOLLY OF YOUR EFFORTS!")
+		ids = batch['ids']
+		posterior_trees = batch['posterior_trees']
+		phyla_embeddings = batch['phyla_embeddings']
+
+		num_samples = 1000
+		
+		num_trees = [str(Tree(num_leaves=len(phyla_embeddings), random=True)) for _ in range(num_samples)]
+		sampled_trees = self.sample(num_trees, phyla_embeddings)
+		
+
+
+
+
+
+
+
 
 	def on_before_optimizer_step(self, optimizer):
 		# Compute the 2-norm for each layer

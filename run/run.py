@@ -49,8 +49,17 @@ def run_test():
     #This works below 
     #res = model.step(batch, autoregressive=True)
     rt = Tree(num_leaves=50, random=True)
-    final_tree = model.sample([str(rt), str(Tree(num_leaves=50, random=True))], None, num_samples=1)
-    import pdb; pdb.set_trace()
+    import time 
+    start = time.time()
+    num_trees = 2
+    trees_to_sample = []
+    for _ in range(num_trees):
+        trees_to_sample.append(str(Tree(num_leaves=50, random=True)))
+    final_tree = model.sample(trees_to_sample, None, num_samples=1, dt_base=0.1)
+    res = time.time() - start
+    print("Sampling time:", res)
+    print(f"Sampling time for a million trees in seconds:", res * 1e6 / num_trees, " in days:", res * 1e6 / num_trees / 86400)
+    print(f"Sampling time for a thousand trees in seconds:", res * 1e3 / num_trees, " in minutes:", res * 1e3 / num_trees / 60)
 
 
 def main():
