@@ -154,7 +154,7 @@ def get_batch_polytomy_indices(
             p = unique_splits[pi]
 
             # Proper subsets of p (exclude p)
-            subs = [s for s in unique_splits[:pi] if is_subset(s, p)]
+            subs = [s for s in unique_splits if s!= p and is_subset(s, p)]
             if len(subs) < min_children:
                 continue
 
@@ -205,3 +205,29 @@ def get_batch_polytomy_indices(
 
     # return batch_polytomy_index, padded
     return batch_polytomy_index, batch_polytomy_splits
+
+def pick_group(W, tau=0.5):
+    # W: symmetric, diag=-inf
+    import pdb; pdb.set_trace()
+    G = W.size(0)
+    i, j = divmod(torch.argmax(W).item(), G)
+    if torch.sigmoid(W[i, j]) < tau:
+        return None  # nothing confident
+
+    S = {i, j}
+
+    while True:
+        best_k, best_score = None, None
+        for k in range(G):
+            if k in S: 
+                continue
+            # score to join group: conservative = min link, or average link
+            score = torch.sigmoid(torch.stack([W[k, s] for s in S]).min())
+            # alternatively: score = torch.sigmoid(torch.stack([W[k,s] for s in S]).mean())
+            if best_score is None or score > best_score:
+                best_k, best_score = k, score
+        if best_score is None or best_score < tau:
+            break
+        S.add(best_k)
+
+    return sorted(S)

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from utils.random_tree import Tree 
 from utils.bhv_utils import BHVEncoder
 from utils.bhv_movie import build_tree_from_splits
+from utils.utils import pick_group, find_polytomy_nodes
 import numpy as np
 
 
@@ -189,7 +190,6 @@ class TrainingModule(LightningModule):
 		n_steps = 0
 
 		while t < T and n_steps < max_steps and n_events < max_events:
-			print("One two three step!")
 			n_steps += 1
 
 			# --- encode/tokenize current trees for the model ---
@@ -199,7 +199,6 @@ class TrainingModule(LightningModule):
 
 			# Assume velocity is aligned to *active* edges for each tree.
 			new_trees = []
-			did_boundary = False
 
 			for td, v, n_leaves, m in zip(trees, velocity, num_leaves, mapping):
 				active_masks = list(td.keys())
@@ -225,22 +224,33 @@ class TrainingModule(LightningModule):
 					# All edges that reach ~0 at this dt are "hit"
 					hit = (L_new <= eps_len)
 					L_new[hit] = 0.0
-					did_boundary = np.any(hit)
 
 				# update dict
 				td2 = {m: float(l) for m, l in zip(active_masks, L_new) if l > eps_len}
+				graph, td2_newick = build_tree_from_splits(list(td2.keys()), td2, n_leaves, root_leaf=n_leaves-1, mapping=m)
+				polytomy_nodes = find_polytomy_nodes(graph)
+				#td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
-				if np.any(hit):
-					td2 = build_tree_from_splits(list(td2.keys()), td2, n_leaves, root_leaf=n_leaves-1, mapping=m)[1]
-					tokenized_trees = self.model.tokenizer([td2])
-
+				if polytomy_nodes:
+					tokenized_trees = self.model.tokenizer([td2_newick])
+					
 					logit_outputs = self.forward(
 						tokenized_trees,
 						t,
 						phyla_embeddings,
-						autoregressive = False
-
+						autoregressive = True
 					)
+
+					for output in logit_outputs:
+						x = output['logits']
+						W = 0.5 * (x + x.T)          # [G,G]
+						W.fill_diagonal_(-float("inf"))
+						P = torch.sigmoid(W)                   # mergeability prob
+						res = pick_group(P)
+						import pdb; pdb.set_trace()
+
+
+
 
 					import pdb; pdb.set_trace()
 
@@ -250,10 +260,7 @@ class TrainingModule(LightningModule):
 			trees = new_trees
 			t += dt
 
-			if did_boundary:
-				n_events += 1
-
-		return [build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves, root_leaf=n_leaves-1, mapping=m) for td, n_leaves, m in zip(trees, num_leaves, mapping)]
+		return [build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves, root_leaf=n_leaves-1, mapping=m)[1] for td, n_leaves, m in zip(trees, num_leaves, mapping)]
 
 			
 			
