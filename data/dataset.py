@@ -70,7 +70,6 @@ class TreeDataset(Dataset):
         self.filter_ids = filter_ids
         self.validation = validation
         self.size_detector = SizeDetector()
-
         # State tracker for adaptive batching (index, subtree_size, num_subtrees)
         # Default initialization
         self.chosen_tree = (0, 100, 1)
@@ -80,8 +79,6 @@ class TreeDataset(Dataset):
         self._ids: List[str] = []  # populated by build_index()
         self._index: List[Dict[str, Any]] = []  # list of sample metadata dicts
         self._id_to_idx: Dict[str, int] = {}
-        self._trees_cache: Dict[str, Any] = {}  # TODO: store parsed tree objects
-        self._seqs_cache: Dict[str, Any] = {}  # TODO: store parsed sequences
 
         # Build index immediately; optionally preload
         self.build_index()
@@ -89,6 +86,12 @@ class TreeDataset(Dataset):
     def __len__(self) -> int:  # Required for torch Dataset
         return len(self._ids)
 
+    def return_number_leaves(self, index: int) -> int:
+        """Return number of leaves in the alignment for the given index."""
+        meta = self._index[index]
+        seqs, _ = self.parse_nexus(meta['nexus_path'])
+        return len(seqs)
+    
     def return_posterior_trees(self, index: int) -> List[str]:
         """Return list of posterior Newick trees for the given index.
 
@@ -98,6 +101,18 @@ class TreeDataset(Dataset):
         tree_paths = meta["tree_paths"]
         trees = self.load_posterior_trees_from_tfiles(tree_paths)
         return trees
+    
+    def return_nexus_filepath(self, index: int) -> str:
+        """Return the Nexus file path for the given index."""
+        meta = self._index[index]
+        return meta['nexus_path']
+    
+    def return_nexus_number_to_name(self, index: int) -> Dict[int, str]:
+        """Return mapping from taxon number to name for the given index."""
+        meta = self._index[index]
+        _, taxa_order = self.parse_nexus(meta['nexus_path'])
+        num_to_name = {i: name for i, name in enumerate(taxa_order)}
+        return num_to_name
 
     def __getitem__(
         self, index: int, preset_subtree_size: Optional[int] = None
@@ -183,7 +198,7 @@ class TreeDataset(Dataset):
             random_tree, real_tree_newick
         )
         chosen_autoregressive_event = random.choice(final_labels)
-
+        num_to_name = self.return_nexus_number_to_name(index)
         sample = {
             "id": meta["id"],
             "nexus_path": meta["nexus_path"],
@@ -194,9 +209,9 @@ class TreeDataset(Dataset):
             "newick_tree": newick,
             "velocity": velocity,
             "timepoint": timepoint,
-            "autoregressive_newick": chosen_autoregressive_event["newick"],
-            "autoregressive_labels": chosen_autoregressive_event["labels"],
-            "original_names_map": original_names_map,
+            "autoregressive_newick": chosen_autoregressive_event['newick'],
+            "autoregressive_labels": chosen_autoregressive_event['labels'],
+            "num_to_name": num_to_name,
         }
 
         return sample
@@ -582,12 +597,17 @@ class PhylaDataModule(pl.LightningDataModule):
         if [len(item) for item in batch][0] == 2:  # validation mode
             ids = [item["id"] for item in batch]
             posterior_trees = [item["posterior_trees"] for item in batch]
+            mappings = [item['num_to_name'] for item in batch]
             phyla_embeddings = None
 
             return {
                 "ids": ids,
                 "posterior_trees": posterior_trees,
-                "phyla_embeddings": phyla_embeddings,
+                "phyla_embeddings": phyla_embeddings,,
+                "mappings": mappings,
+                "nexus_filepaths": [item['nexus_path'] for item in batch],
+                "tree_paths": [item['tree_paths'] for item in batch],
+
             }
 
         # preset_subtree_num is accepted but currently unused in logic below
@@ -606,10 +626,13 @@ class PhylaDataModule(pl.LightningDataModule):
         autoregressive_tokenized_trees = self.tree_tokenizer(
             autoregressive_trees_to_tokenize
         )
+        mappings = [item['num_to_name'] for item in batch]
 
         to_run = {
             "tokenized_trees": tokenized_trees,
             "tokenized_autoregressive_trees": autoregressive_tokenized_trees,
+            "nexus_filepaths": [item['nexus_path'] for item in batch],
+            "tree_paths": [item['tree_paths'] for item in batch],
             "original_trees": [item["newick_tree"] for item in batch],
             "batched_velocity": [item["velocity"] for item in batch],
             "batched_autoregressive_labels": [
@@ -621,6 +644,7 @@ class PhylaDataModule(pl.LightningDataModule):
             # "phyla_embeddings": torch.tensor([item['phyla_embedding'] for item in batch], dtype=torch.float32),
             "phyla_embeddings": None,
             "num_leaves": num_leaves,
+            "mappings": mappings,
         }
         return to_run
 
