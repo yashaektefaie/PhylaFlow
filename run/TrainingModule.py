@@ -228,11 +228,11 @@ class TrainingModule(LightningModule):
                 loss = ((v_pred_gathered - gathered_velocity_labels_flat) ** 2).mean()
             else:
                 loss = torch.tensor(0.0, device=v_pred.device, requires_grad=True)
-            print("Wow congrats")
+            # print("Wow congrats")
             logs["loss"] = loss
-            import pdb
+            # import pdb
 
-            pdb.set_trace()
+            # pdb.set_trace()
         else:
             all_group_logits = self.forward(
                 batch["tokenized_autoregressive_trees"],
@@ -669,7 +669,7 @@ class TrainingModule(LightningModule):
 
                 # If fail will call zero grad again, may need this for deepspeed?
                 opt.zero_grad()
-                if num > 1:
+                if num > 0:
                     print(
                         "Batch is too large decreasing max tree and number of subtrees by a factor of 1.2"
                     )
@@ -722,7 +722,25 @@ class TrainingModule(LightningModule):
                         f"Memory reserved before step: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
                     )
 
-                    # Doing this for now to test autoregressive mode
+                    # --- HEAD 1: VELOCITY ---
+                    print("DEBUG: Starting Velocity Head Training")
+                    logs_vel = self.step(batch, autoregressive=False)
+                    loss_vel = logs_vel["loss"]
+                    self.manual_backward(loss_vel)
+                    self.clip_gradients(
+                        opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+                    )
+                    opt.step()
+                    opt.zero_grad()
+                    print("DEBUG: Finished Velocity Head Training")
+
+                    del logs_vel
+                    del loss_vel
+                    if hasattr(torch.cuda, "empty_cache"):
+                        torch.cuda.empty_cache()
+
+                    # --- HEAD 2: AUTOREGRESSIVE ---
+                    print("DEBUG: Starting Autoregressive Head Training")
                     logs = self.step(batch, autoregressive=True)
                     loss = logs["loss"]
 
@@ -734,6 +752,12 @@ class TrainingModule(LightningModule):
                     )
 
                     self.manual_backward(loss)
+                    self.clip_gradients(
+                        opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+                    )
+                    opt.step()
+                    opt.zero_grad()
+
                     success = True
                     failed = False
 
@@ -794,14 +818,17 @@ class TrainingModule(LightningModule):
                 wandb.log(logs, step=self.global_step)
             if not self.dataset.msa_distance:
                 self.dataset.update_normrf(logs["norm_rf_distance"])
-            self.clip_gradients(
-                opt,
-                gradient_clip_val=1.0,  # tighten / loosen here
-                gradient_clip_algorithm="norm",
-            )
+
+            if self.deepspeed:
+                self.clip_gradients(
+                    opt,
+                    gradient_clip_val=1.0,  # tighten / loosen here
+                    gradient_clip_algorithm="norm",
+                )
 
             self.current_step_value += 1
-            opt.step()
+            if self.deepspeed:
+                opt.step()
             # print("Hi Im here waiting!")
             if self.deepspeed:
                 torch.distributed.barrier()
@@ -832,32 +859,35 @@ class TrainingModule(LightningModule):
             return torch.tensor(0)
 
     def validation_step(self, batch, batch_idx):
-        ids = batch["ids"]
-        posterior_trees = batch["posterior_trees"]
-        phyla_embeddings = batch["phyla_embeddings"]
-
-        num_samples = 1000
-
-        num_trees = [
-            str(Tree(num_leaves=len(phyla_embeddings), random=True))
-            for _ in range(num_samples)
-        ]
-        sampled_trees = self.sample(num_trees, phyla_embeddings)
+        pass
 
     def on_before_optimizer_step(self, optimizer):
         # Compute the 2-norm for each layer
-        # If using mixed precision, the gradients are already unscaled here
         norms = grad_norm(self, norm_type=2)
-        total = norms["grad_2.0_norm_total"]
+        if "grad_2.0_norm_total" in norms:
+            total = norms["grad_2.0_norm_total"]
+        else:
+            total = norms.get("total_grad_norm", 0.0)  # hypothetical fallback
+            if total == 0.0:
+                # Just take the first key that looks like total if exists
+                keys = [k for k in norms.keys() if "total" in k]
+                if keys:
+                    total = norms[keys[0]]
+
+        # total = norms.get("grad_2.0_norm_total", 0.0)
 
         layer_norms = {k: v for k, v in norms.items() if "total" not in k}
-        max_grad = max(layer_norms.values())
-        mean_grad = torch.mean(torch.stack(list(layer_norms.values())))
+        if layer_norms:
+            max_grad = max(layer_norms.values())
+            mean_grad = torch.mean(torch.stack(list(layer_norms.values())))
+        else:
+            max_grad = 0.0
+            mean_grad = 0.0
 
         self.log("grad_norm_max", max_grad, prog_bar=True, on_step=True)
         self.log("grad_norm_mean", mean_grad, prog_bar=False, on_step=True)
 
-        # Optional: Print a warning if exploding
+        # Print a warning if exploding
         if max_grad > 1:
             print(
                 f"[Warning] Gradient norm unusually high: max={max_grad:.2e}, mean={mean_grad:.2e}"
