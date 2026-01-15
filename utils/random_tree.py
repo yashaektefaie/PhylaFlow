@@ -31,6 +31,8 @@ class Tree:
     def _remove_edge(self, u, v):
         if v in self.adj[u]: self.adj[u].remove(v)
         if u in self.adj[v]: self.adj[v].remove(u)
+        self.lengths.pop((u, v), None)
+        self.lengths.pop((v, u), None)
     
     def _build_random_tree(self, num_leaves: int):
         """
@@ -95,13 +97,14 @@ class Tree:
         # 3. Inject the Super Root and Dummy
         # We attach the Super Root to the 'bio_root' we created earlier.
         super_root_id = next_internal_id
+        next_internal_id += 1
         self.root = super_root_id # Set the class root property!
-        
-        # Edge: SuperRoot -- Dummy (Length 0)
-        self._add_edge(super_root_id, dummy_leaf_id, length=0.0)
-        
-        # Edge: SuperRoot -- BioRoot (Length 0)
-        self._add_edge(super_root_id, bio_root, length=0.0)
+
+        nbr0 = self.adj[0][0]          # leaf 0 has exactly one neighbor
+        self._remove_edge(0, nbr0)
+
+        self._add_edge(super_root_id, 0,   length=0.0)
+        self._add_edge(super_root_id, nbr0, length=0.0)
 
         # 4. Randomize lengths for all other edges
         for u in list(self.adj):

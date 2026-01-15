@@ -3,14 +3,16 @@ from utils.bhv_utils import BHVEncoder
 from collections import Counter
 from typing import Dict, List, Tuple
 from scipy.stats import pearsonr
+import numpy as np
 import math
 import random
 import subprocess, tempfile, re, pathlib
+from Bio import AlignIO
+from utils.utils import jensenshannon_loglh_divergence, kl_loglh_divergence, return_total_tree_length
 
-_LOGLH_RE = re.compile(r"Final LogLikelihood:\s*([-0-9.eE]+)")
+_LOGLH_RE = re.compile(r"final logLikelihood:\s*([-0-9.eE]+)")
 
 enc = BHVEncoder()
-
 
 def translate_tree_labels(newick: str, translation: Dict[str, str]) -> str:
     """Replace numeric labels in a Newick tree with actual taxon names."""
@@ -21,7 +23,6 @@ def translate_tree_labels(newick: str, translation: Dict[str, str]) -> str:
     # Match labels that appear before : or , or ) 
     pattern = r'(?<=[,(])([0-9]+)(?=[:,)])'
     return re.sub(pattern, replace_label, newick)
-
 
 def kl_divergence_topological_distributions(posterior_trees: List[str], 
                                             sampled_trees: List[str], 
@@ -125,7 +126,7 @@ def average_likelihood_plausibility(posterior_trees: List[str], sampled_trees: L
     return average_plausibility
 
 def raxmlng_loglh_batch(
-    msa_path: str,
+    nexus_path: str,
     newicks: List[str],
     model: str = "JC",
     threads: int = 1,
@@ -137,20 +138,34 @@ def raxmlng_loglh_batch(
     if not newicks:
         return []
     
-    with tempfile.TemporaryDirectory() as td:
-        td = pathlib.Path(td)
-        tree_file = td / "trees.nwk"
-        # Write all trees to one file, one per line
+    with tempfile.TemporaryDirectory() as td_trees, tempfile.TemporaryDirectory() as td_msa:
+        td_trees = pathlib.Path(td_trees)
+        td_msa = pathlib.Path(td_msa)
+
+        # ---- Write trees ----
+        tree_file = td_trees / "trees.nwk"
         tree_file.write_text("\n".join(t.strip() for t in newicks) + "\n")
+
+        # ---- Convert NEXUS -> FASTA ----
+        msa_file = td_msa / "msa.fasta"
+
+        # Option A (recommended): AlignIO.convert
+        AlignIO.convert(
+            nexus_path,
+            "nexus",
+            msa_file,
+            "fasta",
+        )
 
         cmd = [
             "raxml-ng",
             "--loglh",
-            "--msa", msa_path,
+            "--msa", str(msa_file),
             "--tree", str(tree_file),
             "--model", model,
             "--threads", str(threads),
         ]
+
         p = subprocess.run(cmd, capture_output=True, text=True)
         out = (p.stdout or "") + "\n" + (p.stderr or "")
         if p.returncode != 0:
@@ -166,31 +181,50 @@ def raxmlng_loglh_batch(
         
         return loglhs
 
+def compare_likelihood_distributions(nexus_file_path: str, true_trees: List[str], sampled_trees: List[str], threads: int = 1) -> Dict[str, float]:
+    """Compare likelihood distributions of true and sampled trees using RAxML-NG."""
+    true_loglhs = raxmlng_loglh_batch(
+        nexus_path=nexus_file_path,
+        newicks=true_trees,
+        model="JC",
+        threads=threads
+    )
+    sampled_loglhs = raxmlng_loglh_batch(
+        nexus_path=nexus_file_path,
+        newicks=sampled_trees,
+        model="JC",
+        threads=threads
+    )
 
-def raxmlng_loglh_for_tree(
-    msa_path: str,
-    newick: str,
-    model: str = "JC",
-    threads: int = 1,
-) -> float:
-    """
-    Returns log p(Y | tree, branch_lengths, model) using RAxML-NG --loglh.
-    Assumes Newick includes branch lengths. For multiple trees, use raxmlng_loglh_batch.
-    """
-    results = raxmlng_loglh_batch(msa_path, [newick], model=model, threads=threads)
-    return results[0]
+    avg_true_loglh = sum(true_loglhs) / len(true_loglhs) if true_loglhs else float('-inf')
+    avg_sampled_loglh = sum(sampled_loglhs) / len(sampled_loglhs) if sampled_loglhs else float('-inf')
 
+    # Difference in average log-likelihoods
+    diff_avg_loglh = avg_true_loglh - avg_sampled_loglh
+    js_div = jensenshannon_loglh_divergence(true_loglhs, sampled_loglhs, bins=50)
+    kl_div = kl_loglh_divergence(true_loglhs, sampled_loglhs, bins=50)
 
-def loglh_for_tree_list(msa_path: str, trees: List[str], threads: int = 1) -> List[float]:
-    """Batch version - much faster than one-at-a-time."""
-    return raxmlng_loglh_batch(msa_path, trees, model="JC", threads=threads)
+    return {'avg_true_loglh': avg_true_loglh,
+            'avg_sampled_loglh': avg_sampled_loglh,
+            'diff_avg_loglh': diff_avg_loglh,
+            'js_divergence': js_div,
+            'kl_divergence': kl_div}
 
-def inference_time_per_tree(total_time: float, num_trees: int) -> float:
-    """Compute average inference time per tree."""
-    if num_trees == 0:
-        return 0.0
-    return total_time / num_trees
+def compare_branch_length_distributions(true_trees: List[str], sampled_trees: List[str]) -> Dict[str, float]:
+    """Compare branch length distributions of true and sampled trees."""
+    true_branch_lengths = []
+    for newick in true_trees:
+        true_branch_lengths.append(return_total_tree_length(newick))
+    
+    sampled_branch_lengths = []
+    for newick in sampled_trees:
+        sampled_branch_lengths.append(return_total_tree_length(newick))
+    
+    js_div = jensenshannon_loglh_divergence(true_branch_lengths, sampled_branch_lengths, bins=50)
+    kl_div = kl_loglh_divergence(true_branch_lengths, sampled_branch_lengths, bins=50)
 
+    return {'js_divergence': js_div,
+            'kl_divergence': kl_div}
 
 def load_sample_trprobs(path: str, max_trees: int = 1000) -> Tuple[List[str], Dict[str, str]]:
     """Load sampled Newick trees and the translation map from a .tprobs file."""

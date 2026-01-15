@@ -3,6 +3,10 @@ import networkx as nx
 from typing import List, Set, Tuple, Optional, Iterable, Dict
 from collections import defaultdict, deque
 import torch
+import re
+from scipy.special import rel_entr
+import numpy as np
+from scipy.spatial.distance import jensenshannon
 
 def get_possible_ids(nexus_root):
     ids = []
@@ -230,3 +234,57 @@ def pick_group(W, tau=0.5):
         S.add(best_k)
 
     return sorted(S)
+
+def number_to_name_newick(newick: str, mapping: Dict[int, str], zero_indexed_tree: bool) -> str:
+    # Replace digits that are immediately followed by ':' (branch length delimiter)
+    pat = re.compile(r'\b(\d+)\b(?=:)')
+    def repl(m):
+        num = int(m.group(1))
+        if not zero_indexed_tree:
+            num = num-1
+        if num not in mapping:
+            raise Exception(f"Mapping missing for leaf number {num} in newick.")
+        return mapping.get(num, m.group(1))  # NO colon here
+    
+    return pat.sub(repl, newick)
+
+def jensenshannon_loglh_divergence(
+    true_loglhs: List[float], 
+    sampled_loglhs: List[float], 
+    bins: int = 50
+) -> float:
+    """Compute Jensen-Shannon divergence between two log-likelihood distributions."""
+    all_vals = true_loglhs + sampled_loglhs
+    bin_edges = np.histogram_bin_edges(all_vals, bins=bins)
+    p, _ = np.histogram(true_loglhs, bins=bin_edges, density=True)
+    q, _ = np.histogram(sampled_loglhs, bins=bin_edges, density=True)
+    # Add small epsilon to avoid zero probabilities
+    p = p + 1e-10
+    q = q + 1e-10
+    return jensenshannon(p, q)
+
+
+def kl_loglh_divergence(
+    true_loglhs: List[float], 
+    sampled_loglhs: List[float], 
+    bins: int = 50
+) -> float:
+    """Compute KL divergence D(true || sampled) between two log-likelihood distributions."""
+    all_vals = true_loglhs + sampled_loglhs
+    bin_edges = np.histogram_bin_edges(all_vals, bins=bins)
+    p, _ = np.histogram(true_loglhs, bins=bin_edges, density=True)
+    q, _ = np.histogram(sampled_loglhs, bins=bin_edges, density=True)
+    # Normalize to proper probability distributions and add epsilon
+    p = (p + 1e-10) / (p + 1e-10).sum()
+    q = (q + 1e-10) / (q + 1e-10).sum()
+    return rel_entr(p, q).sum()
+
+def return_total_tree_length(newick: str) -> float:
+    """
+    Computes the total tree length from a Newick string.
+    Assumes branch lengths are provided in the Newick format.
+    """
+    length_pattern = re.compile(r':([\d\.eE+-]+)')
+    lengths = length_pattern.findall(newick)
+    total_length = sum(float(length) for length in lengths)
+    return total_length
