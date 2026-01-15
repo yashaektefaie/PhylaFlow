@@ -1,7 +1,5 @@
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.random_tree import Tree
-from utils.bhv_movie import make_bhv_topology_movie, sample_tree_along_geodesic, build_tree_from_splits
-from utils.utils import find_polytomy_nodes, polytomy_components_at_node, bucket_by_overlap
 import logging 
 logger = logging.getLogger(__name__)
 import random as rm
@@ -139,6 +137,8 @@ def best_decomposition_for_any_orientation(split, sorted_components, full):
 
 
 def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, verbose = False):
+    from utils.utils import find_polytomy_nodes, polytomy_components_at_node, bucket_by_overlap
+    from utils.bhv_movie import build_tree_from_splits
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
     else:
@@ -284,6 +284,7 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
 
 
 def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_point):
+    from utils.bhv_movie import sample_tree_along_geodesic
     t1 = Tree(newick_tree_one)
     t2 = Tree(newick_tree_two)
 
@@ -327,6 +328,7 @@ def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_
 
 
 def test_bhv_on_two_random_20_leaf_trees():
+    from utils.bhv_movie import make_bhv_topology_movie
     n = 20
     print("Generating random trees...")
     T1 = Tree(num_leaves=n, random=True)
@@ -388,6 +390,3 @@ if __name__ == "__main__":
         
        
         
-
-
-
