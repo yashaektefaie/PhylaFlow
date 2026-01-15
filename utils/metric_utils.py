@@ -14,21 +14,11 @@ _LOGLH_RE = re.compile(r"final logLikelihood:\s*([-0-9.eE]+)")
 
 enc = BHVEncoder()
 
-def translate_tree_labels(newick: str, translation: Dict[str, str]) -> str:
-    """Replace numeric labels in a Newick tree with actual taxon names."""
-    def replace_label(match):
-        label = match.group(1)
-        return translation.get(label, label)
-    
-    # Match labels that appear before : or , or ) 
-    pattern = r'(?<=[,(])([0-9]+)(?=[:,)])'
-    return re.sub(pattern, replace_label, newick)
-
 def kl_divergence_topological_distributions(posterior_trees: List[str], 
                                             sampled_trees: List[str], 
                                             num_leaves: int, 
                                             eps: float = 1e-8,
-                                            alpha: float = 1e-6) -> float:
+                                            alpha: float = 1e-6) -> Dict[str, float]:
     """Compute KL divergence between topological distributions of two sets of trees."""
     
     full_mask = (1 << num_leaves) - 1
@@ -66,12 +56,12 @@ def kl_divergence_topological_distributions(posterior_trees: List[str],
         p = (gt_topological_distribution.get(k, 0.0) + alpha) / ZP
         q = (sampled_topological_distribution.get(k, 0.0) + alpha) / ZQ
         kl += p * (math.log(p / q) / math.log(math.e))
-    return kl
+    return {'kl_divergence_topological': kl}
 
 def split_bipartition_frequency_correlation(posterior_trees: List[str], 
                                            sampled_trees: List[str], 
                                            num_leaves: int, 
-                                           eps: float = 1e-8) -> float:
+                                           eps: float = 1e-8) -> Dict[str, float]:
     """Compute correlation between split bipartition frequencies of two sets of trees."""
     
     full_mask = (1 << num_leaves) - 1
@@ -113,17 +103,7 @@ def split_bipartition_frequency_correlation(posterior_trees: List[str],
         sampled_freqs.append(split_counts_sampled.get(s, 0) / len(sampled_trees))
    
     correlation, _ = pearsonr(gt_freqs, sampled_freqs)
-    return correlation
-
-def average_likelihood_plausibility(posterior_trees: List[str], sampled_trees: List[str]) -> float:
-    """Compute average likelihood plausibility of sampled trees under posterior trees."""
-    from utils.bhv_utils import compute_likelihood_plausibility
-    total_plausibility = 0.0
-    for sampled_tree in sampled_trees:
-        plausibility = compute_likelihood_plausibility(sampled_tree, posterior_trees)
-        total_plausibility += plausibility
-    average_plausibility = total_plausibility / len(sampled_trees)
-    return average_plausibility
+    return {'bipartition_frequency_correlation': correlation}
 
 def raxmlng_loglh_batch(
     nexus_path: str,
@@ -207,8 +187,8 @@ def compare_likelihood_distributions(nexus_file_path: str, true_trees: List[str]
     return {'avg_true_loglh': avg_true_loglh,
             'avg_sampled_loglh': avg_sampled_loglh,
             'diff_avg_loglh': diff_avg_loglh,
-            'js_divergence': js_div,
-            'kl_divergence': kl_div}
+            'js_divergence_loglh': js_div,
+            'kl_divergence_loglh': kl_div}
 
 def compare_branch_length_distributions(true_trees: List[str], sampled_trees: List[str]) -> Dict[str, float]:
     """Compare branch length distributions of true and sampled trees."""
@@ -223,8 +203,8 @@ def compare_branch_length_distributions(true_trees: List[str], sampled_trees: Li
     js_div = jensenshannon_loglh_divergence(true_branch_lengths, sampled_branch_lengths, bins=50)
     kl_div = kl_loglh_divergence(true_branch_lengths, sampled_branch_lengths, bins=50)
 
-    return {'js_divergence': js_div,
-            'kl_divergence': kl_div}
+    return {'js_divergence_branch_length': js_div,
+            'kl_divergence_branch_length': kl_div}
 
 def load_sample_trprobs(path: str, max_trees: int = 1000) -> Tuple[List[str], Dict[str, str]]:
     """Load sampled Newick trees and the translation map from a .tprobs file."""
@@ -313,6 +293,7 @@ def load_sample_trprobs(path: str, max_trees: int = 1000) -> Tuple[List[str], Di
         if m:
             # Apply translation mapping to convert numeric labels to taxon names
             import pdb; pdb.set_trace()
+            # BELOW will error but not changing cause we may be deleting this anyways
             translated = translate_tree_labels(m.group(0), translation)
             result.append(translated)
     sampled_trees = result

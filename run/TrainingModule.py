@@ -1,4 +1,4 @@
-from linecache import cache
+import random
 import torch, torch.optim as optim
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities import grad_norm
@@ -15,30 +15,39 @@ import torch.nn.functional as F
 from utils.random_tree import Tree 
 from utils.bhv_utils import BHVEncoder
 from utils.bhv_movie import build_tree_from_splits
-from utils.utils import pick_group, find_polytomy_nodes
+from utils.utils import pick_group, find_polytomy_nodes, number_to_name_newick
+from utils.metric_utils import (
+    kl_divergence_topological_distributions,
+    split_bipartition_frequency_correlation,
+    compare_likelihood_distributions,
+    compare_branch_length_distributions
+)
+from data.dataset import PhylaDataModule
+from model.model import TreeDenoiserTokenGT
 import numpy as np
 import logging 
+from tqdm import tqdm 
 logger = logging.getLogger(__name__)
 
 
 class TrainingModule(LightningModule):
 	def __init__(
 		self,
-		model =  None,
+		model: TreeDenoiserTokenGT,
+		dataset: PhylaDataModule,
 		lr: float = 1e-4,
 		record = False,
 		epochs: int = 5000,
-		lr_scheduler = 'default',
-		num_annealing_steps = 10000,
-		num_warmup_steps = 1000,
-		dataset = None,
-		deepspeed = False,
+		lr_scheduler: str = 'default',
+		num_annealing_steps: int = 10000,
+		num_warmup_steps: int = 1000,
+		deepspeed: bool = False,
 		logger = None,
 		max_num_timesteps: int = 20,
 		#Figure out how to do typing here
 		global_splits = None,
 		random_trees = None,
-		verbose = True
+		verbose: bool = True
 	):
 		super().__init__()
 		self.model = model
@@ -179,9 +188,11 @@ class TrainingModule(LightningModule):
 
 		return logs
 	
-	def sample(self, newick_starting_trees, phyla_embeddings, num_samples=1,
+	def sample(self, newick_starting_trees: list[str], phyla_embeddings, num_samples=1,
            T=1.0, dt_base=0.02, eps_len=1e-8, hit_tol=1e-10,
            max_events=1000, max_steps=20000):
+		
+		self.model.eval()
 
 		#SPEED UP SAMPLING
 		# 1) init: parse tree -> {mask: length}
@@ -297,11 +308,47 @@ class TrainingModule(LightningModule):
 
 			trees = new_trees
 			t += dt
+		
+		self.model.train()
 
 		return [build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves, root_leaf=n_leaves-1, mapping=m)[1] for td, n_leaves, m in zip(trees, num_leaves, mapping)]
 
-			
-			
+	def sample_compare(self, batch, train=True, num_samples=1000):
+		nexus_filepaths = batch['nexus_filepaths']
+		tree_paths = batch['tree_paths']
+		ids = batch['ids']
+
+		if len(set(nexus_filepaths)) != 1 or len(set(tree_paths)) != 1 or len(set(ids)) != 1:
+			raise Exception("Each batch should correspond to one ID, not multiple different IDs, logic is inconsitent somewhere")
+
+		nexus_filepath = batch['nexus_filepaths'][0]
+		id = batch['ids'][0]
+		mapping = batch['mappings'][0]
+
+		if train:
+			real_trees = random.sample(self.dataset.dataset_train.return_posterior_trees(id), num_samples)
+		else:
+			real_trees = random.sample(self.dataset.dataset_val.return_posterior_trees(id), num_samples)
+		
+		num_leaves = self.dataset.return_number_leaves(id)
+		
+		sampled_trees = []
+		for _ in tqdm(range(num_samples)):
+			rt = Tree(num_leaves=num_leaves, random=True)
+			starting_tree = str(rt)
+			sampled_tree = self.sample([starting_tree], batch['phyla_embeddings'], num_samples=1, dt_base=0.02)[0]
+			#Now do something with the sampled tree and the real trees	
+			sampled_trees.append(sampled_tree)
+
+		sampled = [number_to_name_newick(i, mapping, True) for i in sampled_trees]
+		posterior_trees = [number_to_name_newick(i, mapping, False) for i in real_trees]
+
+		metrics = compare_likelihood_distributions(nexus_filepath, true_trees=posterior_trees, sampled_trees=sampled, threads=1)
+		metrics.update(kl_divergence_topological_distributions(posterior_trees, sampled, num_leaves=num_leaves))
+		metrics.update(split_bipartition_frequency_correlation(posterior_trees, sampled, num_leaves=num_leaves))
+		metrics.update(compare_branch_length_distributions(posterior_trees, sampled))
+
+		return metrics
 		
 	def training_step(self, batch, _):
 		opt = self.optimizers()
@@ -582,7 +629,7 @@ class TrainingModule(LightningModule):
 		
 		num_trees = [str(Tree(num_leaves=len(phyla_embeddings), random=True)) for _ in range(num_samples)]
 		sampled_trees = self.sample(num_trees, phyla_embeddings)
-		
+
 
 
 

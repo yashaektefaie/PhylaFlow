@@ -27,10 +27,10 @@ class TestMetricUtils(unittest.TestCase):
 
         kl_same = kl_divergence_topological_distributions(
             posterior, sampled_same, num_leaves=self.num_leaves
-        )
+        )['kl_divergence_topological']
         kl_diff = kl_divergence_topological_distributions(
             posterior, sampled_diff, num_leaves=self.num_leaves
-        )
+        )['kl_divergence_topological']
 
         self.assertLess(kl_same, 1e-8)
         self.assertGreater(kl_diff, 1e-4)
@@ -45,7 +45,7 @@ class TestMetricUtils(unittest.TestCase):
         # )
         corr_diff = split_bipartition_frequency_correlation(
             posterior, sampled_diff, num_leaves=self.num_leaves
-        )
+        )['bipartition_frequency_correlation']
 
         # self.assertAlmostEqual(corr_same, 1.0, places=6)
         self.assertLess(corr_diff, 0.5)
@@ -105,8 +105,8 @@ class TestMetricUtils(unittest.TestCase):
         num_leaves = dataset.return_number_leaves(0)
         sampled = [str(Tree(num_leaves=num_leaves, random=True)) for _ in range(len(posterior_trees))]
         res = compare_branch_length_distributions(posterior_trees, sampled)
-        import pdb; pdb.set_trace()
-
+        self.assertGreater(res['kl_divergence_branch_length'], 0)
+        self.assertGreater(res['js_divergence_branch_length'], 0)
 
 
 if __name__ == "__main__":

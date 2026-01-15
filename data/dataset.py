@@ -433,6 +433,8 @@ class PhylaDataModule(pl.LightningDataModule):
                 "posterior_trees": posterior_trees,
                 "phyla_embeddings": phyla_embeddings,
                 "mappings": mappings,
+                "nexus_filepaths": [item['nexus_path'] for item in batch],
+                "tree_paths": [item['tree_paths'] for item in batch],
 
             }
         
@@ -447,6 +449,8 @@ class PhylaDataModule(pl.LightningDataModule):
         to_run = {
             "tokenized_trees": tokenized_trees,
             "tokenized_autoregressive_trees": autoregressive_tokenized_trees,
+            "nexus_filepaths": [item['nexus_path'] for item in batch],
+            "tree_paths": [item['tree_paths'] for item in batch],
             "original_trees": [item['newick_tree'] for item in batch],
             "batched_velocity": [item['velocity'] for item in batch],
             "batched_autoregressive_labels": [item['autoregressive_labels'] for item in batch],
