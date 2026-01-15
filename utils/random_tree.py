@@ -1,8 +1,6 @@
 import random
 from collections import defaultdict
-import networkx as nx
-from ete3 import Tree as eteTree
-from utils.bhv_movie import tree_to_newick
+from ete3.coretype.tree import Tree as eteTree
 
 
 class Tree:
@@ -185,6 +183,9 @@ class Tree:
         return self.lengths.get((u, v), self.lengths.get((v, u)))
 
     def __str__(self):
+        import networkx as nx
+        from utils.bhv_movie import tree_to_newick
+
         # Build a NetworkX graph from adjacency/lengths and convert to Newick
         G = nx.Graph()
         # add nodes
