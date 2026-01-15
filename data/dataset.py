@@ -88,6 +88,8 @@ class TreeDataset(Dataset):
 
     def return_number_leaves(self, index: int) -> int:
         """Return number of leaves in the alignment for the given index."""
+        if type(index) == str:
+            index = self._id_to_idx[index]
         meta = self._index[index]
         seqs, _ = self.parse_nexus(meta['nexus_path'])
         return len(seqs)
@@ -97,6 +99,8 @@ class TreeDataset(Dataset):
 
         Applies burn-in and thinning as per load_posterior_trees_from_tfiles.
         """
+        if type(index) == str:
+            index = self._id_to_idx[index] 
         meta = self._index[index]
         tree_paths = meta["tree_paths"]
         trees = self.load_posterior_trees_from_tfiles(tree_paths)
@@ -104,11 +108,15 @@ class TreeDataset(Dataset):
     
     def return_nexus_filepath(self, index: int) -> str:
         """Return the Nexus file path for the given index."""
+        if type(index) == str:
+            index = self._id_to_idx[index]
         meta = self._index[index]
         return meta['nexus_path']
     
     def return_nexus_number_to_name(self, index: int) -> Dict[int, str]:
         """Return mapping from taxon number to name for the given index."""
+        if type(index) == str:
+            index = self._id_to_idx[index]
         meta = self._index[index]
         _, taxa_order = self.parse_nexus(meta['nexus_path'])
         num_to_name = {i: name for i, name in enumerate(taxa_order)}
@@ -603,7 +611,7 @@ class PhylaDataModule(pl.LightningDataModule):
             return {
                 "ids": ids,
                 "posterior_trees": posterior_trees,
-                "phyla_embeddings": phyla_embeddings,,
+                "phyla_embeddings": phyla_embeddings,
                 "mappings": mappings,
                 "nexus_filepaths": [item['nexus_path'] for item in batch],
                 "tree_paths": [item['tree_paths'] for item in batch],
@@ -627,6 +635,7 @@ class PhylaDataModule(pl.LightningDataModule):
             autoregressive_trees_to_tokenize
         )
         mappings = [item['num_to_name'] for item in batch]
+        ids = [item["id"] for item in batch]
 
         to_run = {
             "tokenized_trees": tokenized_trees,
@@ -644,6 +653,7 @@ class PhylaDataModule(pl.LightningDataModule):
             # "phyla_embeddings": torch.tensor([item['phyla_embedding'] for item in batch], dtype=torch.float32),
             "phyla_embeddings": None,
             "num_leaves": num_leaves,
+            "ids": ids,
             "mappings": mappings,
         }
         return to_run
