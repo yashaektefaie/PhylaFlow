@@ -1,0 +1,44 @@
+trainer: {
+lr: 0.0001,
+record: True,
+epochs: 25000,
+epochs_callback: 5,
+steps_callback: 1000,
+scheduler: "warmup",
+num_warmup_steps: 150,
+ddp: False,
+deepspeed: False,
+use_tree_loss: True,
+use_mlm_loss: False,
+resume: False,
+symmetry_loss: 1,
+save_path: "",
+model_type: "Phyla-beta",
+} 
+
+model: {
+  d_model: 256,
+  n_layer: 16,
+  #vocab_size: 24,
+  vocab_size: 29,
+  ssm_cfg: {},
+  rms_norm: True,
+  residual_in_fp32: True,
+  fused_add_norm: True,
+  pad_vocab_size_multiple: 8,
+  num_blocks: 10,
+  model_name: 'Phyla-beta',
+  calculation_method: "attention",
+  inject_rotary_attention: False,
+  positional_embeddings: False,
+  bidirectional: True,
+  bidirectional_strategy: "add",
+  bidirectional_weight_tie: True,
+  ranking_loss: False
+}
+
+eval: {
+  random: False, 
+  device: "cuda:0",
+  extra_name: "trained_phyla_treebase"
+}

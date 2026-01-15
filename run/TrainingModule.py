@@ -10,14 +10,28 @@ import gc
 import torch.distributed
 import gc
 import torch
+import sys
+import os
+
+# Ensure the current directory is in sys.path to import 'phyla'
+sys.path.append(os.getcwd())
+# Import utilities from the provided codebase
+from phyla.utils.utils import load_config
+from phyla.eval.evo_reasoning_eval import (
+    Config,
+    load_model,
+    _encode_sequences_openfold_style,
+)
+
 from utils.utils import remove_bit
 import torch.nn.functional as F
-from utils.random_tree import Tree 
+from utils.random_tree import Tree
 from utils.bhv_utils import BHVEncoder
 from utils.bhv_movie import build_tree_from_splits
 from utils.utils import pick_group, find_polytomy_nodes
 import numpy as np
-import logging 
+import logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +52,9 @@ class TrainingModule(LightningModule):
         # Figure out how to do typing here
         global_splits=None,
         random_trees=None,
-        verbose = True,
+        verbose=True,
+        phyla_checkpoint_path=None,
+        phyla_config_path="configs/sample_eval_config.yaml",
     ):
         super().__init__()
         self.model = model
@@ -66,28 +82,100 @@ class TrainingModule(LightningModule):
         else:
             logging.basicConfig(level=logging.WARNING)
 
+        self.phyla_checkpoint_path = phyla_checkpoint_path
+        self.phyla_model = None
+
+        if phyla_checkpoint_path is not None:
+            original_argv = sys.argv
+            sys.argv = ["script", phyla_config_path]
+            try:
+                if not os.path.exists(phyla_config_path):
+                    logging.warning(
+                        f"Phyla configuration file not found at {phyla_config_path}"
+                    )
+
+                config = load_config(Config)
+                config.trainer.checkpoint_path = phyla_checkpoint_path
+                config.eval.device = "cuda" if torch.cuda.is_available() else "cpu"
+                loaded = load_model(config=config, random_model=False)
+                self.phyla_model = loaded["model"]
+                self.phyla_model.eval()
+                if verbose:
+                    logging.info("Phyla model loaded successfully.")
+            except Exception as e:
+                logging.warning(f"Failed to load Phyla model: {e}")
+            finally:
+                sys.argv = original_argv
+
+    def compute_phyla_embeddings(self, sequences, names, device="cuda"):
+        """
+        Generates Phyla embeddings for a batch of sequences.
+        """
+        if self.phyla_model is None:
+            raise ValueError("Phyla model not loaded.")
+
+        # This utility handles tokenization, padding, and CLS token placement
+        batch, _ = _encode_sequences_openfold_style(sequences, names)
+
+        # Generate Embeddings
+        with torch.no_grad():
+            encoded_seqs = batch["encoded_sequences"].to(device)
+            sequence_mask = batch["sequence_mask"].to(device)
+            cls_positions = batch["cls_positions"].bool().to(device)
+
+            self.phyla_model.to(device)
+
+            # Handle different forward pass signatures depending on model wrapper
+            if "TrainingModule" in str(type(self.phyla_model)):
+                embeddings = self.phyla_model(
+                    encoded_seqs,
+                    cls_token_mask=cls_positions,
+                    sequence_mask=sequence_mask,
+                )
+            else:
+                embeddings = self.phyla_model(
+                    encoded_seqs,
+                    sequence_mask,
+                    cls_positions,
+                )
+
+        return embeddings
+
     def forward(
-        self,
-        batched_tokenized_trees,
-        t,
-        phyla_embeddings,
-        autoregressive = False
+        self, batched_tokenized_trees, t, phyla_embeddings, autoregressive=False
     ):
         if not autoregressive:
-            velocity, mask = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings, return_leafs_only = False, return_edges_only = True)
+            velocity, mask = self.model(
+                batched_tokenized_trees,
+                t,
+                phyla_embeddings=phyla_embeddings,
+                return_leafs_only=False,
+                return_edges_only=True,
+            )
             edge_split_masks = batched_tokenized_trees[-1]
             edge_mask = batched_tokenized_trees[-2]
             return velocity, edge_split_masks, edge_mask
         else:
-            all_group_logits = self.model(batched_tokenized_trees, t, phyla_embeddings = phyla_embeddings, return_leafs_only = False, return_edges_only = True, autoregressive = True)
+            all_group_logits = self.model(
+                batched_tokenized_trees,
+                t,
+                phyla_embeddings=phyla_embeddings,
+                return_leafs_only=False,
+                return_edges_only=True,
+                autoregressive=True,
+            )
             return all_group_logits
 
-    def step(self, batch, eval = False, autoregressive = False):
+    def step(self, batch, eval=False, autoregressive=False):
         logs = {}
         if not autoregressive:
-            v_pred, edge_split_masks, edge_mask = self.forward(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
-            velocity_labels = batch['batched_velocity']
-            num_leaves = batch['num_leaves'] 
+            v_pred, edge_split_masks, edge_mask = self.forward(
+                batch["tokenized_trees"],
+                batch["batched_time"],
+                batch["phyla_embeddings"],
+            )
+            velocity_labels = batch["batched_velocity"]
+            num_leaves = batch["num_leaves"]
             gathered_velocity_labels = []
             v_pred_indices = []
 
@@ -106,42 +194,73 @@ class TrainingModule(LightningModule):
                     )
 
                     if vel not in edge_split_masks[num]:
-                        print(f"This split {vel} from velocity labels is not in edge splits {edge_split_masks[num]}!")
+                        print(
+                            f"This split {vel} from velocity labels is not in edge splits {edge_split_masks[num]}!"
+                        )
                         print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
                         raise Exception("Split not found in edge splits")
                     else:
                         print("WOOO ONE FOUND")
                     sub_gathered_velocity_labels.append(velocity_labels[num][vel])
                     sub_v_pred_indices.append(edge_split_masks[num].index(vel))
-                
-                gathered_velocity_labels.append(torch.tensor(sub_gathered_velocity_labels)) 
-                v_pred_indices.append(torch.tensor(sub_v_pred_indices))
-        
-            gathered_velocity_labels = torch.stack(gathered_velocity_labels)
-            v_pred_indices = torch.stack(v_pred_indices)
-            v_pred_gathered = torch.gather(v_pred, 1, v_pred_indices.unsqueeze(-1).expand(-1, -1, v_pred.size(-1))).squeeze(-1)
-            loss = ((v_pred_gathered - gathered_velocity_labels.to(v_pred_gathered.device))**2).mean()
-            print("Wow congrats")
-            logs['loss'] = loss
-            import pdb; pdb.set_trace()
-        else:
-            all_group_logits = self.forward(batch['tokenized_autoregressive_trees'], None, batch['phyla_embeddings'], autoregressive=True)
-            for group in all_group_logits:
-                logits = group['logits']
-                labels = batch['batched_autoregressive_labels']
-                splits_in_polytomy = group['splits_represented']
 
-                y = torch.zeros(logits.size(0), logits.size(1), dtype=torch.long).to(logits.device)
-                
+                gathered_velocity_labels.append(
+                    torch.tensor(sub_gathered_velocity_labels)
+                )
+                v_pred_indices.append(torch.tensor(sub_v_pred_indices))
+
+            # gathered_velocity_labels = torch.stack(gathered_velocity_labels)
+            # v_pred_indices = torch.stack(v_pred_indices)
+
+            # Fix: Flatten tensors to handle variable number of edges per tree
+            preds_list = []
+            for b_idx in range(len(v_pred_indices)):
+                indices = v_pred_indices[b_idx].to(v_pred.device)
+                if indices.numel() > 0:
+                    preds = v_pred[b_idx].index_select(0, indices)
+                    preds_list.append(preds)
+
+            if len(preds_list) > 0:
+                v_pred_gathered = torch.cat(preds_list).squeeze(-1)
+                gathered_velocity_labels_flat = torch.cat(gathered_velocity_labels).to(
+                    v_pred_gathered.device
+                )
+                loss = ((v_pred_gathered - gathered_velocity_labels_flat) ** 2).mean()
+            else:
+                loss = torch.tensor(0.0, device=v_pred.device, requires_grad=True)
+            print("Wow congrats")
+            logs["loss"] = loss
+            import pdb
+
+            pdb.set_trace()
+        else:
+            all_group_logits = self.forward(
+                batch["tokenized_autoregressive_trees"],
+                None,
+                batch["phyla_embeddings"],
+                autoregressive=True,
+            )
+            for group in all_group_logits:
+                logits = group["logits"]
+                labels = batch["batched_autoregressive_labels"]
+                splits_in_polytomy = group["splits_represented"]
+
+                y = torch.zeros(logits.size(0), logits.size(1), dtype=torch.long).to(
+                    logits.device
+                )
 
                 for labeled_merge_cluster in labels:
                     idxs = None
                     for resulting_split, components in labeled_merge_cluster:
                         res = all([i in splits_in_polytomy for i in components])
                         if not res and idxs:
-                            import pdb; pdb.set_trace()
-                            raise Exception("We already found indices which means this merge cluster should all be within the polytomy, it is not!")
-                        
+                            import pdb
+
+                            pdb.set_trace()
+                            raise Exception(
+                                "We already found indices which means this merge cluster should all be within the polytomy, it is not!"
+                            )
+
                         if res:
                             idxs = [splits_in_polytomy.index(i) for i in components]
 
@@ -149,22 +268,24 @@ class TrainingModule(LightningModule):
                                 for j in idxs:
                                     if i != j:
                                         y[i, j] = 1.0
-                
+
                 y = y.float()
 
                 G = logits.size(0)
-                mask = ~torch.eye(G, dtype=torch.bool, device=logits.device)   # off-diagonal only
+                mask = ~torch.eye(
+                    G, dtype=torch.bool, device=logits.device
+                )  # off-diagonal only
 
                 # optionally only use one triangle (avoid double-counting symmetric pairs)
                 tri = torch.triu(mask, diagonal=1)
 
                 logits_vec = logits[tri]
-                y_vec      = y[tri]
+                y_vec = y[tri]
 
                 # ignore any -inf (if any sneak in beyond diagonal)
                 finite = torch.isfinite(logits_vec)
                 logits_vec = logits_vec[finite]
-                y_vec      = y_vec[finite]
+                y_vec = y_vec[finite]
 
                 # class imbalance weighting
                 pos = y_vec.sum().clamp(min=1.0)
@@ -174,16 +295,47 @@ class TrainingModule(LightningModule):
                 loss = F.binary_cross_entropy_with_logits(
                     logits_vec, y_vec, pos_weight=pos_weight
                 )
-                                    
-                logs['loss'] = loss
+
+                logs["loss"] = loss
 
         return logs
-    
-    def sample(self, newick_starting_trees, phyla_embeddings, num_samples=1,
-           T=1.0, dt_base=0.02, eps_len=1e-8, hit_tol=1e-10,
-           max_events=1000, max_steps=20000):
 
-        #SPEED UP SAMPLING
+    def sample(
+        self,
+        newick_starting_trees,
+        phyla_embeddings,
+        num_samples=1,
+        T=1.0,
+        dt_base=0.02,
+        eps_len=1e-8,
+        hit_tol=1e-10,
+        max_events=1000,
+        max_steps=20000,
+    ):
+
+        if (
+            phyla_embeddings is None
+            and self.phyla_model is not None
+            and self.dataset is not None
+        ):
+            # Calculate embeddings on the fly
+            t_temp = Tree(newick_starting_trees[0])
+            sorted_names = [t_temp.id_to_name[i] for i in range(t_temp.n_leaves)]
+
+            # Filter out ROOT_DUMMY as it has no sequence
+            valid_names = [n for n in sorted_names if n != "ROOT_DUMMY"]
+            sorted_seqs = [self.dataset.name_to_seq[name] for name in valid_names]
+
+            raw_emb = self.compute_phyla_embeddings(
+                sorted_seqs, valid_names, device=self.device
+            )
+            # raw_emb is (1, N, D). We want (B, N, D).
+            if raw_emb.size(0) == 1:
+                phyla_embeddings = raw_emb.expand(len(newick_starting_trees), -1, -1)
+            else:
+                phyla_embeddings = raw_emb.expand(len(newick_starting_trees), -1, -1)
+
+        # SPEED UP SAMPLING
         # 1) init: parse tree -> {mask: length}
         trees = []
         num_leaves = []
@@ -204,9 +356,18 @@ class TrainingModule(LightningModule):
             n_steps += 1
 
             # --- encode/tokenize current trees for the model ---
-            tokenized = self.model.tokenizer([build_tree_from_splits(list(td.keys()), td, n_leaves, root_leaf=n_leaves-1, mapping=m)[1] for td, n_leaves, m in zip(trees, num_leaves, mapping)])  # you need this helper
+            tokenized = self.model.tokenizer(
+                [
+                    build_tree_from_splits(
+                        list(td.keys()), td, n_leaves, root_leaf=n_leaves - 1, mapping=m
+                    )[1]
+                    for td, n_leaves, m in zip(trees, num_leaves, mapping)
+                ]
+            )  # you need this helper
             with torch.no_grad():
-                velocity, edge_splits, edge_split_mask = self.forward(tokenized, t, phyla_embeddings)
+                velocity, edge_splits, edge_split_mask = self.forward(
+                    tokenized, t, phyla_embeddings
+                )
 
             # ---- FIRST PASS: compute per-tree dt_hit, cache per-tree arrays ----
 
@@ -215,7 +376,9 @@ class TrainingModule(LightningModule):
             for td, v, n_leaves, m in zip(trees, velocity, num_leaves, mapping):
                 active_masks = list(td.keys())
                 L = np.array([td[m] for m in active_masks], dtype=np.float64)
-                V = np.array(v[:len(active_masks)], dtype=np.float64).squeeze(1)  # adjust to your alignment
+                V = np.array(v[: len(active_masks)], dtype=np.float64).squeeze(
+                    1
+                )  # adjust to your alignment
 
                 # --- compute dt_hit ---
                 neg = (V < 0) & (L > eps_len)
@@ -224,10 +387,10 @@ class TrainingModule(LightningModule):
                     dt_hit = float(np.min(dt_candidates))
                 else:
                     dt_hit = float("inf")
-                
+
                 cache.append((td, active_masks, L, V, n_leaves, m, dt_hit))
                 dt_hit_list.append(dt_hit)
-            
+
             # ---- GLOBAL dt across the batch ----
             dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
             dt = min(dt_base, dt_hit_global, T - t)
@@ -235,7 +398,7 @@ class TrainingModule(LightningModule):
             if dt <= 0:
                 # defensive: prevent hard stall
                 dt = min(dt_base, T - t)
-            
+
             # ---- SECOND PASS: advance everyone with the SAME dt ----
             new_trees = []
             for td, active_masks, L, V, n_leaves, m, dt_hit in cache:
@@ -244,42 +407,50 @@ class TrainingModule(LightningModule):
                 L_new = L + dt * V
 
                 # Did we hit boundary this step?
-                hit_boundary = (dt_hit != float("inf")) and (abs(dt - dt_hit) <= hit_tol)
+                hit_boundary = (dt_hit != float("inf")) and (
+                    abs(dt - dt_hit) <= hit_tol
+                )
                 if hit_boundary:
-                    hit = (L_new <= eps_len)
+                    hit = L_new <= eps_len
                     L_new[hit] = 0.0
 
                 # update dict
                 td2 = {m: float(l) for m, l in zip(active_masks, L_new) if l > eps_len}
 
-                graph, td2_newick = build_tree_from_splits(list(td2.keys()), td2, n_leaves, root_leaf=n_leaves-1, mapping=m)
+                graph, td2_newick = build_tree_from_splits(
+                    list(td2.keys()), td2, n_leaves, root_leaf=n_leaves - 1, mapping=m
+                )
                 if hit_boundary:
                     polytomy_nodes = find_polytomy_nodes(graph)
-                    #td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
+                    # td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
                     if polytomy_nodes:
                         tokenized_trees = self.model.tokenizer([td2_newick])
-                        
+
                         with torch.no_grad():
                             logit_outputs = self.forward(
                                 tokenized_trees,
                                 t,
                                 phyla_embeddings,
-                                autoregressive = True
+                                autoregressive=True,
                             )
 
                         for output in logit_outputs:
-                            x = output['logits']
-                            W = 0.5 * (x + x.T)          # [G,G]
+                            x = output["logits"]
+                            W = 0.5 * (x + x.T)  # [G,G]
                             W.fill_diagonal_(-float("inf"))
-                            P = torch.sigmoid(W)                   # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
-                            #Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
+                            P = torch.sigmoid(
+                                W
+                            )  # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
+                            # Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
                             res = pick_group(W, tau=0.55)
                             if res is None:
                                 logger.debug("No merges found!")
                             else:
                                 logger.debug(f"Merges found: {res}")
-                                split_masks = [output["splits_represented"][idx] for idx in res]
+                                split_masks = [
+                                    output["splits_represented"][idx] for idx in res
+                                ]
                                 new_split = 0
                                 for sm in split_masks:
                                     new_split |= sm
@@ -298,11 +469,17 @@ class TrainingModule(LightningModule):
             trees = new_trees
             t += dt
 
-        return [build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves, root_leaf=n_leaves-1, mapping=m)[1] for td, n_leaves, m in zip(trees, num_leaves, mapping)]
+        return [
+            build_tree_from_splits(
+                list(td.keys()),
+                td,
+                n_leaves=n_leaves,
+                root_leaf=n_leaves - 1,
+                mapping=m,
+            )[1]
+            for td, n_leaves, m in zip(trees, num_leaves, mapping)
+        ]
 
-            
-            
-        
     def training_step(self, batch, _):
         opt = self.optimizers()
         opt.zero_grad()
@@ -545,7 +722,7 @@ class TrainingModule(LightningModule):
                         f"Memory reserved before step: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
                     )
 
-                    #Doing this for now to test autoregressive mode
+                    # Doing this for now to test autoregressive mode
                     logs = self.step(batch, autoregressive=True)
                     loss = logs["loss"]
 
@@ -655,22 +832,17 @@ class TrainingModule(LightningModule):
             return torch.tensor(0)
 
     def validation_step(self, batch, batch_idx):
-        ids = batch['ids']
-        posterior_trees = batch['posterior_trees']
-        phyla_embeddings = batch['phyla_embeddings']
+        ids = batch["ids"]
+        posterior_trees = batch["posterior_trees"]
+        phyla_embeddings = batch["phyla_embeddings"]
 
         num_samples = 1000
-        
-        num_trees = [str(Tree(num_leaves=len(phyla_embeddings), random=True)) for _ in range(num_samples)]
+
+        num_trees = [
+            str(Tree(num_leaves=len(phyla_embeddings), random=True))
+            for _ in range(num_samples)
+        ]
         sampled_trees = self.sample(num_trees, phyla_embeddings)
-        
-
-
-
-
-
-
-
 
     def on_before_optimizer_step(self, optimizer):
         # Compute the 2-norm for each layer
