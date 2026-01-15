@@ -1,6 +1,11 @@
 import unittest
 from unittest import mock
-
+from data.dataset import PhylaDataModule
+import yaml
+from utils.utils import get_possible_ids
+import random
+from model.model import return_model
+from run.TrainingModule import TrainingModule
 
 class DummyTree:
     def __init__(self, num_leaves=None, random=False):
@@ -26,47 +31,49 @@ class DummyDataset:
 
 
 class TestTrainingModuleSampleCompare(unittest.TestCase):
-    def test_sample_compare_runs(self):
-        try:
-            from run import TrainingModule as tm
-        except Exception as exc:
-            self.skipTest(f"TrainingModule import failed: {exc}")
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        with open("configs/train.yaml", "r") as f:
+            config = yaml.safe_load(f)
 
-        mapping = {0: "A", 1: "B", 2: "C"}
-        batch = {
-            "nexus_filepaths": ["dummy.nex"],
-            "tree_paths": ["dummy.trprobs"],
-            "ids": ["ds1"],
-            "mappings": [mapping],
-            "phyla_embeddings": None,
-        }
+        ids = get_possible_ids(config['data']['nexus_root'])
+        #Random 80-20 train-test split for now
+        ran = random.Random(42)
+        ran.shuffle(ids)
+        train_ids = ids[:int(0.8*len(ids))]
+        test_ids = ids[int(0.8*len(ids)):]
 
-        module = tm.TrainingModule(
-            model=object(),
-            dataset=DummyDataset(),
-            lr=1e-4,
-            record=False,
-            epochs=1,
-            deepspeed=False,
-            logger=None,
-            verbose=False,
+        ###TEMPORARY FOR DEBUGGING
+        train_ids = test_ids
+
+        dataset = PhylaDataModule(config, train_ids=train_ids, test_ids=test_ids)
+        one = dataset.dataset_train[0]
+        two = dataset.dataset_train[0]
+        self.batch = dataset.collate_fn([one, two])
+
+        phyla_flow = return_model(config)
+
+        self.training_module = TrainingModule(
+            model=phyla_flow,
+            lr=config['trainer']['lr'],
+            record=config['trainer']['record'],
+            epochs=config['trainer']['epochs'],
+            dataset=dataset,
+            lr_scheduler = 'default',
+            num_annealing_steps = 10000,
+            num_warmup_steps = 1000,
+            deepspeed = False,
+            logger = None
         )
 
-        def fake_sample(*_args, **_kwargs):
-            return ["(0:0.1,1:0.1,2:0.1);"]
-
-        with mock.patch.object(tm, "Tree", DummyTree), \
-            mock.patch.object(tm.TrainingModule, "sample", fake_sample), \
-            mock.patch.object(tm, "compare_likelihood_distributions", lambda *a, **k: {"avg_true_loglh": -1.0}), \
-            mock.patch.object(tm, "kl_divergence_topological_distributions", lambda *a, **k: 0.0), \
-            mock.patch.object(tm, "split_bipartition_frequency_correlation", lambda *a, **k: 1.0), \
-            mock.patch.object(tm, "compare_branch_length_distributions", lambda *a, **k: {"js_divergence_branch_length": 0.0}):
-            metrics = module.sample_compare(batch, train=True, num_samples=2)
-
+    def test_sample_compare_runs(self):
+        metrics = self.training_module.sample_compare(self.batch)
         self.assertIn("avg_true_loglh", metrics)
         self.assertIn("kl_divergence_topology", metrics)
         self.assertIn("split_bipartition_corr", metrics)
         self.assertIn("js_divergence_branch_length", metrics)
+        import pdb; pdb.set_trace()
 
 
 if __name__ == "__main__":

@@ -12,19 +12,19 @@ import gc
 import torch
 import sys
 import os
+import torch.nn.functional as F
 
 # Ensure the current directory is in sys.path to import 'phyla'
 sys.path.append(os.getcwd())
 # Import utilities from the provided codebase
-# from phyla.utils.utils import load_config
-# from phyla.eval.evo_reasoning_eval import (
-#     Config,
-#     load_model,
-#     _encode_sequences_openfold_style,
-# )
-
+from phyla.utils.utils import load_config
 from utils.utils import remove_bit
-import torch.nn.functional as F
+from phyla.eval.evo_reasoning_eval import (
+    Config,
+    load_model,
+    _encode_sequences_openfold_style,
+)
+
 from utils.random_tree import Tree
 from utils.bhv_utils import BHVEncoder
 from utils.bhv_movie import build_tree_from_splits
@@ -33,13 +33,13 @@ from utils.metric_utils import (
     kl_divergence_topological_distributions,
     split_bipartition_frequency_correlation,
     compare_likelihood_distributions,
-    compare_branch_length_distributions
+    compare_branch_length_distributions,
 )
 from data.dataset import PhylaDataModule
 from model.model import TreeDenoiserTokenGT
 import numpy as np
 import logging
-from tqdm import tqdm 
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -50,20 +50,18 @@ class TrainingModule(LightningModule):
 		model: TreeDenoiserTokenGT,
 		dataset: PhylaDataModule,
 		lr: float = 1e-4,
-		record = False,
+		record=False,
 		epochs: int = 5000,
-		lr_scheduler: str = 'default',
+		lr_scheduler: str = "default",
 		num_annealing_steps: int = 10000,
 		num_warmup_steps: int = 1000,
 		deepspeed: bool = False,
-		logger = None,
+		logger=None,
 		max_num_timesteps: int = 20,
-		#Figure out how to do typing here
-		global_splits = None,
-		random_trees = None,
+		# Figure out how to do typing here
+		global_splits=None,
+		random_trees=None,
 		verbose: bool = True,
-		phyla_checkpoint_path: str = None,
-		phyla_config_path: str = None,
 	):
 		super().__init__()
 		self.model = model
@@ -80,19 +78,22 @@ class TrainingModule(LightningModule):
 		self.global_splits = global_splits
 		self.random_trees = random_trees
 		self.verbose = verbose
-          
-		# Important: This property activates manual optimization.
-		# Turning off automatic optimization so I can catch out of memory errors!
+
 		self.automatic_optimization = False
 		self.deepspeed = deepspeed
 		self.logger_ = logger
 		if verbose:
+			logging.getLogger("filelock").setLevel(logging.WARNING)
+			logging.getLogger("fsspec").setLevel(logging.WARNING)
 			logging.basicConfig(level=logging.DEBUG)
 		else:
 			logging.basicConfig(level=logging.WARNING)
 
-		self.phyla_checkpoint_path = phyla_checkpoint_path
+		self.phyla_checkpoint_path = None
 		self.phyla_model = None
+
+		phyla_checkpoint_path = None
+		phyla_config_path = "configs/sample_eval_config.yaml"
 
 		if phyla_checkpoint_path is not None:
 			original_argv = sys.argv
@@ -201,6 +202,15 @@ class TrainingModule(LightningModule):
 					raise Exception(
 						f"Whoa there is a big problem with this split mask {vel} vs real max {real_max_bit}!"
 					)
+				num_leave = num_leaves[num]
+				real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
+				for vel in velocity_labels[num]:
+					if vel.bit_length() == real_max_bit + 1:
+						vel = remove_bit(vel, num_leave - 1)
+					elif vel.bit_length() > real_max_bit + 1:
+						raise Exception(
+							f"Whoa there is a big problem with this split mask {vel} vs real max {real_max_bit}!"
+						)
 
 					if vel not in edge_split_masks[num]:
 						print(
@@ -479,49 +489,79 @@ class TrainingModule(LightningModule):
 
 			trees = new_trees
 			t += dt
-		
+
 		self.model.train()
 
-		return [build_tree_from_splits(list(td.keys()), td, n_leaves=n_leaves, root_leaf=n_leaves-1, mapping=m)[1] for td, n_leaves, m in zip(trees, num_leaves, mapping)]
+		return [
+			build_tree_from_splits(
+				list(td.keys()),
+				td,
+				n_leaves=n_leaves,
+				root_leaf=n_leaves - 1,
+				mapping=m,
+			)[1]
+			for td, n_leaves, m in zip(trees, num_leaves, mapping)
+		]
 
 	def sample_compare(self, batch, train=True, num_samples=1000):
-		nexus_filepaths = batch['nexus_filepaths']
-		ids = batch['ids']
-		
-		if len(set(nexus_filepaths)) != 1 or len(set(ids)) != 1:
-			raise Exception("Each batch should correspond to one ID, not multiple different IDs, logic is inconsitent somewhere")
+		nexus_filepaths = batch["nexus_filepaths"]
+		tree_paths = batch["tree_paths"]
+		ids = batch["ids"]
 
-		nexus_filepath = batch['nexus_filepaths'][0]
-		id = batch['ids'][0]
-		mapping = batch['mappings'][0]
+		if (
+			len(set(nexus_filepaths)) != 1
+			or len(set(tree_paths)) != 1
+			or len(set(ids)) != 1
+		):
+			raise Exception(
+				"Each batch should correspond to one ID, not multiple different IDs, logic is inconsitent somewhere"
+			)
+
+		nexus_filepath = batch["nexus_filepaths"][0]
+		id = batch["ids"][0]
+		mapping = batch["mappings"][0]
 
 		if train:
-			real_trees = self.dataset.dataset_train.return_posterior_trees(id)
+			real_trees = random.sample(
+				self.dataset.dataset_train.return_posterior_trees(id), num_samples
+			)
 		else:
-			real_trees = self.dataset.dataset_val.return_posterior_trees(id)
-		
-		
-		
+			real_trees = random.sample(
+				self.dataset.dataset_val.return_posterior_trees(id), num_samples
+			)
+
 		num_leaves = self.dataset.return_number_leaves(id)
-		
+
 		sampled_trees = []
 		for _ in tqdm(range(num_samples)):
 			rt = Tree(num_leaves=num_leaves, random=True)
 			starting_tree = str(rt)
-			sampled_tree = self.sample([starting_tree], batch['phyla_embeddings'], num_samples=1, dt_base=0.02)[0]
-			#Now do something with the sampled tree and the real trees	
+			sampled_tree = self.sample(
+				[starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=0.02
+			)[0]
+			# Now do something with the sampled tree and the real trees
 			sampled_trees.append(sampled_tree)
 
 		sampled = [number_to_name_newick(i, mapping, True) for i in sampled_trees]
 		posterior_trees = [number_to_name_newick(i, mapping, False) for i in real_trees]
 
-		metrics = compare_likelihood_distributions(nexus_filepath, true_trees=posterior_trees, sampled_trees=sampled, threads=1)
-		metrics.update(kl_divergence_topological_distributions(posterior_trees, sampled, num_leaves=num_leaves))
-		metrics.update(split_bipartition_frequency_correlation(posterior_trees, sampled, num_leaves=num_leaves))
+		metrics = compare_likelihood_distributions(
+			nexus_filepath, true_trees=posterior_trees, sampled_trees=sampled, threads=1
+		)
+		metrics.update(
+			kl_divergence_topological_distributions(
+				posterior_trees, sampled, num_leaves=num_leaves
+			)
+		)
+		metrics.update(
+			split_bipartition_frequency_correlation(
+				posterior_trees, sampled, num_leaves=num_leaves
+			)
+		)
 		metrics.update(compare_branch_length_distributions(posterior_trees, sampled))
 
 		return metrics
-		
+
 	def training_step(self, batch, _):
 		opt = self.optimizers()
 		opt.zero_grad()

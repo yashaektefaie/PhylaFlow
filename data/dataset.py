@@ -91,9 +91,9 @@ class TreeDataset(Dataset):
         if type(index) == str:
             index = self._id_to_idx[index]
         meta = self._index[index]
-        seqs, _ = self.parse_nexus(meta['nexus_path'])
+        seqs, _ = self.parse_nexus(meta["nexus_path"])
         return len(seqs)
-    
+
     def return_posterior_trees(self, index: int) -> List[str]:
         """Return list of posterior Newick trees for the given index.
 
@@ -105,20 +105,20 @@ class TreeDataset(Dataset):
         tree_paths = meta["tree_paths"]
         trees = self.load_posterior_trees_from_tfiles(tree_paths)
         return trees
-    
+
     def return_nexus_filepath(self, index: int) -> str:
         """Return the Nexus file path for the given index."""
         if type(index) == str:
             index = self._id_to_idx[index]
         meta = self._index[index]
-        return meta['nexus_path']
-    
+        return meta["nexus_path"]
+
     def return_nexus_number_to_name(self, index: int) -> Dict[int, str]:
         """Return mapping from taxon number to name for the given index."""
         if type(index) == str:
             index = self._id_to_idx[index]
         meta = self._index[index]
-        _, taxa_order = self.parse_nexus(meta['nexus_path'])
+        _, taxa_order = self.parse_nexus(meta["nexus_path"])
         num_to_name = {i: name for i, name in enumerate(taxa_order)}
         return num_to_name
 
@@ -130,6 +130,9 @@ class TreeDataset(Dataset):
             return {
                 "id": meta["id"],
                 "posterior_trees": self.return_posterior_trees(index),
+                "nexus_path": meta["nexus_path"],
+                "tree_paths": meta["tree_paths"],
+                "num_to_name": self.return_nexus_number_to_name(index),
             }
 
         seqs, taxa_order = self.parse_nexus(meta["nexus_path"])
@@ -217,8 +220,8 @@ class TreeDataset(Dataset):
             "newick_tree": newick,
             "velocity": velocity,
             "timepoint": timepoint,
-            "autoregressive_newick": chosen_autoregressive_event['newick'],
-            "autoregressive_labels": chosen_autoregressive_event['labels'],
+            "autoregressive_newick": chosen_autoregressive_event["newick"],
+            "autoregressive_labels": chosen_autoregressive_event["labels"],
             "num_to_name": num_to_name,
         }
 
@@ -602,10 +605,10 @@ class PhylaDataModule(pl.LightningDataModule):
 
     def collate_fn(self, batch, preset_subtree_num=None):
         """Custom collate function if needed."""
-        if [len(item) for item in batch][0] == 2:  # validation mode
+        if "posterior_trees" in batch[0]:
             ids = [item["id"] for item in batch]
             posterior_trees = [item["posterior_trees"] for item in batch]
-            mappings = [item['num_to_name'] for item in batch]
+            mappings = [item["num_to_name"] for item in batch]
             phyla_embeddings = None
 
             return {
@@ -613,9 +616,8 @@ class PhylaDataModule(pl.LightningDataModule):
                 "posterior_trees": posterior_trees,
                 "phyla_embeddings": phyla_embeddings,
                 "mappings": mappings,
-                "nexus_filepaths": [item['nexus_path'] for item in batch],
-                "tree_paths": [item['tree_paths'] for item in batch],
-
+                "nexus_filepaths": [item["nexus_path"] for item in batch],
+                "tree_paths": [item["tree_paths"] for item in batch],
             }
 
         # preset_subtree_num is accepted but currently unused in logic below
@@ -640,8 +642,8 @@ class PhylaDataModule(pl.LightningDataModule):
         to_run = {
             "tokenized_trees": tokenized_trees,
             "tokenized_autoregressive_trees": autoregressive_tokenized_trees,
-            "nexus_filepaths": [item['nexus_path'] for item in batch],
-            "tree_paths": [item['tree_paths'] for item in batch],
+            "nexus_filepaths": [item["nexus_path"] for item in batch],
+            "tree_paths": [item["tree_paths"] for item in batch],
             "original_trees": [item["newick_tree"] for item in batch],
             "batched_velocity": [item["velocity"] for item in batch],
             "batched_autoregressive_labels": [
