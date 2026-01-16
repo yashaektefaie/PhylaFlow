@@ -1,5 +1,7 @@
 import math
 import pdb
+import os
+import multiprocessing
 
 import numpy as np
 import torch
@@ -8,6 +10,159 @@ import torch.nn.functional as F
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from ete3 import Tree as EteTree
+
+
+def _worker_newick_parser(tree_str):
+    if isinstance(tree_str, str):
+        if "C(0)" in tree_str:
+            tree_str = tree_str.replace("C(0)", '"C"')
+        try:
+            t = EteTree(tree_str, format=1, quoted_node_names=True)
+        except Exception as e:
+            # Fallback or re-raise
+            raise ValueError(f"Failed to parse newick: {tree_str[:50]}...") from e
+    else:
+        # Assuming run in same process or serialized
+        t = tree_str
+
+    # Postorder traversal and index assignment
+    nodes = list(t.traverse("postorder"))
+
+    leaf_masks = {}
+    for node in nodes:
+        if node.is_leaf():
+            node.add_feature("uid", int(node.name))
+            lb = int(node.uid)
+            leaf_masks[node.uid] = 1 << lb
+
+    if not leaf_masks:
+        # Single node tree or weird case
+        max_uid = 0
+    else:
+        max_uid = max(leaf_masks.keys())
+
+    next_internal_id = max_uid + 1
+    for n in t.traverse("postorder"):
+        if not n.is_leaf():
+            if "uid" not in n.features:
+                n.add_feature("uid", next_internal_id)
+                next_internal_id += 1
+
+    # Postorder accumulate subtree masks
+    for node in t.traverse("postorder"):
+        if not node.is_leaf():
+            m = 0
+            for ch in node.children:
+                if ch.uid not in leaf_masks:
+                    leaf_masks[ch.uid] = 0
+                m |= int(leaf_masks[ch.uid])
+            leaf_masks[node.uid] = m
+
+    try:
+        n_bio = max(int(n.uid) for n in t.iter_leaves()) + 2
+    except ValueError:
+        n_bio = 2  # fallback
+
+    full = (1 << n_bio) - 1
+
+    parent_list = []
+    child_list = []
+    branch_list = []
+    edge_type_list = []
+
+    split_mask_list = []
+
+    # We iterate nodes again. ETE3 nodes are not pickle-safe effectively across boundaries if we rely on features?
+    # Actually we just traverse 'nodes' list which we built.
+
+    for parent in nodes:
+        p_idx = parent.uid
+        for child in parent.children:  # can be 0,1,2,... children
+            c_idx = child.uid
+            parent_list.append(p_idx)
+            child_list.append(c_idx)
+
+            bl = getattr(child, "dist", 1.0)
+            branch_list.append(float(bl))
+
+            et = getattr(child, "edge_type_id", 1)  # default 1
+            edge_type_list.append(int(et))
+
+            A = int(leaf_masks[child.uid])
+            if A == 0 or A == full:
+                split_mask_list.append(0)  # trivial / ignore
+            else:
+                split_mask_list.append(min(A, full ^ A))
+
+    E = len(child_list)
+    N = len(nodes)  # Rough node count based on traversal
+
+    # Need to handle empty tree case
+    if N == 0:
+        return (
+            np.zeros(1, dtype=np.int64),  # child_ptr
+            np.zeros(0, dtype=np.int64),  # child_ids
+            np.zeros(0, dtype=np.int64),  # parent_arr
+            np.zeros(0, dtype=np.int64),  # child_arr
+            0,  # root_idx
+            np.zeros(1, dtype=np.float32),  # branch_lengths
+            np.zeros(1, dtype=np.int64),  # edge_types
+            [],  # edge_split_masks
+        )
+
+    child_arr = np.asarray(child_list, dtype=np.int64)
+    order = np.argsort(child_arr)
+
+    parent_arr = np.asarray(parent_list, dtype=np.int64)[order]
+    child_arr = child_arr[order]
+    branch_arr = np.asarray(branch_list, dtype=np.float32)[order]
+    etype_arr = np.asarray(edge_type_list, dtype=np.int64)[order]
+
+    ordered_split_mask = []
+    for i in order:
+        ordered_split_mask.append(split_mask_list[i])
+    split_arr = ordered_split_mask
+
+    # Root index
+    root_idx = t.uid
+
+    # CSR Construction
+    counts = (
+        np.bincount(parent_arr, minlength=next_internal_id)
+        if E > 0
+        else np.zeros((next_internal_id,), dtype=np.int64)
+    )
+    # Ensure size is enough (next_internal_id is usually N)
+
+    child_ptr_arr = np.zeros((len(counts) + 1,), dtype=np.int64)
+    np.cumsum(counts, out=child_ptr_arr[1:])
+
+    child_ids_arr = np.empty((E,), dtype=np.int64)
+
+    write_pos = child_ptr_arr[:-1].copy()  # current write offset per parent
+    for p, c in zip(parent_arr, child_arr):
+        if p < len(write_pos):
+            j = write_pos[p]
+            child_ids_arr[j] = c
+            write_pos[p] += 1
+
+    # Add root self-edge last
+    parent_arr = np.concatenate([parent_arr, np.array([root_idx], dtype=np.int64)])
+    child_arr = np.concatenate([child_arr, np.array([root_idx], dtype=np.int64)])
+    branch_arr = np.concatenate([branch_arr, np.array([0.0], dtype=np.float32)])
+    etype_arr = np.concatenate([etype_arr, np.array([0], dtype=np.int64)])
+    split_arr.append(0)
+
+    return (
+        child_ptr_arr,
+        child_ids_arr,
+        parent_arr,
+        child_arr,
+        root_idx,
+        branch_arr,
+        etype_arr,
+        split_arr,
+    )
 
 
 class TreeFeatureTokenizer(nn.Module):
@@ -704,7 +859,17 @@ class TreeFeatureTokenizer(nn.Module):
         branch_lengths = tree_info[5]
         edge_types = tree_info[6]
         edge_split_masks = tree_info[7]
-        device = child_ptr.device
+
+        device = next(self.parameters()).device
+        if isinstance(child_ptr, np.ndarray):
+            child_ptr = torch.from_numpy(child_ptr).to(device)
+            child_ids = torch.from_numpy(child_ids).to(device)
+            parent_arr = torch.from_numpy(parent_arr).to(device)
+            child_arr = torch.from_numpy(child_arr).to(device)
+            branch_lengths = torch.from_numpy(branch_lengths).to(device)
+            edge_types = torch.from_numpy(edge_types).to(device)
+        else:
+            device = child_ptr.device
 
         (
             node_data,
@@ -839,16 +1004,35 @@ class TreeFeatureTokenizer(nn.Module):
         device = next(self.parameters()).device
         cache_list = []
 
-        for tree in tree_list:
+        use_mp = len(tree_list) > 10
+        parsed_results = []
+
+        if use_mp:
+            try:
+                if all(isinstance(t, str) for t in tree_list):
+                    workers = min(len(tree_list), os.cpu_count() or 1)
+                    chunksize = max(1, len(tree_list) // (workers * 4))
+                    with multiprocessing.Pool(processes=workers) as pool:
+                        parsed_results = pool.map(
+                            _worker_newick_parser, tree_list, chunksize=chunksize
+                        )
+                else:
+                    parsed_results = [_worker_newick_parser(t) for t in tree_list]
+            except Exception as e:
+                print(f"Pool failed: {e}")
+                parsed_results = [_worker_newick_parser(t) for t in tree_list]
+        else:
+            parsed_results = [_worker_newick_parser(t) for t in tree_list]
+
+        for tree_info in parsed_results:
             # 1. Parse Structure
-            tree_info = self._newick_to_structural(tree)
-            child_ptr = tree_info[0]
-            child_ids = tree_info[1]
-            parent_arr = tree_info[2]
-            child_arr = tree_info[3]
+            child_ptr = torch.from_numpy(tree_info[0]).to(device)
+            child_ids = torch.from_numpy(tree_info[1]).to(device)
+            parent_arr = torch.from_numpy(tree_info[2]).to(device)
+            child_arr = torch.from_numpy(tree_info[3]).to(device)
             root_idx = tree_info[4]
-            branch_lengths = tree_info[5]  # Initial BL, we'll override later
-            edge_types = tree_info[6]
+            branch_lengths = torch.from_numpy(tree_info[5]).to(device)
+            edge_types = torch.from_numpy(tree_info[6]).to(device)
             edge_split_masks = tree_info[7]
 
             # 2. Build Graph (Laplacian, masks, etc.)
@@ -877,20 +1061,80 @@ class TreeFeatureTokenizer(nn.Module):
             # Store in cache
             # Note: edge_index corresponds to [sorted_real_edges..., root_self_edge]
             # edge_split_masks also corresponds to this order.
-            # We will use edge_split_masks to map from {mask: len} input to branch_lengths tensor.
+
+            # OPTIMIZATION: pre-compute static parts of the embedding
+            # We bypass _process_and_pack_single to store the static 'base' tensors.
+            # 1. Node tokens
+            node_indices = torch.arange(node_num, device=device)
+            node_attr_embedding = self.node_encoder(node_data) + sin_embed_node
+
+            # 2. Edge tokens (static part: EdgeType + Sin + TypeId + Pos)
+            # Dynamic part is branch_length_encoder(len).
+            edge_base_embedding = self.edge_encoder(edge_data) + sin_embed_edge
+
+            # 3. Type Embeddings
+            type_ids = torch.cat(
+                [
+                    torch.zeros(node_num, dtype=torch.long, device=device),
+                    torch.ones(edge_num, dtype=torch.long, device=device),
+                ]
+            )
+            type_embedding = self.type_encoder(type_ids)
+
+            # 4. Pos Embeddings (Laplacian)
+            node_pairs = torch.stack([node_indices, node_indices], dim=1)
+            edge_pairs = edge_index.t()
+            full_padded_index = torch.cat([node_pairs, edge_pairs], dim=0)
+
+            u = full_padded_index[:, 0]
+            v = full_padded_index[:, 1]
+            pos_pe_concat = torch.cat([lap_pe[u], lap_pe[v]], dim=1)
+            pos_embedding = self.lap_encoder(pos_pe_concat)
+
+            # 5. Combine static parts
+            # Static Feature = (NodeAttr | EdgeBase) + Type + Pos
+            # For Nodes: NodeAttr + Type[Node] + Pos[Node]
+            # For Edges: EdgeBase + Type[Edge] + Pos[Edge]
+            # We can concat them into [N+E, D]
+
+            static_attr = torch.cat([node_attr_embedding, edge_base_embedding], dim=0)
+
+            # Assuming additive combination (concat_features=False)
+            if not self.concat_features:
+                static_tokens = static_attr + type_embedding + pos_embedding
+            else:
+                static_tokens = static_attr + type_embedding + pos_embedding
+
+            # Pre-compute masks
+            if self.concat_features:
+                # Just use the code logic matching _process_and_pack
+                final_len = static_tokens.size(0)  # or output of linear
+                pass
+
+            # Masks
+            edge_mask = torch.cat(
+                [
+                    torch.zeros(node_num, dtype=torch.bool, device=device),
+                    torch.ones(edge_num, dtype=torch.bool, device=device),
+                ]
+            )
+            padding_mask = torch.zeros(
+                node_num + edge_num, dtype=torch.bool, device=device
+            )
 
             cache = {
-                "node_data": node_data,
-                "edge_index": edge_index,
-                "edge_data": edge_data,
+                # Static Precomputed
+                "static_tokens": static_tokens,  # [N+E, D] (Base)
                 "node_num": node_num,
                 "edge_num": edge_num,
-                "lap_pe": lap_pe,
+                "padding_mask": padding_mask,
+                "full_padded_index": full_padded_index,
                 "leaf_mask": leaf_mask,
                 "leaf_idx": leaf_idx,
-                "sin_embed_node": sin_embed_node,
-                "sin_embed_edge": sin_embed_edge,
-                "edge_split_masks": edge_split_masks,  # List of ints
+                "edge_mask": edge_mask,
+                "edge_split_masks": edge_split_masks,
+                # Keep raw data just in case needed for debugging or fallback
+                "edge_split_masks_list": edge_split_masks,
             }
             cache_list.append(cache)
 
@@ -898,80 +1142,63 @@ class TreeFeatureTokenizer(nn.Module):
 
     def forward_cached(self, cache_list, branch_lengths_list):
         """
-        Forward pass using precomputed cache and updated branch lengths.
-
-        cache_list: List of cache dicts from compute_structural_cache.
-        branch_lengths_list: List of Tensors/Arrays/Lists.
-          If using splits-dict input logic (as in sample_eval), we might not pass simple lists.
-          Actually, the caller (TrainingModule.sample) wants to pass {mask: length}.
-          So let's accept that.
-
-        Using the provided branch_lengths (aligned or dicts), we rebuild the embeddings.
+        Forward pass using precomputed cache (static tokens) and updated branch lengths.
         """
         device = next(self.parameters()).device
-
         batched_results = []
 
+        # Optimization: Reuse static tokens
         for i, cache in enumerate(cache_list):
-            # Resolve branch_lengths
             new_lengths_input = branch_lengths_list[i]
 
-            E_total = cache["edge_num"]
-            # Reconstruct tensor
-            # Default to 0.0 or something safe, or keep old?
-            # Usually new_lengths_input is {mask: len}
+            # 1. Resolve Lengths (This python loop is the remaining bottleneck for small batches, but fine for 20 trees)
+            E = cache["edge_num"]
+            # Fast path if list provided
+            if isinstance(new_lengths_input, (list, tuple, np.ndarray)):
+                current_lengths = torch.as_tensor(
+                    new_lengths_input, dtype=torch.float32, device=device
+                )
+            elif isinstance(new_lengths_input, torch.Tensor):
+                current_lengths = new_lengths_input.to(device)
+            else:
+                # Dict input
+                current_lengths = torch.zeros(E, dtype=torch.float32, device=device)
+                masks = cache["edge_split_masks_list"]
 
-            current_lengths = torch.zeros(E_total, dtype=torch.float32, device=device)
-
-            # Map masks to indices
-            # cache["edge_split_masks"] is aligned with edge_index rows 0..E-2
-            # (last one is root self edge, usually mask 0 or handled separately)
-
-            # Optimization: Pre-compute mask->index map in compute_structural_cache?
-            # Doing linear scan here is okay if N is small, but map is better.
-            # Let's assume we do linear scan or simple lookup here for now.
-
-            # If input is dict:
-            if isinstance(new_lengths_input, dict):
-                # new_lengths_input: {mask_int: float_len}
-                # cache["edge_split_masks"]: list of ints of length E
-
-                # Vectorized update might be hard if masks aren't unique or map is complex.
-                # But masks SHOULD be unique for binary tree branches.
-
-                # Create a map if not exists (or do it in Python)
-                # Actually, iterating the edge_split_masks list is fast enough for N=100.
-
-                for idx, mask_val in enumerate(cache["edge_split_masks"]):
-                    if idx >= E_total:
-                        break  # Safety
+                # Check if we can do bulk lookup? Only if we have integer mapping
+                # Fallback to loop
+                for idx, mask_val in enumerate(masks):
+                    if idx >= E:
+                        break
                     if mask_val in new_lengths_input:
                         current_lengths[idx] = new_lengths_input[mask_val]
-                    # Else 0.0? Or keep previous?
-                    # In sample logic: L_new[hit] = 0.0. Missing entires (eps_len) are dropped.
-                    # So 0.0 is correct for missing.
 
-            elif isinstance(new_lengths_input, (torch.Tensor, list, np.ndarray)):
-                # Assumed aligned
-                current_lengths = torch.as_tensor(
-                    new_lengths_input, device=device, dtype=torch.float32
-                )
+            # 2. Compute Branch Embeddings
+            # [E, D]
+            branch_feat = self.branch_length_encoder(current_lengths.unsqueeze(1))
 
-            # Now call process_and_pack
-            res = self._process_and_pack_single(
-                cache["node_data"],
-                cache["edge_index"],
-                cache["edge_data"],
-                current_lengths,
-                cache["node_num"],
-                cache["edge_num"],
-                cache["lap_pe"],
+            # 3. Add to Static Tokens
+            # static_tokens: [N+E, D]
+            # N = node_num
+            # We add branch_feat to the Edge portion [N : N+E]
+
+            N = cache["node_num"]
+
+            # Clone to separate memory for autograd
+            final_features = cache["static_tokens"].clone()
+
+            # In-place add (safe on result of clone)
+            final_features[N : N + E] += branch_feat
+
+            # 4. Pack results (using precomputed masks)
+            res = (
+                final_features,
+                cache["padding_mask"],
+                cache["full_padded_index"],
                 cache["leaf_mask"],
                 cache["leaf_idx"],
-                cache["sin_embed_node"],
-                cache["sin_embed_edge"],
-                device,
-                cache["edge_split_masks"],
+                cache["edge_mask"],
+                cache["edge_split_masks"],  # pass through
             )
             batched_results.append(res)
 
@@ -982,145 +1209,7 @@ class TreeFeatureTokenizer(nn.Module):
         tree_or_str,
         default_edge_type: int = 1,
     ):
-        """
-        Convert a Newick string or an ETE3 Tree into the structural format:
-        (children[N,2], root_idx, branch_lengths[E+1], edge_types[E+1])
-
-        - children[i, :] = [child0, child1] with -1 for missing.
-        - root_idx is the index of the root node.
-        - branch_lengths & edge_types are aligned to the edge_index that
-          tree_to_graph_from_children will construct (i.e., sorted by child id),
-          plus a final entry for the root self-edge.
-        """
-        # Parse if needed
-        if isinstance(tree_or_str, str):
-            if "C(0)" in tree_or_str:
-                tree_or_str = tree_or_str.replace("C(0)", '"C"')
-            t = EteTree(tree_or_str, format=1, quoted_node_names=True)
-        else:
-            # assume already an ETE3 Tree-like object
-            t = tree_or_str
-
-        # Postorder traversal and index assignment
-        nodes = list(t.traverse("postorder"))
-
-        leaf_masks = {}
-        for node in nodes:
-            if node.is_leaf():
-                node.add_feature("uid", int(node.name))
-                lb = int(node.uid)
-                leaf_masks[node.uid] = 1 << lb
-
-        next_internal_id = max(leaf_masks.keys()) + 1
-        for n in t.traverse("postorder"):
-            if not n.is_leaf():
-                if "uid" not in n.features:
-                    n.add_feature("uid", next_internal_id)
-                    next_internal_id += 1
-
-        # Postorder accumulate subtree masks
-        for node in t.traverse("postorder"):
-            if not node.is_leaf():
-                m = 0
-                for ch in node.children:
-                    if ch.uid not in leaf_masks:
-                        leaf_masks[ch.uid] = 0
-                    m |= int(leaf_masks[ch.uid])
-                leaf_masks[node.uid] = m
-
-        n_bio = max(int(n.uid) for n in t.iter_leaves()) + 2
-        full = (1 << n_bio) - 1
-
-        device = next(self.parameters()).device
-
-        parent_list = []
-        child_list = []
-        branch_list = []
-        edge_type_list = []
-
-        split_mask_list = []
-        for parent in nodes:
-            p_idx = parent.uid
-            for child in parent.children:  # can be 0,1,2,... children
-                c_idx = child.uid
-                parent_list.append(p_idx)
-                child_list.append(c_idx)
-
-                bl = getattr(child, "dist", 1.0)
-                branch_list.append(float(bl))
-
-                et = getattr(child, "edge_type_id", default_edge_type)
-                edge_type_list.append(int(et))
-
-                A = int(leaf_masks[child.uid])
-                if A == 0 or A == full:
-                    split_mask_list.append(0)  # trivial / ignore
-                else:
-                    split_mask_list.append(min(A, full ^ A))
-
-        E = len(child_list)
-
-        child_arr = np.asarray(child_list, dtype=np.int64)
-        order = np.argsort(child_arr)
-
-        parent_arr = np.asarray(parent_list, dtype=np.int64)[order]
-        child_arr = child_arr[order]
-        branch_arr = np.asarray(branch_list, dtype=np.float32)[order]
-        etype_arr = np.asarray(edge_type_list, dtype=np.int64)[order]
-        ordered_split_mask = []
-        for i in order:
-            ordered_split_mask.append(split_mask_list[i])
-        split_arr = ordered_split_mask
-
-        # Root index
-        root_idx = t.uid
-
-        N = len(nodes)
-        # Build CSR (child_ptr / child_ids) from the *sorted* edges
-        # Note: CSR groups by parent, so we need to count per-parent on parent_arr.
-        counts = (
-            np.bincount(parent_arr, minlength=N)
-            if E > 0
-            else np.zeros((N,), dtype=np.int64)
-        )
-        child_ptr_arr = np.zeros((N + 1,), dtype=np.int64)
-        np.cumsum(counts, out=child_ptr_arr[1:])
-
-        # Because edges are sorted by child id (global), parent groups are not contiguous.
-        # So we must scatter child ids into CSR slots.
-        child_ids_arr = np.empty((E,), dtype=np.int64)
-
-        write_pos = child_ptr_arr[:-1].copy()  # current write offset per parent
-        for p, c in zip(parent_arr, child_arr):
-            j = write_pos[p]
-            child_ids_arr[j] = c
-            write_pos[p] += 1
-
-        # Add root self-edge last (as you did)
-        branch_arr = np.concatenate([branch_arr, np.array([0.0], dtype=np.float32)])
-        etype_arr = np.concatenate([etype_arr, np.array([0], dtype=np.int64)])
-        parent_arr = np.concatenate([parent_arr, np.array([root_idx], np.int64)])
-        child_arr = np.concatenate([child_arr, np.array([root_idx], np.int64)])
-        split_arr.append(0)
-
-        # To torch
-        child_ptr = torch.tensor(child_ptr_arr, dtype=torch.long, device=device)
-        child_ids = torch.tensor(child_ids_arr, dtype=torch.long, device=device)
-        # edge_split_masks = torch.tensor(split_arr, device=device)
-
-        branch_lengths = torch.tensor(branch_arr, dtype=torch.float32, device=device)
-        edge_types = torch.tensor(etype_arr, dtype=torch.long, device=device)
-
-        return (
-            child_ptr,
-            child_ids,
-            torch.tensor(parent_arr, dtype=torch.long, device=device),  # edge_parent
-            torch.tensor(child_arr, dtype=torch.long, device=device),  # edge_child
-            root_idx,
-            branch_lengths,
-            edge_types,
-            split_arr,
-        )
+        return _worker_newick_parser(tree_or_str)
 
     def _collate_batch(self, batched_results):
         """
@@ -1150,15 +1239,6 @@ class TreeFeatureTokenizer(nn.Module):
                 edge_split_masks,
             ) = res
             # Remove batch dim if present (usually _process_and_pack_single returns [1, ...])
-            # Actually let's check _process_and_pack_single. It returns padded_features with dim 0=1?
-            # No, it returns unbatched usually, wait.
-            # _process_and_pack_single in original code returns stuff ?
-            # No, in original code forward calls _forward_single_tree -> _process_and_pack.
-
-            # Re-checking _process_and_pack_single (lines 720+).
-            # It returns (final_token_features, padding_mask, full_padded_index, leaf_mask, leaf_idx, edge_mask, edge_split_masks)
-            # with NO batch dimension added usually, or maybe it adds it?
-            # "final_token_features" is [T, D].
 
             batch_features.append(features)
             batch_padding_masks.append(padding_mask)

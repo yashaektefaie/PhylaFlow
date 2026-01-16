@@ -416,8 +416,8 @@ class TrainingModule(LightningModule):
             dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
             dt = min(dt_base, dt_hit_global, T - t)
 
+            # defensive: prevent hard stall
             if dt <= 0:
-                # defensive: prevent hard stall
                 dt = min(dt_base, T - t)
 
             # ---- SECOND PASS: advance everyone with the SAME dt ----
@@ -517,8 +517,10 @@ class TrainingModule(LightningModule):
             trees = new_trees
             t += dt
 
-        self.model.train()
+            if n_steps % 100 == 0:
+                print(f"Step {n_steps}: dt={dt:.2e}, t={t:.2f}/{T}")
 
+        print(f"Sampling finished in {n_steps} steps. Total events: {n_events}")
         return [
             build_tree_from_splits(
                 list(td.keys()),

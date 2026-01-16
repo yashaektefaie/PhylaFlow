@@ -23,15 +23,15 @@ trainer:
   record: False
   epochs: 10000
   val_callback_frequency: 10
-  checkpoint_dir: /n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/checkpoint_dir/
+  checkpoint_dir: checkpoints/
   lr: 0.0001
 
 
 data:
   # nexus_root: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow_datasets/nexus
   # mrbayes_root: /n/netscratch/mzitnik_lab/Lab/yektefaie/runs
-  nexus_root: /Users/yashaektefaie/Desktop/PhylaFlow/example_data/nexus/
-  mrbayes_root: /Users/yashaektefaie/Desktop/PhylaFlow/example_data/runs/
+  nexus_root: /home/leo/PhylaFlow/example_data/nexus/
+  mrbayes_root: /home/leo/PhylaFlow/example_data/runs/
   batch_size: 16
   num_workers: 4
   pin_memory: False
