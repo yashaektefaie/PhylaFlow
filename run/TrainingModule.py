@@ -199,15 +199,6 @@ class TrainingModule(LightningModule):
                 sub_gathered_velocity_labels = []
                 sub_v_pred_indices = []
 
-            num_leave = num_leaves[num]
-            real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
-            for vel in velocity_labels[num]:
-                if vel.bit_length() == real_max_bit + 1:
-                    vel = remove_bit(vel, num_leave - 1)
-                elif vel.bit_length() > real_max_bit + 1:
-                    raise Exception(
-                        f"Whoa there is a big problem with this split mask {vel} vs real max {real_max_bit}!"
-                    )
                 num_leave = num_leaves[num]
                 real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
                 for vel in velocity_labels[num]:
@@ -367,6 +358,12 @@ class TrainingModule(LightningModule):
         trees = []
         num_leaves = []
         mapping = []
+        # Precompute cache for initial trees
+        # Since topology changes in the loop, we will update this cache dynamically
+        # Initialize tokenized structure cache
+        current_newicks = list(newick_starting_trees)
+        token_cache = self.model.tokenizer.compute_structural_cache(current_newicks)
+
         for nw in newick_starting_trees:
             t = Tree(nw)
             enc = BHVEncoder()
@@ -383,14 +380,9 @@ class TrainingModule(LightningModule):
             n_steps += 1
 
             # --- encode/tokenize current trees for the model ---
-            tokenized = self.model.tokenizer(
-                [
-                    build_tree_from_splits(
-                        list(td.keys()), td, n_leaves, root_leaf=n_leaves - 1, mapping=m
-                    )[1]
-                    for td, n_leaves, m in zip(trees, num_leaves, mapping)
-                ]
-            )  # you need this helper
+            # Use CACHED tokenizer
+            tokenized = self.model.tokenizer.forward_cached(token_cache, trees)
+
             with torch.no_grad():
                 velocity, edge_splits, edge_split_mask = self.forward(
                     tokenized, t, phyla_embeddings
@@ -430,7 +422,13 @@ class TrainingModule(LightningModule):
 
             # ---- SECOND PASS: advance everyone with the SAME dt ----
             new_trees = []
-            for td, active_masks, L, V, n_leaves, m, dt_hit in cache:
+
+            # Since update of token_cache happens per tree potentially, we need to defer it or track which ones changed.
+            # However, batch indices align with zip(trees...), so we can update token_cache[i] if needed.
+
+            for b_idx, (td, active_masks, L, V, n_leaves, m, dt_hit) in enumerate(
+                cache
+            ):
 
                 # --- advance ---
                 L_new = L + dt * V
@@ -446,14 +444,21 @@ class TrainingModule(LightningModule):
                 # update dict
                 td2 = {m: float(l) for m, l in zip(active_masks, L_new) if l > eps_len}
 
-                graph, td2_newick = build_tree_from_splits(
-                    list(td2.keys()), td2, n_leaves, root_leaf=n_leaves - 1, mapping=m
-                )
+                # We only need to rebuild Newick/Graph if we hit a boundary (topology changed)
                 if hit_boundary:
+                    graph, td2_newick = build_tree_from_splits(
+                        list(td2.keys()),
+                        td2,
+                        n_leaves,
+                        root_leaf=n_leaves - 1,
+                        mapping=m,
+                    )
+
                     polytomy_nodes = find_polytomy_nodes(graph)
                     # td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
                     if polytomy_nodes:
+                        # For autoregressive step, we just use standard tokenizer for now as it's rare event
                         tokenized_trees = self.model.tokenizer([td2_newick])
 
                         with torch.no_grad():
@@ -492,6 +497,20 @@ class TrainingModule(LightningModule):
 
                         n_events += 1
                         logger.debug("Finished processing merges")
+
+                    # Recompute cache for this tree since topology changed (boundary hit + potential merge)
+                    # We might have modified td2 (added split), so rebuild newick again
+                    _, td2_newick_final = build_tree_from_splits(
+                        list(td2.keys()),
+                        td2,
+                        n_leaves,
+                        root_leaf=n_leaves - 1,
+                        mapping=m,
+                    )
+                    # Update the cache for this batch index
+                    token_cache[b_idx] = self.model.tokenizer.compute_structural_cache(
+                        [td2_newick_final]
+                    )[0]
 
                 new_trees.append(td2)
 
