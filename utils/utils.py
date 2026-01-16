@@ -7,6 +7,9 @@ import re
 from scipy.special import rel_entr
 import numpy as np
 from scipy.spatial.distance import jensenshannon
+from ete3 import Tree as EteTree
+import random
+import hashlib
 
 def get_possible_ids(nexus_root):
     ids = []
@@ -288,3 +291,125 @@ def return_total_tree_length(newick: str) -> float:
     lengths = length_pattern.findall(newick)
     total_length = sum(float(length) for length in lengths)
     return total_length
+
+def _stable_seed(newick: str, salt: str = "") -> int:
+    """
+    Deterministic 64-bit seed from (salt | newick). Stable across runs/machines.
+    """
+    h = hashlib.blake2b((salt + "|" + newick).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "big", signed=False)
+
+def resolve_polytomies_random_deterministic(
+    newick: str,
+    *,
+    dummy_name: str = "ROOT_DUMMY",
+    min_len: float = 1e-6,
+    salt: str = "",
+) -> str:
+    """
+    Make a Newick strictly bifurcating by deterministically-randomly resolving polytomies.
+    - Drops a dummy leaf if present.
+    - Contracts unary nodes (degree-2 after rooting representation).
+    - Resolves any node with >2 children by repeatedly grouping 2 children under a new internal node.
+    - Clamps all branch lengths to >= min_len.
+
+    Determinism: seed = hash(salt | newick). Use salt to get K different but reproducible refinements.
+    """
+    rng = random.Random(_stable_seed(newick, salt))
+
+    # Parse (format=1 expects branch lengths if present; still works if absent)
+    t = EteTree(newick, format=1)
+
+    # Drop dummy leaf if present
+    dummies = t.search_nodes(name=dummy_name)
+    if dummies:
+        dummies[0].detach()
+
+    def clamp_lengths(tree: EteTree):
+        for n in tree.traverse():
+            if n.is_root():
+                continue
+            if n.dist is None:
+                n.dist = float(min_len)
+            else:
+                n.dist = max(float(n.dist), float(min_len))
+
+    def contract_unary(tree: EteTree) -> EteTree:
+        """
+        Remove nodes with a single child by contracting them (add lengths).
+        Returns (possibly new) root.
+        """
+        changed = True
+        while changed:
+            changed = False
+            # Postorder so we contract from leaves upward
+            for n in list(tree.traverse("postorder")):
+                if n.is_leaf():
+                    continue
+                if len(n.children) == 1:
+                    child = n.children[0]
+                    # accumulate length into child
+                    if not n.is_root():
+                        child.dist = (child.dist or 0.0) + (n.dist or 0.0)
+                        parent = n.up
+                        child.detach()
+                        n.detach()
+                        parent.add_child(child)
+                        changed = True
+                    else:
+                        # root with one child: promote child to root
+                        child.dist = 0.0
+                        child.detach()
+                        tree = child
+                        changed = True
+        return tree
+
+    # Clean up and clamp
+    t = contract_unary(t)
+    clamp_lengths(t)
+
+    # Resolve polytomies
+    # Postorder so deeper polytomies are resolved first
+    for n in list(t.traverse("postorder")):
+        while not n.is_leaf() and len(n.children) > 2:
+            # Pick two children in a deterministic-random way
+            c1 = rng.choice(n.children); c1.detach()
+            c2 = rng.choice(n.children); c2.detach()
+
+            mid = EteTree()
+            mid.dist = float(min_len)
+            mid.add_child(c1)
+            mid.add_child(c2)
+
+            n.add_child(mid)
+
+    # Contract any unary nodes created by dummy removal / restructuring, clamp again
+    t = contract_unary(t)
+    clamp_lengths(t)
+
+    # Write back
+    return t.write(format=1)
+
+def has_polytomy_fast(newick: str, unrooted_ok: bool = True) -> bool:
+    comma_stack = []  # top-level comma count per open '(' group
+
+    for ch in newick:
+        if ch == '(':
+            comma_stack.append(0)
+        elif ch == ',':
+            if comma_stack:
+                comma_stack[-1] += 1
+        elif ch == ')':
+            if not comma_stack:
+                continue
+            commas = comma_stack.pop()
+
+            # if stack is empty AFTER pop => this was the OUTERMOST group (the Newick "root")
+            is_root_group = (len(comma_stack) == 0)
+
+            children = commas + 1
+            limit = 3 if (unrooted_ok and is_root_group) else 2
+            if children > limit:
+                return True
+
+    return False

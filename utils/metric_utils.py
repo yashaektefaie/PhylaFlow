@@ -169,6 +169,7 @@ def compare_likelihood_distributions(nexus_file_path: str, true_trees: List[str]
         model="JC",
         threads=threads
     )
+    
     sampled_loglhs = raxmlng_loglh_batch(
         nexus_path=nexus_file_path,
         newicks=sampled_trees,

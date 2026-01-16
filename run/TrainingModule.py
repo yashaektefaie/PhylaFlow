@@ -17,18 +17,18 @@ import torch.nn.functional as F
 # Ensure the current directory is in sys.path to import 'phyla'
 sys.path.append(os.getcwd())
 # Import utilities from the provided codebase
-from phyla.utils.utils import load_config
+# from phyla.utils.utils import load_config
 from utils.utils import remove_bit
-from phyla.eval.evo_reasoning_eval import (
-    Config,
-    load_model,
-    _encode_sequences_openfold_style,
-)
+# from phyla.eval.evo_reasoning_eval import (
+#     Config,
+#     load_model,
+#     _encode_sequences_openfold_style,
+# )
 
 from utils.random_tree import Tree
 from utils.bhv_utils import BHVEncoder
 from utils.bhv_movie import build_tree_from_splits
-from utils.utils import pick_group, find_polytomy_nodes, number_to_name_newick
+from utils.utils import pick_group, find_polytomy_nodes, number_to_name_newick, has_polytomy_fast, resolve_polytomies_random_deterministic
 from utils.metric_utils import (
     kl_divergence_topological_distributions,
     split_bipartition_frequency_correlation,
@@ -503,14 +503,13 @@ class TrainingModule(LightningModule):
 			for td, n_leaves, m in zip(trees, num_leaves, mapping)
 		]
 
-	def sample_compare(self, batch, train=True, num_samples=1000):
+	def sample_compare(self, batch, train=True, num_samples=100, dt = 0.02):
 		nexus_filepaths = batch["nexus_filepaths"]
 		tree_paths = batch["tree_paths"]
 		ids = batch["ids"]
 
 		if (
 			len(set(nexus_filepaths)) != 1
-			or len(set(tree_paths)) != 1
 			or len(set(ids)) != 1
 		):
 			raise Exception(
@@ -522,23 +521,31 @@ class TrainingModule(LightningModule):
 		mapping = batch["mappings"][0]
 
 		if train:
-			real_trees = random.sample(
-				self.dataset.dataset_train.return_posterior_trees(id), num_samples
-			)
+			real_trees = self.dataset.dataset_train.return_posterior_trees(id)
+			num_leaves = self.dataset.dataset_train.return_number_leaves(id)
 		else:
-			real_trees = random.sample(
-				self.dataset.dataset_val.return_posterior_trees(id), num_samples
-			)
+			real_trees = self.dataset.dataset_val.return_posterior_trees(id)
+			num_leaves = self.dataset.dataset_val.return_number_leaves(id)
 
-		num_leaves = self.dataset.return_number_leaves(id)
+		if len(real_trees) > num_samples:
+			real_trees = random.sample(real_trees, num_samples)
+		
+		for i in real_trees:
+			if has_polytomy_fast(i):
+				raise Exception("Whoa there is a polytomy in the real trees, need to resolve first!")
 
 		sampled_trees = []
 		for _ in tqdm(range(num_samples)):
 			rt = Tree(num_leaves=num_leaves, random=True)
 			starting_tree = str(rt)
 			sampled_tree = self.sample(
-				[starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=0.02
+				[starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
 			)[0]
+			if has_polytomy_fast(sampled_tree):
+				sampled_tree = resolve_polytomies_random_deterministic(sampled_tree)
+				if has_polytomy_fast(sampled_tree):
+					raise Exception("Whoa there is STILL a polytomy in the sampled tree, something is wrong!")
+				
 			# Now do something with the sampled tree and the real trees
 			sampled_trees.append(sampled_tree)
 

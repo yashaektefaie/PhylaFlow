@@ -7,33 +7,10 @@ import random
 from model.model import return_model
 from run.TrainingModule import TrainingModule
 
-class DummyTree:
-    def __init__(self, num_leaves=None, random=False):
-        self.num_leaves = num_leaves
-        self.random = random
-
-    def __str__(self):
-        return "(0:0.1,1:0.1,2:0.1);"
-
-
-class DummyDatasetTrain:
-    def return_posterior_trees(self, _id):
-        return ["(1:0.1,2:0.1,3:0.1);"] * 3
-
-
-class DummyDataset:
-    def __init__(self):
-        self.dataset_train = DummyDatasetTrain()
-        self.dataset_val = DummyDatasetTrain()
-
-    def return_number_leaves(self, _id):
-        return 3
-
-
 class TestTrainingModuleSampleCompare(unittest.TestCase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
+
         with open("configs/train.yaml", "r") as f:
             config = yaml.safe_load(f)
 
@@ -68,12 +45,11 @@ class TestTrainingModuleSampleCompare(unittest.TestCase):
         )
 
     def test_sample_compare_runs(self):
-        metrics = self.training_module.sample_compare(self.batch)
+        metrics = self.training_module.sample_compare(self.batch, num_samples=100, dt=0.1, train=True)
         self.assertIn("avg_true_loglh", metrics)
-        self.assertIn("kl_divergence_topology", metrics)
-        self.assertIn("split_bipartition_corr", metrics)
+        self.assertIn("kl_divergence_topological", metrics)
+        self.assertIn("bipartition_frequency_correlation", metrics)
         self.assertIn("js_divergence_branch_length", metrics)
-        import pdb; pdb.set_trace()
 
 
 if __name__ == "__main__":
