@@ -17,13 +17,13 @@ import torch.nn.functional as F
 # Ensure the current directory is in sys.path to import 'phyla'
 sys.path.append(os.getcwd())
 # Import utilities from the provided codebase
-# from phyla.utils.utils import load_config
+from phyla.utils.utils import load_config
 from utils.utils import remove_bit
-# from phyla.eval.evo_reasoning_eval import (
-#     Config,
-#     load_model,
-#     _encode_sequences_openfold_style,
-# )
+from phyla.eval.evo_reasoning_eval import (
+    Config,
+    load_model,
+    _encode_sequences_openfold_style,
+)
 
 from utils.random_tree import Tree
 from utils.bhv_utils import BHVEncoder
@@ -218,8 +218,8 @@ class TrainingModule(LightningModule):
 						)
 						print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
 						raise Exception("Split not found in edge splits")
-					else:
-						print("WOOO ONE FOUND")
+					# else:
+					# 	print("WOOO ONE FOUND")
 					sub_gathered_velocity_labels.append(velocity_labels[num][vel])
 					sub_v_pred_indices.append(edge_split_masks[num].index(vel))
 

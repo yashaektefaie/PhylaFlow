@@ -47,7 +47,7 @@ def run_test():
     )
     # res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
     # This fails now btw non-autoregressive LOL NEED TO FIX!
-    # res = model.step(batch)
+    res = model.step(batch)
 
     # This works below
     # res = model.step(batch, autoregressive=True)
@@ -139,5 +139,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
     # run_test()
