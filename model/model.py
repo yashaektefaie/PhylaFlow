@@ -430,7 +430,12 @@ class TreeDenoiserTokenGT(nn.Module):
 
             all_group_logits = []
 
-            batch_polytomy_index, batch_polytomy_splits = get_batch_polytomy_indices(edge_split_masks, edge_mask)
+            num_leaves = leaf_mask.sum(dim=1).item()  # [B]
+            batch_polytomy_index, batch_polytomy_splits = get_batch_polytomy_indices(edge_split_masks, edge_mask, 
+                                                                                    min_children=3, 
+                                                                                    include_root=True,
+                                                                                    num_leaves=num_leaves)
+                                                                                    
             for b, groups in enumerate(batch_polytomy_index):
                 for num, group in enumerate(groups):
                     if group.size(0) <= 1:
@@ -446,6 +451,8 @@ class TreeDenoiserTokenGT(nn.Module):
                         "logits": logits,
                         "splits_represented": splits_represented
                     })
+            # if not all_group_logits:
+            #     raise ValueError("No polytomies found for autoregressive processing.")
             return all_group_logits
 
         elif return_edges_only:

@@ -209,6 +209,7 @@ class TreeDataset(Dataset):
             random_tree, real_tree_newick
         )
         chosen_autoregressive_event = random.choice(final_labels)
+
         num_to_name = self.return_nexus_number_to_name(index)
         sample = {
             "id": meta["id"],
@@ -642,6 +643,7 @@ class PhylaDataModule(pl.LightningDataModule):
         to_run = {
             "tokenized_trees": tokenized_trees,
             "tokenized_autoregressive_trees": autoregressive_tokenized_trees,
+            "newick_autoregressive_trees": autoregressive_trees_to_tokenize,
             "nexus_filepaths": [item["nexus_path"] for item in batch],
             "tree_paths": [item["tree_paths"] for item in batch],
             "original_trees": [item["newick_tree"] for item in batch],
