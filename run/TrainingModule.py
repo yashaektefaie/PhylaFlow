@@ -251,6 +251,14 @@ class TrainingModule(LightningModule):
 				batch["phyla_embeddings"],
 				autoregressive=True,
 			)
+
+			found = {}
+			for merge_cluser in batch["batched_autoregressive_labels"]:
+				for res_split, components in merge_cluser:
+					found[res_split] = False
+			
+			losses = []
+
 			for group in all_group_logits:
 				logits = group["logits"]
 				labels = batch["batched_autoregressive_labels"]
@@ -264,15 +272,9 @@ class TrainingModule(LightningModule):
 					idxs = None
 					for resulting_split, components in labeled_merge_cluster:
 						res = all([i in splits_in_polytomy for i in components])
-						if not res and idxs:
-							import pdb
-
-							pdb.set_trace()
-							raise Exception(
-								"We already found indices which means this merge cluster should all be within the polytomy, it is not!"
-							)
 
 						if res:
+							found[resulting_split] = True
 							idxs = [splits_in_polytomy.index(i) for i in components]
 
 							for i in idxs:
@@ -307,8 +309,17 @@ class TrainingModule(LightningModule):
 					logits_vec, y_vec, pos_weight=pos_weight
 				)
 
-				logs["loss"] = loss
-				logger.info(f"Autoregressive loss: {loss.item()}")
+				losses.append(loss)
+			
+			for i in found:
+				if not found[i]:
+					import pdb; pdb.set_trace()
+					print("Missing split: ", [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1])
+					raise Exception(f"Did not find merge for split {i}!")
+
+			loss = torch.stack(losses).mean()
+			logs["loss"] = loss
+			logger.info(f"Autoregressive loss: {loss.item()}")
 
 		return logs
 

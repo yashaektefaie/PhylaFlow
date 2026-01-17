@@ -123,10 +123,7 @@ def get_batch_polytomy_indices(
     """
 
     full_mask = (1 << num_leaves) - 1
-    root_bit  = 1 << (num_leaves - 1)  # last bit is p_root
 
-    # if edge_split_masks.dim() != 2:
-    #     raise ValueError(f"edge_split_masks must be [B,T], got {tuple(edge_split_masks.shape)}")
     if edge_mask.dim() != 2:
         raise ValueError(f"edge_mask must be [B,T], got {tuple(edge_mask.shape)}")
 
@@ -160,7 +157,8 @@ def get_batch_polytomy_indices(
         # candidates = list(unique_splits)
         # if include_root:
         #     candidates.append(full_mask ^ root_bit)  # p_root
-        unique_splits.append(full_mask ^ root_bit)
+        if include_root:
+            unique_splits.append(full_mask)
 
         polytomy_groups: List[torch.LongTensor] = []
         polytomy_splits: List[List[int]] = []
