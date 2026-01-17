@@ -58,6 +58,9 @@ class TrainingModule(LightningModule):
 		deepspeed: bool = False,
 		logger=None,
 		max_num_timesteps: int = 20,
+		training_sampling_frequency: int = 100,
+		num_samples: int = 100,
+		dt: float = 0.02,
 		# Figure out how to do typing here
 		global_splits=None,
 		random_trees=None,
@@ -78,6 +81,9 @@ class TrainingModule(LightningModule):
 		self.global_splits = global_splits
 		self.random_trees = random_trees
 		self.verbose = verbose
+		self.training_sampling_frequency = training_sampling_frequency
+		self.num_samples = num_samples
+		self.dt = dt
 
 		self.automatic_optimization = False
 		self.deepspeed = deepspeed
@@ -952,6 +958,14 @@ class TrainingModule(LightningModule):
 					self.num_warmup_steps -= 1
 
 			# ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
+			if self.global_step % self.training_sampling_frequency == 0 or self.global_step == 1:
+				metrics = self.sample_compare(batch, train=True, num_samples=self.num_samples, dt=self.dt)
+				for k, v in metrics.items():
+					self.log(f"sample_compare/{k}", v, on_step=True, logger=True)
+				if self.record:
+					wandb.log({f"sample_compare/{k}": v for k, v in metrics.items()}, step=self.global_step)
+				print(metrics)
+
 			return logs["loss"]
 		else:
 			return torch.tensor(0)
