@@ -12,6 +12,106 @@ import scipy.sparse.linalg as spla
 from ete3 import Tree as EteTree
 
 
+class BatchedStructuralCache:
+    def __init__(self, caches, device, encoder_embed_dim):
+        self.device = device
+        self.batch_size = len(caches)
+        self.encoder_embed_dim = encoder_embed_dim
+
+        # Determine max dimensions
+        self.max_tokens = 0
+        self.max_edges = 0
+        for c in caches:
+            # Token count = node_num + edge_num
+            total_tokens = c["static_tokens"].size(0)
+            self.max_tokens = max(self.max_tokens, total_tokens)
+            self.max_edges = max(self.max_edges, c["edge_num"])
+
+        # Pre-allocate batched tensors
+        self.static_tokens = torch.zeros(
+            (self.batch_size, self.max_tokens, encoder_embed_dim), device=device
+        )
+        self.padding_mask = torch.ones(
+            (self.batch_size, self.max_tokens), device=device, dtype=torch.bool
+        ) 
+        self.full_padded_indices = torch.zeros(
+            (self.batch_size, self.max_tokens, 2), device=device, dtype=torch.long
+        )
+        self.leaf_mask = torch.zeros(
+            (self.batch_size, self.max_tokens), device=device, dtype=torch.bool
+        )
+        self.edge_mask = torch.zeros(
+            (self.batch_size, self.max_tokens), device=device, dtype=torch.bool
+        )
+        self.edge_scatter_indices = torch.zeros(
+            (self.batch_size, self.max_edges), device=device, dtype=torch.long
+        )
+        self.edge_scatter_mask = torch.zeros(
+            (self.batch_size, self.max_edges), device=device, dtype=torch.bool
+        )
+
+        self.leaf_indices_list = []
+        self.edge_split_masks_list = []  # List of lists
+
+        for i, c in enumerate(caches):
+            self._set_cache_item(i, c)
+
+    def _set_cache_item(self, i, c):
+        length = c["static_tokens"].size(0)
+
+        # Check size
+        if length > self.static_tokens.size(1):
+            # Resize logic could go here, but for now we warn/error -> simplistic re-alloc
+            # Ideally we shouldn't hit this often if we init with 'max' of batch
+            raise RuntimeError(
+                f"Tree token size {length} grew larger than batch capacity {self.static_tokens.size(1)}"
+            )
+
+        self.static_tokens[i].zero_()  # clear old potentially
+        self.static_tokens[i, :length] = c["static_tokens"]
+
+        self.padding_mask[i] = True
+        self.padding_mask[i, :length] = c[
+            "padding_mask"
+        ]  # c["padding_mask"] is usually 0s (False)
+
+        self.full_padded_indices[i].zero_()
+        self.full_padded_indices[i, :length] = c["full_padded_index"]
+
+        self.leaf_mask[i].zero_()
+        self.leaf_mask[i, :length] = c["leaf_mask"]
+
+        self.edge_mask[i].zero_()
+        self.edge_mask[i, :length] = c["edge_mask"]
+
+        if i >= len(self.leaf_indices_list):
+            self.leaf_indices_list.append(c["leaf_idx"])
+            self.edge_split_masks_list.append(c["edge_split_masks"])
+        else:
+            self.leaf_indices_list[i] = c["leaf_idx"]
+            self.edge_split_masks_list[i] = c["edge_split_masks"]
+
+        n_node = c["node_num"]
+        n_edge = c["edge_num"]
+
+        # Check edge size
+        if n_edge > self.edge_scatter_indices.size(1):
+            raise RuntimeError(
+                f"Edge num {n_edge} > capacity {self.edge_scatter_indices.size(1)}"
+            )
+
+        self.edge_scatter_indices[i].zero_()
+        # Edges start at node_num in the token sequence
+        indices = torch.arange(n_node, n_node + n_edge, device=self.device)
+        self.edge_scatter_indices[i, :n_edge] = indices
+
+        self.edge_scatter_mask[i].zero_()
+        self.edge_scatter_mask[i, :n_edge] = True
+
+    def update(self, idx, single_cache):
+        self._set_cache_item(idx, single_cache)
+
+
 def _worker_newick_parser(tree_str):
     if isinstance(tree_str, str):
         if "C(0)" in tree_str:
@@ -1141,69 +1241,66 @@ class TreeFeatureTokenizer(nn.Module):
 
         return cache_list
 
-    def forward_cached(self, cache_list, branch_lengths_list):
-        """
-        Forward pass using precomputed cache (static tokens) and updated branch lengths.
-        """
-        device = next(self.parameters()).device
-        batched_results = []
+    def create_batched_cache(self, tree_list):
+        caches = self.compute_structural_cache(tree_list)
+        return BatchedStructuralCache(
+            caches, next(self.parameters()).device, self.encoder_embed_dim
+        )
 
-        # Optimization: Reuse static tokens
-        for i, cache in enumerate(cache_list):
-            new_lengths_input = branch_lengths_list[i]
+    def forward_batched(self, batched_cache, branch_lengths_list):
+        B = batched_cache.batch_size
+        MaxE = batched_cache.max_edges
+        device = batched_cache.device
 
-            # 1. Resolve Lengths (This python loop is the remaining bottleneck for small batches, but fine for 20 trees)
-            E = cache["edge_num"]
-            # Fast path if list provided
-            if isinstance(new_lengths_input, (list, tuple, np.ndarray)):
-                current_lengths = torch.as_tensor(
-                    new_lengths_input, dtype=torch.float32, device=device
-                )
-            elif isinstance(new_lengths_input, torch.Tensor):
-                current_lengths = new_lengths_input.to(device)
-            else:
-                # Dict input
-                current_lengths = torch.zeros(E, dtype=torch.float32, device=device)
-                masks = cache["edge_split_masks_list"]
+        lengths_tensor = torch.zeros((B, MaxE), device=device)
 
-                # Check if we can do bulk lookup? Only if we have integer mapping
-                # Fallback to loop
-                for idx, mask_val in enumerate(masks):
-                    if idx >= E:
-                        break
-                    if mask_val in new_lengths_input:
-                        current_lengths[idx] = new_lengths_input[mask_val]
+        # Convert inputs to tensor [B, MaxE]
+        if isinstance(branch_lengths_list[0], dict):
+            # Fast-ish path for dicts
+            for i, length_dict in enumerate(branch_lengths_list):
+                masks = batched_cache.edge_split_masks_list[i]
+                # We simply iterate.
+                # For 100 trees * 100 edges = 10000 lookups. Should be < 10ms.
+                vals = [length_dict.get(m, 0.0) for m in masks]
+                lengths_tensor[i, : len(vals)] = torch.tensor(vals, device=device)
+        else:
+            for i, l in enumerate(branch_lengths_list):
+                if isinstance(l, (list, tuple, np.ndarray)):
+                    t = torch.as_tensor(l, device=device)
+                else:
+                    t = l
+                lengths_tensor[i, : len(t)] = t
 
-            # 2. Compute Branch Embeddings
-            # [E, D]
-            branch_feat = self.branch_length_encoder(current_lengths.unsqueeze(1))
+        # Embed
+        branch_emb = self.branch_length_encoder(lengths_tensor.unsqueeze(-1))
 
-            # 3. Add to Static Tokens
-            # static_tokens: [N+E, D]
-            # N = node_num
-            # We add branch_feat to the Edge portion [N : N+E]
+        # Clone static tokens
+        out_tokens = batched_cache.static_tokens.clone()
 
-            N = cache["node_num"]
+        # Prepare scatter
+        # Mask out invalid embeddings (where lengths didn't exist)
+        mask = batched_cache.edge_scatter_mask.unsqueeze(-1)
+        branch_emb = branch_emb * mask
 
-            # Clone to separate memory for autograd
-            final_features = cache["static_tokens"].clone()
+        # Indices: [B, MaxE, D]
+        indices = batched_cache.edge_scatter_indices.unsqueeze(-1).expand(
+            -1, -1, self.encoder_embed_dim
+        )
 
-            # In-place add (safe on result of clone)
-            final_features[N : N + E] += branch_feat
+        # Scatter add: Add branch embeddings to the correct positions in out_tokens
+        # Note: indices where mask=False are 0. branch_emb is 0.
+        # Adding 0 to token 0 (node) is harmless.
+        out_tokens.scatter_add_(1, indices, branch_emb)
 
-            # 4. Pack results (using precomputed masks)
-            res = (
-                final_features,
-                cache["padding_mask"],
-                cache["full_padded_index"],
-                cache["leaf_mask"],
-                cache["leaf_idx"],
-                cache["edge_mask"],
-                cache["edge_split_masks"],  # pass through
-            )
-            batched_results.append(res)
-
-        return self._collate_batch(batched_results)
+        return (
+            out_tokens,
+            batched_cache.padding_mask,
+            batched_cache.full_padded_indices,
+            batched_cache.leaf_mask,
+            batched_cache.leaf_indices_list,
+            batched_cache.edge_mask,
+            batched_cache.edge_split_masks_list,
+        )
 
     def _newick_to_structural(
         self,
@@ -1211,102 +1308,3 @@ class TreeFeatureTokenizer(nn.Module):
         default_edge_type: int = 1,
     ):
         return _worker_newick_parser(tree_or_str)
-
-    def _collate_batch(self, batched_results):
-        """
-        Collates a list of single-tree results (tuple) into a batched Tensor.
-        Logic extracted from forward().
-        """
-        batch_size = len(batched_results)
-        batch_features = []
-        batch_padding_masks = []
-        batch_padded_indices = []
-        batch_leaf_masks = []
-        batch_leaf_indices = []
-        batch_edge_masks = []
-        batch_edge_split_masks = []
-
-        max_tokens = 0
-
-        # Unpack
-        for res in batched_results:
-            (
-                features,
-                padding_mask,
-                padded_index,
-                leaf_mask_single,
-                leaf_idx_single,
-                edge_mask,
-                edge_split_masks,
-            ) = res
-            # Remove batch dim if present (usually _process_and_pack_single returns [1, ...])
-
-            batch_features.append(features)
-            batch_padding_masks.append(padding_mask)
-            batch_padded_indices.append(padded_index)
-            batch_leaf_masks.append(leaf_mask_single)
-            batch_leaf_indices.append(leaf_idx_single)
-            batch_edge_masks.append(edge_mask)
-            batch_edge_split_masks.append(edge_split_masks)
-            max_tokens = max(max_tokens, features.size(0))
-
-        device = batch_features[0].device
-
-        # Pad sequences to max length
-        padded_features = torch.zeros(
-            (batch_size, max_tokens, self.encoder_embed_dim), device=device
-        )
-        padded_masks = torch.ones(
-            (batch_size, max_tokens), device=device, dtype=torch.bool
-        )  # True = padded
-        padded_indices = torch.zeros(
-            (batch_size, max_tokens, 2), device=device, dtype=torch.long
-        )
-        padded_leaf_masks = torch.zeros(
-            (batch_size, max_tokens), device=device, dtype=torch.bool
-        )
-
-        padded_edge_masks = torch.zeros(
-            (batch_size, max_tokens), device=device, dtype=torch.bool
-        )
-
-        for i in range(batch_size):
-            seq_len = batch_features[i].size(0)
-            # Ensure input is squeezed if it has a batch dim of 1
-            if batch_features[i].dim() == 3 and batch_features[i].size(0) == 1:
-                batch_features[i] = batch_features[i].squeeze(0)
-            # Actually, check dimensions directly
-
-            padded_features[i, :seq_len, :] = batch_features[i]
-            # Handle potentially batched masks too
-            if (
-                batch_padding_masks[i].dim() == 2
-                and batch_padding_masks[i].size(0) == 1
-            ):
-                batch_padding_masks[i] = batch_padding_masks[i].squeeze(0)
-            padded_masks[i, :seq_len] = batch_padding_masks[i]
-
-            if (
-                batch_padded_indices[i].dim() == 3
-                and batch_padded_indices[i].size(0) == 1
-            ):
-                batch_padded_indices[i] = batch_padded_indices[i].squeeze(0)
-            padded_indices[i, :seq_len, :] = batch_padded_indices[i]
-
-            if batch_leaf_masks[i].dim() == 2 and batch_leaf_masks[i].size(0) == 1:
-                batch_leaf_masks[i] = batch_leaf_masks[i].squeeze(0)
-            padded_leaf_masks[i, :seq_len] = batch_leaf_masks[i]
-
-            if batch_edge_masks[i].dim() == 2 and batch_edge_masks[i].size(0) == 1:
-                batch_edge_masks[i] = batch_edge_masks[i].squeeze(0)
-            padded_edge_masks[i, :seq_len] = batch_edge_masks[i]
-
-        return (
-            padded_features,
-            padded_masks,
-            padded_indices,
-            padded_leaf_masks,
-            batch_leaf_indices,
-            padded_edge_masks,
-            batch_edge_split_masks,
-        )
