@@ -613,9 +613,10 @@ class TreeFeatureTokenizer(nn.Module):
         # Leaf mask for tokens: you had nodes first then edges.
         leaf_mask_nodes = is_leaf.clone()
         # force ids 0 and 1 not to be treated as leaves in your convention
-        if N > 1:
-            leaf_mask_nodes[0] = False
-            leaf_mask_nodes[1] = False
+        # REMOVING THIS, THIS IS A BUG
+        # if N > 1:
+        #     leaf_mask_nodes[0] = False
+        #     leaf_mask_nodes[1] = False
 
         leaf_mask = torch.cat(
             [leaf_mask_nodes, torch.zeros(E, dtype=torch.bool, device=device)], dim=0

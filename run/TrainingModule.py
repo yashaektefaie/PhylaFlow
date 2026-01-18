@@ -64,10 +64,13 @@ class TrainingModule(LightningModule):
 		deepspeed: bool = False,
 		logger=None,
 		max_num_timesteps: int = 20,
+		training_sampling_frequency: int = 100,
+		num_samples: int = 100,
+		dt: float = 0.02,
 		# Figure out how to do typing here
 		global_splits=None,
 		random_trees=None,
-		verbose: bool = True,
+		verbose: bool = False,
 	):
 		super().__init__()
 		self.model = model
@@ -84,6 +87,9 @@ class TrainingModule(LightningModule):
 		self.global_splits = global_splits
 		self.random_trees = random_trees
 		self.verbose = verbose
+		self.training_sampling_frequency = training_sampling_frequency
+		self.num_samples = num_samples
+		self.dt = dt
 
 		self.automatic_optimization = False
 		self.deepspeed = deepspeed
@@ -93,7 +99,7 @@ class TrainingModule(LightningModule):
 			logging.getLogger("fsspec").setLevel(logging.WARNING)
 			logging.basicConfig(level=logging.DEBUG)
 		else:
-			logging.basicConfig(level=logging.WARNING)
+			logging.basicConfig(level=logging.INFO)
 
 		self.phyla_checkpoint_path = None
 		self.phyla_model = None
@@ -246,6 +252,7 @@ class TrainingModule(LightningModule):
 				loss = torch.tensor(0.0, device=v_pred.device, requires_grad=True)
 			# print("Wow congrats")
 			logs["loss"] = loss
+			logger.info(f"Velocity loss: {loss.item()}")
 			# import pdb
 
 			# pdb.set_trace()
@@ -256,6 +263,14 @@ class TrainingModule(LightningModule):
 				batch["phyla_embeddings"],
 				autoregressive=True,
 			)
+
+			found = {}
+			for merge_cluser in batch["batched_autoregressive_labels"]:
+				for res_split, components in merge_cluser:
+					found[res_split] = False
+			
+			losses = []
+
 			for group in all_group_logits:
 				logits = group["logits"]
 				labels = batch["batched_autoregressive_labels"]
@@ -269,15 +284,9 @@ class TrainingModule(LightningModule):
 					idxs = None
 					for resulting_split, components in labeled_merge_cluster:
 						res = all([i in splits_in_polytomy for i in components])
-						if not res and idxs:
-							import pdb
-
-							pdb.set_trace()
-							raise Exception(
-								"We already found indices which means this merge cluster should all be within the polytomy, it is not!"
-							)
 
 						if res:
+							found[resulting_split] = True
 							idxs = [splits_in_polytomy.index(i) for i in components]
 
 							for i in idxs:
@@ -312,7 +321,17 @@ class TrainingModule(LightningModule):
 					logits_vec, y_vec, pos_weight=pos_weight
 				)
 
-				logs["loss"] = loss
+				losses.append(loss)
+			
+			for i in found:
+				if not found[i]:
+					import pdb; pdb.set_trace()
+					print("Missing split: ", [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1])
+					raise Exception(f"Did not find merge for split {i}!")
+
+			loss = torch.stack(losses).mean()
+			logs["loss"] = loss
+			logger.info(f"Autoregressive loss: {loss.item()}")
 
 		return logs
 
@@ -789,7 +808,7 @@ class TrainingModule(LightningModule):
 				# If fail will call zero grad again, may need this for deepspeed?
 				opt.zero_grad()
 				if num > 0:
-					print(
+					logging.info(
 						"Batch is too large decreasing max tree and number of subtrees by a factor of 1.2"
 					)
 					index, sub_tree_size, num_subtrees = self.dataset.chosen_tree
@@ -810,13 +829,13 @@ class TrainingModule(LightningModule):
 							* new_sub_tree_size
 							* self.dataset.return_max_length(self.dataset.name_to_seq)
 						)
-						print(
+						logging.info(
 							f"Updating the adaptive batch size sampler with this new information of the max aa of {new_max_aa}"
 						)
 						self.dataset.size_detector.update_max_aa(new_max_aa)
 
 					if num > 10:
-						print("We are spiraling, moving on")
+						logging.info("We are spiraling, moving on")
 						return torch.tensor(0)
 
 					sub_batch = self.dataset.__getitem__(
@@ -825,24 +844,24 @@ class TrainingModule(LightningModule):
 					batch = self.dataset.collate_fn(
 						[sub_batch], preset_subtree_num=new_num_subtrees
 					)
-					print(
+					logging.info(
 						f"Memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
 					)
-					print(
+					logging.info(
 						f"Memory reserved: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
 					)
 
 					gc.collect()
 				try:
-					print(
+					logging.info(
 						f"Memory allocated before step: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
 					)
-					print(
+					logging.info(
 						f"Memory reserved before step: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
 					)
 
 					# --- HEAD 1: VELOCITY ---
-					print("DEBUG: Starting Velocity Head Training")
+					logging.info("DEBUG: Starting Velocity Head Training")
 					logs_vel = self.step(batch, autoregressive=False)
 					loss_vel = logs_vel["loss"]
 					self.manual_backward(loss_vel)
@@ -851,7 +870,7 @@ class TrainingModule(LightningModule):
 					)
 					opt.step()
 					opt.zero_grad()
-					print("DEBUG: Finished Velocity Head Training")
+					logging.info("DEBUG: Finished Velocity Head Training")
 
 					del logs_vel
 					del loss_vel
@@ -859,14 +878,19 @@ class TrainingModule(LightningModule):
 						torch.cuda.empty_cache()
 
 					# --- HEAD 2: AUTOREGRESSIVE ---
-					print("DEBUG: Starting Autoregressive Head Training")
+					logging.info("DEBUG: Starting Autoregressive Head Training")
 					logs = self.step(batch, autoregressive=True)
+					if 'loss' not in logs:
+						import pickle
+						with open("debug_batch.pkl", "wb") as f:
+							pickle.dump(batch, f)
+						raise Exception("Loss not found in logs for autoregressive head!")
 					loss = logs["loss"]
 
-					print(
+					logging.info(
 						f"Memory allocated before backward: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
 					)
-					print(
+					logging.info(
 						f"Memory reserved before backward: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
 					)
 
@@ -880,24 +904,24 @@ class TrainingModule(LightningModule):
 					success = True
 					failed = False
 
-					print(
+					logging.info(
 						f"Memory allocated after backward: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
 					)
-					print(
+					logging.info(
 						f"Memory reserved after backward: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
 					)
 
 				except RuntimeError as e:
 					if "out of memory" in str(e):
-						print("WARNING: out of memory")
+						logging.warning("WARNING: out of memory")
 						if hasattr(torch.cuda, "empty_cache"):
 							# Not sure about this
 							torch.cuda.empty_cache()
 
-						print(
+						logging.info(
 							f"Memory allocated after OOM: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
 						)
-						print(
+						logging.info(
 							f"Memory reserved after OOM: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
 						)
 
@@ -973,6 +997,14 @@ class TrainingModule(LightningModule):
 					self.num_warmup_steps -= 1
 
 			# ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
+			if self.global_step % self.training_sampling_frequency == 0 or self.global_step == 1:
+				metrics = self.sample_compare(batch, train=True, num_samples=self.num_samples, dt=self.dt)
+				for k, v in metrics.items():
+					self.log(f"sample_compare/{k}", v, on_step=True, logger=True)
+				if self.record:
+					wandb.log({f"sample_compare/{k}": v for k, v in metrics.items()}, step=self.global_step)
+				print(metrics)
+
 			return logs["loss"]
 		else:
 			return torch.tensor(0)

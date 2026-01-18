@@ -110,6 +110,8 @@ def get_batch_polytomy_indices(
     edge_split_masks: List[torch.Tensor],  # [B, T_raw] int64 (bitmask per edge-token)
     edge_mask: torch.Tensor,         # [B, T_raw] bool or {0,1} (valid edge-token positions)
     min_children: int = 3,
+    include_root: bool = True,
+    num_leaves: int = 50,
 ) -> List[List[torch.LongTensor]]:
     """
     Groups edge-token indices into overlap-buckets (polytomy "regions") per batch element.
@@ -120,8 +122,8 @@ def get_batch_polytomy_indices(
         Each tensor corresponds to one "polytomy group" bucket.
     """
 
-    # if edge_split_masks.dim() != 2:
-    #     raise ValueError(f"edge_split_masks must be [B,T], got {tuple(edge_split_masks.shape)}")
+    full_mask = (1 << num_leaves) - 1
+
     if edge_mask.dim() != 2:
         raise ValueError(f"edge_mask must be [B,T], got {tuple(edge_mask.shape)}")
 
@@ -150,6 +152,14 @@ def get_batch_polytomy_indices(
             split_to_positions[int(sm)].append(int(pos))
 
         unique_splits = list(split_to_positions.keys())
+
+        #ADD in the root nodes
+        # candidates = list(unique_splits)
+        # if include_root:
+        #     candidates.append(full_mask ^ root_bit)  # p_root
+        if include_root:
+            unique_splits.append(full_mask)
+
         polytomy_groups: List[torch.LongTensor] = []
         polytomy_splits: List[List[int]] = []
 
@@ -193,24 +203,6 @@ def get_batch_polytomy_indices(
         batch_polytomy_index.append(polytomy_groups)
         batch_polytomy_splits.append(polytomy_splits)
 
-    # padded = None
-    # if return_padded:
-    #     Pmax = max((len(g) for g in batch_polytomy_index), default=0)
-    #     Kmax = 0
-    #     for groups in batch_polytomy_index:
-    #         for g in groups:
-    #             Kmax = max(Kmax, int(g.numel()))
-
-    #     if Pmax == 0 or Kmax == 0:
-    #         padded = torch.empty((B, 0, 0), dtype=torch.long, device=device)
-    #     else:
-    #         padded = torch.full((B, Pmax, Kmax), pad_value, dtype=torch.long, device=device)
-    #         for b in range(B):
-    #             for p, g in enumerate(batch_polytomy_index[b]):
-    #                 n = g.numel()
-    #                 padded[b, p, :n] = g
-
-    # return batch_polytomy_index, padded
     return batch_polytomy_index, batch_polytomy_splits
 
 def pick_group(W, tau=0.5):
