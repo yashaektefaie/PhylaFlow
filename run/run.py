@@ -209,9 +209,9 @@ def main():
 
     trainer_args = {}
     if config["trainer"]["record"]:
-        run_name = "test_run"
-        wandb.init(project="phylaflow", group=f"{run_name}")
-        wandb.watch(model, log_freq=100)
+        # run_name = "test_run"
+        wandb.init(project="phylaflow")
+        # wandb.watch(model, log_freq=100)
 
     trainer_args["max_epochs"] = config["trainer"]["epochs"]
     trainer_args["callbacks"] = [save_callback]  # For validation callback runs

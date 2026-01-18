@@ -253,6 +253,7 @@ class TrainingModule(LightningModule):
 			# print("Wow congrats")
 			logs["loss"] = loss
 			logger.info(f"Velocity loss: {loss.item()}")
+			wandb.log({"train/velocity_loss": loss.item()})
 			# import pdb
 
 			# pdb.set_trace()
@@ -332,6 +333,7 @@ class TrainingModule(LightningModule):
 			loss = torch.stack(losses).mean()
 			logs["loss"] = loss
 			logger.info(f"Autoregressive loss: {loss.item()}")
+			wandb.log({"train/autoregressive_loss": loss.item()})
 
 		return logs
 
@@ -399,7 +401,7 @@ class TrainingModule(LightningModule):
 			n_steps += 1
 
 			# --- encode/tokenize current trees for the model ---
-			
+
 			# Use CACHED tokenizer
 			tokenized = self.model.tokenizer.forward_cached(token_cache, trees)
 
@@ -540,7 +542,7 @@ class TrainingModule(LightningModule):
 			if n_steps % 100 == 0:
 				print(f"Step {n_steps}: dt={dt:.2e}, t={t:.2f}/{T}")
 
-		print(f"Sampling finished in {n_steps} steps. Total events: {n_events}")
+		#print(f"Sampling finished in {n_steps} steps. Total events: {n_events}")
 		return [
 			build_tree_from_splits(
 				list(td.keys()),
@@ -998,12 +1000,13 @@ class TrainingModule(LightningModule):
 					self.num_warmup_steps -= 1
 
 			# ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
-			if self.global_step % self.training_sampling_frequency == 0 or self.global_step == 1:
+			
+			if self.global_step % self.training_sampling_frequency == 0:
 				metrics = self.sample_compare(batch, train=True, num_samples=self.num_samples, dt=self.dt)
 				for k, v in metrics.items():
-					self.log(f"sample_compare/{k}", v, on_step=True, logger=True)
+					self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
 				if self.record:
-					wandb.log({f"sample_compare/{k}": v for k, v in metrics.items()}, step=self.global_step)
+					wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.global_step)
 				print(metrics)
 
 			return logs["loss"]
