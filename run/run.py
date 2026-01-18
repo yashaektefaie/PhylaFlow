@@ -181,6 +181,82 @@ def run_test():
     )
 
 
+def run_overfit():
+    # Get first command line argument as config file
+    config_file = sys.argv[1]
+
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    # --- Start Overrides ---
+    print("Running OVERFIT mode (Single Tree)")
+    config["data"]["batch_size"] = 1
+    config["data"]["num_workers"] = 0
+    config["trainer"]["epochs"] = 10000  # Train for a long time
+    config["trainer"]["val_callback_freq"] = 0
+    # config["trainer"]["record"] = True # Optional: force recording
+    # --- End Overrides ---
+
+    ids = get_possible_ids(config["data"]["nexus_root"])
+
+    if not ids:
+        print("No IDs found!")
+        return
+
+    # Override IDs to just one (deterministic)
+    single_id = sorted(ids)[0]
+    train_ids = [single_id]
+    test_ids = [single_id]
+    print(f"Overfitting on ID: {single_id}")
+
+    dataset = PhylaDataModule(config, train_ids=train_ids, test_ids=test_ids)
+
+    phyla_flow = return_model(config)
+
+    model = TrainingModule(
+        model=phyla_flow,
+        lr=config["trainer"]["lr"],
+        record=config["trainer"]["record"],
+        epochs=config["trainer"]["epochs"],
+        dataset=dataset,
+        lr_scheduler="default",
+        num_annealing_steps=10000,
+        num_warmup_steps=1000,
+        deepspeed=False,
+        logger=None,
+    )
+
+    save_callback = ModelCheckpoint(
+        dirpath=config["trainer"]["checkpoint_dir"],
+        filename="overfit-{epoch:02d}",
+        every_n_epochs=50,
+        save_top_k=-1,
+    )
+
+    trainer_args = {}
+    if config["trainer"]["record"]:
+        wandb.init(project="phylaflow_overfit")
+
+    trainer_args["max_epochs"] = config["trainer"]["epochs"]
+    trainer_args["callbacks"] = [save_callback]
+
+    # Log frequently for overfitting
+    trainer_args["log_every_n_steps"] = 1
+
+    if config["trainer"]["val_callback_freq"] != 0:
+        trainer_args["val_check_interval"] = config["trainer"]["val_callback_freq"]
+
+    trainer_args["accelerator"] = "gpu"
+    trainer_args["devices"] = 1
+
+    trainer = Trainer(**trainer_args)
+    trainer.fit(
+        model,
+        train_dataloaders=dataset.train_dataloader(),
+        val_dataloaders=dataset.val_dataloader(),
+    )
+
+
 def main():
     # Get first command line argument as config file
     config_file = sys.argv[1]
@@ -245,4 +321,5 @@ def main():
 
 if __name__ == "__main__":
     # main()
-    run_test()
+    # run_test()
+    run_overfit()

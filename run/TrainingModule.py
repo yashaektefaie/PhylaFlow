@@ -253,7 +253,8 @@ class TrainingModule(LightningModule):
             # print("Wow congrats")
             logs["loss"] = loss
             logger.info(f"Velocity loss: {loss.item()}")
-            wandb.log({"train/velocity_loss": loss.item()})
+            if self.record:
+                wandb.log({"train/velocity_loss": loss.item()})
             # import pdb
 
             # pdb.set_trace()
@@ -338,8 +339,8 @@ class TrainingModule(LightningModule):
             loss = torch.stack(losses).mean()
             logs["loss"] = loss
             logger.info(f"Autoregressive loss: {loss.item()}")
-            wandb.log({"train/autoregressive_loss": loss.item()})
-
+            if self.record:
+                wandb.log({"train/autoregressive_loss": loss.item()})
         return logs
 
     def sample(
@@ -1011,17 +1012,25 @@ class TrainingModule(LightningModule):
             # ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
 
             if self.global_step % self.training_sampling_frequency == 0:
-                metrics = self.sample_compare(
-                    batch, train=True, num_samples=self.num_samples, dt=self.dt
-                )
-                for k, v in metrics.items():
-                    self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
-                if self.record:
-                    wandb.log(
-                        {f"sample_metrics/{k}": v for k, v in metrics.items()},
-                        step=self.global_step,
+                try:
+                    metrics = self.sample_compare(
+                        batch, train=True, num_samples=self.num_samples, dt=self.dt
                     )
-                print(metrics)
+                    for k, v in metrics.items():
+                        self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
+                    if self.record:
+                        wandb.log(
+                            {f"sample_metrics/{k}": v for k, v in metrics.items()},
+                            step=self.global_step,
+                        )
+                    print(metrics)
+                except FileNotFoundError as e:
+                    if "raxml-ng" in str(e):
+                        print("Skipping RAxML-NG based comparison (raxml-ng not found)")
+                    else:
+                        print(f"Skipping sample comparison due to error: {e}")
+                except Exception as e:
+                     print(f"Skipping sample comparison due to unexpected error: {e}")
 
             return logs["loss"]
         else:
