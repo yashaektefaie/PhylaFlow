@@ -394,7 +394,8 @@ class TrainingModule(LightningModule):
 					)[1]
 					for td, n_leaves, m in zip(trees, num_leaves, mapping)
 				]
-			)  # you need this helper
+			)  
+			
 			with torch.no_grad():
 				velocity, edge_splits, edge_split_mask = self.forward(
 					tokenized, t, phyla_embeddings
