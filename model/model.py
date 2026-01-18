@@ -222,6 +222,8 @@ class TreeDenoiserTokenGT(nn.Module):
         self.pairwise_head = PairwiseMergeHead(
             d_model=embed_dim, hidden=embed_dim, dropout=dropout
         )
+        self.group_head = nn.Linear(embed_dim, 1)
+
         self.apply(lambda m: init_params(m, n_layers))
 
     def create_sinusoidal_embedding(self, t, dim):
@@ -463,10 +465,11 @@ class TreeDenoiserTokenGT(nn.Module):
                     group_embeddings = x_no_graph[b, group, :]  # [G, D]
                     logits = self.pairwise_head(group_embeddings)  # [G, G]
                     splits_represented = batch_polytomy_splits[b][num]  # [G]
-                    
+
                     all_group_logits.append({
                         "batch_index": b,
                         "group_indices": group,
+                        "polytomy_pred": self.group_head(group_embeddings.mean(dim=0)),
                         "logits": logits,
                         "splits_represented": splits_represented
                     })

@@ -253,7 +253,8 @@ class TrainingModule(LightningModule):
 			# print("Wow congrats")
 			logs["loss"] = loss
 			logger.info(f"Velocity loss: {loss.item()}")
-			wandb.log({"train/velocity_loss": loss.item()})
+			if self.record:
+				wandb.log({"train/velocity_loss": loss.item()})
 			# import pdb
 
 			# pdb.set_trace()
@@ -271,6 +272,10 @@ class TrainingModule(LightningModule):
 					found[res_split] = False
 			
 			losses = []
+
+			max_logit = 0
+			chosen_polytomies = []
+			polytomy_logits = []
 
 			for group in all_group_logits:
 				logits = group["logits"]
@@ -295,34 +300,45 @@ class TrainingModule(LightningModule):
 									if i != j:
 										y[i, j] = 1.0
 
-				y = y.float()
+				if y.sum() == 0:
+					chosen_polytomies.append(torch.tensor(0.0))
+				else:
+					chosen_polytomies.append(torch.tensor(1.0))
 
-				G = logits.size(0)
-				mask = ~torch.eye(
-					G, dtype=torch.bool, device=logits.device
-				)  # off-diagonal only
+				polytomy_logits.append(group["polytomy_pred"])
 
-				# optionally only use one triangle (avoid double-counting symmetric pairs)
-				tri = torch.triu(mask, diagonal=1)
+				if y.sum() > 0:
+					y = y.float()
 
-				logits_vec = logits[tri]
-				y_vec = y[tri]
+					G = logits.size(0)
+					mask = ~torch.eye(
+						G, dtype=torch.bool, device=logits.device
+					)  # off-diagonal only
 
-				# ignore any -inf (if any sneak in beyond diagonal)
-				finite = torch.isfinite(logits_vec)
-				logits_vec = logits_vec[finite]
-				y_vec = y_vec[finite]
+					# optionally only use one triangle (avoid double-counting symmetric pairs)
+					tri = torch.triu(mask, diagonal=1)
 
-				# class imbalance weighting
-				pos = y_vec.sum().clamp(min=1.0)
-				neg = (y_vec.numel() - y_vec.sum()).clamp(min=1.0)
-				pos_weight = (neg / pos).detach()
+					logits_vec = logits[tri]
+					y_vec = y[tri]
 
-				loss = F.binary_cross_entropy_with_logits(
-					logits_vec, y_vec, pos_weight=pos_weight
-				)
+					# ignore any -inf (if any sneak in beyond diagonal)
+					finite = torch.isfinite(logits_vec)
+					logits_vec = logits_vec[finite]
+					y_vec = y_vec[finite]
 
-				losses.append(loss)
+					if logits_vec.max().item() > max_logit:
+						max_logit = logits_vec.max().item()
+
+					# class imbalance weighting
+					pos = y_vec.sum().clamp(min=1.0)
+					neg = (y_vec.numel() - y_vec.sum()).clamp(min=1.0)
+					pos_weight = (neg / pos).detach()
+
+					loss = F.binary_cross_entropy_with_logits(
+						logits_vec, y_vec, pos_weight=pos_weight
+					)
+
+					losses.append(loss)
 			
 			for i in found:
 				if not found[i]:
@@ -330,10 +346,34 @@ class TrainingModule(LightningModule):
 					print("Missing split: ", [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1])
 					raise Exception(f"Did not find merge for split {i}!")
 
-			loss = torch.stack(losses).mean()
-			logs["loss"] = loss
-			logger.info(f"Autoregressive loss: {loss.item()}")
-			wandb.log({"train/autoregressive_loss": loss.item()})
+			L_polytomy_choosing = None
+
+			if len(chosen_polytomies) > 1:
+				polytomy_logits_tensor = torch.stack(polytomy_logits).squeeze(1)
+				chosen_polytomies_tensor = torch.stack(chosen_polytomies).to(polytomy_logits_tensor.device)
+
+				L_polytomy_choosing = F.binary_cross_entropy_with_logits(
+					polytomy_logits_tensor,
+					chosen_polytomies_tensor,
+				) 
+
+				logger.info(f"Polytomy choosing loss: {L_polytomy_choosing.item()}")
+				if self.record:
+					wandb.log({"train/polytomy_choosing_loss": L_polytomy_choosing.item()})
+
+
+
+			L_merging = torch.stack(losses).mean()
+			logs["loss"] = L_merging
+			logger.info(f"Autoregressive loss: {L_merging.item()}")
+			logger.info(f"Max autoregressive logit: {max_logit}")
+
+			if L_polytomy_choosing is not None:
+				logs["loss"] += L_polytomy_choosing
+
+			if self.record:
+				wandb.log({"train/autoregressive_loss": L_merging.item()})
+				wandb.log({"max_autoregressive_logits": max_logit})
 
 		return logs
 
@@ -396,6 +436,7 @@ class TrainingModule(LightningModule):
 		t = 0.0
 		n_events = 0
 		n_steps = 0
+		n_topology_changes = 0
 
 		while t < T and n_steps < max_steps and n_events < max_events:
 			n_steps += 1
@@ -417,11 +458,17 @@ class TrainingModule(LightningModule):
 			for td, v, n_leaves, m in zip(trees, velocity, num_leaves, mapping):
 				active_masks = list(td.keys())
 				L = np.array([td[m] for m in active_masks], dtype=np.float64)
-				V = np.array(
-					v[: len(active_masks)].detach().cpu(), dtype=np.float64
-				).squeeze(
-					1
-				)  # adjust to your alignment
+
+				if len(v) != len(active_masks):
+					raise Exception("I assume these two things are equal length!")
+				V = v.squeeze(1).detach().cpu().numpy()
+				# V = np.array(
+				# 	v[: len(active_masks)].detach().cpu(), dtype=np.float64
+				# ).squeeze(
+				# 	1
+				# )  # adjust to your alignment
+				if (L < 0).any():
+					raise Exception("There are negative lengths that is not possible!")
 
 				# --- compute dt_hit ---
 				neg = (V < 0) & (L > eps_len)
@@ -480,6 +527,7 @@ class TrainingModule(LightningModule):
 					# td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
 					if polytomy_nodes:
+						topology_changed = False
 						# For autoregressive step, we just use standard tokenizer for now as it's rare event
 						tokenized_trees = self.model.tokenizer([td2_newick])
 
@@ -499,6 +547,7 @@ class TrainingModule(LightningModule):
 								W
 							)  # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
 							# Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
+							# import pdb; pdb.set_trace()
 							res = pick_group(W, tau=0.55)
 							if res is None:
 								logger.debug("No merges found!")
@@ -516,23 +565,26 @@ class TrainingModule(LightningModule):
 								else:
 									# New length is average of merged splits
 									td2[new_split] = eps_len
+								n_topology_changes += 1
+								topology_changed = True
 
 						n_events += 1
 						logger.debug("Finished processing merges")
 
-					# Recompute cache for this tree since topology changed (boundary hit + potential merge)
-					# We might have modified td2 (added split), so rebuild newick again
-					_, td2_newick_final = build_tree_from_splits(
-						list(td2.keys()),
-						td2,
-						n_leaves,
-						root_leaf=n_leaves - 1,
-						mapping=m,
-					)
-					# Update the cache for this batch index
-					token_cache[b_idx] = self.model.tokenizer.compute_structural_cache(
-						[td2_newick_final]
-					)[0]
+						if topology_changed:
+							# Recompute cache for this tree since topology changed (boundary hit + potential merge)
+							# We might have modified td2 (added split), so rebuild newick again
+							_, td2_newick_final = build_tree_from_splits(
+								list(td2.keys()),
+								td2,
+								n_leaves,
+								root_leaf=n_leaves - 1,
+								mapping=m,
+							)
+							# Update the cache for this batch index
+							token_cache[b_idx] = self.model.tokenizer.compute_structural_cache(
+								[td2_newick_final]
+							)[0]
 
 				new_trees.append(td2)
 
@@ -552,7 +604,7 @@ class TrainingModule(LightningModule):
 				mapping=m,
 			)[1]
 			for td, n_leaves, m in zip(trees, num_leaves, mapping)
-		]
+		], n_topology_changes
 
 	def sample_compare(self, batch, train=True, num_samples=100, dt=0.02):
 		nexus_filepaths = batch["nexus_filepaths"]
@@ -585,18 +637,24 @@ class TrainingModule(LightningModule):
 				)
 
 		sampled_trees = []
+		num_topology_changes = []
+		num_polytomies = 0
+
 		for _ in tqdm(range(num_samples)):
 			rt = Tree(num_leaves=num_leaves, random=True)
 			starting_tree = str(rt)
-			sampled_tree = self.sample(
+			sampled_tree, n_topology_changes = self.sample(
 				[starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
-			)[0]
+			)
+			sampled_tree = sampled_tree[0]
+			num_topology_changes.append(n_topology_changes)
 			if has_polytomy_fast(sampled_tree):
 				sampled_tree = resolve_polytomies_random_deterministic(sampled_tree)
 				if has_polytomy_fast(sampled_tree):
 					raise Exception(
 						"Whoa there is STILL a polytomy in the sampled tree, something is wrong!"
 					)
+				num_polytomies += 1
 
 			# Now do something with the sampled tree and the real trees
 			sampled_trees.append(sampled_tree)
@@ -618,8 +676,16 @@ class TrainingModule(LightningModule):
 			)
 		)
 		metrics.update(compare_branch_length_distributions(posterior_trees, sampled))
+		print(f"Num polytomies resolved in sampling: {num_polytomies} out of {num_samples}")
+		print("Average topology changes during sampling: ", np.mean(num_topology_changes))
+		if self.record:
+			wandb.log({'number_of_polytomies_resolved': num_polytomies, 'average_topology_changes': np.mean(num_topology_changes)})
 
 		return metrics
+	
+	def on_train_end(self):
+		if self.record:
+			wandb.finish()
 
 	def training_step(self, batch, _):
 		opt = self.optimizers()
@@ -961,7 +1027,7 @@ class TrainingModule(LightningModule):
 		if logs is not None:
 			if self.record:
 				# wandb.log(logs)
-				wandb.log(logs, step=self.global_step)
+				wandb.log(logs)
 			if not self.dataset.msa_distance:
 				self.dataset.update_normrf(logs["norm_rf_distance"])
 
@@ -1006,7 +1072,7 @@ class TrainingModule(LightningModule):
 				for k, v in metrics.items():
 					self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
 				if self.record:
-					wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.global_step)
+					wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()})
 				print(metrics)
 
 			return logs["loss"]
@@ -1053,9 +1119,9 @@ class TrainingModule(LightningModule):
 			f"step {self.global_step:4d}  total_grad_norm = {total:.2f} mean is {mean_grad:.2f} max is {max_grad:.2f}"
 		)
 		if self.record:
-			wandb.log({"grad_norm_total": total}, step=self.global_step)
-			wandb.log({"grad_norm_max": max_grad}, step=self.global_step)
-			wandb.log({"grad_norm_mean": mean_grad}, step=self.global_step)
+			wandb.log({"grad/grad_norm_total": total})
+			wandb.log({"grad/grad_norm_max": max_grad})
+			wandb.log({"grad/grad_norm_mean": mean_grad})
 
 	def configure_optimizers(self):
 		if self.deepspeed:
