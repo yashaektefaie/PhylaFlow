@@ -24,6 +24,7 @@ def init_params(module, n_layers):
         if hasattr(module, "padding_idx") and module.padding_idx is not None:
             nn.init.zeros_(module.weight[module.padding_idx])
 
+
 class PairwiseMergeHead(nn.Module):
     def __init__(self, d_model: int, hidden: int = 256, dropout: float = 0.1):
         super().__init__()
@@ -50,7 +51,9 @@ class PairwiseMergeHead(nn.Module):
         logits = self.mlp(feats).squeeze(-1)  # [G, G]
 
         # disallow i==j
-        logits = logits.masked_fill(torch.eye(G, device=H.device, dtype=torch.bool), float("-inf"))
+        logits = logits.masked_fill(
+            torch.eye(G, device=H.device, dtype=torch.bool), float("-inf")
+        )
         return logits
 
 
@@ -216,7 +219,9 @@ class TreeDenoiserTokenGT(nn.Module):
         self.final_layer_norm = nn.LayerNorm(embed_dim)
         self.output_layer = nn.Linear(embed_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
-        self.pairwise_head = PairwiseMergeHead(d_model=embed_dim, hidden=embed_dim, dropout=dropout)
+        self.pairwise_head = PairwiseMergeHead(
+            d_model=embed_dim, hidden=embed_dim, dropout=dropout
+        )
         self.apply(lambda m: init_params(m, n_layers))
 
     def create_sinusoidal_embedding(self, t, dim):
@@ -253,12 +258,12 @@ class TreeDenoiserTokenGT(nn.Module):
     def forward(
         self,
         tokenized_tree_batch,
-        t = None,
+        t=None,
         phyla_embeddings=None,
         return_all_tokens=True,
         return_leafs_only=False,
         return_edges_only=False,
-        autoregressive=False
+        autoregressive=False,
     ):
         # Tree is this format now: (children, root_idx[, branch_lengths][, edge_types])
         # Handle both single tree and batch of trees
@@ -266,7 +271,15 @@ class TreeDenoiserTokenGT(nn.Module):
         # if is_single_tree:
         #     tree = [tree]
 
-        padded_feature, padding_mask, padded_index, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (tokenized_tree_batch)
+        (
+            padded_feature,
+            padding_mask,
+            padded_index,
+            leaf_mask,
+            leaf_idx,
+            edge_mask,
+            edge_split_masks,
+        ) = tokenized_tree_batch
 
         x = padded_feature
         B, T_raw, D = x.shape
@@ -277,19 +290,23 @@ class TreeDenoiserTokenGT(nn.Module):
             if isinstance(phyla_embeddings, list):
                 # Find max length across all embeddings in the list
                 max_len = max(emb.shape[0] for emb in phyla_embeddings)
-                
+
                 padded_embeddings = []
-                
+
                 for emb in phyla_embeddings:
                     # Pad each embedding to max_len
                     if emb.shape[0] < max_len:
-                        padding = torch.zeros(max_len - emb.shape[0], emb.shape[1], 
-                                    device=emb.device, dtype=emb.dtype)
+                        padding = torch.zeros(
+                            max_len - emb.shape[0],
+                            emb.shape[1],
+                            device=emb.device,
+                            dtype=emb.dtype,
+                        )
                         padded_emb = torch.cat([emb, padding], dim=0)
                     else:
                         padded_emb = emb
                     padded_embeddings.append(padded_emb)
-                
+
                 # Stack into tensor (B, max_len, embed_dim)
                 phyla_embeddings = torch.stack(padded_embeddings, dim=0)
             # Expected shapes:
@@ -308,7 +325,7 @@ class TreeDenoiserTokenGT(nn.Module):
             phyla_proj_full = self.phyla_proj(phyla_embeddings)  # (B,N,D)
 
             # We'll store phyla_proj_full and leaf_idx_list for use post-concat
-            phyla_info = (phyla_proj_full, leaf_idx_list)
+            phyla_info = (phyla_proj_full, leaf_idx)
         else:
             phyla_info = None
 
@@ -328,10 +345,12 @@ class TreeDenoiserTokenGT(nn.Module):
                 L_b = leaf_indices.numel()
                 max_available = phyla_proj_full.size(1)
                 adjusted = leaf_indices + 1  # +1 for [graph] token
-                
-                 # Ensure we have at least L_b phyla embeddings
+
+                # Ensure we have at least L_b phyla embeddings
                 if phyla_proj_full.size(1) < L_b:
-                    import pdb; pdb.set_trace()
+                    import pdb
+
+                    pdb.set_trace()
                     raise ValueError(
                         f"Need {L_b} phyla embeddings, got {phyla_proj_full.size(1)}"
                     )
@@ -469,8 +488,12 @@ class TreeDenoiserTokenGT(nn.Module):
                 padded_edges = torch.zeros(B, 0, D, device=x.device, dtype=x.dtype)
                 edge_pad_mask = torch.ones(B, 0, device=x.device, dtype=torch.bool)
             else:
-                padded_edges = torch.zeros(B, max_edges, D, device=x.device, dtype=x.dtype)
-                edge_pad_mask = torch.ones(B, max_edges, device=x.device, dtype=torch.bool)
+                padded_edges = torch.zeros(
+                    B, max_edges, D, device=x.device, dtype=x.dtype
+                )
+                edge_pad_mask = torch.ones(
+                    B, max_edges, device=x.device, dtype=torch.bool
+                )
                 for b, edges_b in enumerate(edge_lists):
                     n_b = edges_b.size(0)
                     if n_b == 0:
@@ -481,35 +504,39 @@ class TreeDenoiserTokenGT(nn.Module):
             # Optional: pass through output layer before returning
             edge_outputs = self.output_layer(padded_edges)  # [B, max_edges, output_dim]
 
-            return edge_outputs, edge_pad_mask  # return mask so caller can ignore padding
+            return (
+                edge_outputs,
+                edge_pad_mask,
+            )  # return mask so caller can ignore padding
         elif return_all_tokens:
             return x  # [B, T, D]
         else:
             out = self.output_layer(x[:, 0])
             return out
 
+
 def return_model(config):
     model = TreeDenoiserTokenGT(
-            num_node_types=config["model"]["num_node_types"],
-            num_edge_types=config["model"]["num_edge_types"],
-            embed_dim=config["model"]["embed_dim"],
-            output_dim=config["model"]["output_dim"],
-            n_layers=config["model"]["n_layers"],
-            n_heads=config["model"]["n_heads"],
-            dropout=config["model"]["dropout"],
-            attention_dropout=config["model"]["attention_dropout"],
-            activation_dropout=config["model"]["activation_dropout"],
-            drop_path_rate=config["model"]["drop_path_rate"],
-            use_performer=config["model"]["use_performer"],
-            performer_nb_features=config["model"]["performer_nb_features"],
-            performer_generalized_attention=config["model"][
-                "performer_generalized_attention"
-            ],
-            layernorm_style=config["model"]["layernorm_style"],
-            tokenizer_lap_dim=config["model"]["tokenizer_lap_dim"],
-            tokenizer_lap_dropout=config["model"]["tokenizer_lap_dropout"],
-            tokenizer_n_layers=config["model"]["tokenizer_n_layers"],
-            phyla_dim=config["model"]["phyla_dim"],
-        )
-    
-    return model 
+        num_node_types=config["model"]["num_node_types"],
+        num_edge_types=config["model"]["num_edge_types"],
+        embed_dim=config["model"]["embed_dim"],
+        output_dim=config["model"]["output_dim"],
+        n_layers=config["model"]["n_layers"],
+        n_heads=config["model"]["n_heads"],
+        dropout=config["model"]["dropout"],
+        attention_dropout=config["model"]["attention_dropout"],
+        activation_dropout=config["model"]["activation_dropout"],
+        drop_path_rate=config["model"]["drop_path_rate"],
+        use_performer=config["model"]["use_performer"],
+        performer_nb_features=config["model"]["performer_nb_features"],
+        performer_generalized_attention=config["model"][
+            "performer_generalized_attention"
+        ],
+        layernorm_style=config["model"]["layernorm_style"],
+        tokenizer_lap_dim=config["model"]["tokenizer_lap_dim"],
+        tokenizer_lap_dropout=config["model"]["tokenizer_lap_dropout"],
+        tokenizer_n_layers=config["model"]["tokenizer_n_layers"],
+        phyla_dim=config["model"]["phyla_dim"],
+    )
+
+    return model

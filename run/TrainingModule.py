@@ -20,20 +20,26 @@ sys.path.append(os.getcwd())
 from phyla.utils.utils import load_config
 from utils.utils import remove_bit
 from phyla.eval.evo_reasoning_eval import (
-    Config,
-    load_model,
-    _encode_sequences_openfold_style,
+	Config,
+	load_model,
+	_encode_sequences_openfold_style,
 )
 
 from utils.random_tree import Tree
 from utils.bhv_utils import BHVEncoder
 from utils.bhv_movie import build_tree_from_splits
-from utils.utils import pick_group, find_polytomy_nodes, number_to_name_newick, has_polytomy_fast, resolve_polytomies_random_deterministic
+from utils.utils import (
+	pick_group,
+	find_polytomy_nodes,
+	number_to_name_newick,
+	has_polytomy_fast,
+	resolve_polytomies_random_deterministic,
+)
 from utils.metric_utils import (
-    kl_divergence_topological_distributions,
-    split_bipartition_frequency_correlation,
-    compare_likelihood_distributions,
-    compare_branch_length_distributions,
+	kl_divergence_topological_distributions,
+	split_bipartition_frequency_correlation,
+	compare_likelihood_distributions,
+	compare_branch_length_distributions,
 )
 from data.dataset import PhylaDataModule
 from model.model import TreeDenoiserTokenGT
@@ -341,7 +347,7 @@ class TrainingModule(LightningModule):
 		max_events=1000,
 		max_steps=20000,
 	):
-		
+
 		self.model.eval()
 
 		if (
@@ -371,6 +377,12 @@ class TrainingModule(LightningModule):
 		trees = []
 		num_leaves = []
 		mapping = []
+		# Precompute cache for initial trees
+		# Since topology changes in the loop, we will update this cache dynamically
+		# Initialize tokenized structure cache
+		current_newicks = list(newick_starting_trees)
+		token_cache = self.model.tokenizer.compute_structural_cache(current_newicks)
+
 		for nw in newick_starting_trees:
 			t = Tree(nw)
 			enc = BHVEncoder()
@@ -387,14 +399,9 @@ class TrainingModule(LightningModule):
 			n_steps += 1
 
 			# --- encode/tokenize current trees for the model ---
-			tokenized = self.model.tokenizer(
-				[
-					build_tree_from_splits(
-						list(td.keys()), td, n_leaves, root_leaf=n_leaves - 1, mapping=m
-					)[1]
-					for td, n_leaves, m in zip(trees, num_leaves, mapping)
-				]
-			)  # you need this helper
+			# Use CACHED tokenizer
+			tokenized = self.model.tokenizer.forward_cached(token_cache, trees)
+
 			with torch.no_grad():
 				velocity, edge_splits, edge_split_mask = self.forward(
 					tokenized, t, phyla_embeddings
@@ -407,7 +414,9 @@ class TrainingModule(LightningModule):
 			for td, v, n_leaves, m in zip(trees, velocity, num_leaves, mapping):
 				active_masks = list(td.keys())
 				L = np.array([td[m] for m in active_masks], dtype=np.float64)
-				V = np.array(v[: len(active_masks)], dtype=np.float64).squeeze(
+				V = np.array(
+					v[: len(active_masks)].detach().cpu(), dtype=np.float64
+				).squeeze(
 					1
 				)  # adjust to your alignment
 
@@ -426,13 +435,19 @@ class TrainingModule(LightningModule):
 			dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
 			dt = min(dt_base, dt_hit_global, T - t)
 
+			# defensive: prevent hard stall
 			if dt <= 0:
-				# defensive: prevent hard stall
 				dt = min(dt_base, T - t)
 
 			# ---- SECOND PASS: advance everyone with the SAME dt ----
 			new_trees = []
-			for td, active_masks, L, V, n_leaves, m, dt_hit in cache:
+
+			# Since update of token_cache happens per tree potentially, we need to defer it or track which ones changed.
+			# However, batch indices align with zip(trees...), so we can update token_cache[i] if needed.
+
+			for b_idx, (td, active_masks, L, V, n_leaves, m, dt_hit) in enumerate(
+				cache
+			):
 
 				# --- advance ---
 				L_new = L + dt * V
@@ -448,14 +463,21 @@ class TrainingModule(LightningModule):
 				# update dict
 				td2 = {m: float(l) for m, l in zip(active_masks, L_new) if l > eps_len}
 
-				graph, td2_newick = build_tree_from_splits(
-					list(td2.keys()), td2, n_leaves, root_leaf=n_leaves - 1, mapping=m
-				)
+				# We only need to rebuild Newick/Graph if we hit a boundary (topology changed)
 				if hit_boundary:
+					graph, td2_newick = build_tree_from_splits(
+						list(td2.keys()),
+						td2,
+						n_leaves,
+						root_leaf=n_leaves - 1,
+						mapping=m,
+					)
+
 					polytomy_nodes = find_polytomy_nodes(graph)
 					# td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
 					if polytomy_nodes:
+						# For autoregressive step, we just use standard tokenizer for now as it's rare event
 						tokenized_trees = self.model.tokenizer([td2_newick])
 
 						with torch.no_grad():
@@ -495,13 +517,29 @@ class TrainingModule(LightningModule):
 						n_events += 1
 						logger.debug("Finished processing merges")
 
+					# Recompute cache for this tree since topology changed (boundary hit + potential merge)
+					# We might have modified td2 (added split), so rebuild newick again
+					_, td2_newick_final = build_tree_from_splits(
+						list(td2.keys()),
+						td2,
+						n_leaves,
+						root_leaf=n_leaves - 1,
+						mapping=m,
+					)
+					# Update the cache for this batch index
+					token_cache[b_idx] = self.model.tokenizer.compute_structural_cache(
+						[td2_newick_final]
+					)[0]
+
 				new_trees.append(td2)
 
 			trees = new_trees
 			t += dt
 
-		self.model.train()
+			if n_steps % 100 == 0:
+				print(f"Step {n_steps}: dt={dt:.2e}, t={t:.2f}/{T}")
 
+		print(f"Sampling finished in {n_steps} steps. Total events: {n_events}")
 		return [
 			build_tree_from_splits(
 				list(td.keys()),
@@ -513,15 +551,12 @@ class TrainingModule(LightningModule):
 			for td, n_leaves, m in zip(trees, num_leaves, mapping)
 		]
 
-	def sample_compare(self, batch, train=True, num_samples=100, dt = 0.02):
+	def sample_compare(self, batch, train=True, num_samples=100, dt=0.02):
 		nexus_filepaths = batch["nexus_filepaths"]
 		tree_paths = batch["tree_paths"]
 		ids = batch["ids"]
 
-		if (
-			len(set(nexus_filepaths)) != 1
-			or len(set(ids)) != 1
-		):
+		if len(set(nexus_filepaths)) != 1 or len(set(ids)) != 1:
 			raise Exception(
 				"Each batch should correspond to one ID, not multiple different IDs, logic is inconsitent somewhere"
 			)
@@ -539,10 +574,12 @@ class TrainingModule(LightningModule):
 
 		if len(real_trees) > num_samples:
 			real_trees = random.sample(real_trees, num_samples)
-		
+
 		for i in real_trees:
 			if has_polytomy_fast(i):
-				raise Exception("Whoa there is a polytomy in the real trees, need to resolve first!")
+				raise Exception(
+					"Whoa there is a polytomy in the real trees, need to resolve first!"
+				)
 
 		sampled_trees = []
 		for _ in tqdm(range(num_samples)):
@@ -554,8 +591,10 @@ class TrainingModule(LightningModule):
 			if has_polytomy_fast(sampled_tree):
 				sampled_tree = resolve_polytomies_random_deterministic(sampled_tree)
 				if has_polytomy_fast(sampled_tree):
-					raise Exception("Whoa there is STILL a polytomy in the sampled tree, something is wrong!")
-				
+					raise Exception(
+						"Whoa there is STILL a polytomy in the sampled tree, something is wrong!"
+					)
+
 			# Now do something with the sampled tree and the real trees
 			sampled_trees.append(sampled_tree)
 

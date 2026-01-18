@@ -9,6 +9,57 @@ import random
 import wandb
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning import Trainer
+import multiprocessing
+import os
+import torch
+
+
+def sample_worker_func(args):
+    """
+    Worker function to sample trees in a separate process.
+    args: (tree_list, config_file, device_id)
+    """
+    tree_list, config_file, device_id = args
+
+    # Load config
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    ids = get_possible_ids(config["data"]["nexus_root"])
+    ran = random.Random(42)
+    ran.shuffle(ids)
+    train_ids = ids[: int(0.8 * len(ids))]
+    test_ids = ids[int(0.8 * len(ids)) :]
+
+    dataset = PhylaDataModule(
+        config, train_ids=train_ids, test_ids=test_ids
+    )  # minimal init?
+
+    phyla_flow = return_model(config)
+
+    # Move model to device
+    device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+    phyla_flow.to(device)
+
+    model = TrainingModule(
+        model=phyla_flow,
+        lr=config["trainer"]["lr"],
+        record=config["trainer"]["record"],
+        epochs=config["trainer"]["epochs"],
+        dataset=dataset,
+        lr_scheduler="default",
+        num_annealing_steps=10000,
+        num_warmup_steps=1000,
+        deepspeed=False,
+        logger=None,
+    )
+    model.to(device)
+    model.eval()
+
+    # Run sample
+    # Note: process-based parallelism works best if batch size is small (1-4) to avoid dt-sync issues
+    # dt_base set to 0.1 as in original test
+    return model.sample(tree_list, None, num_samples=1, dt_base=0.1)
 
 
 def run_test():
@@ -55,11 +106,49 @@ def run_test():
     import time
 
     start = time.time()
-    num_trees = 2
+    num_trees = 20
     trees_to_sample = []
+    print(f"Generating {num_trees} trees...")
     for _ in range(num_trees):
         trees_to_sample.append(str(Tree(num_leaves=50, random=True)))
-    final_tree = model.sample(trees_to_sample, None, num_samples=1, dt_base=0.1)
+
+    print("Sampling with Multiprocessing...")
+    print(
+        "Note: Scaling benefits are most visible with >50 trees due to worker startup overhead."
+    )
+
+    # Split into chunks of size 2 (small batch to decouple Time-Steps)
+    batch_size_per_worker = 2
+
+    chunks = [
+        trees_to_sample[i : i + batch_size_per_worker]
+        for i in range(0, len(trees_to_sample), batch_size_per_worker)
+    ]
+
+    # Prepare args: (chunk, config_file, device_id)
+    # We use 0 as device_id assuming single GPU
+    worker_args = [(chk, config_file, 0) for chk in chunks]
+
+    # Use 'spawn' context usually safer for CUDA
+    ctx = multiprocessing.get_context("spawn")
+
+    # Limit workers to avoid VRAM OOM or CPU oversubscription
+    num_workers = min(4, os.cpu_count())
+
+    try:
+        with ctx.Pool(num_workers) as pool:
+            results = pool.map(sample_worker_func, worker_args)
+    except Exception as e:
+        print(f"Multiprocessing failed: {e}. Falling back to sequential.")
+        final_tree = model.sample(trees_to_sample, None, num_samples=1, dt_base=0.1)
+        results = [final_tree]
+
+    # Flatten results
+    final_tree = []
+    for r in results:
+        final_tree.extend(r)
+
+    # final_tree = model.sample(trees_to_sample, None, num_samples=1, dt_base=0.1)
     res = time.time() - start
     print("Sampling time:", res)
     print(
