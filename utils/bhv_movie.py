@@ -371,8 +371,9 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None, root=None, map
         "segment_index": seg_idx,
         "alpha": alpha,
         "total_length": total_L,
-        "velocity": seg['velocity'],
-        "active_velocity": vel_active,
+        #Note an important bug fix here we need to multiply by total_L to get in terms of time, not BHV unit length!
+        "velocity": {e: v * total_L for e, v in seg['velocity'].items()},
+        "active_velocity": {e: v * total_L for e, v in vel_active.items()},
     }
 
     return G, newick, info

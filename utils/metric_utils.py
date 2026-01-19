@@ -50,7 +50,7 @@ def kl_divergence_topological_distributions(posterior_trees: List[str],
     support = set(gt_topological_distribution.keys()).union(set(sampled_topological_distribution.keys()))
     ZP = 1.0 + alpha * len(support)
     ZQ = 1.0 + alpha * len(support)
-
+    
     kl = 0.0
     for k in support:
         p = (gt_topological_distribution.get(k, 0.0) + alpha) / ZP
