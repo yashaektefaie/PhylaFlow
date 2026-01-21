@@ -364,7 +364,7 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None, root=None, map
     G, newick = build_tree_from_splits(split_set, length_map, n_leaves, root_leaf=n_leaves-1, mapping=mapping)
     
     # print(f"Current length is {len(curr_lengths)} and velocity is {len(seg['velocity'])}, graph has {G.number_of_edges()} edges")
-    
+
     info = {
         "u": u,
         "s": s,

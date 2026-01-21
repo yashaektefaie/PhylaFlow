@@ -23,28 +23,24 @@ def kl_divergence_topological_distributions(posterior_trees: List[str],
     
     full_mask = (1 << num_leaves) - 1
 
-    def generate_splits(newick):
-        t1 = Tree(newick)
-        edge_mask, edge_lengths = enc.return_BHV_encoding(t1)
-        splits = []
-        for m, l in zip(edge_mask, edge_lengths):
-            if l <= eps:
-                continue 
-
-            k = int(m).bit_count()
-            if k <= 1 or k >= num_leaves - 1:
-                continue
-
-            if k > num_leaves / 2:
-                m = full_mask ^ int(m)  # Take complement
-
-            splits.append(int(m))
-            
-        return tuple(sorted(splits))    
+    def return_splits(nw):
+        t = Tree(nw)
+        enc = BHVEncoder()
+        masks, lens = enc.return_BHV_encoding(t)
+        return masks
     
-    split_counts_ground_truth = Counter([generate_splits(t) for t in posterior_trees])
+    split_counts_ground_truth = Counter()
+    for t in posterior_trees:
+        splits = return_splits(t)
+        split_counts_ground_truth.update(splits)
+    
     gt_topological_distribution = {k: v / sum(split_counts_ground_truth.values()) for k, v in split_counts_ground_truth.items()}
-    split_counts_sampled = Counter([generate_splits(t) for t in sampled_trees])
+
+    split_counts_sampled = Counter()
+    for t in sampled_trees:
+        splits = return_splits(t)
+        split_counts_sampled.update(splits)
+
     sampled_topological_distribution = {k: v / sum(split_counts_sampled.values()) for k, v in split_counts_sampled.items()}
 
     support = set(gt_topological_distribution.keys()).union(set(sampled_topological_distribution.keys()))
@@ -66,24 +62,11 @@ def split_bipartition_frequency_correlation(posterior_trees: List[str],
     
     full_mask = (1 << num_leaves) - 1
 
-    def generate_splits(newick):
-        t1 = Tree(newick)
-        edge_mask, edge_lengths = enc.return_BHV_encoding(t1)
-        splits = []
-        for m, l in zip(edge_mask, edge_lengths):
-            if l <= eps:
-                continue 
-
-            k = int(m).bit_count()
-            if k <= 1 or k >= num_leaves - 1:
-                continue
-
-            if k > num_leaves / 2:
-                m = full_mask ^ int(m)  # Take complement
-
-            splits.append(int(m))
-            
-        return splits    
+    def generate_splits(nw):
+        t = Tree(nw)
+        enc = BHVEncoder()
+        masks, lens = enc.return_BHV_encoding(t)
+        return masks
     
     split_counts_ground_truth = Counter()
     for t in posterior_trees:

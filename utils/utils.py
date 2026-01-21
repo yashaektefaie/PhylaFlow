@@ -405,3 +405,153 @@ def has_polytomy_fast(newick: str, unrooted_ok: bool = True) -> bool:
                 return True
 
     return False
+
+import torch
+
+@torch.no_grad()
+def binary_auc_roc(scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """
+    scores: [N] float (higher = more positive)
+    labels: [N] bool/0-1
+    returns: scalar tensor (nan if undefined)
+    """
+    labels = labels.bool()
+    n_pos = labels.sum()
+    n_neg = (~labels).sum()
+    if n_pos == 0 or n_neg == 0:
+        return torch.tensor(float("nan"), device=scores.device)
+
+    order = torch.argsort(scores, descending=True)
+    y = labels[order]
+
+    tps = torch.cumsum(y, dim=0).float()
+    fps = torch.cumsum(~y, dim=0).float()
+
+    tpr = tps / n_pos.float()
+    fpr = fps / n_neg.float()
+
+    # prepend (0,0)
+    z = torch.zeros(1, device=scores.device)
+    tpr = torch.cat([z, tpr])
+    fpr = torch.cat([z, fpr])
+
+    return torch.trapz(tpr, fpr)
+
+
+@torch.no_grad()
+def binary_auprc(scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """
+    Average precision (area under precision-recall curve).
+    """
+    labels = labels.bool()
+    n_pos = labels.sum()
+    if n_pos == 0:
+        return torch.tensor(float("nan"), device=scores.device)
+
+    order = torch.argsort(scores, descending=True)
+    y = labels[order]
+
+    tps = torch.cumsum(y, dim=0).float()
+    fps = torch.cumsum(~y, dim=0).float()
+
+    precision = tps / (tps + fps).clamp_min(1.0)  # avoid 0/0 at start
+    recall = tps / n_pos.float()
+
+    # AP = sum over i where y_i=1 of precision_i * (recall_i - recall_{i-1})
+    recall_prev = torch.cat([torch.zeros(1, device=scores.device), recall[:-1]])
+    delta_recall = recall - recall_prev
+    ap = (precision * delta_recall).sum()
+    return ap
+
+
+@torch.no_grad()
+def compute_merge_metrics(
+    logits_vec: torch.Tensor,
+    y_vec: torch.Tensor,
+    threshold_logit: float = 0.0,   # 0.0 <=> sigmoid=0.5
+    topk=(1, 5, 10),
+) -> dict:
+    """
+    logits_vec: [N]
+    y_vec: [N] float or bool (positives are y>0.5)
+    """
+    scores = logits_vec.detach().flatten()
+    labels = (y_vec.detach().flatten() > 0.5)
+
+    n = labels.numel()
+    n_pos = int(labels.sum().item())
+    n_neg = n - n_pos
+
+    out = {
+        "autoregressive_stats/n_candidates": float(n),
+        "autoregressive_stats/n_pos": float(n_pos),
+        "autoregressive_stats/pos_frac": float(n_pos / max(n, 1)),
+    }
+
+    # # Classification metrics at a fixed threshold (note: can be misleading with imbalance)
+    # pred = scores > threshold_logit
+    # out["acc"] = float((pred == labels).float().mean().item())
+
+    # # precision/recall/f1 (defined only if denominators non-zero)
+    # tp = ((pred == 1) & (labels == 1)).sum().item()
+    # fp = ((pred == 1) & (labels == 0)).sum().item()
+    # fn = ((pred == 0) & (labels == 1)).sum().item()
+
+    # prec = tp / max(tp + fp, 1)
+    # rec  = tp / max(tp + fn, 1)
+    # f1   = 2 * prec * rec / max(prec + rec, 1e-12)
+
+    # out["precision"] = float(prec)
+    # out["recall"] = float(rec)
+    # out["f1"] = float(f1)
+
+    # Ranking metrics (usually what you care about for “choose next merge”)
+    if n_pos == 0:
+        # undefined for ranking-based “did we pick a positive?”
+        out["hit@1"] = float("nan")
+        for k in topk:
+            out[f"hit@{k}"] = float("nan")
+        out["mrr_pos"] = float("nan")
+    else:
+        order = torch.argsort(scores, descending=True)
+        y_sorted = labels[order]
+
+        out["autoregressive_stats/hit@1"] = float(y_sorted[0].float().item())
+        for k in topk:
+            k = min(k, n)
+            out[f"autoregressive_stats/hit@{k}"] = float(y_sorted[:k].any().float().item())
+
+        # MRR of the first positive (1 / rank)
+        first_pos = torch.nonzero(y_sorted, as_tuple=False)[0].item()  # 0-index
+        out["autoregressive_stats/mrr_pos"] = float(1.0 / (first_pos + 1))
+    # AUCs
+    out["autoregressive_stats/auroc"] = float(binary_auc_roc(scores, labels).item())
+    # out["autoregressive_stats/auprc"] = float(binary_auprc(scores, labels).item())
+
+    # # Optional: separation diagnostics
+    # if n_pos > 0 and n_neg > 0:
+    #     out["mean_pos_logit"] = float(scores[labels].mean().item())
+    #     out["mean_neg_logit"] = float(scores[~labels].mean().item())
+    #     out["gap_pos_neg"] = out["mean_pos_logit"] - out["mean_neg_logit"]
+
+    return out
+
+
+class RunningAvg:
+    """Simple running mean over step-level dict metrics."""
+    def __init__(self):
+        self.sum = {}
+        self.count = 0
+
+    def update(self, d: dict):
+        self.count += 1
+        for k, v in d.items():
+            if v != v:  # NaN check
+                continue
+            self.sum[k] = self.sum.get(k, 0.0) + float(v)
+
+    def compute(self) -> dict:
+        if self.count == 0:
+            return {}
+        return {k: v / self.count for k, v in self.sum.items()}
+

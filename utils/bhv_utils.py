@@ -156,6 +156,7 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
     geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
     segments = geodesic_result['segments']
     idxs = [rm.randrange(0, len(segments)-1)]
+    # idxs = [1]
 
     final_labels = []
     full = (1 << t1.n_leaves) - 1
@@ -178,6 +179,7 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
             logger.debug(f"Boundary index {bi}: exploring {len(nodes_to_explore)} polytomy nodes")
 
             Bi_split_component = {}
+            # new_Bi_splits = []
 
             for split in Bi_splits:
                 logger.debug(f"Looking for relevant components found for {split}:")
@@ -211,6 +213,8 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
                                 cluster.add(use_split)
                 
                 Bi_split_component[use_split] = best
+
+            # Bi_splits = new_Bi_splits
 
             #Okay for each clustered bucket, find the smallest group we need to merge, and add that to the merge
             initial_labels = []
@@ -271,19 +275,8 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
                 raise Exception("Stuck with unresolved clustered buckets but no possible merges, something is wrong")
         
     return final_labels
-    
 
-        
-
-            
-
-        
-
-        
-
-
-
-def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_point):
+def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_point, extra = False):
     from utils.bhv_movie import sample_tree_along_geodesic
     t1 = Tree(newick_tree_one)
     t2 = Tree(newick_tree_two)
@@ -323,6 +316,8 @@ def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_
     #     else:
     #         print("FOUND WOOHOOOO")
     # import pdb; pdb.set_trace()
+    if extra:
+        return newick, info['active_velocity'], geodesic_result
 
     return newick, info['active_velocity']
 

@@ -46,6 +46,7 @@ from model.model import TreeDenoiserTokenGT
 import numpy as np
 import logging
 from tqdm import tqdm
+from utils.utils import compute_merge_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ class TrainingModule(LightningModule):
 
         self.phyla_checkpoint_path = None
         self.phyla_model = None
+        self.stepper = 1
 
         phyla_checkpoint_path = None
         phyla_config_path = "configs/sample_eval_config.yaml"
@@ -254,14 +256,14 @@ class TrainingModule(LightningModule):
             logs["loss"] = loss
             logger.info(f"Velocity loss: {loss.item()}")
             if self.record:
-                wandb.log({"train/velocity_loss": loss.item()})
+                wandb.log({"train/velocity_loss": loss.item()}, step=self.stepper)
             # import pdb
 
             # pdb.set_trace()
         else:
             all_group_logits = self.forward(
                 batch["tokenized_autoregressive_trees"],
-                None,
+                batch['batched_autoregressive_time'],
                 batch["phyla_embeddings"],
                 autoregressive=True,
             )
@@ -273,7 +275,9 @@ class TrainingModule(LightningModule):
             
             losses = []
 
-            max_logit = 0
+            max_logits = []
+            total_metrics = []
+
             chosen_polytomies = []
             polytomy_logits = []
 
@@ -326,17 +330,41 @@ class TrainingModule(LightningModule):
                     logits_vec = logits_vec[finite]
                     y_vec = y_vec[finite]
 
-                    if logits_vec.max().item() > max_logit:
-                        max_logit = logits_vec.max().item()
+                    max_logits.append(torch.sigmoid(logits_vec).max().item())
+                    # AUC calculation for logging
 
+                    metrics = compute_merge_metrics(logits_vec, y_vec, threshold_logit=0.0, topk=(1,5,10))
+                    total_metrics.append(metrics)
+
+                    pos = (y_vec > 0.5).nonzero(as_tuple=False).squeeze(-1)
+                    neg = (y_vec < 0.5).nonzero(as_tuple=False).squeeze(-1)
+                    # import pdb; pdb.set_trace()
+                    k_neg = 512
+                    if neg.numel() > k_neg:
+                        # take top-k hardest negatives by score
+                        neg_scores = logits_vec[neg]
+                        topk = torch.topk(neg_scores, k=k_neg, largest=True).indices
+                        neg = neg[topk]
+                    
+                    idx = torch.cat([pos, neg])
+                    tau = 1.0
+                    s = logits_vec[idx] / tau
+
+                    lse_all = torch.logsumexp(s, dim=0)
+                    lse_pos = torch.logsumexp(s[:pos.numel()], dim=0)
+
+                    loss = lse_all - lse_pos
+
+                    # import pdb; pdb.set_trace()
+                    #INITIAL LOSS FUNCTION
                     # class imbalance weighting
-                    pos = y_vec.sum().clamp(min=1.0)
-                    neg = (y_vec.numel() - y_vec.sum()).clamp(min=1.0)
-                    pos_weight = (neg / pos).detach()
+                    # pos = y_vec.sum().clamp(min=1.0)
+                    # neg = (y_vec.numel() - y_vec.sum()).clamp(min=1.0)
+                    # pos_weight = (neg / pos).detach()
 
-                    loss = F.binary_cross_entropy_with_logits(
-                        logits_vec, y_vec, pos_weight=pos_weight
-                    )
+                    # loss = F.binary_cross_entropy_with_logits(
+                    #     logits_vec, y_vec, pos_weight=pos_weight
+                    # )
 
                     losses.append(loss)
 
@@ -364,19 +392,30 @@ class TrainingModule(LightningModule):
                 if self.record:
                     wandb.log({"train/polytomy_choosing_loss": L_polytomy_choosing.item()})
 
-
-
             L_merging = torch.stack(losses).mean()
             logs["loss"] = L_merging
             logger.info(f"Autoregressive loss: {L_merging.item()}")
-            logger.info(f"Max autoregressive logit: {max_logit}")
+            logger.info(f"Max autoregressive logit: {np.mean(max_logits)}")
+
+            aggregated_metrics = {}
+            if len(total_metrics) > 0:
+                for key in total_metrics[0]:
+                    aggregated_metrics[key] = sum(
+                        m[key] for m in total_metrics
+                    ) / len(total_metrics)
+
+                for key in aggregated_metrics:
+                    logger.info(f"{key}: {aggregated_metrics[key]}")
+                    if self.record:
+                        wandb.log({f"{key}": aggregated_metrics[key]}, step=self.stepper)
 
             if L_polytomy_choosing is not None:
                 logs["loss"] += L_polytomy_choosing
 
             if self.record:
-                wandb.log({"train/autoregressive_loss": L_merging.item()})
-                wandb.log({"max_autoregressive_logits": max_logit})
+                
+                wandb.log({"train/autoregressive_loss": L_merging.item()}, step=self.stepper)
+                wandb.log({"autoregressive_stats/max_autoregressive_logits": np.mean(max_logits)}, step=self.stepper)
 
         return logs
 
@@ -385,6 +424,7 @@ class TrainingModule(LightningModule):
         newick_starting_trees: list[str],
         phyla_embeddings,
         num_samples=1,
+        mapping=None,
         T=1.0,
         dt_base=0.02,
         eps_len=1e-8,
@@ -528,71 +568,84 @@ class TrainingModule(LightningModule):
                 if hit_boundary:
                     hit = L_new <= eps_len
                     L_new[hit] = 0.0
-
+                
                 # update dict
                 td2 = {m: float(l) for m, l in zip(masks, L_new) if l > eps_len}
 
                 # We only need to rebuild Newick/Graph if we hit a boundary (topology changed)
                 if hit_boundary:
-                    graph, td2_newick = build_tree_from_splits(
-                        list(td2.keys()),
-                        td2,
-                        n_leaves,
-                        root_leaf=n_leaves - 1,
-                        mapping=mapp,
-                    )
+                    num_merges = 0
+                    topology_changed = True
+                    while topology_changed:
+                        graph, td2_newick = build_tree_from_splits(
+                            list(td2.keys()),
+                            td2,
+                            n_leaves,
+                            root_leaf=n_leaves - 1,
+                            mapping=mapp,
+                        )
 
-                    polytomy_nodes = has_polytomy_fast(td2_newick, unrooted_ok=False)
-                    # td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
+                        polytomy_nodes = has_polytomy_fast(td2_newick, unrooted_ok=False)
+                        # td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
-                    if polytomy_nodes:
-                        topology_changed = False
-                        # For autoregressive step, we just use standard tokenizer for now as it's rare event
-                        tokenized_trees = self.model.tokenizer([td2_newick])
-                        # import pdb; pdb.set_trace()
+                        if polytomy_nodes:
+                            # For autoregressive step, we just use standard tokenizer for now as it's rare event
+                            tokenized_trees = self.model.tokenizer([td2_newick])
+                            # import pdb; pdb.set_trace()
 
-                        with torch.no_grad():
-                            logit_outputs = self.forward(
-                                tokenized_trees,
-                                t,
-                                phyla_embeddings,
-                                autoregressive=True,
-                            )
+                            with torch.no_grad():
+                                logit_outputs = self.forward(
+                                    tokenized_trees,
+                                    torch.tensor([num_merges/63], device=self.device),
+                                    phyla_embeddings,
+                                    autoregressive=True,
+                                )
+                            top_change = False
+                            for output in logit_outputs:
+                                if torch.sigmoid(output["polytomy_pred"]).item() < 0.5:
+                                    x = output["logits"]
+                                    W = 0.5 * (x + x.T)  # [G,G]
+                                    W.fill_diagonal_(-float("inf"))
+                                    P = torch.sigmoid(
+                                        W
+                                    )  # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
+                                    # Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
+                                    # import pdb; pdb.set_trace()
+                                    max_logits.append(P.max().item())
+                                    res = pick_group(W, tau=0.55)
+                                    if res is None:
+                                        logger.debug("No merges found!")
+                                    else:
+                                        logger.debug(f"Merges found: {res}")
+                                        # import pdb; pdb.set_trace()
+                                        split_masks = [
+                                            output["splits_represented"][idx] for idx in res
+                                        ]
+                                        new_split = 0
+                                        for sm in split_masks:
+                                            new_split |= sm
 
-                        for output in logit_outputs:
-                            x = output["logits"]
-                            W = 0.5 * (x + x.T)  # [G,G]
-                            W.fill_diagonal_(-float("inf"))
-                            P = torch.sigmoid(
-                                W
-                            )  # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
-                            # Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
-							# import pdb; pdb.set_trace()
-                            max_logits.append(P.max().item())
-                            res = pick_group(W, tau=0.55)
-                            if res is None:
-                                logger.debug("No merges found!")
+                                        if new_split in td2:
+                                            logger.debug("Whoa already in there!")
+                                        else:
+                                            # New length is average of merged splits
+                                            td2[new_split] = 1e-3
+                                        top_change = True
+                            
+                            if not top_change:
+                                topology_changed = False
                             else:
-                                logger.debug(f"Merges found: {res}")
-                                # import pdb; pdb.set_trace()
-                                split_masks = [
-                                    output["splits_represented"][idx] for idx in res
-                                ]
-                                new_split = 0
-                                for sm in split_masks:
-                                    new_split |= sm
+                                num_merges += 1
 
-                                if new_split in td2:
-                                    logger.debug("Whoa already in there!")
-                                else:
-                                    # New length is average of merged splits
-                                    td2[new_split] = 1e-3
-                                topology_changed = True
+                            n_events += 1
+                            logger.debug("Finished processing merges")
+                            if topology_changed:
+                                n_topology_changes += 1
+                                
+                        else:
+                            topology_changed = False
+                            
 
-                        n_events += 1
-                        logger.debug("Finished processing merges")
-                        if topology_changed:
-                            n_topology_changes += 1
 
                     _, td2_newick_final = build_tree_from_splits(
                         list(td2.keys()),
@@ -669,6 +722,7 @@ class TrainingModule(LightningModule):
             sampled_tree, n_topology_changes, avg_max_logit = self.sample(
                 [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
             )
+
             sampled_tree = sampled_tree[0]
             num_topology_changes.append(n_topology_changes)
             avg_max_logits.append(avg_max_logit)
@@ -683,8 +737,8 @@ class TrainingModule(LightningModule):
             # Now do something with the sampled tree and the real trees
             sampled_trees.append(sampled_tree)
 
-        sampled = [number_to_name_newick(i, mapping, True) for i in sampled_trees]
-        posterior_trees = [number_to_name_newick(i, mapping, False) for i in real_trees]
+        sampled = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, True) for i in sampled_trees]
+        posterior_trees = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, False) for i in real_trees]
 
         if save:
             import pickle
@@ -694,6 +748,7 @@ class TrainingModule(LightningModule):
         metrics = compare_likelihood_distributions(
             nexus_filepath, true_trees=posterior_trees, sampled_trees=sampled, threads=1
         )
+
         metrics.update(
             kl_divergence_topological_distributions(
                 posterior_trees, sampled, num_leaves=num_leaves
@@ -710,7 +765,7 @@ class TrainingModule(LightningModule):
         print("Average max logits during sampling: ", np.mean(avg_max_logits))
         if self.record:
             wandb.log({'number_of_polytomies_resolved': num_polytomies, 'average_topology_changes': np.mean(num_topology_changes),
-                       'average_max_logits': np.mean(avg_max_logits)})
+                       'average_max_logits': np.mean(avg_max_logits)}, step=self.stepper)
 
         return metrics
         
@@ -1061,7 +1116,7 @@ class TrainingModule(LightningModule):
         if logs is not None:
             if self.record:
                 # wandb.log(logs)
-                wandb.log(logs)
+                wandb.log(logs, step=self.stepper)
             if not self.dataset.msa_distance:
                 self.dataset.update_normrf(logs["norm_rf_distance"])
 
@@ -1107,8 +1162,10 @@ class TrainingModule(LightningModule):
                 for k, v in metrics.items():
                     self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
                 if self.record:
-                    wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()})
+                    wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.stepper)
                 print(metrics)
+            
+            self.stepper += 1
 
             return logs["loss"]
         else:
@@ -1154,9 +1211,9 @@ class TrainingModule(LightningModule):
             f"step {self.global_step:4d}  total_grad_norm = {total:.2f} mean is {mean_grad:.2f} max is {max_grad:.2f}"
         )
         if self.record:
-            wandb.log({"grad/grad_norm_total": total})
-            wandb.log({"grad/grad_norm_max": max_grad})
-            wandb.log({"grad/grad_norm_mean": mean_grad})
+            wandb.log({"grad/grad_norm_total": total}, step=self.stepper)
+            wandb.log({"grad/grad_norm_max": max_grad}, step=self.stepper)
+            wandb.log({"grad/grad_norm_mean": mean_grad}, step=self.stepper)
 
     def configure_optimizers(self):
         if self.deepspeed:

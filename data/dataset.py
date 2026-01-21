@@ -79,6 +79,7 @@ class TreeDataset(Dataset):
         self._ids: List[str] = []  # populated by build_index()
         self._index: List[Dict[str, Any]] = []  # list of sample metadata dicts
         self._id_to_idx: Dict[str, int] = {}
+        self.random_tree = None
 
         # Build index immediately; optionally preload
         self.build_index()
@@ -153,7 +154,10 @@ class TreeDataset(Dataset):
             )
             return self.__getitem__(0, preset_subtree_size)
 
+        #######VERY IMPORTANT HERE FOR DEBUG PURPOSES WE WILL ALWAYS SAMPLE THE FIRST TREE########
         real_tree_newick = random.sample(trees, 1)[0]
+        # real_tree_newick = trees[0]
+        #########################################################################################
 
         # Pruning logic for adaptive batching
         t = EteTree(real_tree_newick, format=1)
@@ -199,16 +203,24 @@ class TreeDataset(Dataset):
         # (Though prune modifies in-place, let's keep it safe)
         t_pruned = EteTree(real_tree_newick, format=1)
         random_tree = self.sample_random_tree(t_pruned)
+
+        #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
         timepoint = random.uniform(0, 1)
+        # timepoint = 0.5
 
         # Both trees now use "0".."N-1" names, so bhv utils will work happily
         newick, velocity = return_sampled_tree_orthant_velocity(
             random_tree, real_tree_newick, timepoint
         )
+
         final_labels = return_sampled_tree_boundary_decisions(
             random_tree, real_tree_newick
         )
-        chosen_autoregressive_event = random.choice(final_labels)
+
+        random_index = random.randrange(len(final_labels))
+        chosen_autoregressive_event = final_labels[random_index]
+        #autoregressive_time = 0.0 if len(final_labels) <= 1 else random_index / (len(final_labels) - 1)
+        autoregressive_time = random_index / (64 - 1)  # FIXED to see if we can sample better
 
         num_to_name = self.return_nexus_number_to_name(index)
         sample = {
@@ -223,7 +235,8 @@ class TreeDataset(Dataset):
             "timepoint": timepoint,
             "autoregressive_newick": chosen_autoregressive_event["newick"],
             "autoregressive_labels": chosen_autoregressive_event["labels"],
-            "num_to_name": num_to_name,
+            "autoregressive_newick_time": autoregressive_time,
+            "num_to_name": original_names_map,
         }
 
         return sample
@@ -284,6 +297,10 @@ class TreeDataset(Dataset):
         real_tree: Newick string or an ETE Tree.
         Returns: Newick string for a random tree with the same leaf names.
         """
+        ###DEBUG PURPOSES ONLY RETURN THE SAME TREE###
+        # if self.random_tree is not None:
+        #     return self.random_tree
+
         # Parse to ETE
         if isinstance(real_tree, str):
             t = EteTree(real_tree, format=1)
@@ -305,6 +322,8 @@ class TreeDataset(Dataset):
 
         # Produce Newick with the same taxa names but random topology/lengths
         random_newick = str(rt)
+        # if self.random_tree is None:
+        #     self.random_tree = random_newick
         return random_newick
 
     def extract_newick_from_line(self, line: str) -> str:
@@ -640,6 +659,10 @@ class PhylaDataModule(pl.LightningDataModule):
         mappings = [item['num_to_name'] for item in batch]
         ids = [item["id"] for item in batch]
 
+        batched_autoregressive_time = torch.tensor(
+            [item["autoregressive_newick_time"] for item in batch], dtype=torch.float32
+        )
+
         to_run = {
             "tokenized_trees": tokenized_trees,
             "tokenized_autoregressive_trees": autoregressive_tokenized_trees,
@@ -648,6 +671,7 @@ class PhylaDataModule(pl.LightningDataModule):
             "tree_paths": [item["tree_paths"] for item in batch],
             "original_trees": [item["newick_tree"] for item in batch],
             "batched_velocity": [item["velocity"] for item in batch],
+            "batched_autoregressive_time": batched_autoregressive_time,
             "batched_autoregressive_labels": [
                 item["autoregressive_labels"] for item in batch
             ],
