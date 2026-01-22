@@ -390,7 +390,7 @@ class TrainingModule(LightningModule):
 
                 logger.info(f"Polytomy choosing loss: {L_polytomy_choosing.item()}")
                 if self.record:
-                    wandb.log({"train/polytomy_choosing_loss": L_polytomy_choosing.item()})
+                    wandb.log({"train/polytomy_choosing_loss": L_polytomy_choosing.item()}, step=self.stepper)
 
             L_merging = torch.stack(losses).mean()
             logs["loss"] = L_merging
@@ -406,16 +406,18 @@ class TrainingModule(LightningModule):
 
                 for key in aggregated_metrics:
                     logger.info(f"{key}: {aggregated_metrics[key]}")
-                    if self.record:
-                        wandb.log({f"{key}": aggregated_metrics[key]}, step=self.stepper)
 
             if L_polytomy_choosing is not None:
                 logs["loss"] += L_polytomy_choosing
 
             if self.record:
-                
-                wandb.log({"train/autoregressive_loss": L_merging.item()}, step=self.stepper)
-                wandb.log({"autoregressive_stats/max_autoregressive_logits": np.mean(max_logits)}, step=self.stepper)
+                # Batch all metrics into a single wandb.log call to avoid step conflicts
+                wandb_metrics = {
+                    "train/autoregressive_loss": L_merging.item(),
+                    "autoregressive_stats/max_autoregressive_logits": np.mean(max_logits),
+                }
+                wandb_metrics.update({f"{key}": aggregated_metrics[key] for key in aggregated_metrics})
+                wandb.log(wandb_metrics, step=self.stepper)
 
         return logs
 
@@ -774,6 +776,15 @@ class TrainingModule(LightningModule):
             wandb.finish()
 
     def training_step(self, batch, _):
+        # Skip if batch is None (all items failed tokenization in collate_fn)
+        if batch is None:
+            logging.warning("Skipping training step: batch is None (tokenization failed for all items)")
+            print("Skipping training step: batch is None (tokenization failed for all items)")
+            return None
+        
+        # Increment stepper at the START to ensure all logs in this step use the same step number
+        self.stepper += 1
+        
         opt = self.optimizers()
         opt.zero_grad()
 
@@ -1164,8 +1175,6 @@ class TrainingModule(LightningModule):
                 if self.record:
                     wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.stepper)
                 print(metrics)
-            
-            self.stepper += 1
 
             return logs["loss"]
         else:
@@ -1211,9 +1220,11 @@ class TrainingModule(LightningModule):
             f"step {self.global_step:4d}  total_grad_norm = {total:.2f} mean is {mean_grad:.2f} max is {max_grad:.2f}"
         )
         if self.record:
-            wandb.log({"grad/grad_norm_total": total}, step=self.stepper)
-            wandb.log({"grad/grad_norm_max": max_grad}, step=self.stepper)
-            wandb.log({"grad/grad_norm_mean": mean_grad}, step=self.stepper)
+            wandb.log({
+                "grad/grad_norm_total": total,
+                "grad/grad_norm_max": max_grad,
+                "grad/grad_norm_mean": mean_grad,
+            }, step=self.stepper)
 
     def configure_optimizers(self):
         if self.deepspeed:

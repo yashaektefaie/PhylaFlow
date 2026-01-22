@@ -216,6 +216,16 @@ class TreeDataset(Dataset):
         final_labels = return_sampled_tree_boundary_decisions(
             random_tree, real_tree_newick
         )
+        
+        # If final_labels is empty, resample random tree until we get valid labels
+        while not final_labels:
+            random_tree = self.sample_random_tree(t_pruned)
+            newick, velocity = return_sampled_tree_orthant_velocity(
+                random_tree, real_tree_newick, timepoint
+            )
+            final_labels = return_sampled_tree_boundary_decisions(
+                random_tree, real_tree_newick
+            )
 
         random_index = random.randrange(len(final_labels))
         chosen_autoregressive_event = final_labels[random_index]
@@ -646,16 +656,28 @@ class PhylaDataModule(pl.LightningDataModule):
         trees_to_tokenize = [item["newick_tree"] for item in batch]
         # Tokenizer runs in worker if num_workers > 0, so must disable gradients
         # to avoid pickling errors (grad_fn cannot be pickled).
-        with torch.no_grad():
-            tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
+        
+        try:
+            with torch.no_grad():
+                tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
+        except Exception as e:
+            print(f"Error in tree tokenization: {e}")
+            return None 
+
         num_leaves = [len(batch[i]["sequences"]) for i in range(len(batch))]
 
         autoregressive_trees_to_tokenize = [
             item["autoregressive_newick"] for item in batch
         ]
-        autoregressive_tokenized_trees = self.tree_tokenizer(
-            autoregressive_trees_to_tokenize
-        )
+
+        try:
+            autoregressive_tokenized_trees = self.tree_tokenizer(
+                autoregressive_trees_to_tokenize
+            )
+        except Exception as e:
+            print(f"Error in autoregressive tree tokenization: {e}")
+            return None
+            
         mappings = [item['num_to_name'] for item in batch]
         ids = [item["id"] for item in batch]
 

@@ -20,7 +20,7 @@ model:
   phyla_dim: 256
 
 trainer:
-  record: False
+  record: True
   epochs: 10000
   val_callback_frequency: 10
   checkpoint_dir: checkpoints/
