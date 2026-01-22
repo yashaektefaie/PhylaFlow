@@ -24,6 +24,7 @@ trainer:
   epochs: 10000
   val_callback_frequency: 10
   checkpoint_dir: checkpoints/
+  phyla_checkpoint_path: checkpoints/chkpts/epoch%3D00-step%3D004000-treefam_avg_normrf%3D0.6721.ckpt
   lr: 0.0001
   steps_callback: 100
   val_callback_freq: 0

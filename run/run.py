@@ -58,6 +58,7 @@ def init_worker(config_file, device_id):
         num_warmup_steps=1000,
         deepspeed=False,
         logger=None,
+        phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
     )
     model.to(device)
     model.eval()
@@ -107,6 +108,7 @@ def run_test():
         num_warmup_steps=1000,
         deepspeed=False,
         logger=None,
+        phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
     )
     # res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
     # This fails now btw non-autoregressive LOL NEED TO FIX!
@@ -224,6 +226,7 @@ def run_overfit():
         num_warmup_steps=1000,
         deepspeed=False,
         logger=None,
+        phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
     )
 
     save_callback = ModelCheckpoint(
@@ -290,6 +293,7 @@ def main():
         num_warmup_steps=1000,
         deepspeed=False,
         logger=None,
+        phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
     )
 
     save_callback = ModelCheckpoint(

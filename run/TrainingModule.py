@@ -74,6 +74,7 @@ class TrainingModule(LightningModule):
         global_splits=None,
         random_trees=None,
         verbose: bool = False,
+        phyla_checkpoint_path=None,
     ):
         super().__init__()
         self.model = model
@@ -104,14 +105,13 @@ class TrainingModule(LightningModule):
         else:
             logging.basicConfig(level=logging.INFO)
 
-        self.phyla_checkpoint_path = None
+        self.phyla_checkpoint_path = phyla_checkpoint_path
         self.phyla_model = None
         self.stepper = 1
 
-        phyla_checkpoint_path = None
         phyla_config_path = "configs/sample_eval_config.yaml"
 
-        if phyla_checkpoint_path is not None:
+        if self.phyla_checkpoint_path is not None:
             original_argv = sys.argv
             sys.argv = ["script", phyla_config_path]
             try:
@@ -121,7 +121,7 @@ class TrainingModule(LightningModule):
                     )
 
                 config = load_config(Config)
-                config.trainer.checkpoint_path = phyla_checkpoint_path
+                config.trainer.checkpoint_path = self.phyla_checkpoint_path
                 config.eval.device = "cuda" if torch.cuda.is_available() else "cpu"
                 loaded = load_model(config=config, random_model=False)
                 self.phyla_model = loaded["model"]
@@ -194,6 +194,39 @@ class TrainingModule(LightningModule):
 
     def step(self, batch, eval=False, autoregressive=False):
         logs = {}
+        if (
+            self.phyla_model is not None
+            and batch["phyla_embeddings"] is None
+            and "ids" in batch
+        ):
+            phyla_embeddings_list = []
+            for i in range(len(batch["ids"])):
+                mapping = batch["mappings"][i]
+                num_leaf = batch["num_leaves"][i]
+                seqs = []
+                names = []
+                for idx in range(num_leaf):
+                    idx_str = str(idx)
+                    taxon_name = mapping.get(idx_str)
+                    if taxon_name:
+                        seq = self.dataset.name_to_seq.get(taxon_name, "")
+                        seqs.append(seq)
+                        names.append(taxon_name)
+                    else:
+                        seqs.append("")
+                        names.append("unknown")
+
+                embeddings = self.compute_phyla_embeddings(
+                    seqs, names, device=self.device
+                )
+                # Ensure embeddings are (N, D) not (1, N, D)
+                if embeddings.dim() == 3 and embeddings.size(0) == 1:
+                    embeddings = embeddings.squeeze(0)
+                
+                phyla_embeddings_list.append(embeddings)
+
+            batch["phyla_embeddings"] = phyla_embeddings_list
+
         if not autoregressive:
             v_pred, edge_split_masks, edge_mask = self.forward(
                 batch["tokenized_trees"],
@@ -427,6 +460,7 @@ class TrainingModule(LightningModule):
 
             # Calculate average polytomy size
             avg_polytomy_size = np.mean(polytomy_sizes) if polytomy_sizes else 0.0
+            num_polytomies = len(polytomy_sizes)
             logger.info(f"Average polytomy size: {avg_polytomy_size}")
 
             if self.record:
@@ -435,6 +469,7 @@ class TrainingModule(LightningModule):
                     "train/autoregressive_loss": L_merging.item(),
                     "autoregressive_stats/max_autoregressive_logits": np.mean(max_logits),
                     "autoregressive_stats/avg_polytomy_size": avg_polytomy_size,
+                    "autoregressive_stats/num_polytomies": num_polytomies,
                 }
                 wandb_metrics.update(
                     {f"{key}": aggregated_metrics[key] for key in aggregated_metrics}
@@ -744,7 +779,7 @@ class TrainingModule(LightningModule):
                 mapping=mapp,
             )[1]
             for td, n_leaves, mapp in zip(trees, num_leaves, mapping)
-        ], num_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0, avg_polytomy_size
+        ], num_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0, avg_polytomy_size, len(polytomy_sizes)
 
     def sample_compare(self, batch, train=True, num_samples=100, dt=0.02, save=True):
         nexus_filepaths = batch["nexus_filepaths"]
@@ -783,14 +818,17 @@ class TrainingModule(LightningModule):
         starting_trees_nw = []
 
         avg_polytomy_sizes = []
+        num_polytomies_resolved = []
+
         for _ in tqdm(range(num_samples)):
             rt = Tree(num_leaves=num_leaves, random=True)
             starting_tree = str(rt)
             starting_trees_nw.append(starting_tree)
-            sampled_tree, n_topology_changes, avg_max_logit, avg_polytomy_size = self.sample(
+            sampled_tree, n_topology_changes, avg_max_logit, avg_polytomy_size, n_polytomies_resolved = self.sample(
                 [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
             )
             avg_polytomy_sizes.append(avg_polytomy_size)
+            num_polytomies_resolved.append(n_polytomies_resolved)
 
             sampled_tree = sampled_tree[0]
             num_topology_changes.append(n_topology_changes)
@@ -897,12 +935,17 @@ class TrainingModule(LightningModule):
         print("Average max logits during sampling: ", np.mean(avg_max_logits))
         overall_avg_polytomy_size = np.mean([s for s in avg_polytomy_sizes if s > 0]) if any(s > 0 for s in avg_polytomy_sizes) else 0.0
         print(f"Average polytomy size during sampling: {overall_avg_polytomy_size:.2f}")
+        
+        avg_num_polytomies_resolved = np.mean(num_polytomies_resolved)
+        print(f"Average number of polytomies resolved during sampling: {avg_num_polytomies_resolved}")
+        
         if self.record:
             wandb.log(
                 {
                     "number_of_polytomies_resolved": num_polytomies,
                     "average_topology_changes": np.mean(num_topology_changes),
                     "average_max_logits": np.mean(avg_max_logits),
+                    "samples/average_num_polytomies_resolved": avg_num_polytomies_resolved,
                 },
                 step=self.stepper,
             )
