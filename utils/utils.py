@@ -555,3 +555,43 @@ class RunningAvg:
             return {}
         return {k: v / self.count for k, v in self.sum.items()}
 
+
+def _bit_indices(mask: int, max_bits: int):
+    """Return indices of set bits in mask, clipped to [0, max_bits-1]."""
+    out = []
+    m = int(mask)
+    i = 0
+    while m:
+        if m & 1:
+            if i < max_bits:
+                out.append(i)
+        m >>= 1
+        i += 1
+    return out
+
+def _pick_knn_pair(component_embs: torch.Tensor, topM: int = 32, tau: float = 0.05, stochastic: bool = False):
+    """
+    component_embs: [k, D]
+    returns (i, j) indices to merge
+    """
+    # distances [k,k]
+    d = torch.cdist(component_embs, component_embs, p=2)
+    d.fill_diagonal_(float("inf"))
+
+    # flatten
+    k = d.shape[0]
+    flat = d.view(-1)
+
+    # choose smallest pair (or stochastic among topM)
+    if not stochastic:
+        ij = torch.argmin(flat).item()
+        return ij // k, ij % k
+
+    topM = min(topM, flat.numel())
+    vals, idxs = torch.topk(-flat, k=topM, largest=True)  # negative distances -> largest = smallest dist
+    # vals are -dist, convert to logits
+    logits = vals / max(tau, 1e-8)
+    probs = torch.softmax(logits, dim=0)
+    pick = torch.multinomial(probs, num_samples=1).item()
+    ij = idxs[pick].item()
+    return ij // k, ij % k

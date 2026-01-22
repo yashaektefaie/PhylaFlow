@@ -34,6 +34,7 @@ find_polytomy_nodes,
 number_to_name_newick,
 has_polytomy_fast,
 resolve_polytomies_random_deterministic,
+_pick_knn_pair
 )
 from utils.metric_utils import (
 kl_divergence_topological_distributions,
@@ -280,11 +281,15 @@ class TrainingModule(LightningModule):
 
             chosen_polytomies = []
             polytomy_logits = []
+            polytomy_sizes = []  # Track size of each polytomy encountered
 
             for group in all_group_logits:
                 logits = group["logits"]
                 labels = batch["batched_autoregressive_labels"]
                 splits_in_polytomy = group["splits_represented"]
+                
+                # Track polytomy size (number of splits in the polytomy)
+                polytomy_sizes.append(len(splits_in_polytomy))
 
                 y = torch.zeros(logits.size(0), logits.size(1), dtype=torch.long).to(
                     logits.device
@@ -410,11 +415,16 @@ class TrainingModule(LightningModule):
             if L_polytomy_choosing is not None:
                 logs["loss"] += L_polytomy_choosing
 
+            # Calculate average polytomy size
+            avg_polytomy_size = np.mean(polytomy_sizes) if polytomy_sizes else 0.0
+            logger.info(f"Average polytomy size: {avg_polytomy_size}")
+
             if self.record:
                 # Batch all metrics into a single wandb.log call to avoid step conflicts
                 wandb_metrics = {
                     "train/autoregressive_loss": L_merging.item(),
                     "autoregressive_stats/max_autoregressive_logits": np.mean(max_logits),
+                    "autoregressive_stats/avg_polytomy_size": avg_polytomy_size,
                 }
                 wandb_metrics.update({f"{key}": aggregated_metrics[key] for key in aggregated_metrics})
                 wandb.log(wandb_metrics, step=self.stepper)
@@ -426,13 +436,17 @@ class TrainingModule(LightningModule):
         newick_starting_trees: list[str],
         phyla_embeddings,
         num_samples=1,
+        max_size_polytomy=25,
         mapping=None,
         T=1.0,
         dt_base=0.02,
         eps_len=1e-8,
         hit_tol=1e-10,
         max_events=1000,
-        max_steps=20000
+        max_steps=20000,
+        KNN_TOPM = 32,
+        KNN_TAU = 0.05,
+        KNN_STOCHASTIC = False,
     ):
 
         self.model.eval()
@@ -483,7 +497,8 @@ class TrainingModule(LightningModule):
         t = 0.0
         n_events = 0
         n_steps = 0
-        n_topology_changes = 0
+        num_topology_changes = 0
+        polytomy_sizes = []  # Track sizes of polytomies encountered during sampling
 
         while t < T and n_steps < max_steps and n_events < max_events:
             n_steps += 1
@@ -576,9 +591,13 @@ class TrainingModule(LightningModule):
 
                 # We only need to rebuild Newick/Graph if we hit a boundary (topology changed)
                 if hit_boundary:
+                    logger.info(f"Tree hit a boundary, checking for topology changes.")
                     num_merges = 0
                     topology_changed = True
+
                     while topology_changed:
+                        original_td2 = td2.copy()
+
                         graph, td2_newick = build_tree_from_splits(
                             list(td2.keys()),
                             td2,
@@ -604,7 +623,34 @@ class TrainingModule(LightningModule):
                                 )
                             top_change = False
                             for output in logit_outputs:
-                                if torch.sigmoid(output["polytomy_pred"]).item() < 0.5:
+                                # Track polytomy size
+                                polytomy_sizes.append(len(output["splits_represented"]))
+                                
+                                if len(output["splits_represented"]) > max_size_polytomy:
+                                    logger.info("Polytomy is too big time to automatically resolve")
+                                    split_embeddings = output['group_embeddings']
+                                    group_represented = output['splits_represented']
+
+                                    if len(group_represented) != split_embeddings.size(0):
+                                        raise Exception("Whoa size mismatch between groups and split embeddings")
+                                    
+                                    i, j = _pick_knn_pair(split_embeddings, topM=KNN_TOPM, tau=KNN_TAU, stochastic=KNN_STOCHASTIC)
+
+                                    sm_i, sm_j = group_represented[i], group_represented[j]
+                                    new_split = int(sm_i) | int(sm_j)
+                                    import pdb; pdb.set_trace()
+
+                                    if new_split not in td2:
+                                        td2[new_split] = 1e-3  # tiny length
+                                    else:
+                                        # import pdb; pdb.set_trace()
+                                        raise Exception("Not possible to merge into a split that already exists...")
+
+                                    top_change = True
+                                    num_merges += 1
+                                    n_events += 1
+                                    num_topology_changes += 1
+                                elif torch.sigmoid(output["polytomy_pred"]).item() > 0.5:
                                     x = output["logits"]
                                     W = 0.5 * (x + x.T)  # [G,G]
                                     W.fill_diagonal_(-float("inf"))
@@ -616,9 +662,9 @@ class TrainingModule(LightningModule):
                                     max_logits.append(P.max().item())
                                     res = pick_group(W, tau=0.55)
                                     if res is None:
-                                        logger.debug("No merges found!")
+                                        logger.info("No merges found!")
                                     else:
-                                        logger.debug(f"Merges found: {res}")
+                                        logger.info(f"Merges found: {res}")
                                         # import pdb; pdb.set_trace()
                                         split_masks = [
                                             output["splits_represented"][idx] for idx in res
@@ -628,22 +674,21 @@ class TrainingModule(LightningModule):
                                             new_split |= sm
 
                                         if new_split in td2:
-                                            logger.debug("Whoa already in there!")
+                                            import pdb; pdb.set_trace()
+                                            logger.info("Whoa already in there!")
+                                            raise Exception("Not possible to merge into a split that already exists...")
                                         else:
                                             # New length is average of merged splits
                                             td2[new_split] = 1e-3
                                         top_change = True
+                                        num_merges += 1
+                                        n_events += 1
+                                        num_topology_changes += 1
                             
                             if not top_change:
                                 topology_changed = False
-                            else:
-                                num_merges += 1
 
-                            n_events += 1
-                            logger.debug("Finished processing merges")
-                            if topology_changed:
-                                n_topology_changes += 1
-                                
+                            logger.info("Finished processing merges")
                         else:
                             topology_changed = False
                             
@@ -672,6 +717,12 @@ class TrainingModule(LightningModule):
                 print(f"Step {n_steps}: dt={dt:.2e}, t={t:.2f}/{T}")
 
         # print(f"Sampling finished in {n_steps} steps. Total events: {n_events}")
+        avg_polytomy_size = np.mean(polytomy_sizes) if polytomy_sizes else 0.0
+        # if num_topology_changes > 0:
+        #     import pdb; pdb.set_trace()
+    
+        logger.info(f"Sampling finished in {n_steps} steps. Total events: {n_events}, topology changes: {num_topology_changes}, average polytomy size: {avg_polytomy_size:.2f}")
+
         return [
             build_tree_from_splits(
                 list(td.keys()),
@@ -681,7 +732,7 @@ class TrainingModule(LightningModule):
                 mapping=mapp,
             )[1]
             for td, n_leaves, mapp in zip(trees, num_leaves, mapping)
-        ], n_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0
+        ], num_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0, avg_polytomy_size
 
     def sample_compare(self, batch, train=True, num_samples=100, dt=0.02, save = True):
         nexus_filepaths = batch["nexus_filepaths"]
@@ -718,12 +769,14 @@ class TrainingModule(LightningModule):
         avg_max_logits = []
         num_polytomies = 0
 
+        avg_polytomy_sizes = []
         for _ in tqdm(range(num_samples)):
             rt = Tree(num_leaves=num_leaves, random=True)
             starting_tree = str(rt)
-            sampled_tree, n_topology_changes, avg_max_logit = self.sample(
+            sampled_tree, n_topology_changes, avg_max_logit, avg_polytomy_size = self.sample(
                 [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
             )
+            avg_polytomy_sizes.append(avg_polytomy_size)
 
             sampled_tree = sampled_tree[0]
             num_topology_changes.append(n_topology_changes)
@@ -765,9 +818,11 @@ class TrainingModule(LightningModule):
         print(f"Num polytomies resolved in sampling: {num_polytomies} out of {num_samples}")
         print("Average topology changes during sampling: ", np.mean(num_topology_changes))
         print("Average max logits during sampling: ", np.mean(avg_max_logits))
+        overall_avg_polytomy_size = np.mean([s for s in avg_polytomy_sizes if s > 0]) if any(s > 0 for s in avg_polytomy_sizes) else 0.0
+        print(f"Average polytomy size during sampling: {overall_avg_polytomy_size:.2f}")
         if self.record:
             wandb.log({'number_of_polytomies_resolved': num_polytomies, 'average_topology_changes': np.mean(num_topology_changes),
-                       'average_max_logits': np.mean(avg_max_logits)}, step=self.stepper)
+                       'average_max_logits': np.mean(avg_max_logits), 'average_polytomy_size': overall_avg_polytomy_size}, step=self.stepper)
 
         return metrics
         

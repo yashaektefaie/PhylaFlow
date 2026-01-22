@@ -471,7 +471,8 @@ class TreeDenoiserTokenGT(nn.Module):
                         "group_indices": group,
                         "polytomy_pred": self.group_head(group_embeddings.mean(dim=0)),
                         "logits": logits,
-                        "splits_represented": splits_represented
+                        "splits_represented": splits_represented,
+                        "group_embeddings": group_embeddings,
                     })
             # if not all_group_logits:
             #     raise ValueError("No polytomies found for autoregressive processing.")
