@@ -712,8 +712,25 @@ class TrainingModule(LightningModule):
                                     
                                     # Avoid merging all children as it recreates the current node
                                     if res is not None and len(res) == len(output["splits_represented"]):
-                                        logger.info("Model attempted to merge all children - skipping.")
-                                        res = None
+                                        if len(res) > 2:
+                                            logger.info("Model attempted to merge all children - attempting to merge subset.")
+                                            # Try to merge subset
+                                            best_k = -1
+                                            min_strength = float('inf')
+                                            
+                                            for k in res:
+                                                others = [m for m in res if m != k]
+                                                # Sum of logits to other members
+                                                strength = sum(W[k, m].item() for m in others)
+                                                if strength < min_strength:
+                                                    min_strength = strength
+                                                    best_k = k
+                                            
+                                            res.remove(best_k)
+                                            logger.info(f"Removed {best_k} from merge group. New group: {res}")
+                                        else:
+                                            logger.info("Model attempted to merge all children (only 2) - skipping.")
+                                            res = None
                                         
                                     if res is None:
                                         logger.info("No merges found!")
