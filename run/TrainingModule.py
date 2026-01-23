@@ -709,6 +709,12 @@ class TrainingModule(LightningModule):
                                     # import pdb; pdb.set_trace()
                                     max_logits.append(P.max().item())
                                     res = pick_group(W, tau=0.55)
+                                    
+                                    # Avoid merging all children as it recreates the current node
+                                    if res is not None and len(res) == len(output["splits_represented"]):
+                                        logger.info("Model attempted to merge all children - skipping.")
+                                        res = None
+                                        
                                     if res is None:
                                         logger.info("No merges found!")
                                     else:
@@ -723,7 +729,7 @@ class TrainingModule(LightningModule):
                                             new_split |= sm
 
                                         if new_split in td2:
-                                            import pdb; pdb.set_trace()
+                                            # import pdb; pdb.set_trace()
                                             logger.info("Whoa already in there!")
                                             raise Exception("Not possible to merge into a split that already exists...")
                                         else:
@@ -863,9 +869,13 @@ class TrainingModule(LightningModule):
             with open(f"samples/sample_trees_{self.global_step}.pkl", "wb") as f:
                 pickle.dump((sampled, posterior_trees), f)
 
-        metrics = compare_likelihood_distributions(
-            nexus_filepath, true_trees=posterior_trees, sampled_trees=sampled, threads=1
-        )
+        try:
+            metrics = compare_likelihood_distributions(
+                nexus_filepath, true_trees=posterior_trees, sampled_trees=sampled, threads=1
+            )
+        except Exception as e:
+            print(f"Skipping likelihood calc due to error: {e}")
+            metrics = {}
 
         metrics.update(
             kl_divergence_topological_distributions(
@@ -890,17 +900,21 @@ class TrainingModule(LightningModule):
         rf_paired = [calculate_norm_rf(s, e) for s, e in zip(starting_named, sampled)]
         metrics["start_avg_norm_rf"] = np.mean(rf_paired) if rf_paired else 0.0
 
-        metrics.update(
-            {
-                "start_" + k: v
-                for k, v in compare_likelihood_distributions(
-                    nexus_filepath,
-                    true_trees=starting_named,
-                    sampled_trees=sampled,
-                    threads=1,
-                ).items()
-            }
-        )
+        try:
+            metrics.update(
+                {
+                    "start_" + k: v
+                    for k, v in compare_likelihood_distributions(
+                        nexus_filepath,
+                        true_trees=starting_named,
+                        sampled_trees=sampled,
+                        threads=1,
+                    ).items()
+                }
+            )
+        except Exception:
+            pass
+
         metrics.update(
             {
                 "start_" + k: v
