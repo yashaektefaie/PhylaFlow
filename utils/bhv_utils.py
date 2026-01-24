@@ -137,7 +137,7 @@ def best_decomposition_for_any_orientation(split, sorted_components, full):
 
 
 def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, verbose = False):
-    from utils.utils import find_polytomy_nodes, polytomy_components_at_node, bucket_by_overlap
+    from utils.utils import find_polytomy_nodes, polytomy_components_at_node, bucket_by_overlap, leaves_in_component_split
     from utils.bhv_movie import build_tree_from_splits
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
@@ -169,23 +169,35 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
         lengths = {m:L for m, L in segments[bi]['end_lengths'].items() if L > 1e-8}
         Bi_splits = segments[bi]['Bi'].copy()
 
+        # #Ai splits
+        # for m in segments[bi]['Ai']:
+        #     print(f"AI split at boundary {bi}: {[j for j in range(m.bit_length()) if (m >> j) & 1]} or {m}")
+        
+        # #Bi splits
+        # for m in segments[bi]['Bi']:
+        #     print(f"BI split at boundary {bi}: {[j for j in range(m.bit_length()) if (m >> j) & 1]} or {m}")
+
         #canonicalize Bi_splits 
         Bi_splits = [min(split, full ^ split) for split in Bi_splits]
 
         clustered_buckets = bucket_by_overlap(Bi_splits)
+        # for i in clustered_buckets[0]:
+        #     print(f"Initial clustered bucket split: {[j for j in range(i.bit_length()) if (i >> j) & 1]} or {i}")
+        # import pdb; pdb.set_trace()
 
         num_iter = 0    
 
         while clustered_buckets:
             G, newick = build_tree_from_splits(list(lengths.keys()), lengths, t1.n_leaves, root_leaf=t1.n_leaves-1, mapping=t1.id_to_name)
             nodes_to_explore = find_polytomy_nodes(G, min_degree=4)
-            components_to_fix = [polytomy_components_at_node(G, i, t1.n_leaves) for i in nodes_to_explore]
+            #components_to_fix = [polytomy_components_at_node(G, i, t1.n_leaves) for i in nodes_to_explore]
+            components_to_fix = [leaves_in_component_split(int(i.split('_')[-1]), list(lengths.keys())) for i in nodes_to_explore]
             if sum(len(c) for c in components_to_fix) > 25:
-                logger.debug(f"Boundary index {bi}: too many components to fix ({sum(len(c) for c in components_to_fix)}), stopping")
+                logger.info(f"Boundary index {bi}: too many components to fix ({sum(len(c) for c in components_to_fix)}), stopping")
                 #For this part find basically one that does well and focus on that one 
                 break
             else:
-                logger.debug(f"Boundary index {bi}: found {sum(len(c) for c in components_to_fix)} components to fix across {len(components_to_fix)} polytomy nodes")
+                logger.info(f"Boundary index {bi}: found {sum(len(c) for c in components_to_fix)} components to fix across {len(components_to_fix)} polytomy nodes")
                 print("FOUND COMPONENTS TO FIX")
 
             sorted_components = sorted(components_to_fix, key=lambda comps: min(c.bit_count() for c in comps))
@@ -206,6 +218,7 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
                         logger.debug(" Could not find relevant components for split, but have previous labels, skipping this split")
                         return final_labels
                     else:
+                        import pdb; pdb.set_trace()
                         raise Exception("Could not find relevant components for split and no final labels so this is a huge error!")
                
                 logger.debug(f" BEST RELEVANT component found for {split}:")
@@ -245,7 +258,7 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
                     initial_labels.append(to_add)
                 else:
                     raise Exception("Could not find any merges for this cluster, something is wrong!")
-
+                    
             final_labels.append({'newick': newick, 'labels': initial_labels})
 
             #Now merge those components but only do 1 at a time so we keep the labels but just do 1 to avoid weird errors 

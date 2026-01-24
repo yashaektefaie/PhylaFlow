@@ -54,6 +54,17 @@ def polytomy_components_at_node(G: nx.Graph, node: int, n_leaves: int, return_co
                 comps.append(m)
     return comps
 
+def leaves_in_component_split(node: int, possible_splits: List[int]) -> List[int]:
+    contained = [s for s in possible_splits if ((s & node) == s) and s != node]
+    out = []
+    for s in contained:
+        # reject s if there exists a STRICT superset t that is ALSO contained in node
+        if any((t != s) and ((t & node) == t) and ((s & t) == s) for t in contained):
+            continue
+        out.append(s)
+    return out
+
+
 def leaves_in_component(G: nx.Graph, start: int, forbidden: int, leaf_nodes: Set[int]) -> int:
     """Bitmask of leaves reachable from start without passing through forbidden."""
     seen = {forbidden}

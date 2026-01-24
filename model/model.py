@@ -283,6 +283,13 @@ class TreeDenoiserTokenGT(nn.Module):
             edge_split_masks,
         ) = tokenized_tree_batch
 
+        # for i in edge_split_masks[0]:
+        #     print(
+        #                 [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1],
+        #             )
+
+        # import pdb; pdb.set_trace()
+
         x = padded_feature
         B, T_raw, D = x.shape
 
@@ -466,6 +473,11 @@ class TreeDenoiserTokenGT(nn.Module):
                     logits = self.pairwise_head(group_embeddings)  # [G, G]
                     splits_represented = batch_polytomy_splits[b][num]  # [G]
 
+                    # for split in splits_represented:
+                    #     print(
+                    #     [j for j in range(int(split).bit_length()) if (int(split) >> j) & 1],
+                    # )
+
                     all_group_logits.append({
                         "batch_index": b,
                         "group_indices": group,
@@ -476,6 +488,7 @@ class TreeDenoiserTokenGT(nn.Module):
                     })
             # if not all_group_logits:
             #     raise ValueError("No polytomies found for autoregressive processing.")
+            # import pdb; pdb.set_trace()
             return all_group_logits
 
         elif return_edges_only:

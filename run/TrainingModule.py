@@ -290,6 +290,7 @@ class TrainingModule(LightningModule):
             # print("Wow congrats")
             logs["loss"] = loss
             logger.info(f"Velocity loss: {loss.item()}")
+
             if self.record:
                 wandb.log({"train/velocity_loss": loss.item()}, step=self.stepper)
             # import pdb
@@ -593,26 +594,28 @@ class TrainingModule(LightningModule):
                 if (L < 0).any():
                     raise Exception("There are negative lengths that is not possible!")
 
+                eps_dt = max(1e-4, 1e-3 * float(np.median(L)) if len(L) > 0 else 1e-4)
+
                 # --- compute dt_hit ---
-                neg = (V < 0) & (L > eps_len)
+                neg = (V < 0) & (L > eps_dt)
                 if np.any(neg):
                     dt_candidates = L[neg] / -V[neg]
                     dt_hit = float(np.min(dt_candidates))
                 else:
                     dt_hit = float("inf")
-
-                cache.append((td, L, V, n_leaves, mapp, dt_hit, masks))
+                
+                cache.append((td, L, V, n_leaves, mapp, dt_hit, dt_candidates, masks, neg))
                 dt_hit_list.append(dt_hit)
 
             # ---- GLOBAL dt across the batch ----
             dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
             # Experimenting here, dt_hit_global is not a good metric we just jump, jump, jump, so why not use dt_base
-            # dt = min(dt_base, dt_hit_global, T - t)
-            dt = min(dt_base, T - t)
-
-            # defensive: prevent hard stall
+            #dt = min(dt_base, dt_hit_global, T - t)
+            dt = min(dt_base, dt_hit_global, T - t)
             if dt <= 0:
                 dt = min(dt_base, T - t)
+
+            #dt = min(dt_base, T - t)
 
             # ---- SECOND PASS: advance everyone with the SAME dt ----
             new_trees = []
@@ -620,17 +623,30 @@ class TrainingModule(LightningModule):
             # Since update of token_cache happens per tree potentially, we need to defer it or track which ones changed.
             # However, batch indices align with zip(trees...), so we can update token_cache[i] if needed.
 
-            for b_idx, (td, L, V, n_leaves, mapp, dt_hit, masks) in enumerate(cache):
+            for b_idx, (td, L, V, n_leaves, mapp, dt_hit, dt_candidates, masks, neg) in enumerate(cache):
                 model_masks = edge_splits[b_idx]
                 # --- advance ---
                 L_new = L + dt * V
 
-                # Did we hit boundary this step?
-                hit_boundary = (abs(dt - dt_hit) <= hit_tol) or (L_new <= eps_len).any()
+                # treat as boundary if we stepped past the first hit time for THIS tree
+                # (float equality with hit_tol=1e-10 is too strict)
+                hit_boundary = (np.isfinite(dt_hit) and dt >= dt_hit) or (L_new <= eps_len).any()
 
-                if hit_boundary:
-                    hit = L_new <= eps_len
-                    L_new[hit] = 0.0
+                # # Did we hit boundary this step?
+                # hit_boundary = (abs(dt - dt_hit) <= hit_tol) or (L_new <= eps_len).any()
+
+                if hit_boundary and np.isfinite(dt_hit):
+                    # Batch near-simultaneous hits (numerical simultaneity)
+                    eta = 0.01  # relative tie threshold (1%)
+                    eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
+
+                    batch = (dt_candidates <= dt_hit * (1.0 + eta)) | (dt_candidates <= dt_hit + eps_abs)
+
+                    # If we overshot (dt > dt_hit), L_new for those edges will be <= 0 anyway.
+                    # Force exactly 0 for batched edges and anything numerically tiny.
+                    L_new[neg][batch] = 0.0
+                
+                L_new[L_new < eps_len] = 0.0
 
                 # update dict
                 td2 = {m: float(l) for m, l in zip(masks, L_new) if l > eps_len}
@@ -675,7 +691,7 @@ class TrainingModule(LightningModule):
                                 polytomy_sizes.append(len(output["splits_represented"]))
                                 
                                 if len(output["splits_represented"]) > max_size_polytomy:
-                                    logger.info("Polytomy is too big time to automatically resolve")
+                                    logger.info("Polytomy is too big time to automatically resolve DOING KNN")
                                     split_embeddings = output['group_embeddings']
                                     group_represented = output['splits_represented']
 
@@ -686,7 +702,6 @@ class TrainingModule(LightningModule):
 
                                     sm_i, sm_j = group_represented[i], group_represented[j]
                                     new_split = int(sm_i) | int(sm_j)
-                                    import pdb; pdb.set_trace()
 
                                     if new_split not in td2:
                                         td2[new_split] = 1e-3  # tiny length
