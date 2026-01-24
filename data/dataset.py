@@ -271,6 +271,7 @@ class TreeDataset(Dataset):
             "autoregressive_labels": chosen_autoregressive_event["labels"],
             "autoregressive_newick_time": autoregressive_time,
             "num_to_name": original_names_map,
+            "seq_ordering_map": seq_ordering_map,
         }
 
         return sample
@@ -732,6 +733,7 @@ class PhylaDataModule(pl.LightningDataModule):
             "num_leaves": num_leaves,
             "ids": ids,
             "mappings": mappings,
+            "sequence_ordering_maps": [item["seq_ordering_map"] for item in batch],
         }
         return to_run
 

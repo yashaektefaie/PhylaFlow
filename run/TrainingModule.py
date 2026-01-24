@@ -13,6 +13,7 @@ import torch
 import sys
 import os
 import torch.nn.functional as F
+from ete3 import Tree as EteTree
 
 # Ensure the current directory is in sys.path to import 'phyla'
 sys.path.append(os.getcwd())
@@ -610,8 +611,8 @@ class TrainingModule(LightningModule):
             # ---- GLOBAL dt across the batch ----
             dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
             # Experimenting here, dt_hit_global is not a good metric we just jump, jump, jump, so why not use dt_base
-            #dt = min(dt_base, dt_hit_global, T - t)
             dt = min(dt_base, dt_hit_global, T - t)
+            #dt = min(dt_base, T - t)
             if dt <= 0:
                 dt = min(dt_base, T - t)
 
@@ -635,16 +636,16 @@ class TrainingModule(LightningModule):
                 # # Did we hit boundary this step?
                 # hit_boundary = (abs(dt - dt_hit) <= hit_tol) or (L_new <= eps_len).any()
 
-                if hit_boundary and np.isfinite(dt_hit):
-                    # Batch near-simultaneous hits (numerical simultaneity)
-                    eta = 0.01  # relative tie threshold (1%)
-                    eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
+                # if hit_boundary and np.isfinite(dt_hit):
+                #     # Batch near-simultaneous hits (numerical simultaneity)
+                #     eta = 0.01  # relative tie threshold (1%)
+                #     eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
 
-                    batch = (dt_candidates <= dt_hit * (1.0 + eta)) | (dt_candidates <= dt_hit + eps_abs)
+                #     batch = (dt_candidates <= dt_hit * (1.0 + eta)) | (dt_candidates <= dt_hit + eps_abs)
 
-                    # If we overshot (dt > dt_hit), L_new for those edges will be <= 0 anyway.
-                    # Force exactly 0 for batched edges and anything numerically tiny.
-                    L_new[neg][batch] = 0.0
+                #     # If we overshot (dt > dt_hit), L_new for those edges will be <= 0 anyway.
+                #     # Force exactly 0 for batched edges and anything numerically tiny.
+                #     L_new[neg][batch] = 0.0
                 
                 L_new[L_new < eps_len] = 0.0
 
@@ -653,136 +654,136 @@ class TrainingModule(LightningModule):
 
                 # We only need to rebuild Newick/Graph if we hit a boundary (topology changed)
                 if hit_boundary:
-                    logger.info(f"Tree hit a boundary, checking for topology changes.")
+                    logger.info(f"Tree hit a boundary, applying topology changes.")
                     num_merges = 0
                     topology_changed = True
+                    polytomy_nodes = True
 
-                    while topology_changed:
+                    while polytomy_nodes:
                         original_td2 = td2.copy()
 
-                        graph, td2_newick = build_tree_from_splits(
-                            list(td2.keys()),
-                            td2,
-                            n_leaves,
+                        _, td2_newick= build_tree_from_splits(
+                            list(original_td2.keys()),
+                            original_td2,
+                            n_leaves=n_leaves,
                             root_leaf=n_leaves - 1,
                             mapping=mapp,
                         )
 
+                        # For autoregressive step, we just use standard tokenizer for now as it's rare event
+                        tokenized_trees = self.model.tokenizer([td2_newick])
+                        # import pdb; pdb.set_trace()
+                        
                         polytomy_nodes = has_polytomy_fast(
                             td2_newick, unrooted_ok=False
                         )
-                        # td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
-                        if polytomy_nodes:
-                            # For autoregressive step, we just use standard tokenizer for now as it's rare event
-                            tokenized_trees = self.model.tokenizer([td2_newick])
-                            # import pdb; pdb.set_trace()
+                        if not polytomy_nodes:
+                            logger.info("No polytomies remain after merges exit out")
+                            break
 
-                            with torch.no_grad():
-                                logit_outputs = self.forward(
-                                    tokenized_trees,
-                                    torch.tensor([num_merges / 63], device=self.device),
-                                    phyla_embeddings,
-                                    autoregressive=True,
-                                )
-                            top_change = False
-                            for output in logit_outputs:
-                                # Track polytomy size
-                                polytomy_sizes.append(len(output["splits_represented"]))
-                                
-                                if len(output["splits_represented"]) > max_size_polytomy:
-                                    logger.info("Polytomy is too big time to automatically resolve DOING KNN")
-                                    split_embeddings = output['group_embeddings']
-                                    group_represented = output['splits_represented']
+                        with torch.no_grad():
+                            logit_outputs = self.forward(
+                                tokenized_trees,
+                                torch.tensor([num_merges / 63], device=self.device),
+                                phyla_embeddings,
+                                autoregressive=True,
+                            )
+                        
+                        if len(logit_outputs) == 1:
+                            candidates = [logit_outputs[0]]
+                        else:
+                            scores = torch.stack([o["polytomy_pred"].squeeze() for o in logit_outputs])
+                            order = torch.argsort(scores, descending=True)
+                            candidates = [logit_outputs[int(order[0])]]
 
-                                    if len(group_represented) != split_embeddings.size(0):
-                                        raise Exception("Whoa size mismatch between groups and split embeddings")
+                        top_change = False
+                        for output in candidates:
+                            # Track polytomy size
+                            polytomy_sizes.append(len(output["splits_represented"]))
+                            
+                            if torch.sigmoid(output["polytomy_pred"]).item() > 0.5 or len(logit_outputs) == 1:
+                            #else:
+                                logits = output["logits"]
+                                G = logits.size(0)
+                                mask = ~torch.eye(
+                                    G, dtype=torch.bool, device=logits.device
+                                )  # off-diagonal only
+
+                                # optionally only use one triangle (avoid double-counting symmetric pairs)
+                                tri = torch.triu(mask, diagonal=1)
+                                ii, jj = torch.triu_indices(G, G, offset=1, device=logits.device)
+
+                                logits_vec = logits[tri]
+                                finite = torch.isfinite(logits_vec)
+                                if finite.sum() == 0:
+                                    res = None
+                                else:
+                                    logits_vec_f = logits_vec[finite]
+                                    ii_f, jj_f = ii[finite], jj[finite]
+                                    k = torch.argmax(logits_vec_f)
+                                    i, j = ii_f[k].item(), jj_f[k].item()
+                                    res = [i, j]
                                     
-                                    i, j = _pick_knn_pair(split_embeddings, topM=KNN_TOPM, tau=KNN_TAU, stochastic=KNN_STOCHASTIC)
+                                if res is None:
+                                    logger.info("No merges found!")
+                                else:
+                                    logger.info(f"Merges found: {res}")
+                                    # import pdb; pdb.set_trace()
+                                    split_masks = [
+                                        output["splits_represented"][idx]
+                                        for idx in res
+                                    ]
+                                    new_split = 0
+                                    for sm in split_masks:
+                                        new_split |= sm
 
-                                    sm_i, sm_j = group_represented[i], group_represented[j]
-                                    new_split = int(sm_i) | int(sm_j)
-
-                                    if new_split not in td2:
-                                        td2[new_split] = 1e-3  # tiny length
-                                    else:
+                                    if new_split in td2:
                                         # import pdb; pdb.set_trace()
+                                        logger.info("Whoa already in there!")
                                         raise Exception("Not possible to merge into a split that already exists...")
-
+                                    else:
+                                        # New length is average of merged splits
+                                        td2[new_split] = 1e-3
                                     top_change = True
+                                    logger.info("Merge performed time to break out")
                                     num_merges += 1
                                     n_events += 1
                                     num_topology_changes += 1
-                                elif torch.sigmoid(output["polytomy_pred"]).item() > 0.5:
-                                    x = output["logits"]
-                                    W = 0.5 * (x + x.T)  # [G,G]
-                                    W.fill_diagonal_(-float("inf"))
-                                    P = torch.sigmoid(
-                                        W
-                                    )  # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
-                                    # Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
-                                    # import pdb; pdb.set_trace()
-                                    max_logits.append(P.max().item())
-                                    res = pick_group(W, tau=0.55)
-                                    
-                                    # Avoid merging all children as it recreates the current node
-                                    if res is not None and len(res) == len(output["splits_represented"]):
-                                        if len(res) > 2:
-                                            logger.info("Model attempted to merge all children - attempting to merge subset.")
-                                            # Try to merge subset
-                                            best_k = -1
-                                            min_strength = float('inf')
-                                            
-                                            for k in res:
-                                                others = [m for m in res if m != k]
-                                                # Sum of logits to other members
-                                                strength = sum(W[k, m].item() for m in others)
-                                                if strength < min_strength:
-                                                    min_strength = strength
-                                                    best_k = k
-                                            
-                                            res.remove(best_k)
-                                            logger.info(f"Removed {best_k} from merge group. New group: {res}")
-                                        else:
-                                            logger.info("Model attempted to merge all children (only 2) - skipping.")
-                                            res = None
-                                        
-                                    if res is None:
-                                        logger.info("No merges found!")
-                                    else:
-                                        logger.info(f"Merges found: {res}")
-                                        # import pdb; pdb.set_trace()
-                                        split_masks = [
-                                            output["splits_represented"][idx]
-                                            for idx in res
-                                        ]
-                                        new_split = 0
-                                        for sm in split_masks:
-                                            new_split |= sm
 
-                                        if new_split in td2:
-                                            # import pdb; pdb.set_trace()
-                                            logger.info("Whoa already in there!")
-                                            raise Exception("Not possible to merge into a split that already exists...")
-                                        else:
-                                            # New length is average of merged splits
-                                            td2[new_split] = 1e-3
-                                        top_change = True
-                                        num_merges += 1
-                                        n_events += 1
-                                        num_topology_changes += 1
+                                    break
+                        
+                        if not top_change:
+                            logger.info("No more merges possible, pick a random polytomy and do a KNN merge")
+                            output = random.choice(logit_outputs)
+                            split_embeddings = output['group_embeddings']
+                            group_represented = output['splits_represented']
+
+                            if len(group_represented) != split_embeddings.size(0):
+                                raise Exception("Whoa size mismatch between groups and split embeddings")
                             
-                            if not top_change:
-                                topology_changed = False
+                            i, j = _pick_knn_pair(split_embeddings, topM=KNN_TOPM, tau=KNN_TAU, stochastic=KNN_STOCHASTIC)
 
-                            logger.info("Finished processing merges")
-                        else:
-                            topology_changed = False
+                            sm_i, sm_j = group_represented[i], group_represented[j]
+                            new_split = int(sm_i) | int(sm_j)
+
+                            if new_split not in td2:
+                                td2[new_split] = 1e-3  # tiny length
+                            else:
+                                # import pdb; pdb.set_trace()
+                                raise Exception("Not possible to merge into a split that already exists...")
+
+                            top_change = True
+                            num_merges += 1
+                            n_events += 1
+                            num_topology_changes += 1
+
+
 
                     _, td2_newick_final = build_tree_from_splits(
                         list(td2.keys()),
                         td2,
-                        n_leaves,
+                        n_leaves=n_leaves,
                         root_leaf=n_leaves - 1,
                         mapping=mapp,
                     )
@@ -790,7 +791,8 @@ class TrainingModule(LightningModule):
                     new_item = self.model.tokenizer.compute_structural_cache(
                         [td2_newick_final]
                     )[0]
-
+                    # print(b_idx, "Topology changed, updating token cache.")
+                    # import pdb;pdb.set_trace()
                     token_cache.update(b_idx, new_item)
 
                 new_trees.append(td2)
@@ -832,6 +834,7 @@ class TrainingModule(LightningModule):
         nexus_filepath = batch["nexus_filepaths"][0]
         id = batch["ids"][0]
         mapping = batch["mappings"][0]
+        seq_ordering_map = batch["sequence_ordering_maps"][0]
 
         if train:
             real_trees = self.dataset.dataset_train.return_posterior_trees(id)
@@ -841,7 +844,25 @@ class TrainingModule(LightningModule):
             num_leaves = self.dataset.dataset_val.return_number_leaves(id)
 
         if len(real_trees) > num_samples:
-            real_trees = random.sample(real_trees, num_samples)
+            pot_real_trees = random.sample(real_trees, num_samples)
+        else:
+            pot_real_trees = real_trees
+
+        sanity_check = self.dataset.dataset_train.sanity_check if train else self.dataset.dataset_val.sanity_check
+        
+        real_trees = []
+        for i in pot_real_trees:
+            t_real = EteTree(i, format=1)
+            for leaf in t_real.get_leaves():
+                name = leaf.name
+                # direct match (most likely)
+                if name in seq_ordering_map:
+                    leaf.name = seq_ordering_map[name]
+                else:
+                    import pdb; pdb.set_trace()
+                    raise Exception("Leaf name in real tree not found in original names map!")
+            real_trees.append(t_real.write(format=1))
+
 
         for i in real_trees:
             if has_polytomy_fast(i):
@@ -859,12 +880,38 @@ class TrainingModule(LightningModule):
         num_polytomies_resolved = []
 
         for _ in tqdm(range(num_samples)):
-            rt = Tree(num_leaves=num_leaves, random=True)
-            starting_tree = str(rt)
+            # rt = Tree(num_leaves=num_leaves, random=True)
+            # starting_tree = str(rt)
+            if train:
+                starting_tree = self.dataset.dataset_train.sample_random_tree(
+                    real_trees[0]
+                )
+            else:
+                starting_tree = self.dataset.dataset_val.sample_random_tree(
+                    real_trees[0]
+                )
+            
+            #Now remap the random tree to make the indices match up with the real tree
+            t_random = EteTree(starting_tree, format=1)
+
+            for leaf in t_random.get_leaves():
+                name = leaf.name
+                # direct match (most likely)
+                if name in seq_ordering_map:
+                    leaf.name = seq_ordering_map[name]
+                else:
+                    import pdb; pdb.set_trace()
+                    raise Exception("Leaf name in random tree not found in original names map!")
+            starting_tree = t_random.write(format=1)
+
+            #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
+            timepoint = random.uniform(0, 1)
+
             starting_trees_nw.append(starting_tree)
             sampled_tree, n_topology_changes, avg_max_logit, avg_polytomy_size, n_polytomies_resolved = self.sample(
                 [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
             )
+            
             avg_polytomy_sizes.append(avg_polytomy_size)
             num_polytomies_resolved.append(n_polytomies_resolved)
 
@@ -881,13 +928,18 @@ class TrainingModule(LightningModule):
 
             # Now do something with the sampled tree and the real trees
             sampled_trees.append(sampled_tree)
+            if sanity_check:
+                break
+
+        if sanity_check:
+            sampled_trees = sampled_trees*num_samples
 
         sampled = [
             number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, True)
             for i in sampled_trees
         ]
         posterior_trees = [
-            number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, False)
+            number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, True)
             for i in real_trees
         ]
         starting_named = [

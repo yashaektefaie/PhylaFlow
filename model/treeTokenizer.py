@@ -24,8 +24,8 @@ class BatchedStructuralCache:
         for c in caches:
             # Token count = node_num + edge_num
             total_tokens = c["static_tokens"].size(0)
-            self.max_tokens = max(self.max_tokens, total_tokens)
-            self.max_edges = max(self.max_edges, c["edge_num"])
+            self.max_tokens = max(self.max_tokens, total_tokens)+100
+            self.max_edges = max(self.max_edges, c["edge_num"])+100
 
         # Pre-allocate batched tensors
         self.static_tokens = torch.zeros(
