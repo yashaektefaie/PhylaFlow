@@ -612,7 +612,11 @@ class TrainingModule(LightningModule):
             dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
             # Experimenting here, dt_hit_global is not a good metric we just jump, jump, jump, so why not use dt_base
             dt = min(dt_base, dt_hit_global, T - t)
-            #dt = min(dt_base, T - t)
+            
+            if dt < 2e-4:
+                dt = 2e-4
+
+            # dt = min(dt_base, T - t)
             if dt <= 0:
                 dt = min(dt_base, T - t)
 
@@ -744,7 +748,11 @@ class TrainingModule(LightningModule):
                                         raise Exception("Not possible to merge into a split that already exists...")
                                     else:
                                         # New length is average of merged splits
-                                        td2[new_split] = 1e-3
+                                        curr_lens = list(td2.values())
+                                        if len(curr_lens) > 0:
+                                            td2[new_split] = float(np.median(curr_lens))
+                                        else:
+                                            td2[new_split] = 1e-3
                                     top_change = True
                                     logger.info("Merge performed time to break out")
                                     num_merges += 1
@@ -768,7 +776,12 @@ class TrainingModule(LightningModule):
                             new_split = int(sm_i) | int(sm_j)
 
                             if new_split not in td2:
-                                td2[new_split] = 1e-3  # tiny length
+                                # td2[new_split] = 1e-3  # tiny length
+                                curr_lens = list(td2.values())
+                                if len(curr_lens) > 0:
+                                    td2[new_split] = float(np.median(curr_lens))
+                                else:
+                                    td2[new_split] = 1e-3
                             else:
                                 # import pdb; pdb.set_trace()
                                 raise Exception("Not possible to merge into a split that already exists...")
@@ -821,7 +834,7 @@ class TrainingModule(LightningModule):
             for td, n_leaves, mapp in zip(trees, num_leaves, mapping)
         ], num_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0, avg_polytomy_size, len(polytomy_sizes)
 
-    def sample_compare(self, batch, train=True, num_samples=100, dt=0.02, save=True):
+    def sample_compare(self, batch, train=True, num_samples=1, dt=0.02, save=True):
         nexus_filepaths = batch["nexus_filepaths"]
         tree_paths = batch["tree_paths"]
         ids = batch["ids"]
@@ -892,17 +905,18 @@ class TrainingModule(LightningModule):
                 )
             
             #Now remap the random tree to make the indices match up with the real tree
-            t_random = EteTree(starting_tree, format=1)
+            # t_random = EteTree(starting_tree, format=1)
 
-            for leaf in t_random.get_leaves():
-                name = leaf.name
-                # direct match (most likely)
-                if name in seq_ordering_map:
-                    leaf.name = seq_ordering_map[name]
-                else:
-                    import pdb; pdb.set_trace()
-                    raise Exception("Leaf name in random tree not found in original names map!")
-            starting_tree = t_random.write(format=1)
+            # for leaf in t_random.get_leaves()d
+            #     name = leaf.name
+            #     # direct match (most likely)
+            #     if name in seq_ordering_map:
+            #         leaf.name = seq_ordering_map[name]
+            #     else:
+            #         pass
+            #         # import pdb; pdb.set_trace()
+            #         # raise Exception("Leaf name in random tree not found in original names map!")
+            # starting_tree = t_random.write(format=1)
 
             #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
             timepoint = random.uniform(0, 1)
@@ -1451,9 +1465,9 @@ class TrainingModule(LightningModule):
             # ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
 
             if self.global_step % self.training_sampling_frequency == 0:
-                # Moving to 10 samples so we can move faster
+                # Moving to 1 sample so we can move faster
                 metrics = self.sample_compare(
-                    batch, train=True, num_samples=10, dt=self.dt
+                    batch, train=True, num_samples=1, dt=self.dt
                 )
                 for k, v in metrics.items():
                     self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
