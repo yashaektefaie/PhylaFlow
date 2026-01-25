@@ -217,7 +217,7 @@ class TreeDataset(Dataset):
         t_random = EteTree(random_tree, format=1)
 
         for leaf in t_random.get_leaves():
-            name = leaf.name
+            name = str(int(leaf.name)+1)
             # direct match (most likely)
             if name in seq_ordering_map:
                 leaf.name = seq_ordering_map[name]
