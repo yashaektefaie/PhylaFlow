@@ -229,6 +229,15 @@ class TreeDataset(Dataset):
 
         random_tree = random_tree # Already normalized
 
+        for leaf in t_random.get_leaves():
+            name = str(int(leaf.name)+1)
+            # direct match (most likely)
+            if name in seq_ordering_map:
+                leaf.name = seq_ordering_map[name]
+            else:
+                import pdb; pdb.set_trace()
+                raise Exception("Leaf name in random tree not found in original names map!")
+        random_tree = t_random.write(format=1)
 
         #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
         timepoint = random.uniform(0, 1)
