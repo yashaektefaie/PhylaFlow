@@ -125,6 +125,27 @@ def _worker_newick_parser(tree_str):
         # Assuming run in same process or serialized
         t = tree_str
 
+    try:
+        t.unroot()
+    except:
+        pass
+
+    # Canonicalize tree topology
+    for node in t.traverse("postorder"):
+        if node.is_leaf():
+            try:
+                sort_val = int(node.name)
+            except ValueError:
+                sort_val = float('inf')
+        else:
+            if node.children:
+                sort_val = min(getattr(c, "sort_val", float('inf')) for c in node.children)
+            else:
+                sort_val = float('inf')
+        node.add_feature("sort_val", sort_val)
+    
+    t.sort_descendants(attr="sort_val")
+
     # Postorder traversal and index assignment
     nodes = list(t.traverse("postorder"))
 
