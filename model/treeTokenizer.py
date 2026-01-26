@@ -118,6 +118,7 @@ def _worker_newick_parser(tree_str):
             tree_str = tree_str.replace("C(0)", '"C"')
         try:
             t = EteTree(tree_str, format=1, quoted_node_names=True)
+
         except Exception as e:
             # Fallback or re-raise
             raise ValueError(f"Failed to parse newick: {tree_str[:50]}...") from e

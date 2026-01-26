@@ -95,6 +95,9 @@ class TrainingModule(LightningModule):
         self.training_sampling_frequency = training_sampling_frequency
         self.num_samples = num_samples
         self.dt = dt
+        self.train_tokenized_trees = None
+        self.train_batched_time = None
+        self.train_tree = None
 
         self.automatic_optimization = False
         self.deepspeed = deepspeed
@@ -234,6 +237,17 @@ class TrainingModule(LightningModule):
                 batch["batched_time"],
                 batch["phyla_embeddings"],
             )
+            if self.train_tokenized_trees is None:
+                self.train_tokenized_trees = batch["tokenized_trees"]
+                self.train_batched_time = batch["batched_time"]
+                self.train_tree = batch["original_trees"]
+            else:
+                if calculate_norm_rf(batch['original_trees'][0], self.train_tree[0]) != 0:
+                    raise Exception("Training tree topology changed during training!")
+                elif not torch.equal(batch["tokenized_trees"][0], self.train_tokenized_trees[0]):
+                    import pdb; pdb.set_trace()
+                    raise Exception("Training tokenized trees changed during training!")
+
             velocity_labels = batch["batched_velocity"]
             num_leaves = batch["num_leaves"]
             gathered_velocity_labels = []
@@ -498,6 +512,8 @@ class TrainingModule(LightningModule):
         KNN_STOCHASTIC = False,
     ):
 
+        gt = {158475818957369961082530037760: -0.731665585828483, 158475667841642509253883199488: -0.8988413538718826, 10633823966279326983232708282056441856: -0.20368586326845434, 1297036692682702848: -0.3243564495114172, 5575186299632658880234027781612846343782404: -0.9639204068620865, 5575186310017411073122640408634921532260356: -0.3617431909844142, 5575186299632817356052985151573928873820164: -0.2374435317663224, 5575186299632658261264008138922708894220292: -0.9530019126275265, 18446744074246422528: -0.8388591808965112, 65544: -0.5665090723740024, 22300787733826488258843651194474290477006848: -0.9668680615080342, 2475880078570760618517725188: -0.7128061942398058, 2475880078570760549798248452: -0.772267216617224, 11417981562915327060255522087960440916031832064: -0.4042325641560731, 324518558494130005241672719400960: -0.9457872127340289, 664616533193658392910706523548680192: -0.5935464640962718, 85070601871439417691678863969006649344: -0.8163518920011775, 8921691884004065057751092743946531545399955472: -0.8521763419591382, 85070591730234615865843651995381006336: -0.42188566856064574, 41538394830061755369703031248519184: -0.8722759036024446, 41538394830061755369700832225263632: -0.943427003370581, 21267648011789234332364479824969859072: -0.42183774649226297, 10531000427382356270486649808269054939506982384: -0.7628027356450618, 21267647932561071818100142231425908736: -0.13824650750562706, 41538394830061754793240079921840144: -0.8933152510491086, 41538394830061754793240075626872848: -0.5424099000895698, 12131605409268307000784665072685206076409511936: -0.473487549064635, 11417981562915327060255522087960458508218138624: -0.13048199853398915, 21267647932561071818100142222834925568: -0.4277263676151904, 9223372036854775808: -0.371460974, 21267647932558653966460912964485513216: -0.27606764000000006, 51539607552: -0.789158584543765, 53687091200: -0.317142353850169, 170141345719746060945050695293894393856: -0.1265256327378287, 19961783133764987308900089856: -0.9987741288279605, 19961783133476756932748378112: -0.2628487926438454, 170141345719746060954278570930376540160: -0.9571014370828996, 170141345719746060954274067330749169664: -0.597181905893513, 40564819207303340847894502572064: -0.702835855676214, 274877906944: -0.5316655200000001, 41538374868278621028243970633760768: -0.20280910000000002, 8: -0.6586848399999999, 18446744073709551616: -0.89584757, 42535295865117307932921825928971026432: -0.9283643950000001, 174224571863520493293247799005065324265472: -0.5858926, 32768: -0.8984007, 75557863725914323419136: -0.6043512860000001, 89202980794122492567351798982300853608644608: -0.45812724834873847, 12132128094968697343021699179901705138849710080: -0.7752943077886116, 12132128094968697343021699179901704589093896192: -0.15526474870771043, 12132128094968697338069939022760183489497399296: -0.7437469847521373, 181193554738061313024977710965267937236090880: -0.8185402555711767, 12131779645824970297083352527162173358848868352: -0.7684066502166266, 1298074214633706907132624082829312: -0.13632247594001465, 2787593149816327892691964784081045188247552: -0.6313335999999999, 1208925819614629174706176: -0.97317216, 2: -0.5371667999999999, 4611686018427387904: -0.3274074, 10633823966279326983230456482242756608: -0.7173280900000001, 8590983168: -0.2524487730929251, 340282366920938463464671644124450930688: -0.49503663912851253, 10889035741470030830827987437816582766592: -0.93938013, 4722366482869645213696: -0.13801422000000002, 147573952589676412928: -0.7063541000000001, 340282366920938463463374607431768211456: -0.20999499000000002, 64: -0.19947929999999997, 65536: -0.4950193, 348449143727040986586495598010130648530944: -0.8495285450000002, 33451500615458731910139791480672384360398848: -0.752089247054739, 33451500615458730672199752195292109461274624: -0.43837647874383656, 22301128016193409197307115866118414927937536: -0.4936575036071044, 151115727451828646838272: -0.131550556, 1427971984477040136297538520139641290835894624: -0.2499925784297261, 1427971984477040136297538520139641290827506016: -0.9558975449836806, 1125899906842624: -0.3353244, 2596148429267413814265248164610048: -0.35068829970000004, 1427274915959970654148228735669644149578006560: -0.5444269299889422, 41538374868278621028252766726782992: -0.8406278748947806, 8796093022224: -0.8811318992931401, 16: -0.42314170000000006, 36893488147419103232: -0.7664290000000001, 85070591730234615865843651857942052864: -0.660053212, 20769187434140491141771500015583232: -0.2215423043276592, 20769187434140491105742702996619264: -0.1647015821585011, 20769187434140491105742702728183808: -0.14822959293044752, 2722258935367507707706996859454145691648: -0.39281836300000006, 1180591620717411303424: -0.6707895148, 512: -0.8312887399999999, 10633823966279402541096434196379860992: -0.6911298858840041, 664613997892457936451903530142269440: -0.4648114319175766, 11150372599265311570767859136324180752990208: -0.48775007000000004, 4835703278458516698824704: -0.41556431, 2097152: -0.7364710000000001, 1329552514382095629136716866590343168: -0.7096948819956518, 324518597179756232909806309998592: -0.31729109810505934, 696898370530831709732594436453324963192896: -0.3267846636789428, 1427274915959971287973528997358297487606022176: -0.24884675157384795, 4: -0.37704762, 1297036692682719232: -0.3615048844788768, 5070602438691849468944041639936: -0.2688695683901745, 37778931862957228818432: -0.7454440447960716, 87112285931760246646623899502532662132736: -0.2107455, 37778931862957161709568: -0.475919, 16384: -0.4408901, 649037107316853453566312041152512: -0.6217387369999999, 87112285931760246646623899502532662132864: -0.358355172613539, 22969768235052654921127055246504582040609357824: -0.7487449744916324, 22880565254258532428559703447522281187000713216: -0.9486748980724731, 5192296858544272361496235619647488: -0.405831922649313, 3211307308588409732381143431261364056861184000: -0.3901462842337679, 356811923176489970264571492362373784095690752: -0.702716195388327, 5708990770823839524233446109252884202824663040: -0.7288599401511386, 131072: -0.0835494, 302231454903657293676544: -0.8648667400000001, 3212701110480231147117753133498315792256602112: -0.7134704961369555, 8921691881304070671351199242751199995081265152: -0.28782847889949814, 696898287454081973172991196020261297061888: -0.37211505, 2722258935367507707706996859454145691650: -0.7122678160587917, 295147905179352825856: -0.3938135, 680564733841876926926749214863536422912: -0.90725928, 4096: -0.96656028, 87112285931760246646660792990680081236096: -0.24327849190616255, 21778071482940061661655974875633165533184: -0.2688333, 9444732965739290427392: -0.21709334799999996, 2199023255552: -0.528400094, 5070602400912917605986812821504: -0.16108004, 33500768662435011191613705054773636980116340208: -0.9970736264737174, 33500768662435011191613705054773636980116340720: -0.7993039639208753, 128: -0.31548456739999997, 19807040628566084398385987584: -0.5122394, 4503599627370496: -0.09382170000000001, 18014398509481984: -0.218547123, 8589934592: -0.893909, 2305843009213693952: -0.8655166, 5192296858534827628530496329220096: -0.6328248799999999, 140737488355328: -0.15824300000000002, 20769187434139310514121985316880384: -0.9824172999999999, 309485009821345068728975360: -0.9318898825125838, 170141183460469231731687303715884105728: -0.6956975200000001, 73786976294838206464: -0.2634304, 33500768662437607340042972468587902228281016312: -0.16033868696927603, 33500768662435011191613705054773636980116406264: -0.19914292170543108, 32: -0.92875739, 1024: -0.6786740000000001, 2361183241434822606848: -0.845891492, 89202980794122492566142873162686224433938432: -0.4703248939481339, 89202980794122492566142873162651040061849600: -0.9615993304838134, 20599322253708728900222424449024: -0.5947816016441211, 20282409603651671549847174905856: -0.19076486471783796, 87112285931760246646734579966974919442560: -0.768112570858982, 20282409603651670423947268063232: -0.34382355583823504, 89202980794122492566142873090593446023921664: -0.8101786700000001, 38685626227668133590597632: -0.77295635, 16777216: -0.18239849, 12132130817227632710529425776364566440320434178: -0.608841057288808, 10655247261423298577541240952478236672: -0.23006057998971813, 11984799775805394206677957819068579840: -0.15721375947538477, 178405961588244985132285746181186892047843328: -0.9518266, 77371252455336267181195264: -0.24614069200000002, 33554432: -0.876750338, 87197356533631686064426258830943926091904: -1.0006733544373776, 4398046511104: -0.5591561, 8921779081360598689437157170205362489326047376: -0.44015310322655926, 8921691881345609066181260998120903026329784336: -0.5744778740366061, 67108864: -0.8186042699999999, 356811923176489970264571492362373784095686656: -0.7472491, 154742504910672534362390528: -0.46924256000000003, 524288: -0.14976057, 12132130817227632710529406886898564592995401730: -0.2496524105666533, 309485600117155427434627072: -0.3316258096861924, 83076749736557242056487941267529728: -0.6546566371556344, 309490322483638297079840768: -0.6292476882962794, 1361129488283076107562227329949497294848: -0.7740742897783631, 12250663690251526281842553695413718746112: -0.25211205773482903, 43556142965880200694564405087533512294400: -0.44196607556109313, 17592186306560: -0.1634280114481001, 11150372599265321474892636329173694533337088: -0.6056767722632457, 11150372599265311571372322046131495340343296: -0.1367493995095094, 43556142965880123323311949751266331099136: -0.8309685455821875, 12132130817227632710838916103459890755827793922: -0.3286819489546425, 256: -0.7355025, 1361129467683753853853498429727072845824: -0.5540848, 1267650600228229401496703205376: -0.79602339, 633825300114114700748351602688: -0.299743783, 22835963083295358136546656770638941187364356096: -0.6694938576309417, 281474976710656: -0.32151630000000003, 162259276829213363391578010288128: -0.88759204, 2535301200456458802993406410752: -0.6936673600000001, 10141204801825835211973625643008: -0.78936662, 39614081259438011805985669120: -0.9517860424141675, 549755813888: -0.24018540000000002, 20282409603651670423947251286016: -0.5571252999999999, 8192: -0.95794727, 713623846352979940529142984724747568191373312: -0.355079858, 309485009821345068724781056: -0.25884663, 134217728: -0.19717553, 1393801891821414736609702236951735395418112: -0.6279203871408506, 1393801891820147086009474007550238692212736: -0.485396703169406, 8388608: -0.9310123100000001, 44601490397061246283071436545296723011960832: -0.6926529000000001, 536870912: -0.8547623, 2854495385411919762116571938898990272765493248: -0.65608285, 1237940039285380274899124224: -0.9263920899999999, 4194304: -0.2863618, 22300745198530623141535718272648361505980416: -0.4088007, 9671406556917033397649408: -0.60181799, 262144: -0.10429302, 1393796574908163946345982392040522594123776: -0.277364, 1427274915295313556135363039418089731526754304: -0.42476157175087637, 1427274915295313556135363039418089677839663104: -0.737310793889599, 316912650057057350375249543168: -0.6962051657849782, 1073741824: -0.0916866, 44601490398440450136119750134125136099934208: -0.615230327959706, 44601490398359320497705143452429347094790144: -0.4036354465174233, 2475880078570760549798248448: -0.32329020810000003, 27222589353675077077069968594541456916480: -0.7035646769755317, 5708990770823839524233143877797980545530986496: -0.18182857, 590295810358705651712: -0.554357439, 12132130817227632710529425776364566440320565250: -0.6404433106913857, 1427275086101317007729261358193786550891839520: -0.5483040745247466, 1427275086101317007719589951636869517494190112: -0.14742938559435922, 1427275086101317007719589951636868417982562336: -0.38830548251977737, 2417851639229258349412352: -0.6845067, 1048576: -0.5319881000000001, 5575186299632655785383929568162090376495104: -0.3870277, 696898375723128568276866797949560582840640: -0.6298979055769853, 8796093022208: -0.54615, 9007199254740992: -0.5657858, 144115188075855872: -0.4783032, 1099511627776: -0.15149364, 1329227995784915872903807060280344576: -0.567620313, 576460752303423488: -0.6845397999999999, 2048: -0.95081954, 10384593717069655257060992658440192: -0.49213039000000003, 12132130817227632710529425776364496071576256514: -0.8907233515522223, 5444517870735015415413993718908291383296: -0.5986911520000001, 43556142965880123323311949751266331066368: -0.77128803, 2147483648: -0.18069213, 11417981541647679048466287755595961091061972992: -0.9390782999999999, 4951760157141521099596496896: -0.24220397999999999, 18889465931478580854784: -0.9797005500000001, 12250165229753106938390214767766080061440: -0.4729157109932202, 39614081257132168796771975168: -0.27499411999999995, 12132130817227632710529425780976252458747953154: -0.9095502259197155, 17179869184: -0.46371051, 5316911983139663491615228241121378304: -0.40179855000000003, 288230376151711744: -0.5714318799999999, 36028797018963968: -0.3921306, 34359738368: -0.0639124, 696898287454081973175352379965383695663168: -0.5930554063873374, 696898287454081973175352379261696253886528: -0.13810612990336243, 2361183241434956824640: -0.5926955985703701, 2361183241434822606912: -0.27712471422144497, 79228162514264337593543950336: -0.92442973, 12250331383252580052874327743648648659968: -0.6977918703207109, 12250331383252580052874327743648615105536: -0.15084700393496248, 12250165229753106938390214767766080062464: -0.5330723855527605, 1298074214633706907132624082305024: -0.98062812, 562949953421312: -0.6878934999999999, 10655242190820859885691772008436596736: -0.5252614535752409, 10654593153713543032238205696395444224: -0.5203146689389152, 5316911983139663491615509716098088960: -0.8332862440965919, 332306998946228968225951765070086144: -0.139575868, 2251799813685248: -0.93207731, 2658455991569831745825628519070171136: -0.5627937981158709, 166153499473114484112975882535043072: -0.26980696000000004, 83076749736557242056487941267521536: -0.90755406, 1152921504606846976: -0.59735567, 72057594037927936: -0.6106075100000001, 664613997892457936451903530140172288: -0.49048681, 2658455991569831745807614120560689152: -0.8239110900000001, 158456325028528675187087900672: -0.8376991119999999, 68719476736: -0.7228846600000001, 17592186044416: -0.15298233, 5192296858544272361496235619647744: -0.17328533605422589, 12131779633840170521277958320484215539780288512: -0.6933046330050417, 12131779633840170521277958320484211141733777408: -0.1537968872579432, 40564819207303340847894502572032: -0.6992508000000002, 22835963083295358096932575511200929381378686976: -0.1962921374209446, 4294967296: -0.44879330000000006, 22835963083295358096932575511191922182123945984: -0.29888729999999997, 9903520314283042199192993792: -0.44313440000000004, 1427274915295354120954570342758937626029326368: -0.35556344696422204, 35184372088832: -0.80611311, 81129638414606681695789005144064: -0.8535050000000001, 268435456: -0.8734498, 618970019642690137449562112: -0.42264314999999997, 1427247692705959881058285969449495136382746624: -0.6877839499999999, 19342813113834066795298816: -0.9763735802000001, 12250663690251526281842553695413718748160: -0.5875888014578358, 45632899479665240050881888572047792984108810234: -0.7907101120053491, 22880564573693798586682776520773066323464290304: -0.19299567942349613, 70368744177664: -0.1368941, 696898375723128568277161945854739935666496: -0.6592243905122367, 137438953472: -0.6771687, 316912650057057350374175801344: -0.87581393, 604462909807314587353088: -0.137097543, 1427274915959971287973528849784344897929609248: -0.9716313969391362, 9103028442905316134189111288129413648671087760: -0.10617014865176422, 9102984886762350253988416723724326115158793360: -0.7267591724511383, 9102984886762350253988416723724325840280886416: -0.2794603883653689, 8921791332024288940963439012759057903044795536: -0.21991407944129673, 324518553658426726783156020576256: -0.33176211, 45666350980280698782792028363528465368469209082: -0.7310239660354657, 45671926166590716193865151003937100290001469438: -0.17020763288696578, 703687441776640: -0.6406324161906625}
+
         self.model.eval()
         max_logits = []
 
@@ -532,7 +548,15 @@ class TrainingModule(LightningModule):
         # Since topology changes in the loop, we will update this cache dynamically
         # Initialize tokenized structure cache
         current_newicks = list(newick_starting_trees)
-        token_cache = self.model.tokenizer.create_batched_cache(current_newicks)
+        #token_cache = self.model.tokenizer.create_batched_cache(current_newicks)
+        tokenized = self.dataset.tree_tokenizer(current_newicks[0])
+        new_tokenized = ()
+        for i in tokenized:
+            if torch.is_tensor(i):
+                new_tokenized += (i.to(self.device),)
+            else:
+                new_tokenized += (i,)
+
 
         for nw in newick_starting_trees:
             t = Tree(nw)
@@ -555,11 +579,21 @@ class TrainingModule(LightningModule):
             # --- encode/tokenize current trees for the model ---
 
             # Use CACHED tokenizer
-            tokenized = self.model.tokenizer.forward_batched(token_cache, trees)
+            #tokenized = self.model.tokenizer.forward_batched(token_cache, trees)
+            #import pdb; pdb.set_trace()
 
+            # if calculate_norm_rf(current_newicks[0], self.train_tree[0]) != 0:
+            #     raise Exception("Current tree does not match training tree topology!")
+            # import pdb; pdb.set_trace()
+            # if tokenized[0].shape[1] != self.train_tokenized_trees[0].shape[1]:
+            #     raise Exception("Tokenized tree length mismatch!")
+            # elif (new_tokenized[0] == tokenized[0]).all().item() is False:
+            #     raise Exception("Tokenized trees do not match!")
+            
+ 
             with torch.no_grad():
                 velocity, edge_splits, edge_split_mask = self.forward(
-                    tokenized, t, phyla_embeddings
+                    self.train_tokenized_trees, t, phyla_embeddings
                 )
 
             # ---- FIRST PASS: compute per-tree dt_hit, cache per-tree arrays ----
@@ -576,15 +610,32 @@ class TrainingModule(LightningModule):
                 L = []
                 V_val = []
                 masks = []
+                pred_velocity_dict = {}
+                gt_vel_diff = []
 
                 for m in td:
                     if m not in model_masks:
                         # WE GOTTA FIX THIS LOL
-                        print(f"Whoa there is a split missing in velocity masks! {m}")
+                        print(f"Whoa there is a split missing in velocity masks! {m} or {[i for i in range(m.bit_length()) if (m >> i) & 1]}")
                     else:
                         L.append(td[m])
-                        V_val.append(V[mask_idx[m]])
+
+                        #We should not be making moves based on leafs! If leaf, velocity is 0
+                        if m.bit_count() == 1:
+                            V_val.append(0.0)
+                        else:
+                            V_val.append(V[mask_idx[m]])
+
                         masks.append(m)
+                        pred_velocity_dict[m] = V[mask_idx[m]]
+                
+                for item in pred_velocity_dict:
+                    if item in gt:
+                        gt_vel_diff.append(pred_velocity_dict[item] - gt[item])  # Ground truth velocity is 0 for all edges
+                    else:
+                        print(f"Missing ground truth for edge {item} split {[i for i in range(item.bit_length()) if (item >> i) & 1]}")
+                mse = np.mean(np.square(gt_vel_diff))
+                import pdb; pdb.set_trace()
 
                 V = np.array(V_val, dtype=np.float64)
                 L = np.array(L, dtype=np.float64)
@@ -632,24 +683,25 @@ class TrainingModule(LightningModule):
                 model_masks = edge_splits[b_idx]
                 # --- advance ---
                 L_new = L + dt * V
-
+                import pdb; pdb.set_trace()
+                
                 # treat as boundary if we stepped past the first hit time for THIS tree
                 # (float equality with hit_tol=1e-10 is too strict)
                 hit_boundary = (np.isfinite(dt_hit) and dt >= dt_hit) or (L_new <= eps_len).any()
 
-                # # Did we hit boundary this step?
-                # hit_boundary = (abs(dt - dt_hit) <= hit_tol) or (L_new <= eps_len).any()
+                if hit_boundary and np.isfinite(dt_hit):
+                    # Batch near-simultaneous hits (numerical simultaneity)
+                    eta = 0.01  # relative tie threshold (1%)
+                    eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
+                    idx_neg = np.where(neg)[0]
 
-                # if hit_boundary and np.isfinite(dt_hit):
-                #     # Batch near-simultaneous hits (numerical simultaneity)
-                #     eta = 0.01  # relative tie threshold (1%)
-                #     eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
+                    dt_min = dt_candidates.min()
+                    eta = 0.02          # relative window
+                    c = 2.0             # absolute window in *steps*
+                    eps_abs = c * dt_base
 
-                #     batch = (dt_candidates <= dt_hit * (1.0 + eta)) | (dt_candidates <= dt_hit + eps_abs)
-
-                #     # If we overshot (dt > dt_hit), L_new for those edges will be <= 0 anyway.
-                #     # Force exactly 0 for batched edges and anything numerically tiny.
-                #     L_new[neg][batch] = 0.0
+                    batch = (dt_candidates <= dt_min * (1 + eta)) | (dt_candidates <= dt_min + eps_abs)
+                    L_new[idx_neg[batch]] = 0.0
                 
                 L_new[L_new < eps_len] = 0.0
 
@@ -706,90 +758,92 @@ class TrainingModule(LightningModule):
                             # Track polytomy size
                             polytomy_sizes.append(len(output["splits_represented"]))
                             
-                            if torch.sigmoid(output["polytomy_pred"]).item() > 0.5 or len(logit_outputs) == 1:
+                            # if torch.sigmoid(output["polytomy_pred"]).item() > 0.5 or len(logit_outputs) == 1:
                             #else:
-                                logits = output["logits"]
-                                G = logits.size(0)
-                                mask = ~torch.eye(
-                                    G, dtype=torch.bool, device=logits.device
-                                )  # off-diagonal only
+                            logits = output["logits"]
+                            G = logits.size(0)
+                            mask = ~torch.eye(
+                                G, dtype=torch.bool, device=logits.device
+                            )  # off-diagonal only
 
-                                # optionally only use one triangle (avoid double-counting symmetric pairs)
-                                tri = torch.triu(mask, diagonal=1)
-                                ii, jj = torch.triu_indices(G, G, offset=1, device=logits.device)
+                            # optionally only use one triangle (avoid double-counting symmetric pairs)
+                            tri = torch.triu(mask, diagonal=1)
+                            ii, jj = torch.triu_indices(G, G, offset=1, device=logits.device)
 
-                                logits_vec = logits[tri]
-                                finite = torch.isfinite(logits_vec)
-                                if finite.sum() == 0:
-                                    res = None
-                                else:
-                                    logits_vec_f = logits_vec[finite]
-                                    ii_f, jj_f = ii[finite], jj[finite]
-                                    k = torch.argmax(logits_vec_f)
-                                    i, j = ii_f[k].item(), jj_f[k].item()
-                                    res = [i, j]
-                                    
-                                if res is None:
-                                    logger.info("No merges found!")
-                                else:
-                                    logger.info(f"Merges found: {res}")
-                                    # import pdb; pdb.set_trace()
-                                    split_masks = [
-                                        output["splits_represented"][idx]
-                                        for idx in res
-                                    ]
-                                    new_split = 0
-                                    for sm in split_masks:
-                                        new_split |= sm
-
-                                    if new_split in td2:
-                                        # import pdb; pdb.set_trace()
-                                        logger.info("Whoa already in there!")
-                                        raise Exception("Not possible to merge into a split that already exists...")
-                                    else:
-                                        # New length is average of merged splits
-                                        curr_lens = list(td2.values())
-                                        if len(curr_lens) > 0:
-                                            td2[new_split] = float(np.median(curr_lens))
-                                        else:
-                                            td2[new_split] = 1e-3
-                                    top_change = True
-                                    logger.info("Merge performed time to break out")
-                                    num_merges += 1
-                                    n_events += 1
-                                    num_topology_changes += 1
-
-                                    break
-                        
-                        if not top_change:
-                            logger.info("No more merges possible, pick a random polytomy and do a KNN merge")
-                            output = random.choice(logit_outputs)
-                            split_embeddings = output['group_embeddings']
-                            group_represented = output['splits_represented']
-
-                            if len(group_represented) != split_embeddings.size(0):
-                                raise Exception("Whoa size mismatch between groups and split embeddings")
-                            
-                            i, j = _pick_knn_pair(split_embeddings, topM=KNN_TOPM, tau=KNN_TAU, stochastic=KNN_STOCHASTIC)
-
-                            sm_i, sm_j = group_represented[i], group_represented[j]
-                            new_split = int(sm_i) | int(sm_j)
-
-                            if new_split not in td2:
-                                # td2[new_split] = 1e-3  # tiny length
-                                curr_lens = list(td2.values())
-                                if len(curr_lens) > 0:
-                                    td2[new_split] = float(np.median(curr_lens))
-                                else:
-                                    td2[new_split] = 1e-3
+                            logits_vec = logits[tri]
+                            finite = torch.isfinite(logits_vec)
+                            if finite.sum() == 0:
+                                res = None
                             else:
+                                logits_vec_f = logits_vec[finite]
+                                ii_f, jj_f = ii[finite], jj[finite]
+                                k = torch.argmax(logits_vec_f)
+                                i, j = ii_f[k].item(), jj_f[k].item()
+                                res = [i, j]
+                                
+                            if res is None:
+                                logger.info("No merges found!")
+                            else:
+                                logger.info(f"Merges found: {res}")
                                 # import pdb; pdb.set_trace()
-                                raise Exception("Not possible to merge into a split that already exists...")
+                                split_masks = [
+                                    output["splits_represented"][idx]
+                                    for idx in res
+                                ]
+                                new_split = 0
+                                for sm in split_masks:
+                                    new_split |= sm
+                                
+                                to_print = [i for i in range(new_split.bit_length()) if (new_split >> i) & 1]
+                                logger.info(f"Merging splits {split_masks[0]}, {split_masks[1]} to create this split {new_split}: {to_print}")
 
-                            top_change = True
-                            num_merges += 1
-                            n_events += 1
-                            num_topology_changes += 1
+                                if new_split in td2:
+                                    # import pdb; pdb.set_trace()
+                                    logger.info("Whoa already in there!")
+                                    raise Exception("Not possible to merge into a split that already exists...")
+                                else:
+                                    # New length is average of merged splits
+                                    curr_lens = list(td2.values())
+                                    if len(curr_lens) > 0:
+                                        td2[new_split] = float(np.percentile(curr_lens, 10))
+                                    else:
+                                        td2[new_split] = 1e-3
+                                top_change = True
+                                logger.info("Merge performed time to break out")
+                                num_merges += 1
+                                n_events += 1
+                                num_topology_changes += 1
+                                break
+                        
+                        # if not top_change:
+                        #     logger.info("No more merges possible, pick a random polytomy and do a KNN merge")
+                        #     output = random.choice(logit_outputs)
+                        #     split_embeddings = output['group_embeddings']
+                        #     group_represented = output['splits_represented']
+
+                        #     if len(group_represented) != split_embeddings.size(0):
+                        #         raise Exception("Whoa size mismatch between groups and split embeddings")
+                            
+                        #     i, j = _pick_knn_pair(split_embeddings, topM=KNN_TOPM, tau=KNN_TAU, stochastic=KNN_STOCHASTIC)
+
+                        #     sm_i, sm_j = group_represented[i], group_represented[j]
+                        #     new_split = int(sm_i) | int(sm_j)
+
+                        #     if new_split not in td2:
+                        #         # td2[new_split] = 1e-3  # tiny length
+                        #         curr_lens = list(td2.values())
+                        #         if len(curr_lens) > 0:
+                        #             td2[new_split] = float(np.median(curr_lens))
+                        #         else:
+                        #             td2[new_split] = 1e-3
+                        #     else:
+                        #         # import pdb; pdb.set_trace()
+                        #         raise Exception("Not possible to merge into a split that already exists...")
+
+                        #     top_change = True
+                        #     num_merges += 1
+                        #     n_events += 1
+                        #     num_topology_changes += 1
 
 
 
@@ -822,7 +876,6 @@ class TrainingModule(LightningModule):
         #     import pdb; pdb.set_trace()
     
         logger.info(f"Sampling finished in {n_steps} steps. Total events: {n_events}, topology changes: {num_topology_changes}, average polytomy size: {avg_polytomy_size:.2f}")
-
         return [
             build_tree_from_splits(
                 list(td.keys()),
@@ -862,6 +915,7 @@ class TrainingModule(LightningModule):
             pot_real_trees = real_trees
 
         sanity_check = self.dataset.dataset_train.sanity_check if train else self.dataset.dataset_val.sanity_check
+        random_sanity_check = self.dataset.dataset_train.random_sanity_check if train else self.dataset.dataset_val.random_sanity_check
         
         real_trees = []
         for i in pot_real_trees:
@@ -905,18 +959,21 @@ class TrainingModule(LightningModule):
                 )
             
             #Now remap the random tree to make the indices match up with the real tree
-            # t_random = EteTree(starting_tree, format=1)
+            t_random = EteTree(starting_tree, format=1)
 
-            # for leaf in t_random.get_leaves()d
-            #     name = leaf.name
-            #     # direct match (most likely)
-            #     if name in seq_ordering_map:
-            #         leaf.name = seq_ordering_map[name]
-            #     else:
-            #         pass
-            #         # import pdb; pdb.set_trace()
-            #         # raise Exception("Leaf name in random tree not found in original names map!")
-            # starting_tree = t_random.write(format=1)
+            for leaf in t_random.get_leaves():
+                name = leaf.name
+                #Random sanity check to offset by 1
+                if not sanity_check:
+                    name = str(int(leaf.name)+1)
+                # direct match (most likely)
+                if name in seq_ordering_map:
+                    leaf.name = seq_ordering_map[name]
+                else:
+                    import pdb; pdb.set_trace()
+                    raise Exception("Leaf name in random tree not found in original names map!")
+            starting_tree = t_random.write(format=1)
+
 
             #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
             timepoint = random.uniform(0, 1)
@@ -1050,14 +1107,15 @@ class TrainingModule(LightningModule):
         
         avg_num_polytomies_resolved = np.mean(num_polytomies_resolved)
         print(f"Average number of polytomies resolved during sampling: {avg_num_polytomies_resolved}")
-        
+        import pdb; pdb.set_trace()
         if self.record:
             wandb.log(
                 {
-                    "number_of_polytomies_resolved": num_polytomies,
-                    "average_topology_changes": np.mean(num_topology_changes),
-                    "average_max_logits": np.mean(avg_max_logits),
+                    "samples/number_of_polytomies_resolved": num_polytomies,
+                    "samples/average_topology_changes": np.mean(num_topology_changes),
+                    "samples/average_max_logits": np.mean(avg_max_logits),
                     "samples/average_num_polytomies_resolved": avg_num_polytomies_resolved,
+                    "samples/average_polytomy_size": overall_avg_polytomy_size,
                 },
                 step=self.stepper,
             )
@@ -1464,7 +1522,7 @@ class TrainingModule(LightningModule):
 
             # ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
 
-            if self.global_step % self.training_sampling_frequency == 0:
+            if self.global_step >= 500 and self.global_step % self.training_sampling_frequency == 0:
                 # Moving to 1 sample so we can move faster
                 metrics = self.sample_compare(
                     batch, train=True, num_samples=1, dt=self.dt

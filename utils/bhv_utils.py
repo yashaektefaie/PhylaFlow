@@ -191,6 +191,10 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
             G, newick = build_tree_from_splits(list(lengths.keys()), lengths, t1.n_leaves, root_leaf=t1.n_leaves-1, mapping=t1.id_to_name)
             nodes_to_explore = find_polytomy_nodes(G, min_degree=4)
             #components_to_fix = [polytomy_components_at_node(G, i, t1.n_leaves) for i in nodes_to_explore]
+            if 'C_root' in nodes_to_explore:
+                logger.info("Skipping root polytomy node for now")
+                break
+            
             components_to_fix = [leaves_in_component_split(int(i.split('_')[-1]), list(lengths.keys())) for i in nodes_to_explore]
             if sum(len(c) for c in components_to_fix) > 25:
                 logger.info(f"Boundary index {bi}: too many components to fix ({sum(len(c) for c in components_to_fix)}), stopping")
