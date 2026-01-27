@@ -1,4 +1,5 @@
 import random
+import time
 import torch, torch.optim as optim
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities import grad_norm
@@ -13,7 +14,6 @@ import torch
 import sys
 import os
 import torch.nn.functional as F
-from ete3 import Tree as EteTree
 
 # Ensure the current directory is in sys.path to import 'phyla'
 sys.path.append(os.getcwd())
@@ -21,9 +21,9 @@ sys.path.append(os.getcwd())
 from phyla.utils.utils import load_config
 from utils.utils import remove_bit, has_polytomy_fast
 from phyla.eval.evo_reasoning_eval import (
-    Config,
-    load_model,
-    _encode_sequences_openfold_style,
+Config,
+load_model,
+_encode_sequences_openfold_style,
 )
 
 from utils.random_tree import Tree
@@ -35,14 +35,14 @@ find_polytomy_nodes,
 number_to_name_newick,
 has_polytomy_fast,
 resolve_polytomies_random_deterministic,
-_pick_knn_pair
+_pick_knn_pair,
 )
 from utils.metric_utils import (
-    kl_divergence_topological_distributions,
-    split_bipartition_frequency_correlation,
-    compare_likelihood_distributions,
-    compare_branch_length_distributions,
-    calculate_norm_rf,
+kl_divergence_topological_distributions,
+split_bipartition_frequency_correlation,
+compare_likelihood_distributions,
+compare_branch_length_distributions,
+calculate_norm_rf,
 )
 from data.dataset import PhylaDataModule
 from model.model import TreeDenoiserTokenGT
@@ -68,8 +68,9 @@ class TrainingModule(LightningModule):
         deepspeed: bool = False,
         logger=None,
         max_num_timesteps: int = 20,
-        training_sampling_frequency: int = 100,
-        num_samples: int = 100,
+        training_sampling_frequency: int = 200,
+        training_sampling_start: int = 500,
+        num_samples: int = 10,
         dt: float = 0.1,
         # Figure out how to do typing here
         global_splits=None,
@@ -93,6 +94,7 @@ class TrainingModule(LightningModule):
         self.random_trees = random_trees
         self.verbose = verbose
         self.training_sampling_frequency = training_sampling_frequency
+        self.training_sampling_start = training_sampling_start
         self.num_samples = num_samples
         self.dt = dt
 
@@ -218,7 +220,7 @@ class TrainingModule(LightningModule):
                         names.append("unknown")
 
                 embeddings = self.compute_phyla_embeddings(
-                    seqs, names, device=self.device
+                    seqs, names, device=str(self.device)
                 )
                 # Ensure embeddings are (N, D) not (1, N, D)
                 if embeddings.dim() == 3 and embeddings.size(0) == 1:
@@ -291,7 +293,6 @@ class TrainingModule(LightningModule):
             # print("Wow congrats")
             logs["loss"] = loss
             logger.info(f"Velocity loss: {loss.item()}")
-
             if self.record:
                 wandb.log({"train/velocity_loss": loss.item()}, step=self.stepper)
             # import pdb
@@ -388,7 +389,7 @@ class TrainingModule(LightningModule):
                         neg_scores = logits_vec[neg]
                         topk = torch.topk(neg_scores, k=k_neg, largest=True).indices
                         neg = neg[topk]
-
+                    
                     idx = torch.cat([pos, neg])
                     tau = 1.0
                     s = logits_vec[idx] / tau
@@ -413,9 +414,7 @@ class TrainingModule(LightningModule):
 
             for i in found:
                 if not found[i]:
-                    import pdb
-
-                    pdb.set_trace()
+                    import pdb; pdb.set_trace()
                     print(
                         "Missing split: ",
                         [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1],
@@ -426,21 +425,16 @@ class TrainingModule(LightningModule):
 
             if len(chosen_polytomies) > 1:
                 polytomy_logits_tensor = torch.stack(polytomy_logits).squeeze(1)
-                chosen_polytomies_tensor = torch.stack(chosen_polytomies).to(
-                    polytomy_logits_tensor.device
-                )
+                chosen_polytomies_tensor = torch.stack(chosen_polytomies).to(polytomy_logits_tensor.device)
 
                 L_polytomy_choosing = F.binary_cross_entropy_with_logits(
                     polytomy_logits_tensor,
                     chosen_polytomies_tensor,
-                )
+                ) 
 
                 logger.info(f"Polytomy choosing loss: {L_polytomy_choosing.item()}")
                 if self.record:
-                    wandb.log(
-                        {"train/polytomy_choosing_loss": L_polytomy_choosing.item()},
-                        step=self.stepper,
-                    )
+                    wandb.log({"train/polytomy_choosing_loss": L_polytomy_choosing.item()}, step=self.stepper)
 
             L_merging = torch.stack(losses).mean()
             logs["loss"] = L_merging
@@ -450,9 +444,9 @@ class TrainingModule(LightningModule):
             aggregated_metrics = {}
             if len(total_metrics) > 0:
                 for key in total_metrics[0]:
-                    aggregated_metrics[key] = sum(m[key] for m in total_metrics) / len(
-                        total_metrics
-                    )
+                    aggregated_metrics[key] = sum(
+                        m[key] for m in total_metrics
+                    ) / len(total_metrics)
 
                 for key in aggregated_metrics:
                     logger.info(f"{key}: {aggregated_metrics[key]}")
@@ -484,8 +478,7 @@ class TrainingModule(LightningModule):
         self,
         newick_starting_trees: list[str],
         phyla_embeddings,
-        num_samples=1,
-        max_size_polytomy=25,
+        num_samples=None,
         mapping=None,
         T=1.0,
         dt_base=0.02,
@@ -497,6 +490,8 @@ class TrainingModule(LightningModule):
         KNN_TAU = 0.05,
         KNN_STOCHASTIC = False,
     ):
+        if num_samples is None:
+            num_samples = self.num_samples
 
         self.model.eval()
         max_logits = []
@@ -546,7 +541,7 @@ class TrainingModule(LightningModule):
         t = 0.0
         n_events = 0
         n_steps = 0
-        num_topology_changes = 0
+        n_topology_changes = 0
         polytomy_sizes = []  # Track sizes of polytomies encountered during sampling
 
         while t < T and n_steps < max_steps and n_events < max_events:
@@ -566,9 +561,7 @@ class TrainingModule(LightningModule):
 
             dt_hit_list = []
             cache = []
-            for b_idx, (td, v, n_leaves, mapp) in enumerate(
-                zip(trees, velocity, num_leaves, mapping)
-            ):
+            for b_idx, (td, v, n_leaves, mapp) in enumerate(zip(trees, velocity, num_leaves, mapping)):
                 model_masks = edge_splits[b_idx]
                 mask_idx = {mask: i for i, mask in enumerate(model_masks)}
                 V = v.squeeze(1).detach().cpu().numpy()
@@ -588,39 +581,34 @@ class TrainingModule(LightningModule):
 
                 V = np.array(V_val, dtype=np.float64)
                 L = np.array(L, dtype=np.float64)
-
+                
                 if len(V) != len(L):
                     raise Exception("I assume these two things are equal length!")
 
                 if (L < 0).any():
                     raise Exception("There are negative lengths that is not possible!")
 
-                eps_dt = max(1e-4, 1e-3 * float(np.median(L)) if len(L) > 0 else 1e-4)
-
                 # --- compute dt_hit ---
-                neg = (V < 0) & (L > eps_dt)
+                neg = (V < 0) & (L > eps_len)
                 if np.any(neg):
                     dt_candidates = L[neg] / -V[neg]
                     dt_hit = float(np.min(dt_candidates))
                 else:
                     dt_hit = float("inf")
-                
-                cache.append((td, L, V, n_leaves, mapp, dt_hit, dt_candidates, masks, neg))
+
+                cache.append((td, L, V, n_leaves, mapp, dt_hit, masks))
                 dt_hit_list.append(dt_hit)
 
             # ---- GLOBAL dt across the batch ----
             dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
             # Experimenting here, dt_hit_global is not a good metric we just jump, jump, jump, so why not use dt_base
-            dt = min(dt_base, dt_hit_global, T - t)
-            
-            if dt < 2e-4:
-                dt = 2e-4
+            # dt = min(dt_base, dt_hit_global, T - t)
+            dt = min(dt_base, T-t)
 
-            # dt = min(dt_base, T - t)
+            # defensive: prevent hard stall
             if dt <= 0:
                 dt = min(dt_base, T - t)
 
-            #dt = min(dt_base, T - t)
 
             # ---- SECOND PASS: advance everyone with the SAME dt ----
             new_trees = []
@@ -628,175 +616,146 @@ class TrainingModule(LightningModule):
             # Since update of token_cache happens per tree potentially, we need to defer it or track which ones changed.
             # However, batch indices align with zip(trees...), so we can update token_cache[i] if needed.
 
-            for b_idx, (td, L, V, n_leaves, mapp, dt_hit, dt_candidates, masks, neg) in enumerate(cache):
+            for b_idx, (td, L, V, n_leaves, mapp, dt_hit, masks) in enumerate(
+                cache
+            ):
                 model_masks = edge_splits[b_idx]
                 # --- advance ---
                 L_new = L + dt * V
 
-                # treat as boundary if we stepped past the first hit time for THIS tree
-                # (float equality with hit_tol=1e-10 is too strict)
-                hit_boundary = (np.isfinite(dt_hit) and dt >= dt_hit) or (L_new <= eps_len).any()
+                # Did we hit boundary this step?
+                hit_boundary = (abs(dt - dt_hit) <= hit_tol) or (L_new <= eps_len).any()
 
-                # # Did we hit boundary this step?
-                # hit_boundary = (abs(dt - dt_hit) <= hit_tol) or (L_new <= eps_len).any()
-
-                # if hit_boundary and np.isfinite(dt_hit):
-                #     # Batch near-simultaneous hits (numerical simultaneity)
-                #     eta = 0.01  # relative tie threshold (1%)
-                #     eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
-
-                #     batch = (dt_candidates <= dt_hit * (1.0 + eta)) | (dt_candidates <= dt_hit + eps_abs)
-
-                #     # If we overshot (dt > dt_hit), L_new for those edges will be <= 0 anyway.
-                #     # Force exactly 0 for batched edges and anything numerically tiny.
-                #     L_new[neg][batch] = 0.0
+                if hit_boundary:
+                    hit = L_new <= eps_len
+                    L_new[hit] = 0.0
                 
-                L_new[L_new < eps_len] = 0.0
-
                 # update dict
                 td2 = {m: float(l) for m, l in zip(masks, L_new) if l > eps_len}
 
                 # We only need to rebuild Newick/Graph if we hit a boundary (topology changed)
                 if hit_boundary:
-                    logger.info(f"Tree hit a boundary, applying topology changes.")
                     num_merges = 0
                     topology_changed = True
-                    polytomy_nodes = True
-
-                    while polytomy_nodes:
-                        original_td2 = td2.copy()
-
-                        _, td2_newick= build_tree_from_splits(
-                            list(original_td2.keys()),
-                            original_td2,
-                            n_leaves=n_leaves,
+                    while topology_changed:
+                        graph, td2_newick = build_tree_from_splits(
+                            list(td2.keys()),
+                            td2,
+                            n_leaves,
                             root_leaf=n_leaves - 1,
                             mapping=mapp,
                         )
 
-                        # For autoregressive step, we just use standard tokenizer for now as it's rare event
-                        tokenized_trees = self.model.tokenizer([td2_newick])
-                        # import pdb; pdb.set_trace()
-                        
-                        polytomy_nodes = has_polytomy_fast(
-                            td2_newick, unrooted_ok=False
-                        )
+                        polytomy_nodes = has_polytomy_fast(td2_newick, unrooted_ok=False)
+                        # td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
-                        if not polytomy_nodes:
-                            logger.info("No polytomies remain after merges exit out")
-                            break
+                        if polytomy_nodes:
+                            # For autoregressive step, we just use standard tokenizer for now as it's rare event
+                            tokenized_trees = self.model.tokenizer([td2_newick])
+                            # import pdb; pdb.set_trace()
 
-                        with torch.no_grad():
-                            logit_outputs = self.forward(
-                                tokenized_trees,
-                                torch.tensor([num_merges / 63], device=self.device),
-                                phyla_embeddings,
-                                autoregressive=True,
-                            )
-                        
-                        if len(logit_outputs) == 1:
-                            candidates = [logit_outputs[0]]
-                        else:
-                            scores = torch.stack([o["polytomy_pred"].squeeze() for o in logit_outputs])
-                            order = torch.argsort(scores, descending=True)
-                            candidates = [logit_outputs[int(order[0])]]
-
-                        top_change = False
-                        for output in candidates:
-                            # Track polytomy size
-                            polytomy_sizes.append(len(output["splits_represented"]))
-                            
-                            if torch.sigmoid(output["polytomy_pred"]).item() > 0.5 or len(logit_outputs) == 1:
-                            #else:
-                                logits = output["logits"]
-                                G = logits.size(0)
-                                mask = ~torch.eye(
-                                    G, dtype=torch.bool, device=logits.device
-                                )  # off-diagonal only
-
-                                # optionally only use one triangle (avoid double-counting symmetric pairs)
-                                tri = torch.triu(mask, diagonal=1)
-                                ii, jj = torch.triu_indices(G, G, offset=1, device=logits.device)
-
-                                logits_vec = logits[tri]
-                                finite = torch.isfinite(logits_vec)
-                                if finite.sum() == 0:
-                                    res = None
-                                else:
-                                    logits_vec_f = logits_vec[finite]
-                                    ii_f, jj_f = ii[finite], jj[finite]
-                                    k = torch.argmax(logits_vec_f)
-                                    i, j = ii_f[k].item(), jj_f[k].item()
-                                    res = [i, j]
-                                    
-                                if res is None:
-                                    logger.info("No merges found!")
-                                else:
-                                    logger.info(f"Merges found: {res}")
+                            with torch.no_grad():
+                                logit_outputs = self.forward(
+                                    tokenized_trees,
+                                    torch.tensor([num_merges/162], device=self.device),
+                                    phyla_embeddings,
+                                    autoregressive=True,
+                                )
+                            top_change = False
+                            for output in logit_outputs:
+                                # Track polytomy size
+                                polytomy_sizes.append(len(output["splits_represented"]))
+                                
+                                if torch.sigmoid(output["polytomy_pred"]).item() < 0.5:
+                                    x = output["logits"]
+                                    W = 0.5 * (x + x.T)  # [G,G]
+                                    W.fill_diagonal_(-float("inf"))
+                                    P = torch.sigmoid(
+                                        W
+                                    )  # mergeability prob, pick_group already does the sigmoid but I'm doing it here for logging later
+                                    # Can do something here to look at the prob of merging to see if the model is really learning anything or just learning junk for logging purposes
                                     # import pdb; pdb.set_trace()
-                                    split_masks = [
-                                        output["splits_represented"][idx]
-                                        for idx in res
-                                    ]
-                                    new_split = 0
-                                    for sm in split_masks:
-                                        new_split |= sm
-
-                                    if new_split in td2:
-                                        # import pdb; pdb.set_trace()
-                                        logger.info("Whoa already in there!")
-                                        raise Exception("Not possible to merge into a split that already exists...")
+                                    max_logits.append(P.max().item())
+                                    res = pick_group(W, tau=0.55)
+                                    if res is None:
+                                        logger.debug("No merges found!")
                                     else:
-                                        # New length is average of merged splits
-                                        curr_lens = list(td2.values())
-                                        if len(curr_lens) > 0:
-                                            td2[new_split] = float(np.median(curr_lens))
+                                        logger.debug(f"Merges found: {res}")
+                                        # import pdb; pdb.set_trace()
+                                        split_masks = [
+                                            output["splits_represented"][idx] for idx in res
+                                        ]
+                                        new_split = 0
+                                        for sm in split_masks:
+                                            new_split |= sm
+
+                                        if new_split in td2:
+                                            if len(res) > 2:
+                                                logger.debug("Whoa already in there! Trying partial merge")
+                                                res = res[:-1]
+                                                split_masks = [
+                                                    output["splits_represented"][idx] for idx in res
+                                                ]
+                                                new_split = 0
+                                                for sm in split_masks:
+                                                    new_split |= sm
+                                            
+                                        if new_split in td2:
+                                            logger.debug("Whoa already in there!")
                                         else:
+                                            # New length is average of merged splits
                                             td2[new_split] = 1e-3
-                                    top_change = True
-                                    logger.info("Merge performed time to break out")
-                                    num_merges += 1
-                                    n_events += 1
-                                    num_topology_changes += 1
-
-                                    break
-                        
-                        if not top_change:
-                            logger.info("No more merges possible, pick a random polytomy and do a KNN merge")
-                            output = random.choice(logit_outputs)
-                            split_embeddings = output['group_embeddings']
-                            group_represented = output['splits_represented']
-
-                            if len(group_represented) != split_embeddings.size(0):
-                                raise Exception("Whoa size mismatch between groups and split embeddings")
+                                            top_change = True
                             
-                            i, j = _pick_knn_pair(split_embeddings, topM=KNN_TOPM, tau=KNN_TAU, stochastic=KNN_STOCHASTIC)
+                            if not top_change:
+                                logger.info("No more merges possible, pick a random polytomy and do a KNN merge")
+                                output = random.choice(logit_outputs)
+                                split_embeddings = output['group_embeddings']
+                                group_represented = output['splits_represented']
 
-                            sm_i, sm_j = group_represented[i], group_represented[j]
-                            new_split = int(sm_i) | int(sm_j)
+                                if len(group_represented) != split_embeddings.size(0):
+                                    raise Exception("Whoa size mismatch between groups and split embeddings")
+                                
+                                i, j = _pick_knn_pair(split_embeddings, topM=KNN_TOPM, tau=KNN_TAU, stochastic=KNN_STOCHASTIC)
 
-                            if new_split not in td2:
-                                # td2[new_split] = 1e-3  # tiny length
-                                curr_lens = list(td2.values())
-                                if len(curr_lens) > 0:
-                                    td2[new_split] = float(np.median(curr_lens))
+                                sm_i, sm_j = group_represented[i], group_represented[j]
+                                new_split = int(sm_i) | int(sm_j)
+
+                                if new_split not in td2:
+                                    # td2[new_split] = 1e-3  # tiny length
+                                    curr_lens = list(td2.values())
+                                    if len(curr_lens) > 0:
+                                        td2[new_split] = float(np.median(curr_lens))
+                                    else:
+                                        td2[new_split] = 1e-3
                                 else:
-                                    td2[new_split] = 1e-3
+                                    # import pdb; pdb.set_trace()
+                                    raise Exception("Not possible to merge into a split that already exists...")
+
+                                top_change = True
+                                num_merges += 1
+                                n_events += 1
+                                n_topology_changes += 1
+                            
+                            if not top_change:
+                                topology_changed = False
                             else:
-                                # import pdb; pdb.set_trace()
-                                raise Exception("Not possible to merge into a split that already exists...")
+                                num_merges += 1
 
-                            top_change = True
-                            num_merges += 1
                             n_events += 1
-                            num_topology_changes += 1
-
+                            logger.debug("Finished processing merges")
+                            if topology_changed:
+                                n_topology_changes += 1
+                                
+                        else:
+                            topology_changed = False
+                            
 
 
                     _, td2_newick_final = build_tree_from_splits(
                         list(td2.keys()),
                         td2,
-                        n_leaves=n_leaves,
+                        n_leaves,
                         root_leaf=n_leaves - 1,
                         mapping=mapp,
                     )
@@ -804,8 +763,7 @@ class TrainingModule(LightningModule):
                     new_item = self.model.tokenizer.compute_structural_cache(
                         [td2_newick_final]
                     )[0]
-                    # print(b_idx, "Topology changed, updating token cache.")
-                    # import pdb;pdb.set_trace()
+
                     token_cache.update(b_idx, new_item)
 
                 new_trees.append(td2)
@@ -821,7 +779,7 @@ class TrainingModule(LightningModule):
         # if num_topology_changes > 0:
         #     import pdb; pdb.set_trace()
     
-        logger.info(f"Sampling finished in {n_steps} steps. Total events: {n_events}, topology changes: {num_topology_changes}, average polytomy size: {avg_polytomy_size:.2f}")
+        logger.info(f"Sampling finished in {n_steps} steps. Total events: {n_events}, topology changes: {n_topology_changes}, average polytomy size: {avg_polytomy_size:.2f}")
 
         return [
             build_tree_from_splits(
@@ -832,9 +790,11 @@ class TrainingModule(LightningModule):
                 mapping=mapp,
             )[1]
             for td, n_leaves, mapp in zip(trees, num_leaves, mapping)
-        ], num_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0, avg_polytomy_size, len(polytomy_sizes)
+        ], n_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0, avg_polytomy_size, len(polytomy_sizes)
 
-    def sample_compare(self, batch, train=True, num_samples=1, dt=0.02, save=True):
+    def sample_compare(self, batch, train=True, num_samples=None, dt=0.02, save = True):
+        if num_samples is None:
+            num_samples = self.num_samples
         nexus_filepaths = batch["nexus_filepaths"]
         tree_paths = batch["tree_paths"]
         ids = batch["ids"]
@@ -847,7 +807,6 @@ class TrainingModule(LightningModule):
         nexus_filepath = batch["nexus_filepaths"][0]
         id = batch["ids"][0]
         mapping = batch["mappings"][0]
-        seq_ordering_map = batch["sequence_ordering_maps"][0]
 
         if train:
             real_trees = self.dataset.dataset_train.return_posterior_trees(id)
@@ -857,25 +816,7 @@ class TrainingModule(LightningModule):
             num_leaves = self.dataset.dataset_val.return_number_leaves(id)
 
         if len(real_trees) > num_samples:
-            pot_real_trees = random.sample(real_trees, num_samples)
-        else:
-            pot_real_trees = real_trees
-
-        sanity_check = self.dataset.dataset_train.sanity_check if train else self.dataset.dataset_val.sanity_check
-        
-        real_trees = []
-        for i in pot_real_trees:
-            t_real = EteTree(i, format=1)
-            for leaf in t_real.get_leaves():
-                name = leaf.name
-                # direct match (most likely)
-                if name in seq_ordering_map:
-                    leaf.name = seq_ordering_map[name]
-                else:
-                    import pdb; pdb.set_trace()
-                    raise Exception("Leaf name in real tree not found in original names map!")
-            real_trees.append(t_real.write(format=1))
-
+            real_trees = random.sample(real_trees, num_samples)
 
         for i in real_trees:
             if has_polytomy_fast(i):
@@ -887,50 +828,23 @@ class TrainingModule(LightningModule):
         num_topology_changes = []
         avg_max_logits = []
         num_polytomies = 0
-        starting_trees_nw = []
-
         avg_polytomy_sizes = []
         num_polytomies_resolved = []
 
         for _ in tqdm(range(num_samples)):
-            # rt = Tree(num_leaves=num_leaves, random=True)
-            # starting_tree = str(rt)
-            if train:
-                starting_tree = self.dataset.dataset_train.sample_random_tree(
-                    real_trees[0]
-                )
-            else:
-                starting_tree = self.dataset.dataset_val.sample_random_tree(
-                    real_trees[0]
-                )
-            
-            #Now remap the random tree to make the indices match up with the real tree
-            # t_random = EteTree(starting_tree, format=1)
-
-            # for leaf in t_random.get_leaves()d
-            #     name = leaf.name
-            #     # direct match (most likely)
-            #     if name in seq_ordering_map:
-            #         leaf.name = seq_ordering_map[name]
-            #     else:
-            #         pass
-            #         # import pdb; pdb.set_trace()
-            #         # raise Exception("Leaf name in random tree not found in original names map!")
-            # starting_tree = t_random.write(format=1)
-
-            #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
-            timepoint = random.uniform(0, 1)
-
-            starting_trees_nw.append(starting_tree)
-            sampled_tree, n_topology_changes, avg_max_logit, avg_polytomy_size, n_polytomies_resolved = self.sample(
-                [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
+            rt = Tree(num_leaves=num_leaves, random=True)
+            starting_tree = str(rt)
+            start_time = time.time()
+            sampled_tree, n_topo_changes, avg_max_logit, avg_polytomy_size, n_polyt_resolved = self.sample(
+                [starting_tree], batch["phyla_embeddings"], num_samples=num_samples, dt_base=dt
             )
-            
+            print(f"Sampling a single tree took {time.time() - start_time} seconds")
+
             avg_polytomy_sizes.append(avg_polytomy_size)
-            num_polytomies_resolved.append(n_polytomies_resolved)
+            num_polytomies_resolved.append(n_polyt_resolved)
 
             sampled_tree = sampled_tree[0]
-            num_topology_changes.append(n_topology_changes)
+            num_topology_changes.append(n_topo_changes)
             avg_max_logits.append(avg_max_logit)
             if has_polytomy_fast(sampled_tree):
                 sampled_tree = resolve_polytomies_random_deterministic(sampled_tree)
@@ -942,28 +856,19 @@ class TrainingModule(LightningModule):
 
             # Now do something with the sampled tree and the real trees
             sampled_trees.append(sampled_tree)
-            if sanity_check:
-                break
 
-        if sanity_check:
-            sampled_trees = sampled_trees*num_samples
+        sampled = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, True) for i in sampled_trees]
+        posterior_trees = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, False) for i in real_trees]
 
-        sampled = [
-            number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, True)
-            for i in sampled_trees
-        ]
-        posterior_trees = [
-            number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, True)
-            for i in real_trees
-        ]
-        starting_named = [
-            number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, True)
-            for i in starting_trees_nw
-        ]
+        rf_dists = []
+        n_pairs = min(len(sampled), len(posterior_trees))
+        for i in range(n_pairs):
+            rf_dists.append(calculate_norm_rf(sampled[i], posterior_trees[i]))
+        
+        rf_norm_val = np.mean(rf_dists) if rf_dists else 0.0
 
         if save:
             import pickle
-
             with open(f"samples/sample_trees_{self.global_step}.pkl", "wb") as f:
                 pickle.dump((sampled, posterior_trees), f)
 
@@ -972,8 +877,10 @@ class TrainingModule(LightningModule):
                 nexus_filepath, true_trees=posterior_trees, sampled_trees=sampled, threads=1
             )
         except Exception as e:
-            print(f"Skipping likelihood calc due to error: {e}")
+            print(f"An error occurred during likelihood comparison: {e}")
             metrics = {}
+        
+        metrics["rf_norm"] = float(rf_norm_val)
 
         metrics.update(
             kl_divergence_topological_distributions(
@@ -986,64 +893,8 @@ class TrainingModule(LightningModule):
             )
         )
         metrics.update(compare_branch_length_distributions(posterior_trees, sampled))
-
-        rf_vals = []
-        if len(posterior_trees) > 0 and len(sampled) > 0:
-            for _ in range(100):
-                t1 = random.choice(posterior_trees)
-                t2 = random.choice(sampled)
-                rf_vals.append(calculate_norm_rf(t1, t2))
-        metrics["avg_posterior_sample_norm_rf"] = np.mean(rf_vals) if rf_vals else 0.0
-
-        rf_paired = [calculate_norm_rf(s, e) for s, e in zip(starting_named, sampled)]
-        metrics["start_avg_norm_rf"] = np.mean(rf_paired) if rf_paired else 0.0
-
-        try:
-            metrics.update(
-                {
-                    "start_" + k: v
-                    for k, v in compare_likelihood_distributions(
-                        nexus_filepath,
-                        true_trees=starting_named,
-                        sampled_trees=sampled,
-                        threads=1,
-                    ).items()
-                }
-            )
-        except Exception:
-            pass
-
-        metrics.update(
-            {
-                "start_" + k: v
-                for k, v in kl_divergence_topological_distributions(
-                    starting_named, sampled, num_leaves=num_leaves
-                ).items()
-            }
-        )
-        metrics.update(
-            {
-                "start_" + k: v
-                for k, v in split_bipartition_frequency_correlation(
-                    starting_named, sampled, num_leaves=num_leaves
-                ).items()
-            }
-        )
-        metrics.update(
-            {
-                "start_" + k: v
-                for k, v in compare_branch_length_distributions(
-                    starting_named, sampled
-                ).items()
-            }
-        )
-
-        print(
-            f"Num polytomies resolved in sampling: {num_polytomies} out of {num_samples}"
-        )
-        print(
-            "Average topology changes during sampling: ", np.mean(num_topology_changes)
-        )
+        print(f"Num polytomies resolved in sampling: {num_polytomies} out of {num_samples}")
+        print("Average topology changes during sampling: ", np.mean(num_topology_changes))
         print("Average max logits during sampling: ", np.mean(avg_max_logits))
         overall_avg_polytomy_size = np.mean([s for s in avg_polytomy_sizes if s > 0]) if any(s > 0 for s in avg_polytomy_sizes) else 0.0
         print(f"Average polytomy size during sampling: {overall_avg_polytomy_size:.2f}")
@@ -1063,7 +914,7 @@ class TrainingModule(LightningModule):
             )
 
         return metrics
-
+        
     def on_train_end(self):
         if self.record:
             wandb.finish()
@@ -1071,17 +922,13 @@ class TrainingModule(LightningModule):
     def training_step(self, batch, _):
         # Skip if batch is None (all items failed tokenization in collate_fn)
         if batch is None:
-            logging.warning(
-                "Skipping training step: batch is None (tokenization failed for all items)"
-            )
-            print(
-                "Skipping training step: batch is None (tokenization failed for all items)"
-            )
+            logging.warning("Skipping training step: batch is None (tokenization failed for all items)")
+            print("Skipping training step: batch is None (tokenization failed for all items)")
             return None
-
+        
         # Increment stepper at the START to ensure all logs in this step use the same step number
         self.stepper += 1
-
+        
         opt = self.optimizers()
         opt.zero_grad()
 
@@ -1464,18 +1311,12 @@ class TrainingModule(LightningModule):
 
             # ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
 
-            if self.global_step % self.training_sampling_frequency == 0:
-                # Moving to 1 sample so we can move faster
-                metrics = self.sample_compare(
-                    batch, train=True, num_samples=1, dt=self.dt
-                )
+            if self.global_step >= self.training_sampling_start and (self.global_step - self.training_sampling_start) % self.training_sampling_frequency == 0:
+                metrics = self.sample_compare(batch, train=True, dt=self.dt)
                 for k, v in metrics.items():
                     self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
                 if self.record:
-                    wandb.log(
-                        {f"sample_metrics/{k}": v for k, v in metrics.items()},
-                        step=self.stepper,
-                    )
+                    wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.stepper)
                 print(metrics)
 
             return logs["loss"]
@@ -1522,14 +1363,11 @@ class TrainingModule(LightningModule):
             f"step {self.global_step:4d}  total_grad_norm = {total:.2f} mean is {mean_grad:.2f} max is {max_grad:.2f}"
         )
         if self.record:
-            wandb.log(
-                {
-                    "grad/grad_norm_total": total,
-                    "grad/grad_norm_max": max_grad,
-                    "grad/grad_norm_mean": mean_grad,
-                },
-                step=self.stepper,
-            )
+            wandb.log({
+                "grad/grad_norm_total": total,
+                "grad/grad_norm_max": max_grad,
+                "grad/grad_norm_mean": mean_grad,
+            }, step=self.stepper)
 
     def configure_optimizers(self):
         if self.deepspeed:
