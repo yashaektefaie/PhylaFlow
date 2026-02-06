@@ -1,4 +1,5 @@
 import random
+import time
 import torch, torch.optim as optim
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities import grad_norm
@@ -13,7 +14,6 @@ import torch
 import sys
 import os
 import torch.nn.functional as F
-from ete3 import Tree as EteTree
 
 # Ensure the current directory is in sys.path to import 'phyla'
 sys.path.append(os.getcwd())
@@ -21,9 +21,9 @@ sys.path.append(os.getcwd())
 from phyla.utils.utils import load_config
 from utils.utils import remove_bit, has_polytomy_fast
 from phyla.eval.evo_reasoning_eval import (
-    Config,
-    load_model,
-    _encode_sequences_openfold_style,
+Config,
+load_model,
+_encode_sequences_openfold_style,
 )
 
 from utils.random_tree import Tree
@@ -35,14 +35,14 @@ find_polytomy_nodes,
 number_to_name_newick,
 has_polytomy_fast,
 resolve_polytomies_random_deterministic,
-_pick_knn_pair
+_pick_knn_pair,
 )
 from utils.metric_utils import (
-    kl_divergence_topological_distributions,
-    split_bipartition_frequency_correlation,
-    compare_likelihood_distributions,
-    compare_branch_length_distributions,
-    calculate_norm_rf,
+kl_divergence_topological_distributions,
+split_bipartition_frequency_correlation,
+compare_likelihood_distributions,
+compare_branch_length_distributions,
+calculate_norm_rf,
 )
 from data.dataset import PhylaDataModule
 from model.model import TreeDenoiserTokenGT
@@ -68,8 +68,9 @@ class TrainingModule(LightningModule):
         deepspeed: bool = False,
         logger=None,
         max_num_timesteps: int = 20,
-        training_sampling_frequency: int = 100,
-        num_samples: int = 100,
+        training_sampling_frequency: int = 200,
+        training_sampling_start: int = 500,
+        num_samples: int = 10,
         dt: float = 0.1,
         # Figure out how to do typing here
         global_splits=None,
@@ -93,6 +94,7 @@ class TrainingModule(LightningModule):
         self.random_trees = random_trees
         self.verbose = verbose
         self.training_sampling_frequency = training_sampling_frequency
+        self.training_sampling_start = training_sampling_start
         self.num_samples = num_samples
         self.dt = dt
         self.train_tokenized_trees = None
@@ -221,7 +223,7 @@ class TrainingModule(LightningModule):
                         names.append("unknown")
 
                 embeddings = self.compute_phyla_embeddings(
-                    seqs, names, device=self.device
+                    seqs, names, device=str(self.device)
                 )
                 # Ensure embeddings are (N, D) not (1, N, D)
                 if embeddings.dim() == 3 and embeddings.size(0) == 1:
@@ -305,7 +307,6 @@ class TrainingModule(LightningModule):
             # print("Wow congrats")
             logs["loss"] = loss
             logger.info(f"Velocity loss: {loss.item()}")
-
             if self.record:
                 wandb.log({"train/velocity_loss": loss.item()}, step=self.stepper)
             # import pdb
@@ -402,7 +403,7 @@ class TrainingModule(LightningModule):
                         neg_scores = logits_vec[neg]
                         topk = torch.topk(neg_scores, k=k_neg, largest=True).indices
                         neg = neg[topk]
-
+                    
                     idx = torch.cat([pos, neg])
                     tau = 1.0
                     s = logits_vec[idx] / tau
@@ -427,9 +428,7 @@ class TrainingModule(LightningModule):
 
             for i in found:
                 if not found[i]:
-                    import pdb
-
-                    pdb.set_trace()
+                    import pdb; pdb.set_trace()
                     print(
                         "Missing split: ",
                         [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1],
@@ -440,21 +439,16 @@ class TrainingModule(LightningModule):
 
             if len(chosen_polytomies) > 1:
                 polytomy_logits_tensor = torch.stack(polytomy_logits).squeeze(1)
-                chosen_polytomies_tensor = torch.stack(chosen_polytomies).to(
-                    polytomy_logits_tensor.device
-                )
+                chosen_polytomies_tensor = torch.stack(chosen_polytomies).to(polytomy_logits_tensor.device)
 
                 L_polytomy_choosing = F.binary_cross_entropy_with_logits(
                     polytomy_logits_tensor,
                     chosen_polytomies_tensor,
-                )
+                ) 
 
                 logger.info(f"Polytomy choosing loss: {L_polytomy_choosing.item()}")
                 if self.record:
-                    wandb.log(
-                        {"train/polytomy_choosing_loss": L_polytomy_choosing.item()},
-                        step=self.stepper,
-                    )
+                    wandb.log({"train/polytomy_choosing_loss": L_polytomy_choosing.item()}, step=self.stepper)
 
             L_merging = torch.stack(losses).mean()
             logs["loss"] = L_merging
@@ -464,9 +458,9 @@ class TrainingModule(LightningModule):
             aggregated_metrics = {}
             if len(total_metrics) > 0:
                 for key in total_metrics[0]:
-                    aggregated_metrics[key] = sum(m[key] for m in total_metrics) / len(
-                        total_metrics
-                    )
+                    aggregated_metrics[key] = sum(
+                        m[key] for m in total_metrics
+                    ) / len(total_metrics)
 
                 for key in aggregated_metrics:
                     logger.info(f"{key}: {aggregated_metrics[key]}")
@@ -498,8 +492,7 @@ class TrainingModule(LightningModule):
         self,
         newick_starting_trees: list[str],
         phyla_embeddings,
-        num_samples=1,
-        max_size_polytomy=25,
+        num_samples=None,
         mapping=None,
         T=1.0,
         dt_base=0.02,
@@ -511,6 +504,8 @@ class TrainingModule(LightningModule):
         KNN_TAU = 0.05,
         KNN_STOCHASTIC = False,
     ):
+        if num_samples is None:
+            num_samples = self.num_samples
 
         gt = {158475818957369961082530037760: -0.731665585828483, 158475667841642509253883199488: -0.8988413538718826, 10633823966279326983232708282056441856: -0.20368586326845434, 1297036692682702848: -0.3243564495114172, 5575186299632658880234027781612846343782404: -0.9639204068620865, 5575186310017411073122640408634921532260356: -0.3617431909844142, 5575186299632817356052985151573928873820164: -0.2374435317663224, 5575186299632658261264008138922708894220292: -0.9530019126275265, 18446744074246422528: -0.8388591808965112, 65544: -0.5665090723740024, 22300787733826488258843651194474290477006848: -0.9668680615080342, 2475880078570760618517725188: -0.7128061942398058, 2475880078570760549798248452: -0.772267216617224, 11417981562915327060255522087960440916031832064: -0.4042325641560731, 324518558494130005241672719400960: -0.9457872127340289, 664616533193658392910706523548680192: -0.5935464640962718, 85070601871439417691678863969006649344: -0.8163518920011775, 8921691884004065057751092743946531545399955472: -0.8521763419591382, 85070591730234615865843651995381006336: -0.42188566856064574, 41538394830061755369703031248519184: -0.8722759036024446, 41538394830061755369700832225263632: -0.943427003370581, 21267648011789234332364479824969859072: -0.42183774649226297, 10531000427382356270486649808269054939506982384: -0.7628027356450618, 21267647932561071818100142231425908736: -0.13824650750562706, 41538394830061754793240079921840144: -0.8933152510491086, 41538394830061754793240075626872848: -0.5424099000895698, 12131605409268307000784665072685206076409511936: -0.473487549064635, 11417981562915327060255522087960458508218138624: -0.13048199853398915, 21267647932561071818100142222834925568: -0.4277263676151904, 9223372036854775808: -0.371460974, 21267647932558653966460912964485513216: -0.27606764000000006, 51539607552: -0.789158584543765, 53687091200: -0.317142353850169, 170141345719746060945050695293894393856: -0.1265256327378287, 19961783133764987308900089856: -0.9987741288279605, 19961783133476756932748378112: -0.2628487926438454, 170141345719746060954278570930376540160: -0.9571014370828996, 170141345719746060954274067330749169664: -0.597181905893513, 40564819207303340847894502572064: -0.702835855676214, 274877906944: -0.5316655200000001, 41538374868278621028243970633760768: -0.20280910000000002, 8: -0.6586848399999999, 18446744073709551616: -0.89584757, 42535295865117307932921825928971026432: -0.9283643950000001, 174224571863520493293247799005065324265472: -0.5858926, 32768: -0.8984007, 75557863725914323419136: -0.6043512860000001, 89202980794122492567351798982300853608644608: -0.45812724834873847, 12132128094968697343021699179901705138849710080: -0.7752943077886116, 12132128094968697343021699179901704589093896192: -0.15526474870771043, 12132128094968697338069939022760183489497399296: -0.7437469847521373, 181193554738061313024977710965267937236090880: -0.8185402555711767, 12131779645824970297083352527162173358848868352: -0.7684066502166266, 1298074214633706907132624082829312: -0.13632247594001465, 2787593149816327892691964784081045188247552: -0.6313335999999999, 1208925819614629174706176: -0.97317216, 2: -0.5371667999999999, 4611686018427387904: -0.3274074, 10633823966279326983230456482242756608: -0.7173280900000001, 8590983168: -0.2524487730929251, 340282366920938463464671644124450930688: -0.49503663912851253, 10889035741470030830827987437816582766592: -0.93938013, 4722366482869645213696: -0.13801422000000002, 147573952589676412928: -0.7063541000000001, 340282366920938463463374607431768211456: -0.20999499000000002, 64: -0.19947929999999997, 65536: -0.4950193, 348449143727040986586495598010130648530944: -0.8495285450000002, 33451500615458731910139791480672384360398848: -0.752089247054739, 33451500615458730672199752195292109461274624: -0.43837647874383656, 22301128016193409197307115866118414927937536: -0.4936575036071044, 151115727451828646838272: -0.131550556, 1427971984477040136297538520139641290835894624: -0.2499925784297261, 1427971984477040136297538520139641290827506016: -0.9558975449836806, 1125899906842624: -0.3353244, 2596148429267413814265248164610048: -0.35068829970000004, 1427274915959970654148228735669644149578006560: -0.5444269299889422, 41538374868278621028252766726782992: -0.8406278748947806, 8796093022224: -0.8811318992931401, 16: -0.42314170000000006, 36893488147419103232: -0.7664290000000001, 85070591730234615865843651857942052864: -0.660053212, 20769187434140491141771500015583232: -0.2215423043276592, 20769187434140491105742702996619264: -0.1647015821585011, 20769187434140491105742702728183808: -0.14822959293044752, 2722258935367507707706996859454145691648: -0.39281836300000006, 1180591620717411303424: -0.6707895148, 512: -0.8312887399999999, 10633823966279402541096434196379860992: -0.6911298858840041, 664613997892457936451903530142269440: -0.4648114319175766, 11150372599265311570767859136324180752990208: -0.48775007000000004, 4835703278458516698824704: -0.41556431, 2097152: -0.7364710000000001, 1329552514382095629136716866590343168: -0.7096948819956518, 324518597179756232909806309998592: -0.31729109810505934, 696898370530831709732594436453324963192896: -0.3267846636789428, 1427274915959971287973528997358297487606022176: -0.24884675157384795, 4: -0.37704762, 1297036692682719232: -0.3615048844788768, 5070602438691849468944041639936: -0.2688695683901745, 37778931862957228818432: -0.7454440447960716, 87112285931760246646623899502532662132736: -0.2107455, 37778931862957161709568: -0.475919, 16384: -0.4408901, 649037107316853453566312041152512: -0.6217387369999999, 87112285931760246646623899502532662132864: -0.358355172613539, 22969768235052654921127055246504582040609357824: -0.7487449744916324, 22880565254258532428559703447522281187000713216: -0.9486748980724731, 5192296858544272361496235619647488: -0.405831922649313, 3211307308588409732381143431261364056861184000: -0.3901462842337679, 356811923176489970264571492362373784095690752: -0.702716195388327, 5708990770823839524233446109252884202824663040: -0.7288599401511386, 131072: -0.0835494, 302231454903657293676544: -0.8648667400000001, 3212701110480231147117753133498315792256602112: -0.7134704961369555, 8921691881304070671351199242751199995081265152: -0.28782847889949814, 696898287454081973172991196020261297061888: -0.37211505, 2722258935367507707706996859454145691650: -0.7122678160587917, 295147905179352825856: -0.3938135, 680564733841876926926749214863536422912: -0.90725928, 4096: -0.96656028, 87112285931760246646660792990680081236096: -0.24327849190616255, 21778071482940061661655974875633165533184: -0.2688333, 9444732965739290427392: -0.21709334799999996, 2199023255552: -0.528400094, 5070602400912917605986812821504: -0.16108004, 33500768662435011191613705054773636980116340208: -0.9970736264737174, 33500768662435011191613705054773636980116340720: -0.7993039639208753, 128: -0.31548456739999997, 19807040628566084398385987584: -0.5122394, 4503599627370496: -0.09382170000000001, 18014398509481984: -0.218547123, 8589934592: -0.893909, 2305843009213693952: -0.8655166, 5192296858534827628530496329220096: -0.6328248799999999, 140737488355328: -0.15824300000000002, 20769187434139310514121985316880384: -0.9824172999999999, 309485009821345068728975360: -0.9318898825125838, 170141183460469231731687303715884105728: -0.6956975200000001, 73786976294838206464: -0.2634304, 33500768662437607340042972468587902228281016312: -0.16033868696927603, 33500768662435011191613705054773636980116406264: -0.19914292170543108, 32: -0.92875739, 1024: -0.6786740000000001, 2361183241434822606848: -0.845891492, 89202980794122492566142873162686224433938432: -0.4703248939481339, 89202980794122492566142873162651040061849600: -0.9615993304838134, 20599322253708728900222424449024: -0.5947816016441211, 20282409603651671549847174905856: -0.19076486471783796, 87112285931760246646734579966974919442560: -0.768112570858982, 20282409603651670423947268063232: -0.34382355583823504, 89202980794122492566142873090593446023921664: -0.8101786700000001, 38685626227668133590597632: -0.77295635, 16777216: -0.18239849, 12132130817227632710529425776364566440320434178: -0.608841057288808, 10655247261423298577541240952478236672: -0.23006057998971813, 11984799775805394206677957819068579840: -0.15721375947538477, 178405961588244985132285746181186892047843328: -0.9518266, 77371252455336267181195264: -0.24614069200000002, 33554432: -0.876750338, 87197356533631686064426258830943926091904: -1.0006733544373776, 4398046511104: -0.5591561, 8921779081360598689437157170205362489326047376: -0.44015310322655926, 8921691881345609066181260998120903026329784336: -0.5744778740366061, 67108864: -0.8186042699999999, 356811923176489970264571492362373784095686656: -0.7472491, 154742504910672534362390528: -0.46924256000000003, 524288: -0.14976057, 12132130817227632710529406886898564592995401730: -0.2496524105666533, 309485600117155427434627072: -0.3316258096861924, 83076749736557242056487941267529728: -0.6546566371556344, 309490322483638297079840768: -0.6292476882962794, 1361129488283076107562227329949497294848: -0.7740742897783631, 12250663690251526281842553695413718746112: -0.25211205773482903, 43556142965880200694564405087533512294400: -0.44196607556109313, 17592186306560: -0.1634280114481001, 11150372599265321474892636329173694533337088: -0.6056767722632457, 11150372599265311571372322046131495340343296: -0.1367493995095094, 43556142965880123323311949751266331099136: -0.8309685455821875, 12132130817227632710838916103459890755827793922: -0.3286819489546425, 256: -0.7355025, 1361129467683753853853498429727072845824: -0.5540848, 1267650600228229401496703205376: -0.79602339, 633825300114114700748351602688: -0.299743783, 22835963083295358136546656770638941187364356096: -0.6694938576309417, 281474976710656: -0.32151630000000003, 162259276829213363391578010288128: -0.88759204, 2535301200456458802993406410752: -0.6936673600000001, 10141204801825835211973625643008: -0.78936662, 39614081259438011805985669120: -0.9517860424141675, 549755813888: -0.24018540000000002, 20282409603651670423947251286016: -0.5571252999999999, 8192: -0.95794727, 713623846352979940529142984724747568191373312: -0.355079858, 309485009821345068724781056: -0.25884663, 134217728: -0.19717553, 1393801891821414736609702236951735395418112: -0.6279203871408506, 1393801891820147086009474007550238692212736: -0.485396703169406, 8388608: -0.9310123100000001, 44601490397061246283071436545296723011960832: -0.6926529000000001, 536870912: -0.8547623, 2854495385411919762116571938898990272765493248: -0.65608285, 1237940039285380274899124224: -0.9263920899999999, 4194304: -0.2863618, 22300745198530623141535718272648361505980416: -0.4088007, 9671406556917033397649408: -0.60181799, 262144: -0.10429302, 1393796574908163946345982392040522594123776: -0.277364, 1427274915295313556135363039418089731526754304: -0.42476157175087637, 1427274915295313556135363039418089677839663104: -0.737310793889599, 316912650057057350375249543168: -0.6962051657849782, 1073741824: -0.0916866, 44601490398440450136119750134125136099934208: -0.615230327959706, 44601490398359320497705143452429347094790144: -0.4036354465174233, 2475880078570760549798248448: -0.32329020810000003, 27222589353675077077069968594541456916480: -0.7035646769755317, 5708990770823839524233143877797980545530986496: -0.18182857, 590295810358705651712: -0.554357439, 12132130817227632710529425776364566440320565250: -0.6404433106913857, 1427275086101317007729261358193786550891839520: -0.5483040745247466, 1427275086101317007719589951636869517494190112: -0.14742938559435922, 1427275086101317007719589951636868417982562336: -0.38830548251977737, 2417851639229258349412352: -0.6845067, 1048576: -0.5319881000000001, 5575186299632655785383929568162090376495104: -0.3870277, 696898375723128568276866797949560582840640: -0.6298979055769853, 8796093022208: -0.54615, 9007199254740992: -0.5657858, 144115188075855872: -0.4783032, 1099511627776: -0.15149364, 1329227995784915872903807060280344576: -0.567620313, 576460752303423488: -0.6845397999999999, 2048: -0.95081954, 10384593717069655257060992658440192: -0.49213039000000003, 12132130817227632710529425776364496071576256514: -0.8907233515522223, 5444517870735015415413993718908291383296: -0.5986911520000001, 43556142965880123323311949751266331066368: -0.77128803, 2147483648: -0.18069213, 11417981541647679048466287755595961091061972992: -0.9390782999999999, 4951760157141521099596496896: -0.24220397999999999, 18889465931478580854784: -0.9797005500000001, 12250165229753106938390214767766080061440: -0.4729157109932202, 39614081257132168796771975168: -0.27499411999999995, 12132130817227632710529425780976252458747953154: -0.9095502259197155, 17179869184: -0.46371051, 5316911983139663491615228241121378304: -0.40179855000000003, 288230376151711744: -0.5714318799999999, 36028797018963968: -0.3921306, 34359738368: -0.0639124, 696898287454081973175352379965383695663168: -0.5930554063873374, 696898287454081973175352379261696253886528: -0.13810612990336243, 2361183241434956824640: -0.5926955985703701, 2361183241434822606912: -0.27712471422144497, 79228162514264337593543950336: -0.92442973, 12250331383252580052874327743648648659968: -0.6977918703207109, 12250331383252580052874327743648615105536: -0.15084700393496248, 12250165229753106938390214767766080062464: -0.5330723855527605, 1298074214633706907132624082305024: -0.98062812, 562949953421312: -0.6878934999999999, 10655242190820859885691772008436596736: -0.5252614535752409, 10654593153713543032238205696395444224: -0.5203146689389152, 5316911983139663491615509716098088960: -0.8332862440965919, 332306998946228968225951765070086144: -0.139575868, 2251799813685248: -0.93207731, 2658455991569831745825628519070171136: -0.5627937981158709, 166153499473114484112975882535043072: -0.26980696000000004, 83076749736557242056487941267521536: -0.90755406, 1152921504606846976: -0.59735567, 72057594037927936: -0.6106075100000001, 664613997892457936451903530140172288: -0.49048681, 2658455991569831745807614120560689152: -0.8239110900000001, 158456325028528675187087900672: -0.8376991119999999, 68719476736: -0.7228846600000001, 17592186044416: -0.15298233, 5192296858544272361496235619647744: -0.17328533605422589, 12131779633840170521277958320484215539780288512: -0.6933046330050417, 12131779633840170521277958320484211141733777408: -0.1537968872579432, 40564819207303340847894502572032: -0.6992508000000002, 22835963083295358096932575511200929381378686976: -0.1962921374209446, 4294967296: -0.44879330000000006, 22835963083295358096932575511191922182123945984: -0.29888729999999997, 9903520314283042199192993792: -0.44313440000000004, 1427274915295354120954570342758937626029326368: -0.35556344696422204, 35184372088832: -0.80611311, 81129638414606681695789005144064: -0.8535050000000001, 268435456: -0.8734498, 618970019642690137449562112: -0.42264314999999997, 1427247692705959881058285969449495136382746624: -0.6877839499999999, 19342813113834066795298816: -0.9763735802000001, 12250663690251526281842553695413718748160: -0.5875888014578358, 45632899479665240050881888572047792984108810234: -0.7907101120053491, 22880564573693798586682776520773066323464290304: -0.19299567942349613, 70368744177664: -0.1368941, 696898375723128568277161945854739935666496: -0.6592243905122367, 137438953472: -0.6771687, 316912650057057350374175801344: -0.87581393, 604462909807314587353088: -0.137097543, 1427274915959971287973528849784344897929609248: -0.9716313969391362, 9103028442905316134189111288129413648671087760: -0.10617014865176422, 9102984886762350253988416723724326115158793360: -0.7267591724511383, 9102984886762350253988416723724325840280886416: -0.2794603883653689, 8921791332024288940963439012759057903044795536: -0.21991407944129673, 324518553658426726783156020576256: -0.33176211, 45666350980280698782792028363528465368469209082: -0.7310239660354657, 45671926166590716193865151003937100290001469438: -0.17020763288696578, 703687441776640: -0.6406324161906625}
 
@@ -570,7 +565,7 @@ class TrainingModule(LightningModule):
         t = 0.0
         n_events = 0
         n_steps = 0
-        num_topology_changes = 0
+        n_topology_changes = 0
         polytomy_sizes = []  # Track sizes of polytomies encountered during sampling
 
         while t < T and n_steps < max_steps and n_events < max_events:
@@ -600,9 +595,7 @@ class TrainingModule(LightningModule):
 
             dt_hit_list = []
             cache = []
-            for b_idx, (td, v, n_leaves, mapp) in enumerate(
-                zip(trees, velocity, num_leaves, mapping)
-            ):
+            for b_idx, (td, v, n_leaves, mapp) in enumerate(zip(trees, velocity, num_leaves, mapping)):
                 model_masks = edge_splits[b_idx]
                 mask_idx = {mask: i for i, mask in enumerate(model_masks)}
                 V = v.squeeze(1).detach().cpu().numpy()
@@ -639,39 +632,34 @@ class TrainingModule(LightningModule):
 
                 V = np.array(V_val, dtype=np.float64)
                 L = np.array(L, dtype=np.float64)
-
+                
                 if len(V) != len(L):
                     raise Exception("I assume these two things are equal length!")
 
                 if (L < 0).any():
                     raise Exception("There are negative lengths that is not possible!")
 
-                eps_dt = max(1e-4, 1e-3 * float(np.median(L)) if len(L) > 0 else 1e-4)
-
                 # --- compute dt_hit ---
-                neg = (V < 0) & (L > eps_dt)
+                neg = (V < 0) & (L > eps_len)
                 if np.any(neg):
                     dt_candidates = L[neg] / -V[neg]
                     dt_hit = float(np.min(dt_candidates))
                 else:
                     dt_hit = float("inf")
-                
-                cache.append((td, L, V, n_leaves, mapp, dt_hit, dt_candidates, masks, neg))
+
+                cache.append((td, L, V, n_leaves, mapp, dt_hit, masks))
                 dt_hit_list.append(dt_hit)
 
             # ---- GLOBAL dt across the batch ----
             dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
             # Experimenting here, dt_hit_global is not a good metric we just jump, jump, jump, so why not use dt_base
-            dt = min(dt_base, dt_hit_global, T - t)
-            
-            if dt < 2e-4:
-                dt = 2e-4
+            # dt = min(dt_base, dt_hit_global, T - t)
+            dt = min(dt_base, T-t)
 
-            # dt = min(dt_base, T - t)
+            # defensive: prevent hard stall
             if dt <= 0:
                 dt = min(dt_base, T - t)
 
-            #dt = min(dt_base, T - t)
 
             # ---- SECOND PASS: advance everyone with the SAME dt ----
             new_trees = []
@@ -679,7 +667,9 @@ class TrainingModule(LightningModule):
             # Since update of token_cache happens per tree potentially, we need to defer it or track which ones changed.
             # However, batch indices align with zip(trees...), so we can update token_cache[i] if needed.
 
-            for b_idx, (td, L, V, n_leaves, mapp, dt_hit, dt_candidates, masks, neg) in enumerate(cache):
+            for b_idx, (td, L, V, n_leaves, mapp, dt_hit, masks) in enumerate(
+                cache
+            ):
                 model_masks = edge_splits[b_idx]
                 # --- advance ---
                 L_new = L + dt * V
@@ -703,40 +693,29 @@ class TrainingModule(LightningModule):
                     batch = (dt_candidates <= dt_min * (1 + eta)) | (dt_candidates <= dt_min + eps_abs)
                     L_new[idx_neg[batch]] = 0.0
                 
-                L_new[L_new < eps_len] = 0.0
-
                 # update dict
                 td2 = {m: float(l) for m, l in zip(masks, L_new) if l > eps_len}
 
                 # We only need to rebuild Newick/Graph if we hit a boundary (topology changed)
                 if hit_boundary:
-                    logger.info(f"Tree hit a boundary, applying topology changes.")
                     num_merges = 0
                     topology_changed = True
-                    polytomy_nodes = True
-
-                    while polytomy_nodes:
-                        original_td2 = td2.copy()
-
-                        _, td2_newick= build_tree_from_splits(
-                            list(original_td2.keys()),
-                            original_td2,
-                            n_leaves=n_leaves,
+                    while topology_changed:
+                        graph, td2_newick = build_tree_from_splits(
+                            list(td2.keys()),
+                            td2,
+                            n_leaves,
                             root_leaf=n_leaves - 1,
                             mapping=mapp,
                         )
 
-                        # For autoregressive step, we just use standard tokenizer for now as it's rare event
-                        tokenized_trees = self.model.tokenizer([td2_newick])
-                        # import pdb; pdb.set_trace()
-                        
-                        polytomy_nodes = has_polytomy_fast(
-                            td2_newick, unrooted_ok=False
-                        )
+                        polytomy_nodes = has_polytomy_fast(td2_newick, unrooted_ok=False)
+                        # td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
-                        if not polytomy_nodes:
-                            logger.info("No polytomies remain after merges exit out")
-                            break
+                        if polytomy_nodes:
+                            # For autoregressive step, we just use standard tokenizer for now as it's rare event
+                            tokenized_trees = self.model.tokenizer([td2_newick])
+                            # import pdb; pdb.set_trace()
 
                         with torch.no_grad():
                             logit_outputs = self.forward(
@@ -847,11 +826,10 @@ class TrainingModule(LightningModule):
                         #     num_topology_changes += 1
 
 
-
                     _, td2_newick_final = build_tree_from_splits(
                         list(td2.keys()),
                         td2,
-                        n_leaves=n_leaves,
+                        n_leaves,
                         root_leaf=n_leaves - 1,
                         mapping=mapp,
                     )
@@ -859,8 +837,7 @@ class TrainingModule(LightningModule):
                     new_item = self.model.tokenizer.compute_structural_cache(
                         [td2_newick_final]
                     )[0]
-                    # print(b_idx, "Topology changed, updating token cache.")
-                    # import pdb;pdb.set_trace()
+
                     token_cache.update(b_idx, new_item)
 
                 new_trees.append(td2)
@@ -877,6 +854,7 @@ class TrainingModule(LightningModule):
         #     import pdb; pdb.set_trace()
     
         logger.info(f"Sampling finished in {n_steps} steps. Total events: {n_events}, topology changes: {num_topology_changes}, average polytomy size: {avg_polytomy_size:.2f}")
+
         return [
             build_tree_from_splits(
                 list(td.keys()),
@@ -886,9 +864,11 @@ class TrainingModule(LightningModule):
                 mapping=mapp,
             )[1]
             for td, n_leaves, mapp in zip(trees, num_leaves, mapping)
-        ], num_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0, avg_polytomy_size, len(polytomy_sizes)
+        ], n_topology_changes, sum(max_logits) / len(max_logits) if len(max_logits) > 0 else 0.0, avg_polytomy_size, len(polytomy_sizes)
 
-    def sample_compare(self, batch, train=True, num_samples=1, dt=0.02, save=True):
+    def sample_compare(self, batch, train=True, num_samples=None, dt=0.02, save = True):
+        if num_samples is None:
+            num_samples = self.num_samples
         nexus_filepaths = batch["nexus_filepaths"]
         tree_paths = batch["tree_paths"]
         ids = batch["ids"]
@@ -901,7 +881,6 @@ class TrainingModule(LightningModule):
         nexus_filepath = batch["nexus_filepaths"][0]
         id = batch["ids"][0]
         mapping = batch["mappings"][0]
-        seq_ordering_map = batch["sequence_ordering_maps"][0]
 
         if train:
             real_trees = self.dataset.dataset_train.return_posterior_trees(id)
@@ -931,7 +910,6 @@ class TrainingModule(LightningModule):
                     raise Exception("Leaf name in real tree not found in original names map!")
             real_trees.append(t_real.write(format=1))
 
-
         for i in real_trees:
             if has_polytomy_fast(i):
                 raise Exception(
@@ -942,8 +920,6 @@ class TrainingModule(LightningModule):
         num_topology_changes = []
         avg_max_logits = []
         num_polytomies = 0
-        starting_trees_nw = []
-
         avg_polytomy_sizes = []
         num_polytomies_resolved = []
 
@@ -983,12 +959,13 @@ class TrainingModule(LightningModule):
             sampled_tree, n_topology_changes, avg_max_logit, avg_polytomy_size, n_polytomies_resolved = self.sample(
                 [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
             )
-            
+            print(f"Sampling a single tree took {time.time() - start_time} seconds")
+
             avg_polytomy_sizes.append(avg_polytomy_size)
-            num_polytomies_resolved.append(n_polytomies_resolved)
+            num_polytomies_resolved.append(n_polyt_resolved)
 
             sampled_tree = sampled_tree[0]
-            num_topology_changes.append(n_topology_changes)
+            num_topology_changes.append(n_topo_changes)
             avg_max_logits.append(avg_max_logit)
             if has_polytomy_fast(sampled_tree):
                 sampled_tree = resolve_polytomies_random_deterministic(sampled_tree)
@@ -1000,28 +977,19 @@ class TrainingModule(LightningModule):
 
             # Now do something with the sampled tree and the real trees
             sampled_trees.append(sampled_tree)
-            if sanity_check:
-                break
 
-        if sanity_check:
-            sampled_trees = sampled_trees*num_samples
+        sampled = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, True) for i in sampled_trees]
+        posterior_trees = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, False) for i in real_trees]
 
-        sampled = [
-            number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, True)
-            for i in sampled_trees
-        ]
-        posterior_trees = [
-            number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, True)
-            for i in real_trees
-        ]
-        starting_named = [
-            number_to_name_newick(i, {int(i): v for i, v in mapping.items()}, True)
-            for i in starting_trees_nw
-        ]
+        rf_dists = []
+        n_pairs = min(len(sampled), len(posterior_trees))
+        for i in range(n_pairs):
+            rf_dists.append(calculate_norm_rf(sampled[i], posterior_trees[i]))
+        
+        rf_norm_val = np.mean(rf_dists) if rf_dists else 0.0
 
         if save:
             import pickle
-
             with open(f"samples/sample_trees_{self.global_step}.pkl", "wb") as f:
                 pickle.dump((sampled, posterior_trees), f)
 
@@ -1030,8 +998,10 @@ class TrainingModule(LightningModule):
                 nexus_filepath, true_trees=posterior_trees, sampled_trees=sampled, threads=1
             )
         except Exception as e:
-            print(f"Skipping likelihood calc due to error: {e}")
+            print(f"An error occurred during likelihood comparison: {e}")
             metrics = {}
+        
+        metrics["rf_norm"] = float(rf_norm_val)
 
         metrics.update(
             kl_divergence_topological_distributions(
@@ -1044,64 +1014,8 @@ class TrainingModule(LightningModule):
             )
         )
         metrics.update(compare_branch_length_distributions(posterior_trees, sampled))
-
-        rf_vals = []
-        if len(posterior_trees) > 0 and len(sampled) > 0:
-            for _ in range(100):
-                t1 = random.choice(posterior_trees)
-                t2 = random.choice(sampled)
-                rf_vals.append(calculate_norm_rf(t1, t2))
-        metrics["avg_posterior_sample_norm_rf"] = np.mean(rf_vals) if rf_vals else 0.0
-
-        rf_paired = [calculate_norm_rf(s, e) for s, e in zip(starting_named, sampled)]
-        metrics["start_avg_norm_rf"] = np.mean(rf_paired) if rf_paired else 0.0
-
-        try:
-            metrics.update(
-                {
-                    "start_" + k: v
-                    for k, v in compare_likelihood_distributions(
-                        nexus_filepath,
-                        true_trees=starting_named,
-                        sampled_trees=sampled,
-                        threads=1,
-                    ).items()
-                }
-            )
-        except Exception:
-            pass
-
-        metrics.update(
-            {
-                "start_" + k: v
-                for k, v in kl_divergence_topological_distributions(
-                    starting_named, sampled, num_leaves=num_leaves
-                ).items()
-            }
-        )
-        metrics.update(
-            {
-                "start_" + k: v
-                for k, v in split_bipartition_frequency_correlation(
-                    starting_named, sampled, num_leaves=num_leaves
-                ).items()
-            }
-        )
-        metrics.update(
-            {
-                "start_" + k: v
-                for k, v in compare_branch_length_distributions(
-                    starting_named, sampled
-                ).items()
-            }
-        )
-
-        print(
-            f"Num polytomies resolved in sampling: {num_polytomies} out of {num_samples}"
-        )
-        print(
-            "Average topology changes during sampling: ", np.mean(num_topology_changes)
-        )
+        print(f"Num polytomies resolved in sampling: {num_polytomies} out of {num_samples}")
+        print("Average topology changes during sampling: ", np.mean(num_topology_changes))
         print("Average max logits during sampling: ", np.mean(avg_max_logits))
         overall_avg_polytomy_size = np.mean([s for s in avg_polytomy_sizes if s > 0]) if any(s > 0 for s in avg_polytomy_sizes) else 0.0
         print(f"Average polytomy size during sampling: {overall_avg_polytomy_size:.2f}")
@@ -1122,7 +1036,7 @@ class TrainingModule(LightningModule):
             )
 
         return metrics
-
+        
     def on_train_end(self):
         if self.record:
             wandb.finish()
@@ -1130,17 +1044,13 @@ class TrainingModule(LightningModule):
     def training_step(self, batch, _):
         # Skip if batch is None (all items failed tokenization in collate_fn)
         if batch is None:
-            logging.warning(
-                "Skipping training step: batch is None (tokenization failed for all items)"
-            )
-            print(
-                "Skipping training step: batch is None (tokenization failed for all items)"
-            )
+            logging.warning("Skipping training step: batch is None (tokenization failed for all items)")
+            print("Skipping training step: batch is None (tokenization failed for all items)")
             return None
-
+        
         # Increment stepper at the START to ensure all logs in this step use the same step number
         self.stepper += 1
-
+        
         opt = self.optimizers()
         opt.zero_grad()
 
@@ -1523,18 +1433,13 @@ class TrainingModule(LightningModule):
 
             # ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
 
-            if self.global_step >= 500 and self.global_step % self.training_sampling_frequency == 0:
-                # Moving to 1 sample so we can move faster
-                metrics = self.sample_compare(
-                    batch, train=True, num_samples=1, dt=self.dt
-                )
+            if self.global_step >= self.training_sampling_start and (self.global_step - self.training_sampling_start) % self.training_sampling_frequency == 0:
+                metrics = self.sample_compare(batch, train=True, dt=self.dt)
+                
                 for k, v in metrics.items():
                     self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
                 if self.record:
-                    wandb.log(
-                        {f"sample_metrics/{k}": v for k, v in metrics.items()},
-                        step=self.stepper,
-                    )
+                    wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.stepper)
                 print(metrics)
 
             return logs["loss"]
@@ -1581,14 +1486,11 @@ class TrainingModule(LightningModule):
             f"step {self.global_step:4d}  total_grad_norm = {total:.2f} mean is {mean_grad:.2f} max is {max_grad:.2f}"
         )
         if self.record:
-            wandb.log(
-                {
-                    "grad/grad_norm_total": total,
-                    "grad/grad_norm_max": max_grad,
-                    "grad/grad_norm_mean": mean_grad,
-                },
-                step=self.stepper,
-            )
+            wandb.log({
+                "grad/grad_norm_total": total,
+                "grad/grad_norm_max": max_grad,
+                "grad/grad_norm_mean": mean_grad,
+            }, step=self.stepper)
 
     def configure_optimizers(self):
         if self.deepspeed:
