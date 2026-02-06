@@ -109,3 +109,4 @@ if tokenization_one[0].shape[1] != tokenization_two[0].shape[1]:
 elif (tokenization_one[0] == tokenization_two[0]).all().item() is False:
     raise Exception("Tokenized trees do not match!")
 
+print("Tree tokenization test passed!")

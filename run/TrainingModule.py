@@ -241,12 +241,12 @@ class TrainingModule(LightningModule):
                 self.train_tokenized_trees = batch["tokenized_trees"]
                 self.train_batched_time = batch["batched_time"]
                 self.train_tree = batch["original_trees"]
-            else:
-                if calculate_norm_rf(batch['original_trees'][0], self.train_tree[0]) != 0:
-                    raise Exception("Training tree topology changed during training!")
-                elif not torch.equal(batch["tokenized_trees"][0], self.train_tokenized_trees[0]):
-                    import pdb; pdb.set_trace()
-                    raise Exception("Training tokenized trees changed during training!")
+            # else:
+            #     if calculate_norm_rf(batch['original_trees'][0], self.train_tree[0]) != 0:
+            #         raise Exception("Training tree topology changed during training!")
+            #     elif not torch.equal(batch["tokenized_trees"][0], self.train_tokenized_trees[0]):
+            #         import pdb; pdb.set_trace()
+            #         raise Exception("Training tokenized trees changed during training!")
 
             velocity_labels = batch["batched_velocity"]
             num_leaves = batch["num_leaves"]
@@ -548,14 +548,14 @@ class TrainingModule(LightningModule):
         # Since topology changes in the loop, we will update this cache dynamically
         # Initialize tokenized structure cache
         current_newicks = list(newick_starting_trees)
-        #token_cache = self.model.tokenizer.create_batched_cache(current_newicks)
-        tokenized = self.dataset.tree_tokenizer(current_newicks[0])
-        new_tokenized = ()
-        for i in tokenized:
-            if torch.is_tensor(i):
-                new_tokenized += (i.to(self.device),)
-            else:
-                new_tokenized += (i,)
+        token_cache = self.model.tokenizer.create_batched_cache(current_newicks)
+        #tokenized = self.dataset.tree_tokenizer(current_newicks[0])
+        # new_tokenized = ()
+        # for i in tokenized:
+        #     if torch.is_tensor(i):
+        #         new_tokenized += (i.to(self.device),)
+        #     else:
+        #         new_tokenized += (i,)
 
 
         for nw in newick_starting_trees:
@@ -579,21 +579,21 @@ class TrainingModule(LightningModule):
             # --- encode/tokenize current trees for the model ---
 
             # Use CACHED tokenizer
-            #tokenized = self.model.tokenizer.forward_batched(token_cache, trees)
+            tokenized = self.model.tokenizer.forward_batched(token_cache, trees)
             #import pdb; pdb.set_trace()
 
             # if calculate_norm_rf(current_newicks[0], self.train_tree[0]) != 0:
             #     raise Exception("Current tree does not match training tree topology!")
-            # import pdb; pdb.set_trace()
+            # #import pdb; pdb.set_trace()
             # if tokenized[0].shape[1] != self.train_tokenized_trees[0].shape[1]:
             #     raise Exception("Tokenized tree length mismatch!")
-            # elif (new_tokenized[0] == tokenized[0]).all().item() is False:
+            # elif (new_tokenized[0] == self.train_tokenized_trees[0]).all().item() is False:
             #     raise Exception("Tokenized trees do not match!")
             
  
             with torch.no_grad():
                 velocity, edge_splits, edge_split_mask = self.forward(
-                    self.train_tokenized_trees, t, phyla_embeddings
+                    tokenized, t, phyla_embeddings
                 )
 
             # ---- FIRST PASS: compute per-tree dt_hit, cache per-tree arrays ----
@@ -629,13 +629,13 @@ class TrainingModule(LightningModule):
                         masks.append(m)
                         pred_velocity_dict[m] = V[mask_idx[m]]
                 
-                for item in pred_velocity_dict:
-                    if item in gt:
-                        gt_vel_diff.append(pred_velocity_dict[item] - gt[item])  # Ground truth velocity is 0 for all edges
-                    else:
-                        print(f"Missing ground truth for edge {item} split {[i for i in range(item.bit_length()) if (item >> i) & 1]}")
-                mse = np.mean(np.square(gt_vel_diff))
-                import pdb; pdb.set_trace()
+                # for item in pred_velocity_dict:
+                #     if item in gt:
+                #         gt_vel_diff.append(pred_velocity_dict[item] - gt[item])  # Ground truth velocity is 0 for all edges
+                #     else:
+                #         print(f"Missing ground truth for edge {item} split {[i for i in range(item.bit_length()) if (item >> i) & 1]}")
+                # mse = np.mean(np.square(gt_vel_diff))
+                # import pdb; pdb.set_trace()
 
                 V = np.array(V_val, dtype=np.float64)
                 L = np.array(L, dtype=np.float64)
@@ -683,7 +683,7 @@ class TrainingModule(LightningModule):
                 model_masks = edge_splits[b_idx]
                 # --- advance ---
                 L_new = L + dt * V
-                import pdb; pdb.set_trace()
+                # import pdb; pdb.set_trace()
                 
                 # treat as boundary if we stepped past the first hit time for THIS tree
                 # (float equality with hit_tol=1e-10 is too strict)
@@ -797,8 +797,9 @@ class TrainingModule(LightningModule):
                                 to_print = [i for i in range(new_split.bit_length()) if (new_split >> i) & 1]
                                 logger.info(f"Merging splits {split_masks[0]}, {split_masks[1]} to create this split {new_split}: {to_print}")
 
+
                                 if new_split in td2:
-                                    # import pdb; pdb.set_trace()
+                                    import pdb; pdb.set_trace()
                                     logger.info("Whoa already in there!")
                                     raise Exception("Not possible to merge into a split that already exists...")
                                 else:
