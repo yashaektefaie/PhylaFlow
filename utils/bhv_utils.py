@@ -136,7 +136,7 @@ def best_decomposition_for_any_orientation(split, sorted_components, full):
 
 
 
-def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, verbose = False):
+def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, verbose = False, id_to_test = None):
     from utils.utils import find_polytomy_nodes, polytomy_components_at_node, bucket_by_overlap, leaves_in_component_split
     from utils.bhv_movie import build_tree_from_splits
     if verbose:
@@ -155,8 +155,11 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
     
     geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
     segments = geodesic_result['segments']
-    idxs = list(range(len(segments)-1))
-    rm.shuffle(idxs)
+    if id_to_test is not None:
+        idxs = [id_to_test]
+    else:
+        idxs = list(range(len(segments)-1))
+        rm.shuffle(idxs)
     #idxs = [rm.randrange(0, len(segments)-1)]
     # idxs = [1]
 
@@ -192,10 +195,20 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
             nodes_to_explore = find_polytomy_nodes(G, min_degree=4)
             #components_to_fix = [polytomy_components_at_node(G, i, t1.n_leaves) for i in nodes_to_explore]
             if 'C_root' in nodes_to_explore:
-                logger.info("Skipping root polytomy node for now")
-                break
-            
-            components_to_fix = [leaves_in_component_split(int(i.split('_')[-1]), list(lengths.keys())) for i in nodes_to_explore]
+                logger.info("Handling root components separately for boundary decisions")
+
+            components_to_fix = [
+                leaves_in_component_split(int(i.split('_')[-1]), list(lengths.keys()))
+                for i in nodes_to_explore
+                if i != 'C_root'
+            ]
+            # Root-aligned components over biological leaves (dummy leaf removed).
+            # Some Bi splits decompose only at root even when C_root is degree-3
+            # after dummy removal in build_tree_from_splits/tree_to_newick.
+            root_mask = (1 << (t1.n_leaves - 1)) - 1
+            root_components = leaves_in_component_split(root_mask, list(lengths.keys()))
+            if root_components:
+                components_to_fix.append(root_components)
             if sum(len(c) for c in components_to_fix) > 25:
                 logger.info(f"Boundary index {bi}: too many components to fix ({sum(len(c) for c in components_to_fix)}), stopping")
                 #For this part find basically one that does well and focus on that one 
@@ -222,7 +235,7 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
                         logger.debug(" Could not find relevant components for split, but have previous labels, skipping this split")
                         return final_labels
                     else:
-                        import pdb; pdb.set_trace()
+                        # import pdb; pdb.set_trace()
                         raise Exception("Could not find relevant components for split and no final labels so this is a huge error!")
                
                 logger.debug(f" BEST RELEVANT component found for {split}:")

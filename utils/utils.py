@@ -1,6 +1,6 @@
 import os
 import networkx as nx
-from typing import List, Set, Tuple, Optional, Iterable, Dict
+from typing import List, Set, Tuple, Optional, Iterable, Dict, Union
 from collections import defaultdict, deque
 import torch
 import re
@@ -122,7 +122,7 @@ def get_batch_polytomy_indices(
     edge_mask: torch.Tensor,         # [B, T_raw] bool or {0,1} (valid edge-token positions)
     min_children: int = 3,
     include_root: bool = True,
-    num_leaves: int = 50,
+    num_leaves: Union[int, List[int], torch.Tensor, None] = None,
 ) -> List[List[torch.LongTensor]]:
     """
     Groups edge-token indices into overlap-buckets (polytomy "regions") per batch element.
@@ -132,8 +132,6 @@ def get_batch_polytomy_indices(
         List over b, each is a List of 1D LongTensors of token indices (positions in [0..T_raw-1]).
         Each tensor corresponds to one "polytomy group" bucket.
     """
-
-    full_mask = (1 << num_leaves) - 1
 
     if edge_mask.dim() != 2:
         raise ValueError(f"edge_mask must be [B,T], got {tuple(edge_mask.shape)}")
@@ -164,11 +162,33 @@ def get_batch_polytomy_indices(
 
         unique_splits = list(split_to_positions.keys())
 
+        # Resolve the leaf-universe mask for this batch element.
+        if isinstance(num_leaves, torch.Tensor):
+            if num_leaves.numel() == 0:
+                n_b = 0
+            elif num_leaves.numel() == 1:
+                n_b = int(num_leaves.item())
+            else:
+                n_b = int(num_leaves[b].item())
+        elif isinstance(num_leaves, (list, tuple)):
+            n_b = int(num_leaves[b]) if len(num_leaves) > b else 0
+        elif isinstance(num_leaves, int):
+            n_b = int(num_leaves)
+        else:
+            n_b = 0
+
+        if n_b > 0:
+            full_mask = (1 << n_b) - 1
+        else:
+            full_mask = 0
+            for s in unique_splits:
+                full_mask |= int(s)
+
         #ADD in the root nodes
         # candidates = list(unique_splits)
         # if include_root:
         #     candidates.append(full_mask ^ root_bit)  # p_root
-        if include_root:
+        if include_root and full_mask != 0:
             unique_splits.append(full_mask)
 
         polytomy_groups: List[torch.LongTensor] = []

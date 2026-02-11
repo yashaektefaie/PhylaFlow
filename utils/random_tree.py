@@ -13,12 +13,14 @@ class Tree:
     """
 
     def __init__(
-        self, newick: str = None, num_leaves: int = None, random: bool = False
+        self, newick: str = None, num_leaves: int = None, random: bool = False,
+        dummy: bool = True
     ):
         self.adj = defaultdict(list)
         self.lengths = {}  # symmetric edge lengths: key=(u,v) or (v,u)
         self.n_leaves = 0
         self.id_to_name = {}
+        self.dummy = dummy
 
         if random and num_leaves is not None:
             self._build_random_tree(num_leaves)
@@ -47,14 +49,17 @@ class Tree:
         # 1. Setup IDs
         # Biological leaves: 0 to num_leaves-1
         # Dummy leaf: num_leaves
-        dummy_leaf_id = num_leaves
+        if self.dummy:
+            dummy_leaf_id = num_leaves
 
-        self.n_leaves = num_leaves + 1
+            self.n_leaves = num_leaves + 1
 
         # Populate Names
         for i in range(num_leaves):
             self.id_to_name[i] = str(i)  # Name is string of int
-        self.id_to_name[dummy_leaf_id] = "ROOT_DUMMY"
+        
+        if self.dummy:
+            self.id_to_name[dummy_leaf_id] = "ROOT_DUMMY"
 
         # Internal IDs start after the leaves
         next_internal_id = self.n_leaves

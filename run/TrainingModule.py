@@ -14,6 +14,7 @@ import torch
 import sys
 import os
 import torch.nn.functional as F
+from ete3 import Tree as EteTree
 
 # Ensure the current directory is in sys.path to import 'phyla'
 sys.path.append(os.getcwd())
@@ -27,7 +28,7 @@ _encode_sequences_openfold_style,
 )
 
 from utils.random_tree import Tree
-from utils.bhv_utils import BHVEncoder
+from utils.bhv_utils import BHVEncoder, return_sampled_tree_orthant_velocity
 from utils.bhv_movie import build_tree_from_splits
 from utils.utils import (
 pick_group,
@@ -262,6 +263,7 @@ class TrainingModule(LightningModule):
                 num_leave = num_leaves[num]
                 real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
                 for vel in velocity_labels[num]:
+                    original_vel = vel
                     if vel.bit_length() == real_max_bit + 1:
                         vel = remove_bit(vel, num_leave - 1)
                     elif vel.bit_length() > real_max_bit + 1:
@@ -269,16 +271,32 @@ class TrainingModule(LightningModule):
                             f"Whoa there is a big problem with this split mask {vel} vs real max {real_max_bit}!"
                         )
 
+                    matched_vel = vel
                     if vel not in edge_split_masks[num]:
-                        print(
-                            f"This split {vel} from velocity labels is not in edge splits {edge_split_masks[num]}!"
-                        )
-                        print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
-                        raise Exception("Split not found in edge splits")
+                        # Split orientation can flip after dummy-root removal; allow complement match.
+                        full_mask = (1 << real_max_bit) - 1
+                        complement_vel = full_mask ^ vel
+                        if complement_vel in edge_split_masks[num]:
+                            matched_vel = complement_vel
+                        else:
+                            print(
+                                f"This split {vel} from velocity labels is not in edge splits {edge_split_masks[num]}!"
+                            )
+                            print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
+                            raise Exception("Split not found in edge splits")
+                    
+                    #Ignore leaf edges
+                    n_bits = real_max_bit
+                    k = int(matched_vel).bit_count()
+                    is_pendant = min(k, n_bits - k) == 1
+                    if is_pendant:
+                        continue
+
                     # else:
                     # 	print("WOOO ONE FOUND")
-                    sub_gathered_velocity_labels.append(velocity_labels[num][vel])
-                    sub_v_pred_indices.append(edge_split_masks[num].index(vel))
+
+                    sub_gathered_velocity_labels.append(velocity_labels[num][original_vel])
+                    sub_v_pred_indices.append(edge_split_masks[num].index(matched_vel))
 
                 gathered_velocity_labels.append(
                     torch.tensor(sub_gathered_velocity_labels)
@@ -301,7 +319,29 @@ class TrainingModule(LightningModule):
                 gathered_velocity_labels_flat = torch.cat(gathered_velocity_labels).to(
                     v_pred_gathered.device
                 )
-                loss = ((v_pred_gathered - gathered_velocity_labels_flat) ** 2).mean()
+
+                y = gathered_velocity_labels_flat
+                p = v_pred_gathered
+
+                abs_y = y.abs()
+                # import pdb; pdb.set_trace()
+                
+
+                eps = 1e-6
+                tau = 1e-3
+                scale = abs_y.median().clamp_min(eps)  # robust scale
+                moving = abs_y > tau
+
+                if moving.any():
+                    scale = abs_y[moving].median().clamp_min(1e-6)
+                else:
+                    scale = torch.tensor(1.0, device=y.device)
+
+                w = (abs_y / scale).clamp(min=0.0, max=20.0)
+
+                loss = (w * (p - y).pow(2)).sum() / w.sum()
+
+                # loss = ((v_pred_gathered - gathered_velocity_labels_flat) ** 2).mean()
             else:
                 loss = torch.tensor(0.0, device=v_pred.device, requires_grad=True)
             # print("Wow congrats")
@@ -503,11 +543,10 @@ class TrainingModule(LightningModule):
         KNN_TOPM = 32,
         KNN_TAU = 0.05,
         KNN_STOCHASTIC = False,
+        debug_real_tree=None,
     ):
         if num_samples is None:
             num_samples = self.num_samples
-
-        gt = {158475818957369961082530037760: -0.731665585828483, 158475667841642509253883199488: -0.8988413538718826, 10633823966279326983232708282056441856: -0.20368586326845434, 1297036692682702848: -0.3243564495114172, 5575186299632658880234027781612846343782404: -0.9639204068620865, 5575186310017411073122640408634921532260356: -0.3617431909844142, 5575186299632817356052985151573928873820164: -0.2374435317663224, 5575186299632658261264008138922708894220292: -0.9530019126275265, 18446744074246422528: -0.8388591808965112, 65544: -0.5665090723740024, 22300787733826488258843651194474290477006848: -0.9668680615080342, 2475880078570760618517725188: -0.7128061942398058, 2475880078570760549798248452: -0.772267216617224, 11417981562915327060255522087960440916031832064: -0.4042325641560731, 324518558494130005241672719400960: -0.9457872127340289, 664616533193658392910706523548680192: -0.5935464640962718, 85070601871439417691678863969006649344: -0.8163518920011775, 8921691884004065057751092743946531545399955472: -0.8521763419591382, 85070591730234615865843651995381006336: -0.42188566856064574, 41538394830061755369703031248519184: -0.8722759036024446, 41538394830061755369700832225263632: -0.943427003370581, 21267648011789234332364479824969859072: -0.42183774649226297, 10531000427382356270486649808269054939506982384: -0.7628027356450618, 21267647932561071818100142231425908736: -0.13824650750562706, 41538394830061754793240079921840144: -0.8933152510491086, 41538394830061754793240075626872848: -0.5424099000895698, 12131605409268307000784665072685206076409511936: -0.473487549064635, 11417981562915327060255522087960458508218138624: -0.13048199853398915, 21267647932561071818100142222834925568: -0.4277263676151904, 9223372036854775808: -0.371460974, 21267647932558653966460912964485513216: -0.27606764000000006, 51539607552: -0.789158584543765, 53687091200: -0.317142353850169, 170141345719746060945050695293894393856: -0.1265256327378287, 19961783133764987308900089856: -0.9987741288279605, 19961783133476756932748378112: -0.2628487926438454, 170141345719746060954278570930376540160: -0.9571014370828996, 170141345719746060954274067330749169664: -0.597181905893513, 40564819207303340847894502572064: -0.702835855676214, 274877906944: -0.5316655200000001, 41538374868278621028243970633760768: -0.20280910000000002, 8: -0.6586848399999999, 18446744073709551616: -0.89584757, 42535295865117307932921825928971026432: -0.9283643950000001, 174224571863520493293247799005065324265472: -0.5858926, 32768: -0.8984007, 75557863725914323419136: -0.6043512860000001, 89202980794122492567351798982300853608644608: -0.45812724834873847, 12132128094968697343021699179901705138849710080: -0.7752943077886116, 12132128094968697343021699179901704589093896192: -0.15526474870771043, 12132128094968697338069939022760183489497399296: -0.7437469847521373, 181193554738061313024977710965267937236090880: -0.8185402555711767, 12131779645824970297083352527162173358848868352: -0.7684066502166266, 1298074214633706907132624082829312: -0.13632247594001465, 2787593149816327892691964784081045188247552: -0.6313335999999999, 1208925819614629174706176: -0.97317216, 2: -0.5371667999999999, 4611686018427387904: -0.3274074, 10633823966279326983230456482242756608: -0.7173280900000001, 8590983168: -0.2524487730929251, 340282366920938463464671644124450930688: -0.49503663912851253, 10889035741470030830827987437816582766592: -0.93938013, 4722366482869645213696: -0.13801422000000002, 147573952589676412928: -0.7063541000000001, 340282366920938463463374607431768211456: -0.20999499000000002, 64: -0.19947929999999997, 65536: -0.4950193, 348449143727040986586495598010130648530944: -0.8495285450000002, 33451500615458731910139791480672384360398848: -0.752089247054739, 33451500615458730672199752195292109461274624: -0.43837647874383656, 22301128016193409197307115866118414927937536: -0.4936575036071044, 151115727451828646838272: -0.131550556, 1427971984477040136297538520139641290835894624: -0.2499925784297261, 1427971984477040136297538520139641290827506016: -0.9558975449836806, 1125899906842624: -0.3353244, 2596148429267413814265248164610048: -0.35068829970000004, 1427274915959970654148228735669644149578006560: -0.5444269299889422, 41538374868278621028252766726782992: -0.8406278748947806, 8796093022224: -0.8811318992931401, 16: -0.42314170000000006, 36893488147419103232: -0.7664290000000001, 85070591730234615865843651857942052864: -0.660053212, 20769187434140491141771500015583232: -0.2215423043276592, 20769187434140491105742702996619264: -0.1647015821585011, 20769187434140491105742702728183808: -0.14822959293044752, 2722258935367507707706996859454145691648: -0.39281836300000006, 1180591620717411303424: -0.6707895148, 512: -0.8312887399999999, 10633823966279402541096434196379860992: -0.6911298858840041, 664613997892457936451903530142269440: -0.4648114319175766, 11150372599265311570767859136324180752990208: -0.48775007000000004, 4835703278458516698824704: -0.41556431, 2097152: -0.7364710000000001, 1329552514382095629136716866590343168: -0.7096948819956518, 324518597179756232909806309998592: -0.31729109810505934, 696898370530831709732594436453324963192896: -0.3267846636789428, 1427274915959971287973528997358297487606022176: -0.24884675157384795, 4: -0.37704762, 1297036692682719232: -0.3615048844788768, 5070602438691849468944041639936: -0.2688695683901745, 37778931862957228818432: -0.7454440447960716, 87112285931760246646623899502532662132736: -0.2107455, 37778931862957161709568: -0.475919, 16384: -0.4408901, 649037107316853453566312041152512: -0.6217387369999999, 87112285931760246646623899502532662132864: -0.358355172613539, 22969768235052654921127055246504582040609357824: -0.7487449744916324, 22880565254258532428559703447522281187000713216: -0.9486748980724731, 5192296858544272361496235619647488: -0.405831922649313, 3211307308588409732381143431261364056861184000: -0.3901462842337679, 356811923176489970264571492362373784095690752: -0.702716195388327, 5708990770823839524233446109252884202824663040: -0.7288599401511386, 131072: -0.0835494, 302231454903657293676544: -0.8648667400000001, 3212701110480231147117753133498315792256602112: -0.7134704961369555, 8921691881304070671351199242751199995081265152: -0.28782847889949814, 696898287454081973172991196020261297061888: -0.37211505, 2722258935367507707706996859454145691650: -0.7122678160587917, 295147905179352825856: -0.3938135, 680564733841876926926749214863536422912: -0.90725928, 4096: -0.96656028, 87112285931760246646660792990680081236096: -0.24327849190616255, 21778071482940061661655974875633165533184: -0.2688333, 9444732965739290427392: -0.21709334799999996, 2199023255552: -0.528400094, 5070602400912917605986812821504: -0.16108004, 33500768662435011191613705054773636980116340208: -0.9970736264737174, 33500768662435011191613705054773636980116340720: -0.7993039639208753, 128: -0.31548456739999997, 19807040628566084398385987584: -0.5122394, 4503599627370496: -0.09382170000000001, 18014398509481984: -0.218547123, 8589934592: -0.893909, 2305843009213693952: -0.8655166, 5192296858534827628530496329220096: -0.6328248799999999, 140737488355328: -0.15824300000000002, 20769187434139310514121985316880384: -0.9824172999999999, 309485009821345068728975360: -0.9318898825125838, 170141183460469231731687303715884105728: -0.6956975200000001, 73786976294838206464: -0.2634304, 33500768662437607340042972468587902228281016312: -0.16033868696927603, 33500768662435011191613705054773636980116406264: -0.19914292170543108, 32: -0.92875739, 1024: -0.6786740000000001, 2361183241434822606848: -0.845891492, 89202980794122492566142873162686224433938432: -0.4703248939481339, 89202980794122492566142873162651040061849600: -0.9615993304838134, 20599322253708728900222424449024: -0.5947816016441211, 20282409603651671549847174905856: -0.19076486471783796, 87112285931760246646734579966974919442560: -0.768112570858982, 20282409603651670423947268063232: -0.34382355583823504, 89202980794122492566142873090593446023921664: -0.8101786700000001, 38685626227668133590597632: -0.77295635, 16777216: -0.18239849, 12132130817227632710529425776364566440320434178: -0.608841057288808, 10655247261423298577541240952478236672: -0.23006057998971813, 11984799775805394206677957819068579840: -0.15721375947538477, 178405961588244985132285746181186892047843328: -0.9518266, 77371252455336267181195264: -0.24614069200000002, 33554432: -0.876750338, 87197356533631686064426258830943926091904: -1.0006733544373776, 4398046511104: -0.5591561, 8921779081360598689437157170205362489326047376: -0.44015310322655926, 8921691881345609066181260998120903026329784336: -0.5744778740366061, 67108864: -0.8186042699999999, 356811923176489970264571492362373784095686656: -0.7472491, 154742504910672534362390528: -0.46924256000000003, 524288: -0.14976057, 12132130817227632710529406886898564592995401730: -0.2496524105666533, 309485600117155427434627072: -0.3316258096861924, 83076749736557242056487941267529728: -0.6546566371556344, 309490322483638297079840768: -0.6292476882962794, 1361129488283076107562227329949497294848: -0.7740742897783631, 12250663690251526281842553695413718746112: -0.25211205773482903, 43556142965880200694564405087533512294400: -0.44196607556109313, 17592186306560: -0.1634280114481001, 11150372599265321474892636329173694533337088: -0.6056767722632457, 11150372599265311571372322046131495340343296: -0.1367493995095094, 43556142965880123323311949751266331099136: -0.8309685455821875, 12132130817227632710838916103459890755827793922: -0.3286819489546425, 256: -0.7355025, 1361129467683753853853498429727072845824: -0.5540848, 1267650600228229401496703205376: -0.79602339, 633825300114114700748351602688: -0.299743783, 22835963083295358136546656770638941187364356096: -0.6694938576309417, 281474976710656: -0.32151630000000003, 162259276829213363391578010288128: -0.88759204, 2535301200456458802993406410752: -0.6936673600000001, 10141204801825835211973625643008: -0.78936662, 39614081259438011805985669120: -0.9517860424141675, 549755813888: -0.24018540000000002, 20282409603651670423947251286016: -0.5571252999999999, 8192: -0.95794727, 713623846352979940529142984724747568191373312: -0.355079858, 309485009821345068724781056: -0.25884663, 134217728: -0.19717553, 1393801891821414736609702236951735395418112: -0.6279203871408506, 1393801891820147086009474007550238692212736: -0.485396703169406, 8388608: -0.9310123100000001, 44601490397061246283071436545296723011960832: -0.6926529000000001, 536870912: -0.8547623, 2854495385411919762116571938898990272765493248: -0.65608285, 1237940039285380274899124224: -0.9263920899999999, 4194304: -0.2863618, 22300745198530623141535718272648361505980416: -0.4088007, 9671406556917033397649408: -0.60181799, 262144: -0.10429302, 1393796574908163946345982392040522594123776: -0.277364, 1427274915295313556135363039418089731526754304: -0.42476157175087637, 1427274915295313556135363039418089677839663104: -0.737310793889599, 316912650057057350375249543168: -0.6962051657849782, 1073741824: -0.0916866, 44601490398440450136119750134125136099934208: -0.615230327959706, 44601490398359320497705143452429347094790144: -0.4036354465174233, 2475880078570760549798248448: -0.32329020810000003, 27222589353675077077069968594541456916480: -0.7035646769755317, 5708990770823839524233143877797980545530986496: -0.18182857, 590295810358705651712: -0.554357439, 12132130817227632710529425776364566440320565250: -0.6404433106913857, 1427275086101317007729261358193786550891839520: -0.5483040745247466, 1427275086101317007719589951636869517494190112: -0.14742938559435922, 1427275086101317007719589951636868417982562336: -0.38830548251977737, 2417851639229258349412352: -0.6845067, 1048576: -0.5319881000000001, 5575186299632655785383929568162090376495104: -0.3870277, 696898375723128568276866797949560582840640: -0.6298979055769853, 8796093022208: -0.54615, 9007199254740992: -0.5657858, 144115188075855872: -0.4783032, 1099511627776: -0.15149364, 1329227995784915872903807060280344576: -0.567620313, 576460752303423488: -0.6845397999999999, 2048: -0.95081954, 10384593717069655257060992658440192: -0.49213039000000003, 12132130817227632710529425776364496071576256514: -0.8907233515522223, 5444517870735015415413993718908291383296: -0.5986911520000001, 43556142965880123323311949751266331066368: -0.77128803, 2147483648: -0.18069213, 11417981541647679048466287755595961091061972992: -0.9390782999999999, 4951760157141521099596496896: -0.24220397999999999, 18889465931478580854784: -0.9797005500000001, 12250165229753106938390214767766080061440: -0.4729157109932202, 39614081257132168796771975168: -0.27499411999999995, 12132130817227632710529425780976252458747953154: -0.9095502259197155, 17179869184: -0.46371051, 5316911983139663491615228241121378304: -0.40179855000000003, 288230376151711744: -0.5714318799999999, 36028797018963968: -0.3921306, 34359738368: -0.0639124, 696898287454081973175352379965383695663168: -0.5930554063873374, 696898287454081973175352379261696253886528: -0.13810612990336243, 2361183241434956824640: -0.5926955985703701, 2361183241434822606912: -0.27712471422144497, 79228162514264337593543950336: -0.92442973, 12250331383252580052874327743648648659968: -0.6977918703207109, 12250331383252580052874327743648615105536: -0.15084700393496248, 12250165229753106938390214767766080062464: -0.5330723855527605, 1298074214633706907132624082305024: -0.98062812, 562949953421312: -0.6878934999999999, 10655242190820859885691772008436596736: -0.5252614535752409, 10654593153713543032238205696395444224: -0.5203146689389152, 5316911983139663491615509716098088960: -0.8332862440965919, 332306998946228968225951765070086144: -0.139575868, 2251799813685248: -0.93207731, 2658455991569831745825628519070171136: -0.5627937981158709, 166153499473114484112975882535043072: -0.26980696000000004, 83076749736557242056487941267521536: -0.90755406, 1152921504606846976: -0.59735567, 72057594037927936: -0.6106075100000001, 664613997892457936451903530140172288: -0.49048681, 2658455991569831745807614120560689152: -0.8239110900000001, 158456325028528675187087900672: -0.8376991119999999, 68719476736: -0.7228846600000001, 17592186044416: -0.15298233, 5192296858544272361496235619647744: -0.17328533605422589, 12131779633840170521277958320484215539780288512: -0.6933046330050417, 12131779633840170521277958320484211141733777408: -0.1537968872579432, 40564819207303340847894502572032: -0.6992508000000002, 22835963083295358096932575511200929381378686976: -0.1962921374209446, 4294967296: -0.44879330000000006, 22835963083295358096932575511191922182123945984: -0.29888729999999997, 9903520314283042199192993792: -0.44313440000000004, 1427274915295354120954570342758937626029326368: -0.35556344696422204, 35184372088832: -0.80611311, 81129638414606681695789005144064: -0.8535050000000001, 268435456: -0.8734498, 618970019642690137449562112: -0.42264314999999997, 1427247692705959881058285969449495136382746624: -0.6877839499999999, 19342813113834066795298816: -0.9763735802000001, 12250663690251526281842553695413718748160: -0.5875888014578358, 45632899479665240050881888572047792984108810234: -0.7907101120053491, 22880564573693798586682776520773066323464290304: -0.19299567942349613, 70368744177664: -0.1368941, 696898375723128568277161945854739935666496: -0.6592243905122367, 137438953472: -0.6771687, 316912650057057350374175801344: -0.87581393, 604462909807314587353088: -0.137097543, 1427274915959971287973528849784344897929609248: -0.9716313969391362, 9103028442905316134189111288129413648671087760: -0.10617014865176422, 9102984886762350253988416723724326115158793360: -0.7267591724511383, 9102984886762350253988416723724325840280886416: -0.2794603883653689, 8921791332024288940963439012759057903044795536: -0.21991407944129673, 324518553658426726783156020576256: -0.33176211, 45666350980280698782792028363528465368469209082: -0.7310239660354657, 45671926166590716193865151003937100290001469438: -0.17020763288696578, 703687441776640: -0.6406324161906625}
 
         self.model.eval()
         max_logits = []
@@ -553,12 +592,33 @@ class TrainingModule(LightningModule):
         #         new_tokenized += (i,)
 
 
-        for nw in newick_starting_trees:
+        for b_idx, nw in enumerate(newick_starting_trees):
             t = Tree(nw)
             enc = BHVEncoder()
             masks, lens = enc.return_BHV_encoding(t)
-            # Initial trees have no polytomies and all lengths should be greater than 0, so any 0 edges need to be removed
-            trees.append({m: float(l) for m, l in zip(masks, lens) if l is not None})
+            # BHV encoder uses canonical split orientation (with dummy-root influence),
+            # while model/tokenizer uses directed edge masks on dummy-free Newick.
+            # Convert initial lengths into tokenizer split-mask space once, so the
+            # sampler state remains in one consistent representation.
+            bhv_lengths = {int(m): float(l) for m, l in zip(masks, lens) if l is not None}
+            model_masks_init = [int(m) for m in token_cache.edge_split_masks_list[b_idx] if int(m) != 0]
+
+            biological_bits = max(t.n_leaves - 1, 0)
+            full_model_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
+
+            td_init = {}
+            for m_model in model_masks_init:
+                length = bhv_lengths.get(m_model)
+                if length is None and full_model_mask:
+                    length = bhv_lengths.get(full_model_mask ^ m_model)
+
+                if length is None:
+                    raise Exception(
+                        f"Could not map initial split {m_model} from BHV encoding to tokenizer mask space."
+                    )
+                td_init[m_model] = float(length)
+
+            trees.append(td_init)
             num_leaves.append(t.n_leaves)
             mapping.append(t.id_to_name)
 
@@ -566,6 +626,7 @@ class TrainingModule(LightningModule):
         n_events = 0
         n_steps = 0
         n_topology_changes = 0
+        num_topology_changes = 0
         polytomy_sizes = []  # Track sizes of polytomies encountered during sampling
 
         while t < T and n_steps < max_steps and n_events < max_events:
@@ -598,6 +659,15 @@ class TrainingModule(LightningModule):
             for b_idx, (td, v, n_leaves, mapp) in enumerate(zip(trees, velocity, num_leaves, mapping)):
                 model_masks = edge_splits[b_idx]
                 mask_idx = {mask: i for i, mask in enumerate(model_masks)}
+                # Use biological leaf universe (exclude dummy root leaf) for canonicalization.
+                # Deriving bit-width from observed model masks can undercount when a high-index
+                # leaf is absent in the current split set, which breaks complement matching.
+                biological_bits = max(n_leaves - 1, 0)
+                full_model_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
+                # In Tree(...) representation we carry a dummy leaf at index n_leaves-1.
+                # The edge incident to the dummy can appear as "all biological leaves" split;
+                # tokenizer masks (built on dummy-free Newick) do not include this split.
+                dummy_artifact_mask = full_model_mask
                 V = v.squeeze(1).detach().cpu().numpy()
 
                 L = []
@@ -607,28 +677,46 @@ class TrainingModule(LightningModule):
                 gt_vel_diff = []
 
                 for m in td:
-                    if m not in model_masks:
-                        # WE GOTTA FIX THIS LOL
-                        print(f"Whoa there is a split missing in velocity masks! {m} or {[i for i in range(m.bit_length()) if (m >> i) & 1]}")
+                    if m == dummy_artifact_mask:
+                        continue
+
+                    matched_m = m
+                    dummy_bit_idx = n_leaves - 1
+                    if biological_bits > 0 and ((m >> dummy_bit_idx) & 1):
+                        matched_m = remove_bit(m, dummy_bit_idx)
+
+                    if biological_bits > 0 and matched_m.bit_length() > biological_bits:
+                        print(
+                            f"Skipping split with unexpected bit_length: {m} "
+                            f"(bit_length={m.bit_length()}, expected <= {biological_bits + 1})"
+                        )
+                        raise Exception("Unexpected split in tree while sampling that cannot be matched to model masks!")
+
+                    idx = mask_idx.get(matched_m)
+                    if idx is None and full_model_mask:
+                        complement_m = full_model_mask ^ matched_m
+                        idx = mask_idx.get(complement_m)
+                        if idx is not None:
+                            matched_m = complement_m
+
+                    if idx is None:
+                        print(
+                            f"Whoa there is a split missing in velocity masks! {m} or "
+                            f"{[i for i in range(m.bit_length()) if (m >> i) & 1]}"
+                        )
+                        raise Exception("Missing split in velocity masks!")
+
+                    L.append(td[m])
+
+                    #We should not be making moves based on leafs! If leaf, velocity is 0
+                    if matched_m.bit_count() == 1:
+                        V_val.append(0.0)
                     else:
-                        L.append(td[m])
+                        V_val.append(V[idx])
 
-                        #We should not be making moves based on leafs! If leaf, velocity is 0
-                        if m.bit_count() == 1:
-                            V_val.append(0.0)
-                        else:
-                            V_val.append(V[mask_idx[m]])
+                    masks.append(m)
+                    pred_velocity_dict[m] = V[idx]
 
-                        masks.append(m)
-                        pred_velocity_dict[m] = V[mask_idx[m]]
-                
-                # for item in pred_velocity_dict:
-                #     if item in gt:
-                #         gt_vel_diff.append(pred_velocity_dict[item] - gt[item])  # Ground truth velocity is 0 for all edges
-                #     else:
-                #         print(f"Missing ground truth for edge {item} split {[i for i in range(item.bit_length()) if (item >> i) & 1]}")
-                # mse = np.mean(np.square(gt_vel_diff))
-                # import pdb; pdb.set_trace()
 
                 V = np.array(V_val, dtype=np.float64)
                 L = np.array(L, dtype=np.float64)
@@ -638,6 +726,57 @@ class TrainingModule(LightningModule):
 
                 if (L < 0).any():
                     raise Exception("There are negative lengths that is not possible!")
+
+                # --- DEBUG: compare predicted vs true velocity at t=0 ---
+                if debug_real_tree is not None and n_steps == 1:
+                    try:
+                        _, true_velocity = return_sampled_tree_orthant_velocity(
+                            newick_starting_trees[b_idx], debug_real_tree, 0.0
+                        )
+                        # Build a comparable dict of predicted velocities keyed by split mask
+                        v_pred_arr = []
+                        v_true_arr = []
+                        matched_masks_dbg = []
+                        for m_i, m_val in enumerate(masks):
+                            # Try to find this mask in true_velocity (with possible complement / remove_bit)
+                            tv = true_velocity.get(m_val)
+                            if tv is None and full_model_mask:
+                                tv = true_velocity.get(full_model_mask ^ m_val)
+                            if tv is None:
+                                # Try with dummy bit added back
+                                m_with_dummy = m_val | (1 << (n_leaves - 1))
+                                tv = true_velocity.get(m_with_dummy)
+                            if tv is not None:
+                                v_pred_arr.append(V_val[m_i])
+                                v_true_arr.append(tv)
+                                matched_masks_dbg.append(m_val)
+                        if len(v_pred_arr) > 0:
+                            v_pred_np = np.array(v_pred_arr)
+                            v_true_np = np.array(v_true_arr)
+                            mse = float(np.mean((v_pred_np - v_true_np) ** 2))
+                            mae = float(np.mean(np.abs(v_pred_np - v_true_np)))
+                            cos_num = np.dot(v_pred_np, v_true_np)
+                            cos_den = (np.linalg.norm(v_pred_np) * np.linalg.norm(v_true_np))
+                            cosine_sim = float(cos_num / cos_den) if cos_den > 0 else 0.0
+                            print(f"\n===== DEBUG: Predicted vs True velocity at t=0 (tree {b_idx}) =====")
+                            print(f"  Matched edges: {len(v_pred_arr)} / {len(masks)} (of {len(true_velocity)} true)")
+                            print(f"  MSE:  {mse:.6e}")
+                            print(f"  MAE:  {mae:.6e}")
+                            print(f"  Cosine similarity: {cosine_sim:.6f}")
+                            print(f"  Pred  range: [{v_pred_np.min():.6e}, {v_pred_np.max():.6e}]")
+                            print(f"  True  range: [{v_true_np.min():.6e}, {v_true_np.max():.6e}]")
+                            # Show top-5 worst mismatches
+                            abs_err = np.abs(v_pred_np - v_true_np)
+                            worst_idx = np.argsort(abs_err)[::-1][:5]
+                            print(f"  Top-5 worst mismatches:")
+                            for wi in worst_idx:
+                                print(f"    split={matched_masks_dbg[wi]:>12}  pred={v_pred_np[wi]:+.6e}  true={v_true_np[wi]:+.6e}  err={abs_err[wi]:.6e}")
+                            print(f"============================================================\n")
+                            import pdb; pdb.set_trace()
+                        else:
+                            print(f"DEBUG: Could not match any velocity splits for tree {b_idx}")
+                    except Exception as e:
+                        print(f"DEBUG: Failed to compute true velocity for comparison: {e}")
 
                 # --- compute dt_hit ---
                 neg = (V < 0) & (L > eps_len)
@@ -653,8 +792,8 @@ class TrainingModule(LightningModule):
             # ---- GLOBAL dt across the batch ----
             dt_hit_global = min(dt_hit_list) if len(dt_hit_list) else float("inf")
             # Experimenting here, dt_hit_global is not a good metric we just jump, jump, jump, so why not use dt_base
-            # dt = min(dt_base, dt_hit_global, T - t)
-            dt = min(dt_base, T-t)
+            dt = min(dt_base, dt_hit_global, T - t)
+            #dt = min(dt_base, T-t)
 
             # defensive: prevent hard stall
             if dt <= 0:
@@ -692,6 +831,7 @@ class TrainingModule(LightningModule):
 
                     batch = (dt_candidates <= dt_min * (1 + eta)) | (dt_candidates <= dt_min + eps_abs)
                     L_new[idx_neg[batch]] = 0.0
+
                 
                 # update dict
                 td2 = {m: float(l) for m, l in zip(masks, L_new) if l > eps_len}
@@ -716,6 +856,8 @@ class TrainingModule(LightningModule):
                             # For autoregressive step, we just use standard tokenizer for now as it's rare event
                             tokenized_trees = self.model.tokenizer([td2_newick])
                             # import pdb; pdb.set_trace()
+                        else:
+                            break
 
                         with torch.no_grad():
                             logit_outputs = self.forward(
@@ -751,50 +893,56 @@ class TrainingModule(LightningModule):
 
                             logits_vec = logits[tri]
                             finite = torch.isfinite(logits_vec)
-                            if finite.sum() == 0:
-                                res = None
-                            else:
+                            res = None
+                            new_split = None
+                            full = (1 << (n_leaves - 1)) - 1
+
+                            if finite.sum() > 0:
                                 logits_vec_f = logits_vec[finite]
                                 ii_f, jj_f = ii[finite], jj[finite]
-                                k = torch.argmax(logits_vec_f)
-                                i, j = ii_f[k].item(), jj_f[k].item()
-                                res = [i, j]
-                                
+                                order = torch.argsort(logits_vec_f, descending=True)
+                                k = order.tolist()[0]
+                                i_try, j_try = ii_f[k].item(), jj_f[k].item()
+                                split_masks_try = [
+                                    output["splits_represented"][i_try],
+                                    output["splits_represented"][j_try],
+                                ]
+
+                                candidate_split = int(split_masks_try[0]) | int(split_masks_try[1])
+
+                                if candidate_split in td2:
+                                    import pdb; pdb.set_trace()
+                                    raise Exception("Trying to merge into a split that already exists in the tree, this should not happen!")
+
+                                res = [i_try, j_try]
+                                new_split = candidate_split
+
                             if res is None:
-                                logger.info("No merges found!")
+                                logger.info("No valid merges found!")
                             else:
                                 logger.info(f"Merges found: {res}")
-                                # import pdb; pdb.set_trace()
                                 split_masks = [
                                     output["splits_represented"][idx]
                                     for idx in res
                                 ]
-                                new_split = 0
-                                for sm in split_masks:
-                                    new_split |= sm
-                                
+
                                 to_print = [i for i in range(new_split.bit_length()) if (new_split >> i) & 1]
                                 logger.info(f"Merging splits {split_masks[0]}, {split_masks[1]} to create this split {new_split}: {to_print}")
 
-
-                                if new_split in td2:
-                                    import pdb; pdb.set_trace()
-                                    logger.info("Whoa already in there!")
-                                    raise Exception("Not possible to merge into a split that already exists...")
+                                # New length is average of merged splits
+                                curr_lens = list(td2.values())
+                                if len(curr_lens) > 0:
+                                    td2[new_split] = float(np.percentile(curr_lens, 10))
                                 else:
-                                    # New length is average of merged splits
-                                    curr_lens = list(td2.values())
-                                    if len(curr_lens) > 0:
-                                        td2[new_split] = float(np.percentile(curr_lens, 10))
-                                    else:
-                                        td2[new_split] = 1e-3
+                                    td2[new_split] = 1e-3
                                 top_change = True
                                 logger.info("Merge performed time to break out")
                                 num_merges += 1
                                 n_events += 1
                                 num_topology_changes += 1
                                 break
-                        
+                        topology_changed = top_change
+
                         # if not top_change:
                         #     logger.info("No more merges possible, pick a random polytomy and do a KNN merge")
                         #     output = random.choice(logit_outputs)
@@ -825,7 +973,7 @@ class TrainingModule(LightningModule):
                         #     n_events += 1
                         #     num_topology_changes += 1
 
-
+                        
                     _, td2_newick_final = build_tree_from_splits(
                         list(td2.keys()),
                         td2,
@@ -881,6 +1029,7 @@ class TrainingModule(LightningModule):
         nexus_filepath = batch["nexus_filepaths"][0]
         id = batch["ids"][0]
         mapping = batch["mappings"][0]
+        seq_ordering_map = batch["sequence_ordering_maps"][0]
 
         if train:
             real_trees = self.dataset.dataset_train.return_posterior_trees(id)
@@ -896,19 +1045,31 @@ class TrainingModule(LightningModule):
 
         sanity_check = self.dataset.dataset_train.sanity_check if train else self.dataset.dataset_val.sanity_check
         random_sanity_check = self.dataset.dataset_train.random_sanity_check if train else self.dataset.dataset_val.random_sanity_check
-        
+
+        def _remap_tree_to_batch_indexing(tree_newick, offset=0, tree_kind="tree"):
+            t_obj = EteTree(tree_newick, format=1)
+            for leaf in t_obj.get_leaves():
+                lookup_name = leaf.name
+                if offset:
+                    try:
+                        lookup_name = str(int(lookup_name) + offset)
+                    except ValueError:
+                        raise Exception(
+                            f"Non-integer leaf name '{leaf.name}' encountered in {tree_kind} while applying offset {offset}."
+                        )
+
+                mapped_name = seq_ordering_map.get(lookup_name)
+                if mapped_name is None:
+                    raise Exception(
+                        f"Leaf name '{lookup_name}' in {tree_kind} not found in sequence ordering map."
+                    )
+                leaf.name = mapped_name
+
+            return t_obj.write(format=1)
+
         real_trees = []
         for i in pot_real_trees:
-            t_real = EteTree(i, format=1)
-            for leaf in t_real.get_leaves():
-                name = leaf.name
-                # direct match (most likely)
-                if name in seq_ordering_map:
-                    leaf.name = seq_ordering_map[name]
-                else:
-                    import pdb; pdb.set_trace()
-                    raise Exception("Leaf name in real tree not found in original names map!")
-            real_trees.append(t_real.write(format=1))
+            real_trees.append(_remap_tree_to_batch_indexing(i, offset=0, tree_kind="real tree"))
 
         for i in real_trees:
             if has_polytomy_fast(i):
@@ -934,38 +1095,29 @@ class TrainingModule(LightningModule):
                 starting_tree = self.dataset.dataset_val.sample_random_tree(
                     real_trees[0]
                 )
-            
-            #Now remap the random tree to make the indices match up with the real tree
-            t_random = EteTree(starting_tree, format=1)
 
-            for leaf in t_random.get_leaves():
-                name = leaf.name
-                #Random sanity check to offset by 1
-                if not sanity_check:
-                    name = str(int(leaf.name)+1)
-                # direct match (most likely)
-                if name in seq_ordering_map:
-                    leaf.name = seq_ordering_map[name]
-                else:
-                    import pdb; pdb.set_trace()
-                    raise Exception("Leaf name in random tree not found in original names map!")
-            starting_tree = t_random.write(format=1)
+            # Random trees are offset only in the default non-sanity path.
+            random_tree_offset = 1 if (not sanity_check and not random_sanity_check) else 0
+            starting_tree = _remap_tree_to_batch_indexing(
+                starting_tree, offset=random_tree_offset, tree_kind="random tree"
+            )
 
 
             #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
             timepoint = random.uniform(0, 1)
 
-            starting_trees_nw.append(starting_tree)
-            sampled_tree, n_topology_changes, avg_max_logit, avg_polytomy_size, n_polytomies_resolved = self.sample(
-                [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt
+            start_time = time.time()
+            sampled_tree, n_topology_changes_one, avg_max_logit, avg_polytomy_size, n_polytomies_resolved_one = self.sample(
+                [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt,
+                debug_real_tree=real_trees[0],
             )
             print(f"Sampling a single tree took {time.time() - start_time} seconds")
 
             avg_polytomy_sizes.append(avg_polytomy_size)
-            num_polytomies_resolved.append(n_polyt_resolved)
+            num_polytomies_resolved.append(n_polytomies_resolved_one)
 
             sampled_tree = sampled_tree[0]
-            num_topology_changes.append(n_topo_changes)
+            num_topology_changes.append(n_topology_changes_one)
             avg_max_logits.append(avg_max_logit)
             if has_polytomy_fast(sampled_tree):
                 sampled_tree = resolve_polytomies_random_deterministic(sampled_tree)
@@ -979,7 +1131,7 @@ class TrainingModule(LightningModule):
             sampled_trees.append(sampled_tree)
 
         sampled = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, True) for i in sampled_trees]
-        posterior_trees = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, False) for i in real_trees]
+        posterior_trees = [number_to_name_newick(i, {int(i):v for i, v in mapping.items()}, True) for i in real_trees]
 
         rf_dists = []
         n_pairs = min(len(sampled), len(posterior_trees))
@@ -1022,7 +1174,6 @@ class TrainingModule(LightningModule):
         
         avg_num_polytomies_resolved = np.mean(num_polytomies_resolved)
         print(f"Average number of polytomies resolved during sampling: {avg_num_polytomies_resolved}")
-        import pdb; pdb.set_trace()
         if self.record:
             wandb.log(
                 {

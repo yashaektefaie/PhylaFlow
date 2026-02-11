@@ -458,11 +458,24 @@ class TreeDenoiserTokenGT(nn.Module):
 
             all_group_logits = []
 
-            num_leaves = leaf_mask.sum(dim=1).item()  # [B]
-            batch_polytomy_index, batch_polytomy_splits = get_batch_polytomy_indices(edge_split_masks, edge_mask, 
-                                                                                    min_children=3, 
-                                                                                    include_root=True,
-                                                                                    num_leaves=num_leaves)
+            # Derive per-sample split universe from actual edge masks.
+            # This keeps polytomy grouping in the exact same bit-space used by tokenizer splits.
+            num_leaves = []
+            for splits_b in edge_split_masks:
+                max_bit = 0
+                for s in splits_b:
+                    s_int = int(s)
+                    if s_int != 0:
+                        max_bit = max(max_bit, s_int.bit_length())
+                num_leaves.append(max_bit)
+
+            batch_polytomy_index, batch_polytomy_splits = get_batch_polytomy_indices(
+                edge_split_masks,
+                edge_mask,
+                min_children=3,
+                include_root=True,
+                num_leaves=num_leaves,
+            )
                                                                                     
             for b, groups in enumerate(batch_polytomy_index):
                 for num, group in enumerate(groups):

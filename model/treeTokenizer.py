@@ -126,10 +126,12 @@ def _worker_newick_parser(tree_str):
         # Assuming run in same process or serialized
         t = tree_str
 
-    try:
-        t.unroot()
-    except:
-        pass
+    # Preserve the serialized rooting.
+    #
+    # Autoregressive reconstruction can transiently create a degree-2 root where
+    # both incident edges carry distinct split-length information. Forcing
+    # unroot() contracts that root and silently drops one split/length pair,
+    # which breaks split-mask <-> length-map consistency.
 
     # Canonicalize tree topology
     for node in t.traverse("postorder"):
@@ -180,12 +182,15 @@ def _worker_newick_parser(tree_str):
                 m |= int(leaf_masks[ch.uid])
             leaf_masks[node.uid] = m
 
-    try:
-        n_bio = max(int(n.uid) for n in t.iter_leaves()) + 2
-    except ValueError:
-        n_bio = 2  # fallback
+    # Build the split universe from actual leaf IDs present in this tree.
+    # This avoids off-by-one / indexing-assumption bugs when leaf labels are not
+    # exactly 0..N-1 in the serialized Newick.
+    full = 0
+    for leaf in t.iter_leaves():
+        full |= (1 << int(leaf.uid))
 
-    full = (1 << n_bio) - 1
+    if full == 0:
+        full = 1  # fallback for degenerate cases
 
     parent_list = []
     child_list = []
@@ -214,7 +219,10 @@ def _worker_newick_parser(tree_str):
             if A == 0 or A == full:
                 split_mask_list.append(0)  # trivial / ignore
             else:
-                split_mask_list.append(min(A, full ^ A))
+                # Keep the directed child-subtree mask instead of canonical min(A, full^A).
+                # Autoregressive polytomy grouping relies on component-set structure
+                # (maximal proper subsets), which is broken if leaf sides are flipped.
+                split_mask_list.append(A)
 
     E = len(child_list)
     N = len(nodes)  # Rough node count based on traversal

@@ -224,6 +224,7 @@ def run_overfit():
         lr_scheduler="default",
         num_annealing_steps=10000,
         num_warmup_steps=1000,
+        num_samples=1,
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
