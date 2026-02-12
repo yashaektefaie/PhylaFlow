@@ -126,12 +126,27 @@ def _worker_newick_parser(tree_str):
         # Assuming run in same process or serialized
         t = tree_str
 
-    # Preserve the serialized rooting.
-    #
-    # Autoregressive reconstruction can transiently create a degree-2 root where
-    # both incident edges carry distinct split-length information. Forcing
-    # unroot() contracts that root and silently drops one split/length pair,
-    # which breaks split-mask <-> length-map consistency.
+    # Deterministic rooting for ambiguous roots only:
+    # Equivalent unrooted trees can be serialized with a multifurcating root
+    # (e.g., 3 children) vs a bifurcating root, which changes node/edge counts
+    # and token lengths. For such ambiguous cases we re-root on a stable
+    # outgroup. For already-bifurcating roots we preserve the serialized root
+    # to keep directed split-mask orientation consistent with upstream TD2/BHV
+    # split dictionaries.
+    leaves = list(t.iter_leaves())
+    if len(leaves) > 1 and len(t.children) > 2:
+        leaves_by_name = {lf.name: lf for lf in leaves}
+        outgroup = None
+        for lbl in ("0", "1"):
+            if lbl in leaves_by_name:
+                outgroup = leaves_by_name[lbl]
+                break
+        if outgroup is None:
+            try:
+                outgroup = min(leaves, key=lambda x: int(x.name))
+            except ValueError:
+                outgroup = min(leaves, key=lambda x: x.name)
+        t.set_outgroup(outgroup)
 
     # Canonicalize tree topology
     for node in t.traverse("postorder"):
@@ -153,11 +168,17 @@ def _worker_newick_parser(tree_str):
     nodes = list(t.traverse("postorder"))
 
     leaf_masks = {}
-    for node in nodes:
-        if node.is_leaf():
-            node.add_feature("uid", int(node.name))
-            lb = int(node.uid)
-            leaf_masks[node.uid] = 1 << lb
+    leaf_nodes = [node for node in nodes if node.is_leaf()]
+    # Match BHV/Tree indexing: remap leaves to contiguous IDs by sorted name order.
+    # Using raw labels directly (e.g., 1..N) shifts split bits and breaks alignment.
+    try:
+        leaf_nodes.sort(key=lambda x: int(x.name))
+    except ValueError:
+        leaf_nodes.sort(key=lambda x: x.name)
+
+    for uid, node in enumerate(leaf_nodes):
+        node.add_feature("uid", uid)
+        leaf_masks[uid] = 1 << uid
 
     if not leaf_masks:
         # Single node tree or weird case
@@ -182,9 +203,7 @@ def _worker_newick_parser(tree_str):
                 m |= int(leaf_masks[ch.uid])
             leaf_masks[node.uid] = m
 
-    # Build the split universe from actual leaf IDs present in this tree.
-    # This avoids off-by-one / indexing-assumption bugs when leaf labels are not
-    # exactly 0..N-1 in the serialized Newick.
+    # Build split universe in contiguous BHV-compatible leaf index space.
     full = 0
     for leaf in t.iter_leaves():
         full |= (1 << int(leaf.uid))

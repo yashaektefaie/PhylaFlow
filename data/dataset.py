@@ -66,11 +66,13 @@ class TreeDataset(Dataset):
         validation=False,
         sanity_check: bool = False,
         random_sanity_check: bool = False,
+        overfit_velocity_zero: bool = False,
     ) -> None:
         self.nexus_root = nexus_root
         self.mrbayes_root = mrbayes_root
         self.filter_ids = filter_ids
         self.validation = validation
+        self.overfit_velocity_zero = overfit_velocity_zero
         self.size_detector = SizeDetector()
         # State tracker for adaptive batching (index, subtree_size, num_subtrees)
         # Default initialization
@@ -244,8 +246,11 @@ class TreeDataset(Dataset):
         # print("Normalized RF distance between real and random tree:", calculate_norm_rf(real_tree_newick, random_tree))
         # import pdb; pdb.set_trace()
         #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
-        timepoint = random.uniform(0, 1)
-        #timepoint = 0
+        if self.overfit_velocity_zero:
+            timepoint = 0.0
+        else:
+            timepoint = random.uniform(0, 1)
+        # timepoint = 0
         # timepoint = 0.5
 
         # Both trees now use "0".."N-1" names, so bhv utils will work happily
@@ -610,10 +615,12 @@ class PhylaDataModule(pl.LightningDataModule):
         self.test_ids = test_ids
 
         self.dataset_train = TreeDataset(
-            self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids, sanity_check=config["data"].get("sanity_check", False), random_sanity_check=config["data"].get("random_sanity_check", False)
+            self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids, sanity_check=config["data"].get("sanity_check", False), random_sanity_check=config["data"].get("random_sanity_check", False),
+            overfit_velocity_zero=config["data"].get("overfit_velocity_zero", False)
         )
         self.dataset_val = TreeDataset(
-            self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, validation=True, sanity_check=config["data"].get("sanity_check", False), random_sanity_check=config["data"].get("random_sanity_check", False)
+            self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, validation=True, sanity_check=config["data"].get("sanity_check", False), random_sanity_check=config["data"].get("random_sanity_check", False),
+            overfit_velocity_zero=config["data"].get("overfit_velocity_zero", False)
         )
         self.tree_tokenizer = TreeFeatureTokenizer(
             config["model"]["num_node_types"],

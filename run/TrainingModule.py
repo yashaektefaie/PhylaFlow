@@ -51,6 +51,7 @@ import numpy as np
 import logging
 from tqdm import tqdm
 from utils.utils import compute_merge_metrics
+from utils.utils import _velocity_diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,11 @@ class TrainingModule(LightningModule):
         random_trees=None,
         verbose: bool = False,
         phyla_checkpoint_path=None,
+        velocity_loss_mode: str = "weighted",
+        velocity_loss_plain_weight: float = 0.5,
+        velocity_sign_eps: float = 1e-3,
+        training_step_velocity_weight: float = 1.0,
+        training_step_autoregressive_weight: float = 1.0,
     ):
         super().__init__()
         self.model = model
@@ -115,6 +121,39 @@ class TrainingModule(LightningModule):
         self.phyla_checkpoint_path = phyla_checkpoint_path
         self.phyla_model = None
         self.stepper = 1
+
+        valid_velocity_loss_modes = {"plain", "weighted", "blended"}
+        if velocity_loss_mode not in valid_velocity_loss_modes:
+            raise ValueError(
+                f"Invalid velocity_loss_mode={velocity_loss_mode!r}. "
+                f"Expected one of {sorted(valid_velocity_loss_modes)}."
+            )
+        if not (0.0 <= float(velocity_loss_plain_weight) <= 1.0):
+            raise ValueError(
+                "velocity_loss_plain_weight must be in [0, 1], "
+                f"got {velocity_loss_plain_weight}."
+            )
+        if float(velocity_sign_eps) < 0.0:
+            raise ValueError(
+                f"velocity_sign_eps must be non-negative, got {velocity_sign_eps}."
+            )
+        if float(training_step_velocity_weight) < 0.0:
+            raise ValueError(
+                "training_step_velocity_weight must be non-negative, "
+                f"got {training_step_velocity_weight}."
+            )
+        if float(training_step_autoregressive_weight) < 0.0:
+            raise ValueError(
+                "training_step_autoregressive_weight must be non-negative, "
+                f"got {training_step_autoregressive_weight}."
+            )
+        self.velocity_loss_mode = velocity_loss_mode
+        self.velocity_loss_plain_weight = float(velocity_loss_plain_weight)
+        self.velocity_sign_eps = float(velocity_sign_eps)
+        self.training_step_velocity_weight = float(training_step_velocity_weight)
+        self.training_step_autoregressive_weight = float(
+            training_step_autoregressive_weight
+        )
 
         phyla_config_path = "configs/sample_eval_config.yaml"
 
@@ -240,6 +279,12 @@ class TrainingModule(LightningModule):
                 batch["batched_time"],
                 batch["phyla_embeddings"],
             )
+
+            t1 = Tree(batch['original_trees'][0])
+            enc = BHVEncoder()
+            t1_edge_mask, t1_edge_length = enc.return_BHV_encoding(t1)
+            mask_to_length = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
+
             if self.train_tokenized_trees is None:
                 self.train_tokenized_trees = batch["tokenized_trees"]
                 self.train_batched_time = batch["batched_time"]
@@ -255,10 +300,12 @@ class TrainingModule(LightningModule):
             num_leaves = batch["num_leaves"]
             gathered_velocity_labels = []
             v_pred_indices = []
+            gathered_velocity_lengths = []
 
             for num in range(len(velocity_labels)):
                 sub_gathered_velocity_labels = []
                 sub_v_pred_indices = []
+                sub_gathered_velocity_lengths = []
 
                 num_leave = num_leaves[num]
                 real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
@@ -297,11 +344,14 @@ class TrainingModule(LightningModule):
 
                     sub_gathered_velocity_labels.append(velocity_labels[num][original_vel])
                     sub_v_pred_indices.append(edge_split_masks[num].index(matched_vel))
+                    # sub_gathered_velocity_lengths.append(mask_to_length[matched_vel])
+
 
                 gathered_velocity_labels.append(
                     torch.tensor(sub_gathered_velocity_labels)
                 )
                 v_pred_indices.append(torch.tensor(sub_v_pred_indices))
+                # gathered_velocity_lengths.append(torch.tensor(sub_gathered_velocity_lengths))
 
             # gathered_velocity_labels = torch.stack(gathered_velocity_labels)
             # v_pred_indices = torch.stack(v_pred_indices)
@@ -323,32 +373,107 @@ class TrainingModule(LightningModule):
                 y = gathered_velocity_labels_flat
                 p = v_pred_gathered
 
+                # --- Velocity diagnostics ---
+                with torch.no_grad():
+                    vel_metrics = _velocity_diagnostics(
+                        p, y, topk=3, sign_eps=self.velocity_sign_eps
+                    )
+                logger.info(
+                    f"Velocity metrics: MSE={vel_metrics['mse']:.6f}  "
+                    f"Cosine={vel_metrics['cosine']:.4f}  "
+                    f"Pearson={vel_metrics['pearson']:.4f}  "
+                    f"Spearman={vel_metrics['spearman']:.4f}  "
+                    f"SignAcc={vel_metrics['sign_acc']:.4f}  "
+                    f"TopK={vel_metrics['topk_overlap']:.4f}  "
+                    f"N={vel_metrics['n_edges']}"
+                )
+
+                residual_sq = (p - y).pow(2)
+                plain_mse = residual_sq.mean()
+
                 abs_y = y.abs()
-                # import pdb; pdb.set_trace()
-                
-
                 eps = 1e-6
-                tau = 1e-3
                 scale = abs_y.median().clamp_min(eps)  # robust scale
-                moving = abs_y > tau
-
-                if moving.any():
-                    scale = abs_y[moving].median().clamp_min(1e-6)
-                else:
-                    scale = torch.tensor(1.0, device=y.device)
-
                 w = (abs_y / scale).clamp(min=0.0, max=20.0)
+                weighted_mse = (w * residual_sq).sum() / w.sum().clamp_min(eps)
 
-                loss = (w * (p - y).pow(2)).sum() / w.sum()
+                if self.velocity_loss_mode == "plain":
+                    loss = plain_mse
+                elif self.velocity_loss_mode == "weighted":
+                    loss = weighted_mse
+                else:
+                    loss = (
+                        self.velocity_loss_plain_weight * plain_mse
+                        + (1.0 - self.velocity_loss_plain_weight) * weighted_mse
+                    )
 
+                #Trying to add new loss to velocity
+               
+                # eps_v = 1e-6
+                # eps_L = 1e-6
+
+                # L = gathered_velocity_lengths[0].to(v_pred.device)  # make sure this is FLAT and aligned
+                # y = gathered_velocity_labels_flat
+                # p = v_pred_gathered
+
+                # # moving set: edges truly moving toward 0
+                # moving = (y < 0) & (L > 1e-8)
+                # if moving.sum() < 2:
+                #     hit_loss = p.new_tensor(0.0)
+                # else:
+                #     Lm = L[moving].clamp_min(1e-4)   # IMPORTANT: floor lengths (tune 1e-4~1e-3)
+
+                #     # stable "hit logits" (bigger => hits sooner)
+                #     z_true = torch.log(F.relu(-y[moving]) + eps_v) - torch.log(Lm + eps_L)
+                #     z_pred = torch.log(F.relu(-p[moving]) + eps_v) - torch.log(Lm + eps_L)
+
+                #     # clamp logits so softmax doesn't saturate
+                #     z_true = z_true.clamp(-10, 10)
+                #     z_pred = z_pred.clamp(-10, 10)
+
+                #     temp_q = 1.0
+                #     temp_p = 1.0
+
+                #     q = F.softmax(z_true / temp_q, dim=0).detach()
+
+                #     # optional label smoothing so q isn't one-hot
+                #     alpha = 0.05
+                #     q = (1 - alpha) * q + alpha / q.numel()
+
+                #     logp = F.log_softmax(z_pred / temp_p, dim=0)
+                #     hit_loss = -(q * logp).sum()
+                # loss = loss + hit_loss
                 # loss = ((v_pred_gathered - gathered_velocity_labels_flat) ** 2).mean()
             else:
                 loss = torch.tensor(0.0, device=v_pred.device, requires_grad=True)
             # print("Wow congrats")
             logs["loss"] = loss
-            logger.info(f"Velocity loss: {loss.item()}")
+            if len(preds_list) > 0:
+                logger.info(
+                    f"Velocity loss ({self.velocity_loss_mode}): total={loss.item():.6f} "
+                    f"plain={plain_mse.item():.6f} weighted={weighted_mse.item():.6f}"
+                )
+            else:
+                logger.info(f"Velocity loss: {loss.item()}")
             if self.record:
-                wandb.log({"train/velocity_loss": loss.item()}, step=self.stepper)
+                vel_wandb = {"train/velocity_loss": loss.item()}
+                if len(preds_list) > 0:
+                    vel_wandb.update({
+                        "velocity/loss_plain_mse": plain_mse.item(),
+                        "velocity/loss_weighted_mse": weighted_mse.item(),
+                        "velocity/mse": vel_metrics["mse"],
+                        "velocity/mse_vs_zero": vel_metrics["mse_vs_zero"],
+                        "velocity/mse_vs_mean": vel_metrics["mse_vs_mean"],
+                        "velocity/zero_baseline_mse": vel_metrics["zero_baseline_mse"],
+                        "velocity/mean_baseline_mse": vel_metrics["mean_baseline_mse"],
+                        "velocity/cosine": vel_metrics["cosine"],
+                        "velocity/pearson": vel_metrics["pearson"],
+                        "velocity/spearman": vel_metrics["spearman"],
+                        "velocity/sign_acc": vel_metrics["sign_acc"],
+                        "velocity/topk_overlap": vel_metrics["topk_overlap"],
+                        "velocity/n_edges": vel_metrics["n_edges"],
+                    })
+                wandb.log(vel_wandb, step=self.stepper)
             # import pdb
 
             # pdb.set_trace()
@@ -359,6 +484,18 @@ class TrainingModule(LightningModule):
                 batch["phyla_embeddings"],
                 autoregressive=True,
             )
+           # Derive full leaf-universe mask for complement matching.
+            # BHV labels use canonical orientation min(A, full^A) but the
+            # tokenizer uses directed child-subtree masks.  We need the
+            # full mask so we can try the complement, exactly like the
+            # velocity path already does.
+            _ar_edge_split_masks = batch["tokenized_autoregressive_trees"][-1]
+            _ar_full_masks = []
+            for _splits_b in _ar_edge_split_masks:
+                _fm = 0
+                for _s in _splits_b:
+                    _fm |= int(_s)
+                _ar_full_masks.append(_fm)
 
             found = {}
             for merge_cluser in batch["batched_autoregressive_labels"]:
@@ -378,6 +515,8 @@ class TrainingModule(LightningModule):
                 logits = group["logits"]
                 labels = batch["batched_autoregressive_labels"]
                 splits_in_polytomy = group["splits_represented"]
+                b_idx = group["batch_index"]
+                full_mask = _ar_full_masks[b_idx] if b_idx < len(_ar_full_masks) else 0
                 
                 # Track polytomy size (number of splits in the polytomy)
                 polytomy_sizes.append(len(splits_in_polytomy))
@@ -389,11 +528,23 @@ class TrainingModule(LightningModule):
                 for labeled_merge_cluster in labels:
                     idxs = None
                     for resulting_split, components in labeled_merge_cluster:
-                        res = all([i in splits_in_polytomy for i in components])
+                        # Match each component to splits_in_polytomy,
+                        # allowing complement orientation (same pattern
+                        # as the velocity path's complement fallback).
+                        resolved_idxs = []
+                        for comp in components:
+                            comp_int = int(comp)
+                            if comp_int in splits_in_polytomy:
+                                resolved_idxs.append(splits_in_polytomy.index(comp_int))
+                            elif full_mask and (full_mask ^ comp_int) in splits_in_polytomy:
+                                resolved_idxs.append(splits_in_polytomy.index(full_mask ^ comp_int))
+                            else:
+                                resolved_idxs = None
+                                break
 
-                        if res:
+                        if resolved_idxs is not None:
                             found[resulting_split] = True
-                            idxs = [splits_in_polytomy.index(i) for i in components]
+                            idxs = resolved_idxs
 
                             for i in idxs:
                                 for j in idxs:
@@ -468,7 +619,6 @@ class TrainingModule(LightningModule):
 
             for i in found:
                 if not found[i]:
-                    import pdb; pdb.set_trace()
                     print(
                         "Missing split: ",
                         [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1],
@@ -772,7 +922,6 @@ class TrainingModule(LightningModule):
                             for wi in worst_idx:
                                 print(f"    split={matched_masks_dbg[wi]:>12}  pred={v_pred_np[wi]:+.6e}  true={v_true_np[wi]:+.6e}  err={abs_err[wi]:.6e}")
                             print(f"============================================================\n")
-                            import pdb; pdb.set_trace()
                         else:
                             print(f"DEBUG: Could not match any velocity splits for tree {b_idx}")
                     except Exception as e:
@@ -818,19 +967,19 @@ class TrainingModule(LightningModule):
                 # (float equality with hit_tol=1e-10 is too strict)
                 hit_boundary = (np.isfinite(dt_hit) and dt >= dt_hit) or (L_new <= eps_len).any()
 
-                if hit_boundary and np.isfinite(dt_hit):
-                    # Batch near-simultaneous hits (numerical simultaneity)
-                    eta = 0.01  # relative tie threshold (1%)
-                    eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
-                    idx_neg = np.where(neg)[0]
+                # if hit_boundary and np.isfinite(dt_hit):
+                #     # Batch near-simultaneous hits (numerical simultaneity)
+                #     eta = 0.01  # relative tie threshold (1%)
+                #     eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
+                #     idx_neg = np.where(neg)[0]
 
-                    dt_min = dt_candidates.min()
-                    eta = 0.02          # relative window
-                    c = 2.0             # absolute window in *steps*
-                    eps_abs = c * dt_base
+                #     dt_min = dt_candidates.min()
+                #     eta = 0.02          # relative window
+                #     c = 2.0             # absolute window in *steps*
+                #     eps_abs = c * dt_base
 
-                    batch = (dt_candidates <= dt_min * (1 + eta)) | (dt_candidates <= dt_min + eps_abs)
-                    L_new[idx_neg[batch]] = 0.0
+                #     batch = (dt_candidates <= dt_min * (1 + eta)) | (dt_candidates <= dt_min + eps_abs)
+                #     L_new[idx_neg[batch]] = 0.0
 
                 
                 # update dict
@@ -1285,7 +1434,13 @@ class TrainingModule(LightningModule):
                     ).cuda()
                     logs = self.step(batch)
                     if logs is not None:
-                        loss = logs["loss"]
+                        loss_unscaled = logs["loss"]
+                        loss = (
+                            loss_unscaled * self.training_step_velocity_weight
+                        )
+                        logs["train/velocity_loss_unscaled"] = loss_unscaled.detach()
+                        logs["train/velocity_loss_scaled"] = loss.detach()
+                        logs["loss"] = loss
                         memory_error_tensor = torch.zeros(1).cuda()
 
                         # Go through every GPU get memmory used, if it is above 70% we will abort the manual backward and fail
@@ -1446,16 +1601,28 @@ class TrainingModule(LightningModule):
                     # --- HEAD 1: VELOCITY ---
                     logging.info("DEBUG: Starting Velocity Head Training")
                     logs_vel = self.step(batch, autoregressive=False)
-                    loss_vel = logs_vel["loss"]
-                    self.manual_backward(loss_vel)
-                    self.clip_gradients(
-                        opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+                    loss_vel_unscaled = logs_vel["loss"]
+                    loss_vel = (
+                        loss_vel_unscaled * self.training_step_velocity_weight
                     )
-                    opt.step()
-                    opt.zero_grad()
+                    loss_vel_unscaled_detached = loss_vel_unscaled.detach()
+                    loss_vel_scaled_detached = loss_vel.detach()
+                    logging.info(
+                        "Velocity head loss: raw=%.6f scaled=%.6f weight=%.4f",
+                        float(loss_vel_unscaled_detached.item()),
+                        float(loss_vel_scaled_detached.item()),
+                        float(self.training_step_velocity_weight),
+                    )
+                    self.manual_backward(loss_vel)
+                    # self.clip_gradients(
+                    #     opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+                    # )
+                    # opt.step()
+                    # opt.zero_grad()
                     logging.info("DEBUG: Finished Velocity Head Training")
 
                     del logs_vel
+                    del loss_vel_unscaled
                     del loss_vel
                     if hasattr(torch.cuda, "empty_cache"):
                         torch.cuda.empty_cache()
@@ -1472,6 +1639,27 @@ class TrainingModule(LightningModule):
                             "Loss not found in logs for autoregressive head!"
                         )
                     loss = logs["loss"]
+                    loss_unscaled = loss
+                    loss = (
+                        loss_unscaled * self.training_step_autoregressive_weight
+                    )
+                    logs["train/autoregressive_loss_unscaled"] = (
+                        loss_unscaled.detach()
+                    )
+                    logs["train/autoregressive_loss_scaled"] = loss.detach()
+                    logs["train/velocity_loss_unscaled"] = (
+                        loss_vel_unscaled_detached
+                    )
+                    logs["train/velocity_loss_scaled"] = (
+                        loss_vel_scaled_detached
+                    )
+                    logs["loss"] = loss
+                    logging.info(
+                        "Autoregressive head loss: raw=%.6f scaled=%.6f weight=%.4f",
+                        float(loss_unscaled.detach().item()),
+                        float(loss.detach().item()),
+                        float(self.training_step_autoregressive_weight),
+                    )
 
                     logging.info(
                         f"Memory allocated before backward: {torch.cuda.memory_allocated() / 1024 ** 2} MB"

@@ -267,15 +267,25 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
 
                 for potential_split in cluster:
                     sub_split = Bi_split_component[potential_split]
+                    # Autoregressive head only models true polytomies (>=3 components).
+                    # Binary merges are deterministic and are not represented in
+                    # get_batch_polytomy_indices(min_children=3).
+                    if len(sub_split) < 3:
+                        continue
+
                     if smallest_num is None or len(sub_split) < smallest_num:
                         smallest_num = len(sub_split)
                         to_add = (potential_split, sub_split)
 
                 if to_add is not None:
                     initial_labels.append(to_add)
-                else:
-                    raise Exception("Could not find any merges for this cluster, something is wrong!")
-                    
+
+            if not initial_labels:
+                logger.info(
+                    f"Boundary index {bi}: no >=3-component merges remain, stopping boundary label generation"
+                )
+                break
+
             final_labels.append({'newick': newick, 'labels': initial_labels})
 
             #Now merge those components but only do 1 at a time so we keep the labels but just do 1 to avoid weird errors 

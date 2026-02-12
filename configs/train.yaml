@@ -21,13 +21,18 @@ model:
 
 trainer:
   record: False
-  epochs: 10000
+  epochs: 10000000
   val_callback_frequency: 10
   checkpoint_dir: checkpoints/
   phyla_checkpoint_path: checkpoints/chkpts/epoch%3D00-step%3D004000-treefam_avg_normrf%3D0.6721.ckpt
   lr: 0.0001
   steps_callback: 100
   val_callback_freq: 0
+  velocity_loss_mode: plain
+  velocity_loss_plain_weight: 1.0
+  velocity_sign_eps: 0.001
+  training_step_velocity_weight: 1.0
+  training_step_autoregressive_weight: 1.0
 
 
 data:
@@ -41,4 +46,4 @@ data:
   num_workers: 0
   pin_memory: False
   sanity_check: False
-  random_sanity_check: True
+  random_sanity_check: False

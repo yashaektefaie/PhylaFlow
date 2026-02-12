@@ -59,6 +59,17 @@ def init_worker(config_file, device_id):
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
+        velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
+        velocity_loss_plain_weight=config["trainer"].get(
+            "velocity_loss_plain_weight", 0.5
+        ),
+        velocity_sign_eps=config["trainer"].get("velocity_sign_eps", 1e-3),
+        training_step_velocity_weight=config["trainer"].get(
+            "training_step_velocity_weight", 1.0
+        ),
+        training_step_autoregressive_weight=config["trainer"].get(
+            "training_step_autoregressive_weight", 1.0
+        ),
     )
     model.to(device)
     model.eval()
@@ -109,6 +120,17 @@ def run_test():
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
+        velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
+        velocity_loss_plain_weight=config["trainer"].get(
+            "velocity_loss_plain_weight", 0.5
+        ),
+        velocity_sign_eps=config["trainer"].get("velocity_sign_eps", 1e-3),
+        training_step_velocity_weight=config["trainer"].get(
+            "training_step_velocity_weight", 1.0
+        ),
+        training_step_autoregressive_weight=config["trainer"].get(
+            "training_step_autoregressive_weight", 1.0
+        ),
     )
     # res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
     # This fails now btw non-autoregressive LOL NEED TO FIX!
@@ -194,7 +216,7 @@ def run_overfit():
     print("Running OVERFIT mode (Single Tree)")
     config["data"]["batch_size"] = 1
     config["data"]["num_workers"] = 0
-    config["trainer"]["epochs"] = 10000  # Train for a long time
+    # config["trainer"]["epochs"] = 10000  # Train for a long time
     config["trainer"]["val_callback_freq"] = 0
     # config["trainer"]["record"] = True # Optional: force recording
     # --- End Overrides ---
@@ -228,6 +250,17 @@ def run_overfit():
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
+        velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
+        velocity_loss_plain_weight=config["trainer"].get(
+            "velocity_loss_plain_weight", 0.5
+        ),
+        velocity_sign_eps=config["trainer"].get("velocity_sign_eps", 1e-3),
+        training_step_velocity_weight=config["trainer"].get(
+            "training_step_velocity_weight", 1.0
+        ),
+        training_step_autoregressive_weight=config["trainer"].get(
+            "training_step_autoregressive_weight", 1.0
+        ),
     )
 
     save_callback = ModelCheckpoint(
@@ -295,6 +328,17 @@ def main():
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
+        velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
+        velocity_loss_plain_weight=config["trainer"].get(
+            "velocity_loss_plain_weight", 0.5
+        ),
+        velocity_sign_eps=config["trainer"].get("velocity_sign_eps", 1e-3),
+        training_step_velocity_weight=config["trainer"].get(
+            "training_step_velocity_weight", 1.0
+        ),
+        training_step_autoregressive_weight=config["trainer"].get(
+            "training_step_autoregressive_weight", 1.0
+        ),
     )
 
     save_callback = ModelCheckpoint(

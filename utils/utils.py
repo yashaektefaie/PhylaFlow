@@ -10,6 +10,7 @@ from scipy.spatial.distance import jensenshannon
 from ete3 import Tree as EteTree
 import random
 import hashlib
+import torch.nn.functional as F
 
 def get_possible_ids(nexus_root):
     ids = []
@@ -626,3 +627,61 @@ def _pick_knn_pair(component_embs: torch.Tensor, topM: int = 32, tau: float = 0.
     pick = torch.multinomial(probs, num_samples=1).item()
     ij = idxs[pick].item()
     return ij // k, ij % k
+
+
+def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    """Pearson correlation between two 1-D tensors."""
+    xm = x - x.mean()
+    ym = y - y.mean()
+    denom = xm.norm() * ym.norm()
+    if float(denom) <= 1e-12:
+        return 1.0 if torch.allclose(x, y) else 0.0
+    return float((xm * ym).sum() / denom)
+
+
+def _spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    """Spearman rank correlation between two 1-D tensors."""
+    xr = torch.empty_like(x)
+    yr = torch.empty_like(y)
+    xr[torch.argsort(x)] = torch.arange(x.numel(), dtype=x.dtype, device=x.device)
+    yr[torch.argsort(y)] = torch.arange(y.numel(), dtype=y.dtype, device=y.device)
+    return _pearson_corr(xr, yr)
+
+
+def _velocity_diagnostics(
+    p: torch.Tensor, y: torch.Tensor, topk: int = 3, sign_eps: float = 1e-3
+) -> dict:
+    """
+    Compute diagnostic metrics for predicted (p) vs true (y) velocity vectors.
+    Returns a dict with: mse, cosine, pearson, spearman, sign_acc, topk_overlap, n_edges.
+    """
+    metrics = {}
+    metrics["n_edges"] = int(p.numel())
+    metrics["mse"] = float(torch.mean((p - y) ** 2))
+    metrics["zero_baseline_mse"] = float(torch.mean(y ** 2))
+    metrics["mean_baseline_mse"] = float(torch.mean((y - y.mean()) ** 2))
+    metrics["mse_vs_zero"] = metrics["mse"] / max(metrics["zero_baseline_mse"], 1e-12)
+    metrics["mse_vs_mean"] = metrics["mse"] / max(metrics["mean_baseline_mse"], 1e-12)
+    metrics["cosine"] = float(F.cosine_similarity(p, y, dim=0))
+    metrics["pearson"] = _pearson_corr(p.detach(), y.detach())
+    metrics["spearman"] = _spearman_corr(p.detach(), y.detach())
+
+    # Sign accuracy on edges that are actually moving
+    moving = y.abs() > float(sign_eps)
+    if int(moving.sum()) > 0:
+        metrics["sign_acc"] = float(
+            (torch.sign(p[moving]) == torch.sign(y[moving])).float().mean()
+        )
+    else:
+        metrics["sign_acc"] = 1.0
+
+    # Top-k overlap: do the top-k largest-magnitude predicted edges match the true ones?
+    k = min(int(topk), int(p.numel()))
+    if k > 0:
+        pred_topk = set(torch.topk(p.abs(), k=k).indices.tolist())
+        true_topk = set(torch.topk(y.abs(), k=k).indices.tolist())
+        metrics["topk_overlap"] = len(pred_topk & true_topk) / float(k)
+    else:
+        metrics["topk_overlap"] = 1.0
+
+    return metrics
