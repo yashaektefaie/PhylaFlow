@@ -84,6 +84,13 @@ class TrainingModule(LightningModule):
         velocity_sign_eps: float = 1e-3,
         training_step_velocity_weight: float = 1.0,
         training_step_autoregressive_weight: float = 1.0,
+        velocity_dt_candidate_weight: float = 0.0,
+        velocity_dt_hit_weight: float = 0.0,
+        velocity_dt_eps: float = 1e-6,
+        velocity_event_weight: float = 0.5,
+        velocity_event_temp: float = 0.5,
+        velocity_event_rate_beta: float = 5.0,
+        velocity_event_normalize_by_log_candidates: bool = True,
     ):
         super().__init__()
         self.model = model
@@ -147,12 +154,48 @@ class TrainingModule(LightningModule):
                 "training_step_autoregressive_weight must be non-negative, "
                 f"got {training_step_autoregressive_weight}."
             )
+        if float(velocity_dt_candidate_weight) < 0.0:
+            raise ValueError(
+                "velocity_dt_candidate_weight must be non-negative, "
+                f"got {velocity_dt_candidate_weight}."
+            )
+        if float(velocity_dt_hit_weight) < 0.0:
+            raise ValueError(
+                "velocity_dt_hit_weight must be non-negative, "
+                f"got {velocity_dt_hit_weight}."
+            )
+        if float(velocity_dt_eps) <= 0.0:
+            raise ValueError(
+                f"velocity_dt_eps must be > 0, got {velocity_dt_eps}."
+            )
+        if float(velocity_event_weight) < 0.0:
+            raise ValueError(
+                "velocity_event_weight must be non-negative, "
+                f"got {velocity_event_weight}."
+            )
+        if float(velocity_event_temp) <= 0.0:
+            raise ValueError(
+                f"velocity_event_temp must be > 0, got {velocity_event_temp}."
+            )
+        if float(velocity_event_rate_beta) <= 0.0:
+            raise ValueError(
+                f"velocity_event_rate_beta must be > 0, got {velocity_event_rate_beta}."
+            )
         self.velocity_loss_mode = velocity_loss_mode
         self.velocity_loss_plain_weight = float(velocity_loss_plain_weight)
         self.velocity_sign_eps = float(velocity_sign_eps)
         self.training_step_velocity_weight = float(training_step_velocity_weight)
         self.training_step_autoregressive_weight = float(
             training_step_autoregressive_weight
+        )
+        self.velocity_dt_candidate_weight = float(velocity_dt_candidate_weight)
+        self.velocity_dt_hit_weight = float(velocity_dt_hit_weight)
+        self.velocity_dt_eps = float(velocity_dt_eps)
+        self.velocity_event_weight = float(velocity_event_weight)
+        self.velocity_event_temp = float(velocity_event_temp)
+        self.velocity_event_rate_beta = float(velocity_event_rate_beta)
+        self.velocity_event_normalize_by_log_candidates = bool(
+            velocity_event_normalize_by_log_candidates
         )
 
         phyla_config_path = "configs/sample_eval_config.yaml"
@@ -240,6 +283,8 @@ class TrainingModule(LightningModule):
 
     def step(self, batch, eval=False, autoregressive=False):
         logs = {}
+        if not eval and not autoregressive:
+            self.current_step_value += 1
         if (
             self.phyla_model is not None
             and batch["phyla_embeddings"] is None
@@ -280,10 +325,7 @@ class TrainingModule(LightningModule):
                 batch["phyla_embeddings"],
             )
 
-            t1 = Tree(batch['original_trees'][0])
             enc = BHVEncoder()
-            t1_edge_mask, t1_edge_length = enc.return_BHV_encoding(t1)
-            mask_to_length = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
 
             if self.train_tokenized_trees is None:
                 self.train_tokenized_trees = batch["tokenized_trees"]
@@ -307,8 +349,30 @@ class TrainingModule(LightningModule):
                 sub_v_pred_indices = []
                 sub_gathered_velocity_lengths = []
 
-                num_leave = num_leaves[num]
-                real_max_bit = max(m.bit_length() for m in edge_split_masks[num])
+                num_leave = int(num_leaves[num])
+                split_masks_num = [int(m) for m in edge_split_masks[num]]
+                split_masks_nonzero = [m for m in split_masks_num if m != 0]
+                if len(split_masks_nonzero) == 0:
+                    gathered_velocity_labels.append(
+                        torch.tensor(sub_gathered_velocity_labels)
+                    )
+                    v_pred_indices.append(torch.tensor(sub_v_pred_indices))
+                    gathered_velocity_lengths.append(
+                        torch.tensor(sub_gathered_velocity_lengths)
+                    )
+                    continue
+
+                real_max_bit = max(m.bit_length() for m in split_masks_nonzero)
+                full_mask = (1 << real_max_bit) - 1 if real_max_bit > 0 else 0
+                mask_to_idx = {m: i for i, m in enumerate(split_masks_num)}
+
+                tree_obj = Tree(batch["original_trees"][num])
+                tree_masks, tree_lengths = enc.return_BHV_encoding(tree_obj)
+                length_map = {
+                    int(m): float(l)
+                    for m, l in zip(tree_masks, tree_lengths)
+                    if l is not None
+                }
                 for vel in velocity_labels[num]:
                     original_vel = vel
                     if vel.bit_length() == real_max_bit + 1:
@@ -319,15 +383,14 @@ class TrainingModule(LightningModule):
                         )
 
                     matched_vel = vel
-                    if vel not in edge_split_masks[num]:
+                    if matched_vel not in mask_to_idx:
                         # Split orientation can flip after dummy-root removal; allow complement match.
-                        full_mask = (1 << real_max_bit) - 1
                         complement_vel = full_mask ^ vel
-                        if complement_vel in edge_split_masks[num]:
+                        if complement_vel in mask_to_idx:
                             matched_vel = complement_vel
                         else:
                             print(
-                                f"This split {vel} from velocity labels is not in edge splits {edge_split_masks[num]}!"
+                                f"This split {vel} from velocity labels is not in edge splits {split_masks_num}!"
                             )
                             print([i for i in range(vel.bit_length()) if (vel >> i) & 1])
                             raise Exception("Split not found in edge splits")
@@ -339,19 +402,22 @@ class TrainingModule(LightningModule):
                     if is_pendant:
                         continue
 
-                    # else:
-                    # 	print("WOOO ONE FOUND")
+                    edge_len = length_map.get(int(matched_vel))
+                    if edge_len is None and full_mask:
+                        edge_len = length_map.get(full_mask ^ int(matched_vel))
+                    if edge_len is None:
+                        edge_len = 0.0
 
                     sub_gathered_velocity_labels.append(velocity_labels[num][original_vel])
-                    sub_v_pred_indices.append(edge_split_masks[num].index(matched_vel))
-                    # sub_gathered_velocity_lengths.append(mask_to_length[matched_vel])
+                    sub_v_pred_indices.append(mask_to_idx[int(matched_vel)])
+                    sub_gathered_velocity_lengths.append(max(float(edge_len), 0.0))
 
 
                 gathered_velocity_labels.append(
                     torch.tensor(sub_gathered_velocity_labels)
                 )
                 v_pred_indices.append(torch.tensor(sub_v_pred_indices))
-                # gathered_velocity_lengths.append(torch.tensor(sub_gathered_velocity_lengths))
+                gathered_velocity_lengths.append(torch.tensor(sub_gathered_velocity_lengths))
 
             # gathered_velocity_labels = torch.stack(gathered_velocity_labels)
             # v_pred_indices = torch.stack(v_pred_indices)
@@ -369,24 +435,29 @@ class TrainingModule(LightningModule):
                 gathered_velocity_labels_flat = torch.cat(gathered_velocity_labels).to(
                     v_pred_gathered.device
                 )
+                gathered_velocity_lengths_flat = torch.cat(gathered_velocity_lengths).to(
+                    v_pred_gathered.device
+                )
 
                 y = gathered_velocity_labels_flat
                 p = v_pred_gathered
+                lengths = gathered_velocity_lengths_flat
 
                 # --- Velocity diagnostics ---
                 with torch.no_grad():
                     vel_metrics = _velocity_diagnostics(
                         p, y, topk=3, sign_eps=self.velocity_sign_eps
                     )
-                logger.info(
-                    f"Velocity metrics: MSE={vel_metrics['mse']:.6f}  "
-                    f"Cosine={vel_metrics['cosine']:.4f}  "
-                    f"Pearson={vel_metrics['pearson']:.4f}  "
-                    f"Spearman={vel_metrics['spearman']:.4f}  "
-                    f"SignAcc={vel_metrics['sign_acc']:.4f}  "
-                    f"TopK={vel_metrics['topk_overlap']:.4f}  "
-                    f"N={vel_metrics['n_edges']}"
-                )
+                if self.verbose:
+                    logger.info(
+                        f"Velocity metrics: MSE={vel_metrics['mse']:.6f}  "
+                        f"Cosine={vel_metrics['cosine']:.4f}  "
+                        f"Pearson={vel_metrics['pearson']:.4f}  "
+                        f"Spearman={vel_metrics['spearman']:.4f}  "
+                        f"SignAcc={vel_metrics['sign_acc']:.4f}  "
+                        f"TopK={vel_metrics['topk_overlap']:.4f}  "
+                        f"N={vel_metrics['n_edges']}"
+                    )
 
                 residual_sq = (p - y).pow(2)
                 plain_mse = residual_sq.mean()
@@ -396,7 +467,6 @@ class TrainingModule(LightningModule):
                 scale = abs_y.median().clamp_min(eps)  # robust scale
                 w = (abs_y / scale).clamp(min=0.0, max=20.0)
                 weighted_mse = (w * residual_sq).sum() / w.sum().clamp_min(eps)
-
                 if self.velocity_loss_mode == "plain":
                     loss = plain_mse
                 elif self.velocity_loss_mode == "weighted":
@@ -407,54 +477,116 @@ class TrainingModule(LightningModule):
                         + (1.0 - self.velocity_loss_plain_weight) * weighted_mse
                     )
 
-                #Trying to add new loss to velocity
-               
-                # eps_v = 1e-6
-                # eps_L = 1e-6
+                # ------------------------------------------------------------------
+                # First-hit structured loss on true contracting edges:
+                #   1) keep the fastest true contracting edges accurate in rate space
+                #   2) ensure true first-hit edges remain earlier than later edges
+                #   3) keep the tied first-hit set collapsed together
+                # ------------------------------------------------------------------
+                # contract_mask = (y < -self.velocity_sign_eps) & (lengths > 1e-8)
+                # fast_rate_loss = p.new_tensor(0.0)
+                # first_hit_dt_loss = p.new_tensor(0.0)
 
-                # L = gathered_velocity_lengths[0].to(v_pred.device)  # make sure this is FLAT and aligned
-                # y = gathered_velocity_labels_flat
-                # p = v_pred_gathered
+                # if int(contract_mask.sum()) > 0:
+                #     Lc = lengths[contract_mask].clamp_min(eps)
+                #     yc = y[contract_mask]
+                #     pc = p[contract_mask]
 
-                # # moving set: edges truly moving toward 0
-                # moving = (y < 0) & (L > 1e-8)
-                # if moving.sum() < 2:
-                #     hit_loss = p.new_tensor(0.0)
+                #     # First-hit ordering is governed by contraction rate (-v / length).
+                #     rate_true = (-yc).clamp_min(eps) / Lc
+                #     rate_pred = F.softplus(
+                #         -pc, beta=self.velocity_event_rate_beta
+                #     ) / Lc
+
+                #     # True collapse times for truly contracting edges
+                #     tau_true = 1.0 / rate_true.clamp_min(eps)
+                #     tau_pred = 1.0 / rate_pred.clamp_min(eps)
+
+                #     # Identify the true first-hit set with tolerance
+                #     tau_true_min = tau_true.min()
+                #     first_mask = torch.abs(tau_true - tau_true_min) <= 0.01
+                #     later_mask = ~first_mask
+                #     fast_k = min(8, int(tau_true.numel()))
+                #     fast_idx = torch.argsort(tau_true)[:fast_k]
+                #     fast_mask = torch.zeros_like(first_mask)
+                #     fast_mask[fast_idx] = True
+                #     rate_scale = rate_true[fast_mask].median().clamp_min(1.0)
+                #     fast_rate_loss = F.smooth_l1_loss(
+                #         rate_pred[fast_mask] / rate_scale,
+                #         rate_true[fast_mask] / rate_scale,
+                #     )
+
+                #     z_pred = torch.log(tau_pred.clamp_min(eps))
+
+                #     # 1) Tie loss: first-hit edges should have similar predicted dt
+                #     if int(first_mask.sum()) > 1:
+                #         z_first = z_pred[first_mask]
+                #         first_hit_tie_loss = ((z_first - z_first.mean()) ** 2).mean()
+                #     else:
+                #         first_hit_tie_loss = p.new_tensor(0.0)
+                #     if int(first_mask.sum()) > 0:
+                #         first_hit_dt_loss = F.smooth_l1_loss(
+                #             z_pred[first_mask],
+                #             torch.log(tau_true[first_mask].clamp_min(eps)),
+                #         )
+
+                #     # 2) Rank loss: first-hit edges should be earlier than later contracting edges
+                #     if int(first_mask.sum()) > 0 and int(later_mask.sum()) > 0:
+                #         z_first = z_pred[first_mask][:, None]   # shape [F, 1]
+                #         z_later = z_pred[later_mask][None, :]   # shape [1, L]
+                #         first_hit_rank_loss = F.relu(
+                #             z_later - z_first + 0.02
+                #         ).mean()
+                #     else:
+                #         first_hit_rank_loss = p.new_tensor(0.0)
+
+                #     first_hit_loss = (
+                #         first_hit_tie_loss
+                #         + first_hit_rank_loss
+                #     )
+
+                #     n_contract = int(contract_mask.sum())
+                #     n_first = int(first_mask.sum())
+                #     n_later = int(later_mask.sum())
                 # else:
-                #     Lm = L[moving].clamp_min(1e-4)   # IMPORTANT: floor lengths (tune 1e-4~1e-3)
+                #     first_hit_tie_loss = p.new_tensor(0.0)
+                #     first_hit_rank_loss = p.new_tensor(0.0)
+                #     first_hit_loss = p.new_tensor(0.0)
+                #     n_contract = 0
+                #     n_first = 0
+                #     n_later = 0
 
-                #     # stable "hit logits" (bigger => hits sooner)
-                #     z_true = torch.log(F.relu(-y[moving]) + eps_v) - torch.log(Lm + eps_L)
-                #     z_pred = torch.log(F.relu(-p[moving]) + eps_v) - torch.log(Lm + eps_L)
+                # first_hit_aux_weight = float(
+                #     min(max((self.current_step_value - 100) / 200.0, 0.0), 1.0)
+                # )
 
-                #     # clamp logits so softmax doesn't saturate
-                #     z_true = z_true.clamp(-10, 10)
-                #     z_pred = z_pred.clamp(-10, 10)
-
-                #     temp_q = 1.0
-                #     temp_p = 1.0
-
-                #     q = F.softmax(z_true / temp_q, dim=0).detach()
-
-                #     # optional label smoothing so q isn't one-hot
-                #     alpha = 0.05
-                #     q = (1 - alpha) * q + alpha / q.numel()
-
-                #     logp = F.log_softmax(z_pred / temp_p, dim=0)
-                #     hit_loss = -(q * logp).sum()
-                # loss = loss + hit_loss
-                # loss = ((v_pred_gathered - gathered_velocity_labels_flat) ** 2).mean()
+                loss = loss 
+                # loss = (
+                #     loss
+                #     + first_hit_aux_weight
+                #     * (
+                #         0.02 * fast_rate_loss
+                #         + 0.05 * first_hit_dt_loss
+                #         + 0.02 * first_hit_loss
+                #     )
+                # )
+    
             else:
                 loss = torch.tensor(0.0, device=v_pred.device, requires_grad=True)
+                event_loss_raw = loss.detach() * 0.0
+                event_loss = loss.detach() * 0.0
+                n_contract = 0
             # print("Wow congrats")
             logs["loss"] = loss
-            if len(preds_list) > 0:
-                logger.info(
-                    f"Velocity loss ({self.velocity_loss_mode}): total={loss.item():.6f} "
-                    f"plain={plain_mse.item():.6f} weighted={weighted_mse.item():.6f}"
-                )
-            else:
-                logger.info(f"Velocity loss: {loss.item()}")
+            # if len(preds_list) > 0:
+            #     logger.info(
+            #         f"Velocity loss ({self.velocity_loss_mode}): total={loss.item():.6f} "
+            #         f"plain={plain_mse.item():.6f} weighted={weighted_mse.item():.6f} "
+            #         # f"dt_gate={dt_gate.item():.4f} dt_candidates={dt_candidates_loss.item():.6f} "
+            #         # f"dt_hit={dt_hit_loss.item():.6f}"
+            #     )
+            # else:
+
             if self.record:
                 vel_wandb = {"train/velocity_loss": loss.item()}
                 if len(preds_list) > 0:
@@ -766,7 +898,10 @@ class TrainingModule(LightningModule):
                     raise Exception(
                         f"Could not map initial split {m_model} from BHV encoding to tokenizer mask space."
                     )
-                td_init[m_model] = float(length)
+                # Keep sampler state aligned with active edges only; zero-length edges
+                # are represented as absent and do not participate in dynamics.
+                if float(length) > eps_len:
+                    td_init[m_model] = float(length)
 
             trees.append(td_init)
             num_leaves.append(t.n_leaves)
@@ -818,14 +953,13 @@ class TrainingModule(LightningModule):
                 # The edge incident to the dummy can appear as "all biological leaves" split;
                 # tokenizer masks (built on dummy-free Newick) do not include this split.
                 dummy_artifact_mask = full_model_mask
-                V = v.squeeze(1).detach().cpu().numpy()
+                V_model = v.squeeze(1).detach().cpu().numpy()
 
                 L = []
                 V_val = []
                 masks = []
-                pred_velocity_dict = {}
-                gt_vel_diff = []
-
+                supervised_edge_flags = []
+                aligned_model_masks = []
                 for m in td:
                     if m == dummy_artifact_mask:
                         continue
@@ -856,23 +990,35 @@ class TrainingModule(LightningModule):
                         )
                         raise Exception("Missing split in velocity masks!")
 
-                    L.append(td[m])
+                    curr_len = float(td[m])
+                    if curr_len <= eps_len:
+                        continue
+                    L.append(curr_len)
 
                     #We should not be making moves based on leafs! If leaf, velocity is 0
-                    if matched_m.bit_count() == 1:
+                    k_bits = int(matched_m).bit_count()
+                    is_pendant = biological_bits > 0 and min(
+                        k_bits, biological_bits - k_bits
+                    ) == 1
+                    if is_pendant:
                         V_val.append(0.0)
+                        supervised_edge_flags.append(False)
                     else:
-                        V_val.append(V[idx])
+                        V_val.append(V_model[idx])
+                        supervised_edge_flags.append(True)
 
                     masks.append(m)
-                    pred_velocity_dict[m] = V[idx]
+                    aligned_model_masks.append(int(matched_m))
 
 
                 V = np.array(V_val, dtype=np.float64)
                 L = np.array(L, dtype=np.float64)
+                supervised_mask = np.array(supervised_edge_flags, dtype=bool)
                 
                 if len(V) != len(L):
                     raise Exception("I assume these two things are equal length!")
+                if len(supervised_mask) != len(L):
+                    raise Exception("Supervised-mask and edge-length arrays must align!")
 
                 if (L < 0).any():
                     raise Exception("There are negative lengths that is not possible!")
@@ -883,23 +1029,48 @@ class TrainingModule(LightningModule):
                         _, true_velocity = return_sampled_tree_orthant_velocity(
                             newick_starting_trees[b_idx], debug_real_tree, 0.0
                         )
-                        # Build a comparable dict of predicted velocities keyed by split mask
+                        # Match exactly the supervised subset used during training:
+                        # remove dummy bit if present, allow complement orientation,
+                        # and drop pendant edges.
                         v_pred_arr = []
                         v_true_arr = []
                         matched_masks_dbg = []
-                        for m_i, m_val in enumerate(masks):
-                            # Try to find this mask in true_velocity (with possible complement / remove_bit)
-                            tv = true_velocity.get(m_val)
-                            if tv is None and full_model_mask:
-                                tv = true_velocity.get(full_model_mask ^ m_val)
-                            if tv is None:
-                                # Try with dummy bit added back
-                                m_with_dummy = m_val | (1 << (n_leaves - 1))
-                                tv = true_velocity.get(m_with_dummy)
-                            if tv is not None:
-                                v_pred_arr.append(V_val[m_i])
-                                v_true_arr.append(tv)
-                                matched_masks_dbg.append(m_val)
+                        true_vel_by_model_mask = {}
+                        skipped_pendant = 0
+                        unmatched = 0
+                        for vel_mask, tv in true_velocity.items():
+                            vel = int(vel_mask)
+                            if biological_bits > 0 and vel.bit_length() == biological_bits + 1:
+                                vel = remove_bit(vel, n_leaves - 1)
+                            elif biological_bits > 0 and vel.bit_length() > biological_bits + 1:
+                                unmatched += 1
+                                continue
+
+                            matched_vel = vel
+                            idx = mask_idx.get(matched_vel)
+                            if idx is None and full_model_mask:
+                                complement_vel = full_model_mask ^ matched_vel
+                                idx = mask_idx.get(complement_vel)
+                                if idx is not None:
+                                    matched_vel = complement_vel
+
+                            if idx is None:
+                                unmatched += 1
+                                continue
+
+                            k_bits = int(matched_vel).bit_count()
+                            is_pendant = biological_bits > 0 and min(
+                                k_bits, biological_bits - k_bits
+                            ) == 1
+                            if is_pendant:
+                                skipped_pendant += 1
+                                continue
+
+                            v_pred_arr.append(float(V_model[idx]))
+                            v_true_arr.append(float(tv))
+                            matched_masks_dbg.append(int(matched_vel))
+                            true_vel_by_model_mask[int(matched_vel)] = float(tv)
+
                         if len(v_pred_arr) > 0:
                             v_pred_np = np.array(v_pred_arr)
                             v_true_np = np.array(v_true_arr)
@@ -909,12 +1080,75 @@ class TrainingModule(LightningModule):
                             cos_den = (np.linalg.norm(v_pred_np) * np.linalg.norm(v_true_np))
                             cosine_sim = float(cos_num / cos_den) if cos_den > 0 else 0.0
                             print(f"\n===== DEBUG: Predicted vs True velocity at t=0 (tree {b_idx}) =====")
-                            print(f"  Matched edges: {len(v_pred_arr)} / {len(masks)} (of {len(true_velocity)} true)")
+                            print(
+                                f"  Matched supervised internal edges: {len(v_pred_arr)} "
+                                f"(of {len(true_velocity)} true; skipped pendant={skipped_pendant}, unmatched={unmatched})"
+                            )
                             print(f"  MSE:  {mse:.6e}")
                             print(f"  MAE:  {mae:.6e}")
                             print(f"  Cosine similarity: {cosine_sim:.6f}")
                             print(f"  Pred  range: [{v_pred_np.min():.6e}, {v_pred_np.max():.6e}]")
                             print(f"  True  range: [{v_true_np.min():.6e}, {v_true_np.max():.6e}]")
+
+                            # Compare dt_hit on matched supervised edges using the same lengths.
+                            matched_idx = [
+                                i
+                                for i, mm in enumerate(aligned_model_masks)
+                                if supervised_mask[i] and (mm in true_vel_by_model_mask)
+                            ]
+                            if len(matched_idx) > 0:
+                                L_match = L[matched_idx]
+                                v_pred_match = V[matched_idx]
+                                v_true_match = np.array(
+                                    [true_vel_by_model_mask[aligned_model_masks[i]] for i in matched_idx],
+                                    dtype=np.float64,
+                                )
+
+                                pred_neg_match = (v_pred_match < 0.0) & (L_match > eps_len)
+                                true_neg_match = (v_true_match < 0.0) & (L_match > eps_len)
+
+                                pred_dt_candidates = (
+                                    L_match[pred_neg_match] / -v_pred_match[pred_neg_match]
+                                    if np.any(pred_neg_match)
+                                    else np.array([], dtype=np.float64)
+                                )
+                                true_dt_candidates = (
+                                    L_match[true_neg_match] / -v_true_match[true_neg_match]
+                                    if np.any(true_neg_match)
+                                    else np.array([], dtype=np.float64)
+                                )
+
+                                dt_hit_pred_dbg = (
+                                    float(np.min(pred_dt_candidates))
+                                    if pred_dt_candidates.size > 0
+                                    else float("inf")
+                                )
+                                dt_hit_true_dbg = (
+                                    float(np.min(true_dt_candidates))
+                                    if true_dt_candidates.size > 0
+                                    else float("inf")
+                                )
+
+                                print(
+                                    f"  dt_hit(pred, matched supervised): {dt_hit_pred_dbg:.6e} "
+                                    f"(neg={int(pred_neg_match.sum())}, candidates={pred_dt_candidates.size})"
+                                )
+                                print(
+                                    f"  dt_hit(true, matched supervised): {dt_hit_true_dbg:.6e} "
+                                    f"(neg={int(true_neg_match.sum())}, candidates={true_dt_candidates.size})"
+                                )
+                                if pred_dt_candidates.size > 0:
+                                    print(
+                                        f"  Pred dt candidates (min-5): {np.sort(pred_dt_candidates)[:5]}"
+                                    )
+                                if true_dt_candidates.size > 0:
+                                    print(
+                                        f"  True dt candidates (min-5): {np.sort(true_dt_candidates)[:5]}"
+                                    )
+                            else:
+                                print(
+                                    "  dt_hit debug: no matched supervised edges with both length and true velocity."
+                                )
                             # Show top-5 worst mismatches
                             abs_err = np.abs(v_pred_np - v_true_np)
                             worst_idx = np.argsort(abs_err)[::-1][:5]
@@ -922,20 +1156,21 @@ class TrainingModule(LightningModule):
                             for wi in worst_idx:
                                 print(f"    split={matched_masks_dbg[wi]:>12}  pred={v_pred_np[wi]:+.6e}  true={v_true_np[wi]:+.6e}  err={abs_err[wi]:.6e}")
                             print(f"============================================================\n")
+                            import pdb; pdb.set_trace()
                         else:
                             print(f"DEBUG: Could not match any velocity splits for tree {b_idx}")
                     except Exception as e:
                         print(f"DEBUG: Failed to compute true velocity for comparison: {e}")
 
                 # --- compute dt_hit ---
-                neg = (V < 0) & (L > eps_len)
-                if np.any(neg):
-                    dt_candidates = L[neg] / -V[neg]
+                moving_neg = supervised_mask & (V < 0.0) & (L > eps_len)
+                if np.any(moving_neg):
+                    dt_candidates = L[moving_neg] / -V[moving_neg]
                     dt_hit = float(np.min(dt_candidates))
                 else:
                     dt_hit = float("inf")
 
-                cache.append((td, L, V, n_leaves, mapp, dt_hit, masks))
+                cache.append((td, L, V, n_leaves, mapp, dt_hit, masks, moving_neg))
                 dt_hit_list.append(dt_hit)
 
             # ---- GLOBAL dt across the batch ----
@@ -955,7 +1190,7 @@ class TrainingModule(LightningModule):
             # Since update of token_cache happens per tree potentially, we need to defer it or track which ones changed.
             # However, batch indices align with zip(trees...), so we can update token_cache[i] if needed.
 
-            for b_idx, (td, L, V, n_leaves, mapp, dt_hit, masks) in enumerate(
+            for b_idx, (td, L, V, n_leaves, mapp, dt_hit, masks, moving_neg) in enumerate(
                 cache
             ):
                 model_masks = edge_splits[b_idx]
@@ -965,7 +1200,10 @@ class TrainingModule(LightningModule):
                 
                 # treat as boundary if we stepped past the first hit time for THIS tree
                 # (float equality with hit_tol=1e-10 is too strict)
-                hit_boundary = (np.isfinite(dt_hit) and dt >= dt_hit) or (L_new <= eps_len).any()
+                hit_boundary = np.isfinite(dt_hit) and dt >= dt_hit
+                if not hit_boundary and np.any(moving_neg):
+                    # Numerical fallback: only moving supervised edges can trigger hits.
+                    hit_boundary = bool((L_new[moving_neg] <= eps_len).any())
 
                 # if hit_boundary and np.isfinite(dt_hit):
                 #     # Batch near-simultaneous hits (numerical simultaneity)

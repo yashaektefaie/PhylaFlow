@@ -28,6 +28,8 @@ def init_params(module, n_layers):
 class PairwiseMergeHead(nn.Module):
     def __init__(self, d_model: int, hidden: int = 256, dropout: float = 0.1):
         super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+
         in_dim = 4 * d_model  # [hi, hj, |hi-hj|, hi*hj]
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -44,6 +46,7 @@ class PairwiseMergeHead(nn.Module):
         H: [G, D]
         returns logits: [G, G] with -inf on diagonal (no self-merge)
         """
+        H = self.norm(H)
         G, D = H.shape
         hi = H.unsqueeze(1).expand(G, G, D)  # [G, G, D]
         hj = H.unsqueeze(0).expand(G, G, D)  # [G, G, D]
@@ -218,6 +221,30 @@ class TreeDenoiserTokenGT(nn.Module):
         )
         self.final_layer_norm = nn.LayerNorm(embed_dim)
         self.output_layer = nn.Linear(embed_dim, output_dim)
+
+        self.edge_output_layer = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, output_dim), # Final layer is LINEAR
+        )
+        #This used to be 0.2
+        self.edge_output_scale = 2
+        self.max_split_bits = 256
+        self.split_mask_proj = nn.Sequential(
+            nn.Linear(self.max_split_bits, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        # self.split_output_layer = nn.Sequential(
+        #     nn.LayerNorm(embed_dim),
+        #     nn.Linear(embed_dim, embed_dim),
+        #     nn.GELU(),
+        #     nn.Linear(embed_dim, output_dim),
+        # )
+        self.split_identity_scale = 0.75
+        self.split_output_scale = 0.5
         self.dropout = nn.Dropout(dropout)
         self.pairwise_head = PairwiseMergeHead(
             d_model=embed_dim, hidden=embed_dim, dropout=dropout
@@ -256,6 +283,27 @@ class TreeDenoiserTokenGT(nn.Module):
             emb = F.pad(emb, (0, 1))  # Pad last dimension
 
         return emb
+
+    def create_split_identity_embedding(self, split_masks, device):
+        if not split_masks:
+            return torch.zeros(0, self.embed_dim, device=device)
+
+        binary_masks = torch.zeros(
+            len(split_masks),
+            self.max_split_bits,
+            device=device,
+            dtype=self.graph_token.dtype,
+        )
+        for row_idx, mask in enumerate(split_masks):
+            mask_int = int(mask)
+            bit_idx = 0
+            while mask_int and bit_idx < self.max_split_bits:
+                if mask_int & 1:
+                    binary_masks[row_idx, bit_idx] = 1.0
+                mask_int >>= 1
+                bit_idx += 1
+
+        return self.split_mask_proj(binary_masks)
 
     def forward(
         self,
@@ -483,20 +531,20 @@ class TreeDenoiserTokenGT(nn.Module):
                         continue
                     # Get the embeddings for this group
                     group_embeddings = x_no_graph[b, group, :]  # [G, D]
+                    group_splits = batch_polytomy_splits[b][num]
+                    group_identity = self.create_split_identity_embedding(group_splits, x.device)
+
+                    group_embeddings = group_embeddings + (self.split_identity_scale * group_identity)
+
                     logits = self.pairwise_head(group_embeddings)  # [G, G]
-                    splits_represented = batch_polytomy_splits[b][num]  # [G]
-
-                    # for split in splits_represented:
-                    #     print(
-                    #     [j for j in range(int(split).bit_length()) if (int(split) >> j) & 1],
-                    # )
-
+                    
                     all_group_logits.append({
                         "batch_index": b,
                         "group_indices": group,
-                        "polytomy_pred": self.group_head(group_embeddings.mean(dim=0)),
+                        # Pass through the norm for the group head as well
+                        "polytomy_pred": self.group_head(self.final_layer_norm(group_embeddings).mean(dim=0)),
                         "logits": logits,
-                        "splits_represented": splits_represented,
+                        "splits_represented": group_splits,
                         "group_embeddings": group_embeddings,
                     })
             # if not all_group_logits:
@@ -505,39 +553,36 @@ class TreeDenoiserTokenGT(nn.Module):
             return all_group_logits
 
         elif return_edges_only:
-            # Remove graph token; edge_mask assumed shape [B, T_raw]
             x_no_graph = x[:, 1:, :]
-
-            # Collect per-batch edge embeddings using the provided mask
             edge_mask_bool = edge_mask.bool()
             edge_lists = [x_no_graph[b][edge_mask_bool[b]] for b in range(B)]
             max_edges = max((e.size(0) for e in edge_lists), default=0)
 
-            # Pad to max_edges so outputs can be batched
             if max_edges == 0:
-                padded_edges = torch.zeros(B, 0, D, device=x.device, dtype=x.dtype)
-                edge_pad_mask = torch.ones(B, 0, device=x.device, dtype=torch.bool)
-            else:
-                padded_edges = torch.zeros(
-                    B, max_edges, D, device=x.device, dtype=x.dtype
-                )
-                edge_pad_mask = torch.ones(
-                    B, max_edges, device=x.device, dtype=torch.bool
-                )
-                for b, edges_b in enumerate(edge_lists):
-                    n_b = edges_b.size(0)
-                    if n_b == 0:
-                        continue
-                    padded_edges[b, :n_b] = edges_b
-                    edge_pad_mask[b, :n_b] = False  # False = real, True = pad
+                return torch.zeros(B, 0, D, ...), torch.ones(B, 0, ...)
 
-            # Optional: pass through output layer before returning
-            edge_outputs = self.output_layer(padded_edges)  # [B, max_edges, output_dim]
+            padded_edges = torch.zeros(B, max_edges, D, device=x.device, dtype=x.dtype)
+            edge_pad_mask = torch.ones(B, max_edges, device=x.device, dtype=torch.bool)
 
-            return (
-                edge_outputs,
-                edge_pad_mask,
-            )  # return mask so caller can ignore padding
+            for b, edges_b in enumerate(edge_lists):
+                n_b = edges_b.size(0)
+                if n_b == 0: continue
+                
+                # 1. Get the positional embedding for the splits
+                split_identity = self.create_split_identity_embedding(
+                    edge_split_masks[b][:n_b], x.device
+                )
+                
+                # 2. Combine Node Context + Split Identity ONCE
+                # We use a residual-style addition to keep the Transformer signal alive
+                padded_edges[b, :n_b] = edges_b + (self.split_identity_scale * split_identity)
+                edge_pad_mask[b, :n_b] = False
+
+            # 3. Pass through the head. 
+            # No tanh on the outside. The LayerNorm inside the MLP provides the stability.
+            edge_outputs = self.edge_output_layer(padded_edges) 
+            
+            return edge_outputs, edge_pad_mask
         elif return_all_tokens:
             return x  # [B, T, D]
         else:

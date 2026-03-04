@@ -358,6 +358,8 @@ def main():
     trainer_args["callbacks"] = [save_callback]  # For validation callback runs
     if config["trainer"]["val_callback_freq"] != 0:
         trainer_args["val_check_interval"] = config["trainer"]["val_callback_freq"]
+    if config["trainer"]["limit_val_batches"] == 0:
+        trainer_args["limit_val_batches"] = 0.0  # Disable validation
 
     trainer_args["accelerator"] = "gpu"
     trainer = Trainer(**trainer_args)
