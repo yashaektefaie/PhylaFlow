@@ -406,11 +406,18 @@ class TrainingModule(LightningModule):
                     if edge_len is None and full_mask:
                         edge_len = length_map.get(full_mask ^ int(matched_vel))
                     if edge_len is None:
-                        edge_len = 0.0
+                        print(
+                            f"Edge length not found for split {matched_vel} (original {original_vel}) in tree {batch['original_trees'][num]}"
+                        )
+                        print(f"Available splits: {split_masks_num}")
+                        print(f"Length map keys: {list(length_map.keys())}")
+                        raise Exception("Edge length not found for matched split")
+                    if edge_len is None or float(edge_len) <= 1e-8:
+                        continue
 
                     sub_gathered_velocity_labels.append(velocity_labels[num][original_vel])
                     sub_v_pred_indices.append(mask_to_idx[int(matched_vel)])
-                    sub_gathered_velocity_lengths.append(max(float(edge_len), 0.0))
+                    sub_gathered_velocity_lengths.append(float(edge_len))
 
 
                 gathered_velocity_labels.append(
@@ -446,7 +453,11 @@ class TrainingModule(LightningModule):
                 # --- Velocity diagnostics ---
                 with torch.no_grad():
                     vel_metrics = _velocity_diagnostics(
-                        p, y, topk=3, sign_eps=self.velocity_sign_eps
+                        p,
+                        y,
+                        topk=3,
+                        sign_eps=self.velocity_sign_eps,
+                        lengths=gathered_velocity_lengths_flat,
                     )
                 if self.verbose:
                     logger.info(
@@ -456,9 +467,72 @@ class TrainingModule(LightningModule):
                         f"Spearman={vel_metrics['spearman']:.4f}  "
                         f"SignAcc={vel_metrics['sign_acc']:.4f}  "
                         f"TopK={vel_metrics['topk_overlap']:.4f}  "
+                        f"dtTopK={vel_metrics['dt_topk_overlap']:.4f}  "
+                        f"dtFirstHitRecall={vel_metrics['dt_first_hit_recall']:.4f}  "
+                        f"dtHitRelErr={vel_metrics['dt_hit_rel_err']:.4f}  "
                         f"N={vel_metrics['n_edges']}"
                     )
+                logs.update(
+                    {
+                        "velocity/cosine": torch.tensor(
+                            vel_metrics["cosine"], device=v_pred.device
+                        ),
+                        "velocity/pearson": torch.tensor(
+                            vel_metrics["pearson"], device=v_pred.device
+                        ),
+                        "velocity/spearman": torch.tensor(
+                            vel_metrics["spearman"], device=v_pred.device
+                        ),
+                        "velocity/sign_acc": torch.tensor(
+                            vel_metrics["sign_acc"], device=v_pred.device
+                        ),
+                        "velocity/topk_overlap": torch.tensor(
+                            vel_metrics["topk_overlap"], device=v_pred.device
+                        ),
+                        "velocity/dt_topk_overlap": torch.tensor(
+                            vel_metrics["dt_topk_overlap"], device=v_pred.device
+                        ),
+                        "velocity/dt_first_hit_recall": torch.tensor(
+                            vel_metrics["dt_first_hit_recall"], device=v_pred.device
+                        ),
+                        "velocity/dt_first_hit_precision": torch.tensor(
+                            vel_metrics["dt_first_hit_precision"], device=v_pred.device
+                        ),
+                        "velocity/dt_neg_jaccard": torch.tensor(
+                            vel_metrics["dt_neg_jaccard"], device=v_pred.device
+                        ),
+                    }
+                )
 
+                # eps = 1e-6
+                # first_hit_tol = 0.01
+                # contract = (y < -self.velocity_sign_eps) & (lengths > 1e-8)
+
+                # Lc = lengths[contract].clamp_min(eps)
+                # yc = y[contract]
+                # pc = p[contract]
+
+                # tau_true = Lc / (-yc).clamp_min(eps)
+                # w = (tau_true.median().clamp_min(eps) / tau_true).clamp(max=20.0)
+
+                # tau_min = tau_true.min()
+                # first = (tau_true - tau_min).abs() <= 0.01  # true tol (could be 0)
+
+                # boost = 5.0
+                # w = w * (1.0 + boost * first.float())
+
+                # loss = (w * (pc - yc)**2).mean()
+                # import pdb; pdb.set_trace()
+
+                # tau_true = lengths[contract] / (-y[contract]).clamp_min(eps)
+                # tau_min = tau_true.min()
+                # first = torch.abs(tau_true - tau_min) <= first_hit_tol
+                # w = torch.ones_like(y[contract])
+                # alpha = 10
+                # w[first] = 1.0 + alpha
+                # loss = (w * (p[contract] - y[contract])**2).mean()
+
+                # ####OG LOSS HERE
                 residual_sq = (p - y).pow(2)
                 plain_mse = residual_sq.mean()
 
@@ -560,7 +634,42 @@ class TrainingModule(LightningModule):
                 #     min(max((self.current_step_value - 100) / 200.0, 0.0), 1.0)
                 # )
 
-                loss = loss 
+                first_hit_velocity_loss = p.new_tensor(0.0)
+                contract_mask = (y < -self.velocity_sign_eps) & (lengths > 1e-8)
+                if self.velocity_dt_hit_weight > 0.0 and int(contract_mask.sum()) > 0:
+                    Lc = lengths[contract_mask].clamp_min(eps)
+                    yc = y[contract_mask]
+                    pc = p[contract_mask]
+                    tau_true = Lc / (-yc).clamp_min(eps)
+                    tau_true_min = tau_true.min()
+                    first_mask = torch.abs(tau_true - tau_true_min) <= 0.01
+                    if int(first_mask.sum()) > 0:
+                        first_hit_velocity_loss = F.smooth_l1_loss(
+                            pc[first_mask], yc[first_mask]
+                        )
+
+                # first_hit_aux_weight = float(
+                #     min(max((self.current_step_value - 100) / 200.0, 0.0), 1.0)
+                # )
+
+                # loss = (
+                #     loss
+                #     + 1
+                #     * (0.5 * self.velocity_dt_hit_weight * first_hit_velocity_loss)
+                # )
+
+                # loss = loss
+
+                # loss = (
+                #     loss
+                #     + self.velocity_dt_hit_weight * first_hit_velocity_loss
+                # )
+
+                loss = (
+                    loss
+                    + first_hit_velocity_loss
+                )
+
                 # loss = (
                 #     loss
                 #     + first_hit_aux_weight
@@ -588,22 +697,53 @@ class TrainingModule(LightningModule):
             # else:
 
             if self.record:
+                dt_hit_pred_log = (
+                    vel_metrics["dt_hit_pred"]
+                    if np.isfinite(vel_metrics["dt_hit_pred"])
+                    else -1.0
+                )
+                dt_hit_true_log = (
+                    vel_metrics["dt_hit_true"]
+                    if np.isfinite(vel_metrics["dt_hit_true"])
+                    else -1.0
+                )
+                dt_hit_abs_err_log = (
+                    vel_metrics["dt_hit_abs_err"]
+                    if np.isfinite(vel_metrics["dt_hit_abs_err"])
+                    else 1e6
+                )
+                dt_hit_rel_err_log = (
+                    vel_metrics["dt_hit_rel_err"]
+                    if np.isfinite(vel_metrics["dt_hit_rel_err"])
+                    else 1e6
+                )
                 vel_wandb = {"train/velocity_loss": loss.item()}
                 if len(preds_list) > 0:
                     vel_wandb.update({
                         "velocity/loss_plain_mse": plain_mse.item(),
                         "velocity/loss_weighted_mse": weighted_mse.item(),
-                        "velocity/mse": vel_metrics["mse"],
-                        "velocity/mse_vs_zero": vel_metrics["mse_vs_zero"],
-                        "velocity/mse_vs_mean": vel_metrics["mse_vs_mean"],
-                        "velocity/zero_baseline_mse": vel_metrics["zero_baseline_mse"],
-                        "velocity/mean_baseline_mse": vel_metrics["mean_baseline_mse"],
-                        "velocity/cosine": vel_metrics["cosine"],
-                        "velocity/pearson": vel_metrics["pearson"],
-                        "velocity/spearman": vel_metrics["spearman"],
-                        "velocity/sign_acc": vel_metrics["sign_acc"],
-                        "velocity/topk_overlap": vel_metrics["topk_overlap"],
-                        "velocity/n_edges": vel_metrics["n_edges"],
+                    "velocity/mse": vel_metrics["mse"],
+                    "velocity/mse_vs_zero": vel_metrics["mse_vs_zero"],
+                    "velocity/mse_vs_mean": vel_metrics["mse_vs_mean"],
+                    "velocity/zero_baseline_mse": vel_metrics["zero_baseline_mse"],
+                    "velocity/mean_baseline_mse": vel_metrics["mean_baseline_mse"],
+                    "velocity/cosine": vel_metrics["cosine"],
+                    "velocity/pearson": vel_metrics["pearson"],
+                    "velocity/spearman": vel_metrics["spearman"],
+                    "velocity/sign_acc": vel_metrics["sign_acc"],
+                    "velocity/topk_overlap": vel_metrics["topk_overlap"],
+                    "velocity/dt_hit_pred": dt_hit_pred_log,
+                    "velocity/dt_hit_true": dt_hit_true_log,
+                    "velocity/dt_hit_abs_err": dt_hit_abs_err_log,
+                    "velocity/dt_hit_rel_err": dt_hit_rel_err_log,
+                    # "velocity/dt_neg_jaccard": vel_metrics["dt_neg_jaccard"],
+                    "velocity/dt_first_hit_match": vel_metrics["dt_first_hit_match"],
+                    "velocity/dt_first_hit_recall": vel_metrics["dt_first_hit_recall"],
+                    "velocity/dt_first_hit_precision": vel_metrics["dt_first_hit_precision"],
+                    "velocity/dt_topk_overlap": vel_metrics["dt_topk_overlap"],
+                    # "velocity/n_pred_dt_candidates": vel_metrics["n_pred_dt_candidates"],
+                    # "velocity/n_true_dt_candidates": vel_metrics["n_true_dt_candidates"],
+                    # "velocity/n_edges": vel_metrics["n_edges"],
                     })
                 wandb.log(vel_wandb, step=self.stepper)
             # import pdb
@@ -820,6 +960,7 @@ class TrainingModule(LightningModule):
         dt_base=0.02,
         eps_len=1e-8,
         hit_tol=1e-10,
+        first_hit_tol=0.01,
         max_events=1000,
         max_steps=20000,
         KNN_TOPM = 32,
@@ -1205,19 +1346,13 @@ class TrainingModule(LightningModule):
                     # Numerical fallback: only moving supervised edges can trigger hits.
                     hit_boundary = bool((L_new[moving_neg] <= eps_len).any())
 
-                # if hit_boundary and np.isfinite(dt_hit):
-                #     # Batch near-simultaneous hits (numerical simultaneity)
-                #     eta = 0.01  # relative tie threshold (1%)
-                #     eps_abs = 0.1 * dt_hit  # absolute floor, scaled to event time (often ~1e-3 here)
-                #     idx_neg = np.where(neg)[0]
-
-                #     dt_min = dt_candidates.min()
-                #     eta = 0.02          # relative window
-                #     c = 2.0             # absolute window in *steps*
-                #     eps_abs = c * dt_base
-
-                #     batch = (dt_candidates <= dt_min * (1 + eta)) | (dt_candidates <= dt_min + eps_abs)
-                #     L_new[idx_neg[batch]] = 0.0
+                if hit_boundary and np.isfinite(dt_hit) and np.any(moving_neg):
+                    # Collapse near-simultaneous first-hit edges into the same boundary event.
+                    neg_idx = np.where(moving_neg)[0]
+                    dt_candidates = L[neg_idx] / np.maximum(-V[neg_idx], eps_len)
+                    near_first_hit = np.abs(dt_candidates - dt_hit) <= float(first_hit_tol)
+                    if np.any(near_first_hit):
+                        L_new[neg_idx[near_first_hit]] = 0.0
 
                 
                 # update dict
@@ -1839,6 +1974,9 @@ class TrainingModule(LightningModule):
                     # --- HEAD 1: VELOCITY ---
                     logging.info("DEBUG: Starting Velocity Head Training")
                     logs_vel = self.step(batch, autoregressive=False)
+                    velocity_metric_logs = {
+                        k: v for k, v in logs_vel.items() if k.startswith("velocity/")
+                    }
                     loss_vel_unscaled = logs_vel["loss"]
                     loss_vel = (
                         loss_vel_unscaled * self.training_step_velocity_weight
@@ -1891,6 +2029,7 @@ class TrainingModule(LightningModule):
                     logs["train/velocity_loss_scaled"] = (
                         loss_vel_scaled_detached
                     )
+                    logs.update(velocity_metric_logs)
                     logs["loss"] = loss
                     logging.info(
                         "Autoregressive head loss: raw=%.6f scaled=%.6f weight=%.4f",

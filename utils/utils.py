@@ -649,11 +649,17 @@ def _spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def _velocity_diagnostics(
-    p: torch.Tensor, y: torch.Tensor, topk: int = 3, sign_eps: float = 1e-3
+    p: torch.Tensor,
+    y: torch.Tensor,
+    topk: int = 3,
+    sign_eps: float = 1e-3,
+    lengths: Optional[torch.Tensor] = None,
+    dt_first_hit_tol: float = 0.01,
+    dt_eps: float = 1e-8,
 ) -> dict:
     """
     Compute diagnostic metrics for predicted (p) vs true (y) velocity vectors.
-    Returns a dict with: mse, cosine, pearson, spearman, sign_acc, topk_overlap, n_edges.
+    Returns a dict with correlation/sign/top-k metrics and dt-hit overlap diagnostics.
     """
     metrics = {}
     metrics["n_edges"] = int(p.numel())
@@ -683,5 +689,109 @@ def _velocity_diagnostics(
         metrics["topk_overlap"] = len(pred_topk & true_topk) / float(k)
     else:
         metrics["topk_overlap"] = 1.0
+
+    metrics["dt_first_hit_tol"] = float(dt_first_hit_tol)
+    metrics["dt_hit_pred"] = float("inf")
+    metrics["dt_hit_true"] = float("inf")
+    metrics["dt_hit_abs_err"] = 0.0
+    metrics["dt_hit_rel_err"] = 0.0
+    metrics["dt_neg_jaccard"] = 1.0
+    metrics["dt_first_hit_match"] = 1.0
+    metrics["dt_first_hit_recall"] = 1.0
+    metrics["dt_first_hit_precision"] = 1.0
+    metrics["dt_topk_overlap"] = 1.0
+    metrics["n_pred_dt_candidates"] = 0
+    metrics["n_true_dt_candidates"] = 0
+
+    if lengths is not None and int(lengths.numel()) == int(p.numel()):
+        L = lengths.detach()
+        p_det = p.detach()
+        y_det = y.detach()
+        valid = L > float(dt_eps)
+        pred_neg = (p_det < 0.0) & valid
+        true_neg = (y_det < 0.0) & valid
+
+        pred_neg_idx = torch.where(pred_neg)[0]
+        true_neg_idx = torch.where(true_neg)[0]
+
+        if int(pred_neg_idx.numel()) > 0:
+            pred_dt_all = L[pred_neg_idx] / (-p_det[pred_neg_idx]).clamp_min(1e-8)
+            metrics["dt_hit_pred"] = float(torch.min(pred_dt_all))
+            metrics["n_pred_dt_candidates"] = int(pred_dt_all.numel())
+        else:
+            pred_dt_all = torch.empty(0, dtype=L.dtype, device=L.device)
+
+        if int(true_neg_idx.numel()) > 0:
+            true_dt_all = L[true_neg_idx] / (-y_det[true_neg_idx]).clamp_min(1e-8)
+            metrics["dt_hit_true"] = float(torch.min(true_dt_all))
+            metrics["n_true_dt_candidates"] = int(true_dt_all.numel())
+        else:
+            true_dt_all = torch.empty(0, dtype=L.dtype, device=L.device)
+
+        both_neg = pred_neg & true_neg
+        any_neg = pred_neg | true_neg
+        if int(any_neg.sum()) > 0:
+            metrics["dt_neg_jaccard"] = float(
+                int(both_neg.sum()) / float(int(any_neg.sum()))
+            )
+
+        pred_dt_hit = metrics["dt_hit_pred"]
+        true_dt_hit = metrics["dt_hit_true"]
+        if np.isfinite(pred_dt_hit) and np.isfinite(true_dt_hit):
+            metrics["dt_hit_abs_err"] = abs(pred_dt_hit - true_dt_hit)
+            metrics["dt_hit_rel_err"] = metrics["dt_hit_abs_err"] / max(
+                abs(true_dt_hit), 1e-8
+            )
+        elif (not np.isfinite(pred_dt_hit)) and (not np.isfinite(true_dt_hit)):
+            metrics["dt_hit_abs_err"] = 0.0
+            metrics["dt_hit_rel_err"] = 0.0
+        else:
+            metrics["dt_hit_abs_err"] = float("inf")
+            metrics["dt_hit_rel_err"] = float("inf")
+
+        if int(pred_neg_idx.numel()) == 0 and int(true_neg_idx.numel()) == 0:
+            metrics["dt_first_hit_match"] = 1.0
+            metrics["dt_topk_overlap"] = 1.0
+            metrics["dt_first_hit_recall"] = 1.0
+            metrics["dt_first_hit_precision"] = 1.0
+        elif int(pred_neg_idx.numel()) == 0 or int(true_neg_idx.numel()) == 0:
+            metrics["dt_first_hit_match"] = 0.0
+            metrics["dt_topk_overlap"] = 0.0
+            metrics["dt_first_hit_recall"] = 0.0
+            metrics["dt_first_hit_precision"] = 0.0
+        else:
+            pred_order = pred_neg_idx[torch.argsort(pred_dt_all)]
+            true_order = true_neg_idx[torch.argsort(true_dt_all)]
+
+            pred_first_idx = torch.where(
+                torch.abs(pred_dt_all - torch.min(pred_dt_all))
+                <= float(dt_first_hit_tol)
+            )[0]
+            true_first_idx = torch.where(
+                torch.abs(true_dt_all - torch.min(true_dt_all)) <= 0.0
+            )[0]
+
+            pred_first_masks = set(pred_neg_idx[pred_first_idx].tolist())
+            true_first_masks = set(true_neg_idx[true_first_idx].tolist())
+            first_hit_overlap = pred_first_masks & true_first_masks
+            metrics["dt_first_hit_recall"] = len(first_hit_overlap) / float(
+                max(len(true_first_masks), 1)
+            )
+            metrics["dt_first_hit_precision"] = len(first_hit_overlap) / float(
+                max(len(pred_first_masks), 1)
+            )
+            metrics["dt_first_hit_match"] = (
+                1.0 if true_first_masks.issubset(pred_first_masks) else 0.0
+            )
+
+            k_dt = min(int(topk), int(pred_order.numel()), int(true_order.numel()))
+            if k_dt > 0:
+                pred_top_masks = set(pred_order[:k_dt].tolist())
+                true_top_masks = set(true_order[:k_dt].tolist())
+                metrics["dt_topk_overlap"] = len(pred_top_masks & true_top_masks) / float(
+                    k_dt
+                )
+            else:
+                metrics["dt_topk_overlap"] = 1.0
 
     return metrics

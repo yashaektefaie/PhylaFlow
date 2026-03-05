@@ -245,7 +245,7 @@ def run_overfit():
         dataset=dataset,
         lr_scheduler="default",
         num_annealing_steps=10000,
-        num_warmup_steps=1000,
+        num_warmup_steps=config["trainer"].get("num_warmup_steps", 1000),
         num_samples=1,
         deepspeed=False,
         logger=None,
@@ -261,6 +261,8 @@ def run_overfit():
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
         ),
+        training_sampling_start = config["trainer"].get("training_sampling_start", 500),  # Start sampling from the beginning for overfitting
+        verbose=True,  # Enable verbose logging for overfitting
     )
 
     save_callback = ModelCheckpoint(
