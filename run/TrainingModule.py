@@ -84,6 +84,7 @@ class TrainingModule(LightningModule):
         velocity_sign_eps: float = 1e-3,
         training_step_velocity_weight: float = 1.0,
         training_step_autoregressive_weight: float = 1.0,
+        training_step_autoregressive_grad_ratio = None,
         velocity_dt_candidate_weight: float = 0.0,
         velocity_dt_hit_weight: float = 0.0,
         velocity_dt_eps: float = 1e-6,
@@ -154,6 +155,14 @@ class TrainingModule(LightningModule):
                 "training_step_autoregressive_weight must be non-negative, "
                 f"got {training_step_autoregressive_weight}."
             )
+        if (
+            training_step_autoregressive_grad_ratio is not None
+            and float(training_step_autoregressive_grad_ratio) < 0.0
+        ):
+            raise ValueError(
+                "training_step_autoregressive_grad_ratio must be non-negative "
+                f"or None, got {training_step_autoregressive_grad_ratio}."
+            )
         if float(velocity_dt_candidate_weight) < 0.0:
             raise ValueError(
                 "velocity_dt_candidate_weight must be non-negative, "
@@ -188,6 +197,12 @@ class TrainingModule(LightningModule):
         self.training_step_autoregressive_weight = float(
             training_step_autoregressive_weight
         )
+        if training_step_autoregressive_grad_ratio is None:
+            self.training_step_autoregressive_grad_ratio = None
+        else:
+            self.training_step_autoregressive_grad_ratio = float(
+                training_step_autoregressive_grad_ratio
+            )
         self.velocity_dt_candidate_weight = float(velocity_dt_candidate_weight)
         self.velocity_dt_hit_weight = float(velocity_dt_hit_weight)
         self.velocity_dt_eps = float(velocity_dt_eps)
@@ -666,7 +681,7 @@ class TrainingModule(LightningModule):
                 # )
 
                 loss = (
-                    loss
+                    loss 
                     + first_hit_velocity_loss
                 )
 
@@ -1297,7 +1312,7 @@ class TrainingModule(LightningModule):
                             for wi in worst_idx:
                                 print(f"    split={matched_masks_dbg[wi]:>12}  pred={v_pred_np[wi]:+.6e}  true={v_true_np[wi]:+.6e}  err={abs_err[wi]:.6e}")
                             print(f"============================================================\n")
-                            import pdb; pdb.set_trace()
+                            # import pdb; pdb.set_trace()
                         else:
                             print(f"DEBUG: Could not match any velocity splits for tree {b_idx}")
                     except Exception as e:
@@ -1990,6 +2005,18 @@ class TrainingModule(LightningModule):
                         float(self.training_step_velocity_weight),
                     )
                     self.manual_backward(loss_vel)
+                    pre_ar_grads = None
+                    velocity_grad_norm = None
+                    if self.training_step_autoregressive_grad_ratio is not None:
+                        pre_ar_grads = {}
+                        vel_sq = 0.0
+                        for p in self.model.parameters():
+                            if p.grad is None:
+                                continue
+                            g_prev = p.grad.detach().clone()
+                            pre_ar_grads[p] = g_prev
+                            vel_sq += float(torch.sum(g_prev * g_prev))
+                        velocity_grad_norm = vel_sq ** 0.5
                     # self.clip_gradients(
                     #     opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
                     # )
@@ -2046,6 +2073,57 @@ class TrainingModule(LightningModule):
                     )
 
                     self.manual_backward(loss)
+                    if (
+                        self.training_step_autoregressive_grad_ratio is not None
+                        and pre_ar_grads is not None
+                        and velocity_grad_norm is not None
+                    ):
+                        ar_sq = 0.0
+                        for p in self.model.parameters():
+                            if p.grad is None:
+                                continue
+                            g_prev = pre_ar_grads.get(p)
+                            if g_prev is None:
+                                ar_delta = p.grad.detach()
+                            else:
+                                ar_delta = p.grad.detach() - g_prev
+                            ar_sq += float(torch.sum(ar_delta * ar_delta))
+                        autoregressive_grad_norm = ar_sq ** 0.5
+                        grad_scale = 1.0
+                        if (
+                            autoregressive_grad_norm > 1e-12
+                            and velocity_grad_norm > 1e-12
+                        ):
+                            target_norm = (
+                                velocity_grad_norm
+                                * self.training_step_autoregressive_grad_ratio
+                            )
+                            if autoregressive_grad_norm > target_norm:
+                                grad_scale = target_norm / (
+                                    autoregressive_grad_norm + 1e-12
+                                )
+                                for p in self.model.parameters():
+                                    g_prev = pre_ar_grads.get(p)
+                                    if p.grad is None:
+                                        if g_prev is not None:
+                                            p.grad = g_prev.clone()
+                                        continue
+                                    if g_prev is None:
+                                        p.grad.mul_(grad_scale)
+                                    else:
+                                        p.grad.copy_(
+                                            g_prev + (p.grad - g_prev) * grad_scale
+                                        )
+                        device_for_logs = loss.device
+                        logs["train/velocity_grad_norm"] = torch.tensor(
+                            velocity_grad_norm, device=device_for_logs
+                        )
+                        logs["train/autoregressive_grad_norm"] = torch.tensor(
+                            autoregressive_grad_norm, device=device_for_logs
+                        )
+                        logs["train/autoregressive_grad_scale"] = torch.tensor(
+                            grad_scale, device=device_for_logs
+                        )
                     self.clip_gradients(
                         opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
                     )

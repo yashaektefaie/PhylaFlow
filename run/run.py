@@ -70,6 +70,20 @@ def init_worker(config_file, device_id):
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
         ),
+        training_step_autoregressive_grad_ratio=config["trainer"].get(
+            "training_step_autoregressive_grad_ratio"
+        ),
+        velocity_dt_candidate_weight=config["trainer"].get(
+            "velocity_dt_candidate_weight", 0.0
+        ),
+        velocity_dt_hit_weight=config["trainer"].get("velocity_dt_hit_weight", 0.0),
+        velocity_dt_eps=config["trainer"].get("velocity_dt_eps", 1e-6),
+        velocity_event_weight=config["trainer"].get("velocity_event_weight", 0.5),
+        velocity_event_temp=config["trainer"].get("velocity_event_temp", 0.5),
+        velocity_event_rate_beta=config["trainer"].get("velocity_event_rate_beta", 5.0),
+        velocity_event_normalize_by_log_candidates=config["trainer"].get(
+            "velocity_event_normalize_by_log_candidates", True
+        ),
     )
     model.to(device)
     model.eval()
@@ -130,6 +144,20 @@ def run_test():
         ),
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
+        ),
+        training_step_autoregressive_grad_ratio=config["trainer"].get(
+            "training_step_autoregressive_grad_ratio"
+        ),
+        velocity_dt_candidate_weight=config["trainer"].get(
+            "velocity_dt_candidate_weight", 0.0
+        ),
+        velocity_dt_hit_weight=config["trainer"].get("velocity_dt_hit_weight", 0.0),
+        velocity_dt_eps=config["trainer"].get("velocity_dt_eps", 1e-6),
+        velocity_event_weight=config["trainer"].get("velocity_event_weight", 0.5),
+        velocity_event_temp=config["trainer"].get("velocity_event_temp", 0.5),
+        velocity_event_rate_beta=config["trainer"].get("velocity_event_rate_beta", 5.0),
+        velocity_event_normalize_by_log_candidates=config["trainer"].get(
+            "velocity_event_normalize_by_log_candidates", True
         ),
     )
     # res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
@@ -261,6 +289,20 @@ def run_overfit():
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
         ),
+        training_step_autoregressive_grad_ratio=config["trainer"].get(
+            "training_step_autoregressive_grad_ratio"
+        ),
+        velocity_dt_candidate_weight=config["trainer"].get(
+            "velocity_dt_candidate_weight", 0.0
+        ),
+        velocity_dt_hit_weight=config["trainer"].get("velocity_dt_hit_weight", 0.0),
+        velocity_dt_eps=config["trainer"].get("velocity_dt_eps", 1e-6),
+        velocity_event_weight=config["trainer"].get("velocity_event_weight", 0.5),
+        velocity_event_temp=config["trainer"].get("velocity_event_temp", 0.5),
+        velocity_event_rate_beta=config["trainer"].get("velocity_event_rate_beta", 5.0),
+        velocity_event_normalize_by_log_candidates=config["trainer"].get(
+            "velocity_event_normalize_by_log_candidates", True
+        ),
         training_sampling_start = config["trainer"].get("training_sampling_start", 500),  # Start sampling from the beginning for overfitting
         verbose=True,  # Enable verbose logging for overfitting
     )
@@ -340,6 +382,20 @@ def main():
         ),
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
+        ),
+        training_step_autoregressive_grad_ratio=config["trainer"].get(
+            "training_step_autoregressive_grad_ratio"
+        ),
+        velocity_dt_candidate_weight=config["trainer"].get(
+            "velocity_dt_candidate_weight", 0.0
+        ),
+        velocity_dt_hit_weight=config["trainer"].get("velocity_dt_hit_weight", 0.0),
+        velocity_dt_eps=config["trainer"].get("velocity_dt_eps", 1e-6),
+        velocity_event_weight=config["trainer"].get("velocity_event_weight", 0.5),
+        velocity_event_temp=config["trainer"].get("velocity_event_temp", 0.5),
+        velocity_event_rate_beta=config["trainer"].get("velocity_event_rate_beta", 5.0),
+        velocity_event_normalize_by_log_candidates=config["trainer"].get(
+            "velocity_event_normalize_by_log_candidates", True
         ),
     )
 

@@ -20,7 +20,7 @@ model:
   phyla_dim: 16
 
 trainer:
-  record: False
+  record: True
   epochs: 10000000
   checkpoint_dir: checkpoints/
   phyla_checkpoint_path: checkpoints/chkpts/epoch%3D00-step%3D004000-treefam_avg_normrf%3D0.6721.ckpt
@@ -31,8 +31,12 @@ trainer:
   velocity_loss_mode: plain
   velocity_loss_plain_weight: 1.0
   velocity_sign_eps: 0.001
-  training_step_velocity_weight: 1
-  training_step_autoregressive_weight: 0
+  training_step_velocity_weight: 100
+  training_step_autoregressive_weight: 0.1
+  training_step_autoregressive_grad_ratio: 0.05
+  velocity_dt_candidate_weight: 1.0
+  velocity_dt_hit_weight: 1.0
+  velocity_event_weight: 0.0
   training_sampling_start: 1000
   num_warmup_steps: 0
 
@@ -49,4 +53,4 @@ data:
   pin_memory: False
   sanity_check: False
   random_sanity_check: True
-  overfit_velocity_zero: True
+  overfit_velocity_zero: False
