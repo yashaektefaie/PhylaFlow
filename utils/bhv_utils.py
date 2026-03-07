@@ -2,7 +2,6 @@ from utils.bhv_distance import bhv_geodesic_with_support
 from utils.random_tree import Tree
 import logging 
 logger = logging.getLogger(__name__)
-import random as rm
 
 class BHVEncoder():
 
@@ -103,46 +102,461 @@ class BHVEncoder():
             print("  ratio:", seg["ratio"])
             # seg["start_splits"], seg["end_splits"] give you orthant topology at each step
 
-def best_decomposition_for_any_orientation(split, sorted_components, full):
-    best = None
-    best_split = None
+def _bio_full_mask(n_leaves):
+    return (1 << (n_leaves - 1)) - 1
 
-    for cand in (split, full ^ split):
-        for comps in sorted_components:
-            region_mask = 0
-            for comp in comps:
-                region_mask |= comp
 
-            if cand & ~region_mask:
+def _sort_masks(masks):
+    return sorted({int(mask) for mask in masks}, key=lambda mask: (mask.bit_count(), mask))
+
+
+def _is_strict_subset(sub, sup):
+    sub = int(sub)
+    sup = int(sup)
+    return sub != sup and (sub & ~sup) == 0
+
+
+def _orient_split_away_from_dummy(split, n_leaves):
+    split = int(split)
+    root_leaf = n_leaves - 1
+    root_bit = 1 << root_leaf
+    full_mask = (1 << n_leaves) - 1
+    cluster = full_mask ^ split if split & root_bit else split
+    return cluster & _bio_full_mask(n_leaves)
+
+
+def _resolve_num_leaves(num_leaves, batch_index, edge_split_masks_b):
+    if isinstance(num_leaves, int):
+        return int(num_leaves)
+    if isinstance(num_leaves, (list, tuple)):
+        if len(num_leaves) > batch_index:
+            return int(num_leaves[batch_index])
+        return 0
+    try:
+        import torch
+
+        if isinstance(num_leaves, torch.Tensor):
+            if num_leaves.numel() == 0:
+                return 0
+            if num_leaves.numel() == 1:
+                return int(num_leaves.item())
+            return int(num_leaves[batch_index].item())
+    except Exception:
+        pass
+
+    max_bit = 0
+    for split in edge_split_masks_b:
+        split_int = int(split)
+        if split_int != 0:
+            max_bit = max(max_bit, split_int.bit_length())
+    return max_bit
+
+
+def _lookup_component_positions(mask_to_positions, component, bio_full):
+    component = int(component)
+    positions = mask_to_positions.get(component)
+    if positions:
+        return positions
+
+    complement = int(bio_full) ^ component
+    if complement == 0 or complement == int(bio_full):
+        return None
+    return mask_to_positions.get(complement)
+
+
+def _internal_bio_clusters_from_splits(splits, n_leaves):
+    bio_full = _bio_full_mask(n_leaves)
+    clusters = set()
+    for split in splits:
+        cluster = _orient_split_away_from_dummy(split, n_leaves)
+        if 1 < cluster.bit_count() < bio_full.bit_count():
+            clusters.add(cluster)
+    return clusters
+
+
+def get_structural_polytomy_groups_from_newick(newick_tree, min_children=3):
+    tree = Tree(newick_tree)
+    split_masks, _ = BHVEncoder().return_BHV_encoding(tree)
+    current_clusters = _internal_bio_clusters_from_splits(split_masks, tree.n_leaves)
+    current_regions = set(current_clusters)
+    current_regions.add(_bio_full_mask(tree.n_leaves))
+
+    groups = []
+    seen = set()
+    for parent in sorted(current_regions, key=lambda region: (region.bit_count(), region)):
+        children = tuple(_direct_children(parent, current_clusters, tree.n_leaves))
+        if len(children) < min_children:
+            continue
+        if children in seen:
+            continue
+        seen.add(children)
+        groups.append(list(children))
+
+    return groups
+
+
+def _direct_children(parent, internal_clusters, n_leaves):
+    parent = int(parent)
+    leaf_masks = [1 << leaf for leaf in range(n_leaves - 1) if parent & (1 << leaf)]
+    candidates = [cluster for cluster in internal_clusters if _is_strict_subset(cluster, parent)]
+    candidates.extend(leaf_masks)
+
+    children = []
+    for candidate in candidates:
+        dominated = False
+        for other in candidates:
+            if _is_strict_subset(candidate, other) and _is_strict_subset(other, parent):
+                dominated = True
+                break
+        if not dominated:
+            children.append(int(candidate))
+
+    children = _sort_masks(children)
+    union = 0
+    for child in children:
+        union |= child
+
+    if union != parent:
+        raise ValueError(
+            f"Children of parent mask {parent} do not partition the parent. "
+            f"Observed union {union}."
+        )
+
+    return children
+
+
+def get_batch_structural_polytomy_indices(
+    edge_split_masks,
+    edge_mask,
+    min_children=3,
+    num_leaves=None,
+):
+    import torch
+
+    if edge_mask.dim() != 2:
+        raise ValueError(f"edge_mask must be [B,T], got {tuple(edge_mask.shape)}")
+
+    batch_polytomy_index = []
+    batch_polytomy_splits = []
+
+    for batch_index, splits_b in enumerate(edge_split_masks):
+        valid_pos = torch.nonzero(edge_mask[batch_index], as_tuple=False).squeeze(1)
+        if len(splits_b) != edge_mask[batch_index].sum().item():
+            raise ValueError("Length mismatch between splits and valid edge mask. This SHOULD NOT HAPPEN.")
+
+        n_b = _resolve_num_leaves(num_leaves, batch_index, splits_b)
+        if n_b <= 1:
+            batch_polytomy_index.append([])
+            batch_polytomy_splits.append([])
+            continue
+
+        bio_full = _bio_full_mask(n_b)
+        mask_to_positions = {}
+        for pos, split in zip(valid_pos.tolist(), splits_b):
+            split_int = int(split)
+            if split_int == 0:
+                continue
+            bio_mask = _orient_split_away_from_dummy(split_int, n_b)
+            if bio_mask == 0 or bio_mask == bio_full:
+                continue
+            mask_to_positions.setdefault(int(bio_mask), []).append(int(pos))
+
+        current_clusters = _internal_bio_clusters_from_splits(splits_b, n_b)
+        current_regions = set(current_clusters)
+        current_regions.add(bio_full)
+
+        groups = []
+        group_splits = []
+        seen = set()
+        for parent in sorted(current_regions, key=lambda region: (region.bit_count(), region)):
+            children = _direct_children(parent, current_clusters, n_b)
+            if len(children) < min_children:
                 continue
 
-            relevant = []
-            ok = True
-            for comp in comps:
-                inter = comp & cand
-                if inter == 0:
-                    continue
-                if inter == comp:
-                    relevant.append(comp)
-                else:
-                    ok = False
+            key = tuple(children)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            group_indices = []
+            valid_group = True
+            for child in children:
+                positions = _lookup_component_positions(
+                    mask_to_positions,
+                    child,
+                    bio_full,
+                )
+                if not positions:
+                    valid_group = False
                     break
+                group_indices.append(int(positions[0]))
 
-            if ok and (best is None or len(relevant) < len(best)):
-                best = relevant
-                best_split = cand
+            if valid_group:
+                groups.append(torch.tensor(group_indices, dtype=torch.long, device=edge_mask.device))
+                group_splits.append([int(child) for child in children])
 
-    return best_split, best
+        batch_polytomy_index.append(groups)
+        batch_polytomy_splits.append(group_splits)
+
+    return batch_polytomy_index, batch_polytomy_splits
 
 
+def get_batch_explicit_structural_group_indices(
+    edge_split_masks,
+    edge_mask,
+    structural_groups,
+    num_leaves=None,
+):
+    import torch
 
-def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, verbose = False, id_to_test = None):
-    from utils.utils import find_polytomy_nodes, polytomy_components_at_node, bucket_by_overlap, leaves_in_component_split
+    if edge_mask.dim() != 2:
+        raise ValueError(f"edge_mask must be [B,T], got {tuple(edge_mask.shape)}")
+
+    batch_group_index = []
+    batch_group_splits = []
+
+    for batch_index, splits_b in enumerate(edge_split_masks):
+        valid_pos = torch.nonzero(edge_mask[batch_index], as_tuple=False).squeeze(1)
+        if len(splits_b) != edge_mask[batch_index].sum().item():
+            raise ValueError("Length mismatch between splits and valid edge mask. This SHOULD NOT HAPPEN.")
+
+        n_b = _resolve_num_leaves(num_leaves, batch_index, splits_b)
+        if n_b <= 1:
+            batch_group_index.append([])
+            batch_group_splits.append([])
+            continue
+
+        bio_full = _bio_full_mask(n_b)
+        mask_to_positions = {}
+        for pos, split in zip(valid_pos.tolist(), splits_b):
+            split_int = int(split)
+            if split_int == 0:
+                continue
+            bio_mask = _orient_split_away_from_dummy(split_int, n_b)
+            if bio_mask == 0 or bio_mask == bio_full:
+                continue
+            mask_to_positions.setdefault(int(bio_mask), []).append(int(pos))
+
+        groups = []
+        group_splits = []
+        for group in structural_groups[batch_index]:
+            group = [int(component) for component in group]
+            if len(group) < 2:
+                continue
+
+            group_indices = []
+            valid_group = True
+            for component in group:
+                positions = _lookup_component_positions(
+                    mask_to_positions,
+                    component,
+                    bio_full,
+                )
+                if not positions:
+                    valid_group = False
+                    break
+                group_indices.append(int(positions[0]))
+
+            if valid_group:
+                groups.append(
+                    torch.tensor(group_indices, dtype=torch.long, device=edge_mask.device)
+                )
+                group_splits.append(group)
+
+        batch_group_index.append(groups)
+        batch_group_splits.append(group_splits)
+
+    return batch_group_index, batch_group_splits
+
+
+def _merge_schedule_for_parent(parent, atoms, target_clusters):
+    target_clusters = _sort_masks(target_clusters)
+    if not target_clusters:
+        return []
+
+    child_map = {}
+    for cluster in target_clusters:
+        candidates = [
+            atom for atom in atoms
+            if (int(atom) & ~int(cluster)) == 0
+        ]
+        candidates.extend(
+            other for other in target_clusters if _is_strict_subset(other, cluster)
+        )
+
+        maximal_children = []
+        for candidate in candidates:
+            dominated = False
+            for other in candidates:
+                if _is_strict_subset(candidate, other) and _is_strict_subset(other, cluster):
+                    dominated = True
+                    break
+            if not dominated:
+                maximal_children.append(int(candidate))
+
+        maximal_children = _sort_masks(maximal_children)
+        union = 0
+        for child in maximal_children:
+            union |= child
+
+        if union != cluster or len(maximal_children) < 2:
+            raise ValueError(
+                f"Target cluster {cluster} inside parent {parent} is not a valid "
+                f"merge from current components. Children={maximal_children}, union={union}."
+            )
+
+        child_map[cluster] = maximal_children
+
+    pending = list(target_clusters)
+    current_components = set(int(atom) for atom in atoms)
+    events = []
+
+    while pending:
+        ready = []
+        for cluster in pending:
+            children = child_map[cluster]
+            if all(child in current_components for child in children):
+                ready.append((cluster, children))
+
+        if not ready:
+            raise ValueError(
+                f"Could not find a ready merge inside parent {parent}. "
+                f"Pending clusters={pending}, current_components={sorted(current_components)}."
+            )
+
+        used_children = set()
+        for _, children in ready:
+            for child in children:
+                if child in used_children:
+                    raise ValueError(
+                        f"Parent {parent} produced overlapping ready merges in one step."
+                    )
+                used_children.add(child)
+
+        ready = sorted(
+            ready,
+            key=lambda item: (len(item[1]), item[0].bit_count(), item[0]),
+        )
+        for cluster, children in ready:
+            for child in children:
+                current_components.remove(child)
+            current_components.add(cluster)
+
+        ready_clusters = {cluster for cluster, _ in ready}
+        pending = [cluster for cluster in pending if cluster not in ready_clusters]
+        events.append(ready)
+
+    return events
+
+
+def _build_boundary_merge_events(boundary_lengths, boundary_births, n_leaves):
+    current_clusters = _internal_bio_clusters_from_splits(boundary_lengths.keys(), n_leaves)
+    final_clusters = _internal_bio_clusters_from_splits(
+        list(boundary_lengths.keys()) + [int(split) for split in boundary_births],
+        n_leaves,
+    )
+    new_clusters = _sort_masks(final_clusters - current_clusters)
+
+    if not new_clusters:
+        return []
+
+    current_regions = set(current_clusters)
+    current_regions.add(_bio_full_mask(n_leaves))
+
+    parent_to_clusters = {}
+    for cluster in new_clusters:
+        candidate_parents = [
+            region for region in current_regions if _is_strict_subset(cluster, region)
+        ]
+        if not candidate_parents:
+            raise ValueError(f"Could not locate a current parent region for cluster {cluster}.")
+
+        parent = min(candidate_parents, key=lambda region: (region.bit_count(), region))
+        parent_to_clusters.setdefault(parent, []).append(cluster)
+
+    parent_events = []
+    for parent in sorted(parent_to_clusters, key=lambda region: (region.bit_count(), region)):
+        atoms = _direct_children(parent, current_clusters, n_leaves)
+        if len(atoms) < 2:
+            raise ValueError(
+                f"Parent {parent} has only {len(atoms)} children, so it cannot be refined."
+            )
+
+        levels = _merge_schedule_for_parent(parent, atoms, parent_to_clusters[parent])
+        parent_events.append(levels)
+
+    events = []
+    max_depth = max(len(levels) for levels in parent_events)
+    for depth in range(max_depth):
+        labels = []
+        for levels in parent_events:
+            if depth < len(levels):
+                labels.extend(levels[depth])
+        if labels:
+            events.append(
+                sorted(
+                    labels,
+                    key=lambda item: (len(item[1]), item[0].bit_count(), item[0]),
+                )
+            )
+
+    returned_clusters = {int(cluster) for level in events for cluster, _ in level}
+    if returned_clusters != set(new_clusters):
+        raise ValueError(
+            "Boundary merge schedule did not recover the full post-boundary refinement. "
+            f"Returned={sorted(returned_clusters)}, expected={new_clusters}."
+        )
+
+    return events
+
+
+def _current_parent_and_children_for_split(split, current_clusters, n_leaves):
+    current_regions = set(int(cluster) for cluster in current_clusters)
+    current_regions.add(_bio_full_mask(n_leaves))
+
+    candidate_parents = [
+        region for region in current_regions if _is_strict_subset(int(split), region)
+    ]
+    if not candidate_parents:
+        raise ValueError(f"Could not locate a current parent region for split {split}.")
+
+    parent = min(candidate_parents, key=lambda region: (region.bit_count(), region))
+    children = _direct_children(parent, current_clusters, n_leaves)
+    return int(parent), [int(child) for child in children]
+
+
+def _filter_training_boundary_events(boundary_paths):
+    training_events = []
+    for boundary_path in boundary_paths:
+        for event in boundary_path["events"]:
+            labels = [
+                label
+                for label in event["labels"]
+                if len(label["components"]) >= 3
+            ]
+            if labels:
+                training_events.append(
+                    {
+                        "newick": event["newick"],
+                        "labels": labels,
+                    }
+                )
+    return training_events
+
+
+def return_tree_boundary_merge_paths(
+    newick_tree_one,
+    newick_tree_two,
+    verbose=False,
+    id_to_test=None,
+):
     from utils.bhv_movie import build_tree_from_splits
+
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.WARNING)
+
     t1 = Tree(newick_tree_one)
     t2 = Tree(newick_tree_two)
 
@@ -152,189 +566,137 @@ def return_sampled_tree_boundary_decisions(newick_tree_one, newick_tree_two, ver
 
     tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
     tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
-    
     geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
-    segments = geodesic_result['segments']
+    segments = geodesic_result["segments"]
+
     if id_to_test is not None:
         idxs = [id_to_test]
     else:
-        idxs = list(range(len(segments)-1))
-        rm.shuffle(idxs)
-    #idxs = [rm.randrange(0, len(segments)-1)]
-    # idxs = [1]
+        idxs = list(range(len(segments) - 1))
 
-    
-    full = (1 << t1.n_leaves) - 1
-
+    boundary_paths = []
     for bi in idxs:
-        final_labels = []
+        boundary_lengths = {
+            int(mask): float(length)
+            for mask, length in segments[bi]["end_lengths"].items()
+            if length > 1e-8
+        }
+        boundary_births = [int(split) for split in segments[bi]["Bi"]]
 
-        lengths = {m:L for m, L in segments[bi]['end_lengths'].items() if L > 1e-8}
-        Bi_splits = segments[bi]['Bi'].copy()
+        _, start_newick = build_tree_from_splits(
+            list(boundary_lengths.keys()),
+            boundary_lengths,
+            t1.n_leaves,
+            root_leaf=t1.n_leaves - 1,
+            mapping=t1.id_to_name,
+        )
 
-        # #Ai splits
-        # for m in segments[bi]['Ai']:
-        #     print(f"AI split at boundary {bi}: {[j for j in range(m.bit_length()) if (m >> j) & 1]} or {m}")
-        
-        # #Bi splits
-        # for m in segments[bi]['Bi']:
-        #     print(f"BI split at boundary {bi}: {[j for j in range(m.bit_length()) if (m >> j) & 1]} or {m}")
+        current_clusters = _internal_bio_clusters_from_splits(
+            boundary_lengths.keys(),
+            t1.n_leaves,
+        )
+        final_clusters = _internal_bio_clusters_from_splits(
+            list(boundary_lengths.keys()) + boundary_births,
+            t1.n_leaves,
+        )
+        new_clusters = _sort_masks(final_clusters - current_clusters)
 
-        #canonicalize Bi_splits 
-        Bi_splits = [min(split, full ^ split) for split in Bi_splits]
+        end_lengths = dict(boundary_lengths)
+        for cluster in new_clusters:
+            end_lengths[int(cluster)] = 0.1
 
-        clustered_buckets = bucket_by_overlap(Bi_splits)
-        # for i in clustered_buckets[0]:
-        #     print(f"Initial clustered bucket split: {[j for j in range(i.bit_length()) if (i >> j) & 1]} or {i}")
-        # import pdb; pdb.set_trace()
+        _, end_newick = build_tree_from_splits(
+            list(end_lengths.keys()),
+            end_lengths,
+            t1.n_leaves,
+            root_leaf=t1.n_leaves - 1,
+            mapping=t1.id_to_name,
+        )
 
-        num_iter = 0    
+        current_lengths = dict(boundary_lengths)
+        events = []
+        for labels in _build_boundary_merge_events(
+            boundary_lengths,
+            boundary_births,
+            t1.n_leaves,
+        ):
+            event_current_clusters = _internal_bio_clusters_from_splits(
+                current_lengths.keys(),
+                t1.n_leaves,
+            )
+            _, newick = build_tree_from_splits(
+                list(current_lengths.keys()),
+                current_lengths,
+                t1.n_leaves,
+                root_leaf=t1.n_leaves - 1,
+                mapping=t1.id_to_name,
+            )
 
-        while clustered_buckets:
-            G, newick = build_tree_from_splits(list(lengths.keys()), lengths, t1.n_leaves, root_leaf=t1.n_leaves-1, mapping=t1.id_to_name)
-            nodes_to_explore = find_polytomy_nodes(G, min_degree=4)
-            #components_to_fix = [polytomy_components_at_node(G, i, t1.n_leaves) for i in nodes_to_explore]
-            if 'C_root' in nodes_to_explore:
-                logger.info("Handling root components separately for boundary decisions")
+            emitted_labels = []
+            for split_merge, comps in labels:
+                check = 0
+                for comp in comps:
+                    check |= int(comp)
+                if check != int(split_merge):
+                    raise ValueError(
+                        f"Merged components {comps} do not equal resulting split {split_merge}."
+                    )
 
-            components_to_fix = [
-                leaves_in_component_split(int(i.split('_')[-1]), list(lengths.keys()))
-                for i in nodes_to_explore
-                if i != 'C_root'
-            ]
-            # Root-aligned components over biological leaves (dummy leaf removed).
-            # Some Bi splits decompose only at root even when C_root is degree-3
-            # after dummy removal in build_tree_from_splits/tree_to_newick.
-            root_mask = (1 << (t1.n_leaves - 1)) - 1
-            root_components = leaves_in_component_split(root_mask, list(lengths.keys()))
-            if root_components:
-                components_to_fix.append(root_components)
-            if sum(len(c) for c in components_to_fix) > 25:
-                logger.info(f"Boundary index {bi}: too many components to fix ({sum(len(c) for c in components_to_fix)}), stopping")
-                #For this part find basically one that does well and focus on that one 
-                break
-            else:
-                logger.info(f"Boundary index {bi}: found {sum(len(c) for c in components_to_fix)} components to fix across {len(components_to_fix)} polytomy nodes")
-                print("FOUND COMPONENTS TO FIX")
-
-            sorted_components = sorted(components_to_fix, key=lambda comps: min(c.bit_count() for c in comps))
-            logger.debug(f"Boundary index {bi}: exploring {len(nodes_to_explore)} polytomy nodes")
-
-            Bi_split_component = {}
-            # new_Bi_splits = []
-
-            for split in Bi_splits:
-                logger.debug(f"Looking for relevant components found for {split}:")
-                if split not in Bi_split_component:
-                    Bi_split_component[split] = []
-
-                use_split, best = best_decomposition_for_any_orientation(split, sorted_components, full)
-
-                if best is None:
-                    if len(final_labels) > 10:
-                        logger.debug(" Could not find relevant components for split, but have previous labels, skipping this split")
-                        return final_labels
-                    else:
-                        # import pdb; pdb.set_trace()
-                        raise Exception("Could not find relevant components for split and no final labels so this is a huge error!")
-               
-                logger.debug(f" BEST RELEVANT component found for {split}:")
-                for comp in best:
-                    logger.debug(f"BEST RELEVANT component: {[i for i in range(comp.bit_length()) if (comp >> i) & 1]}")
-                logger.debug("\n\n\n\n\n\n\n")
-
-                if use_split != split:
-                    logger.debug(f"Using complementary orientation for split {split} -> {use_split}")
-                    if use_split != split:
-                        Bi_splits.remove(split)
-                        Bi_splits.append(use_split)  # or manage as a set (recommended)
-
-                        # also fix clustered_buckets if you keep them:
-                        for cluster in clustered_buckets:
-                            if split in cluster:
-                                cluster.remove(split)
-                                cluster.add(use_split)
-                
-                Bi_split_component[use_split] = best
-
-            # Bi_splits = new_Bi_splits
-
-            #Okay for each clustered bucket, find the smallest group we need to merge, and add that to the merge
-            initial_labels = []
-            for cluster in clustered_buckets:
-                to_add = None 
-                smallest_num = None
-
-                for potential_split in cluster:
-                    sub_split = Bi_split_component[potential_split]
-                    # Autoregressive head only models true polytomies (>=3 components).
-                    # Binary merges are deterministic and are not represented in
-                    # get_batch_polytomy_indices(min_children=3).
-                    if len(sub_split) < 3:
-                        continue
-
-                    if smallest_num is None or len(sub_split) < smallest_num:
-                        smallest_num = len(sub_split)
-                        to_add = (potential_split, sub_split)
-
-                if to_add is not None:
-                    initial_labels.append(to_add)
-
-            if not initial_labels:
-                logger.info(
-                    f"Boundary index {bi}: no >=3-component merges remain, stopping boundary label generation"
+                parent_split, polytomy_components = _current_parent_and_children_for_split(
+                    split_merge,
+                    event_current_clusters,
+                    t1.n_leaves,
                 )
-                break
+                merge_indices = []
+                for comp in comps:
+                    comp_int = int(comp)
+                    if comp_int not in polytomy_components:
+                        raise ValueError(
+                            f"Merge component {comp_int} is not in current polytomy "
+                            f"{polytomy_components} for split {split_merge}."
+                        )
+                    merge_indices.append(polytomy_components.index(comp_int))
 
-            final_labels.append({'newick': newick, 'labels': initial_labels})
+                emitted_labels.append(
+                    {
+                        "result_split": int(split_merge),
+                        "parent_split": int(parent_split),
+                        "components": polytomy_components,
+                        "merge_indices": merge_indices,
+                    }
+                )
+                current_lengths[int(split_merge)] = 0.1
 
-            #Now merge those components but only do 1 at a time so we keep the labels but just do 1 to avoid weird errors 
-            for split_merge, comps in initial_labels:
+            events.append({"newick": newick, "labels": emitted_labels})
 
-                check = comps[0]
-                for c in comps[1:]:
-                    check |= c
-                if check != split_merge:
-                    raise Exception("Merged components do not equal original split, something is wrong!")
+        boundary_paths.append(
+            {
+                "boundary_index": bi,
+                "start_newick": start_newick,
+                "end_newick": end_newick,
+                "births": new_clusters,
+                "events": events,
+            }
+        )
 
-                lengths[split_merge] = 0.1  #length really does not matter
+    return boundary_paths
 
-                found = False
-                #Remove this merged mask from clustered_buckets
-                for cluster in clustered_buckets:
-                    if split_merge in cluster:
-                        cluster.remove(split_merge)
-                        found = True
-                
-                Bi_splits.remove(split_merge)
-                logger.debug(f"Removed {split_merge} from Bi_splits")
-                
-                if not found:
-                    raise Exception("Could not find merged mask in clustered buckets which should not be possible")
-            
-            #Remove any empty clusters from clustered buckets
-            clustered_buckets = [cluster for cluster in clustered_buckets if cluster]
-            num_iter += 1
-            if not initial_labels:
-                print("Nothing happened this iteration??")
-                import pdb; pdb.set_trace()
-            if num_iter > 20 and not initial_labels:
-                import pdb; pdb.set_trace()
-                raise Exception("Too many iterations trying to resolve boundary decisions, something is wrong")
-            if clustered_buckets and not initial_labels:
-                for original_births in segments[bi]['Bi']:
-                    logger.debug(f"Original Bi split: {[i for i in range(original_births.bit_length()) if (original_births >> i) & 1]} or {original_births}")
-                import pdb; pdb.set_trace()
-                raise Exception("Stuck with unresolved clustered buckets but no possible merges, something is wrong")
-        
-        if final_labels:
-            logger.info(f"Found a suitable boundary index {bi}")
-            return final_labels
-        
-    if not final_labels:
-        print("This was a difficult path, polytomies are too great")
 
-    return final_labels
+def return_sampled_tree_boundary_decisions(
+    newick_tree_one,
+    newick_tree_two,
+    verbose=False,
+    id_to_test=None,
+    require_complete_boundary=False,
+):
+    _ = require_complete_boundary
+    boundary_paths = return_tree_boundary_merge_paths(
+        newick_tree_one,
+        newick_tree_two,
+        verbose=verbose,
+        id_to_test=id_to_test,
+    )
+    return _filter_training_boundary_events(boundary_paths)
 
 def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_point, extra = False):
     from utils.bhv_movie import sample_tree_along_geodesic

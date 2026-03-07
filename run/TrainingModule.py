@@ -1,5 +1,6 @@
 import random
 import time
+import inspect
 import torch, torch.optim as optim
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities import grad_norm
@@ -28,7 +29,11 @@ _encode_sequences_openfold_style,
 )
 
 from utils.random_tree import Tree
-from utils.bhv_utils import BHVEncoder, return_sampled_tree_orthant_velocity
+from utils.bhv_utils import (
+    BHVEncoder,
+    get_structural_polytomy_groups_from_newick,
+    return_sampled_tree_orthant_velocity,
+)
 from utils.bhv_movie import build_tree_from_splits
 from utils.utils import (
 pick_group,
@@ -272,7 +277,12 @@ class TrainingModule(LightningModule):
         return embeddings
 
     def forward(
-        self, batched_tokenized_trees, t, phyla_embeddings, autoregressive=False
+        self,
+        batched_tokenized_trees,
+        t,
+        phyla_embeddings,
+        autoregressive=False,
+        autoregressive_component_groups=None,
     ):
         if not autoregressive:
             velocity, mask = self.model(
@@ -286,13 +296,32 @@ class TrainingModule(LightningModule):
             edge_mask = batched_tokenized_trees[-2]
             return velocity, edge_split_masks, edge_mask
         else:
-            all_group_logits = self.model(
-                batched_tokenized_trees,
-                t,
+            model_kwargs = dict(
                 phyla_embeddings=phyla_embeddings,
                 return_leafs_only=False,
                 return_edges_only=True,
                 autoregressive=True,
+            )
+            model_signature = inspect.signature(self.model.forward)
+            supports_component_groups = (
+                "autoregressive_component_groups" in model_signature.parameters
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in model_signature.parameters.values()
+                )
+            )
+            if (
+                autoregressive_component_groups is not None
+                and supports_component_groups
+            ):
+                model_kwargs["autoregressive_component_groups"] = (
+                    autoregressive_component_groups
+                )
+
+            all_group_logits = self.model(
+                batched_tokenized_trees,
+                t,
+                **model_kwargs,
             )
             return all_group_logits
 
@@ -765,29 +794,45 @@ class TrainingModule(LightningModule):
 
             # pdb.set_trace()
         else:
+            if "newick_autoregressive_trees" in batch:
+                autoregressive_component_groups = [
+                    get_structural_polytomy_groups_from_newick(newick_tree)
+                    for newick_tree in batch["newick_autoregressive_trees"]
+                ]
+            else:
+                autoregressive_component_groups = []
+                for labeled_merge_cluster in batch["batched_autoregressive_labels"]:
+                    seen_groups = set()
+                    groups = []
+                    for label in labeled_merge_cluster:
+                        components = tuple(int(component) for component in label["components"])
+                        if components in seen_groups:
+                            continue
+                        seen_groups.add(components)
+                        groups.append(list(components))
+                    autoregressive_component_groups.append(groups)
+
             all_group_logits = self.forward(
                 batch["tokenized_autoregressive_trees"],
                 batch["batched_autoregressive_time"],
                 batch["phyla_embeddings"],
                 autoregressive=True,
+                autoregressive_component_groups=autoregressive_component_groups,
             )
-           # Derive full leaf-universe mask for complement matching.
-            # BHV labels use canonical orientation min(A, full^A) but the
-            # tokenizer uses directed child-subtree masks.  We need the
-            # full mask so we can try the complement, exactly like the
-            # velocity path already does.
-            _ar_edge_split_masks = batch["tokenized_autoregressive_trees"][-1]
-            _ar_full_masks = []
-            for _splits_b in _ar_edge_split_masks:
-                _fm = 0
-                for _s in _splits_b:
-                    _fm |= int(_s)
-                _ar_full_masks.append(_fm)
 
             found = {}
-            for merge_cluser in batch["batched_autoregressive_labels"]:
-                for res_split, components in merge_cluser:
-                    found[res_split] = False
+            label_targets_by_batch = []
+            for batch_index, labeled_merge_cluster in enumerate(batch["batched_autoregressive_labels"]):
+                group_targets = {}
+                for label in labeled_merge_cluster:
+                    result_split = int(label["result_split"])
+                    components = tuple(int(component) for component in label["components"])
+                    merge_indices = [int(idx) for idx in label["merge_indices"]]
+                    found[(batch_index, result_split)] = False
+                    group_targets.setdefault(components, []).append(
+                        (result_split, merge_indices)
+                    )
+                label_targets_by_batch.append(group_targets)
 
             losses = []
 
@@ -800,10 +845,8 @@ class TrainingModule(LightningModule):
 
             for group in all_group_logits:
                 logits = group["logits"]
-                labels = batch["batched_autoregressive_labels"]
-                splits_in_polytomy = group["splits_represented"]
-                b_idx = group["batch_index"]
-                full_mask = _ar_full_masks[b_idx] if b_idx < len(_ar_full_masks) else 0
+                splits_in_polytomy = tuple(int(split) for split in group["splits_represented"])
+                batch_index = int(group["batch_index"])
                 
                 # Track polytomy size (number of splits in the polytomy)
                 polytomy_sizes.append(len(splits_in_polytomy))
@@ -812,31 +855,15 @@ class TrainingModule(LightningModule):
                     logits.device
                 )
 
-                for labeled_merge_cluster in labels:
-                    idxs = None
-                    for resulting_split, components in labeled_merge_cluster:
-                        # Match each component to splits_in_polytomy,
-                        # allowing complement orientation (same pattern
-                        # as the velocity path's complement fallback).
-                        resolved_idxs = []
-                        for comp in components:
-                            comp_int = int(comp)
-                            if comp_int in splits_in_polytomy:
-                                resolved_idxs.append(splits_in_polytomy.index(comp_int))
-                            elif full_mask and (full_mask ^ comp_int) in splits_in_polytomy:
-                                resolved_idxs.append(splits_in_polytomy.index(full_mask ^ comp_int))
-                            else:
-                                resolved_idxs = None
-                                break
-
-                        if resolved_idxs is not None:
-                            found[resulting_split] = True
-                            idxs = resolved_idxs
-
-                            for i in idxs:
-                                for j in idxs:
-                                    if i != j:
-                                        y[i, j] = 1.0
+                for resulting_split, idxs in label_targets_by_batch[batch_index].get(
+                    splits_in_polytomy,
+                    [],
+                ):
+                    found[(batch_index, resulting_split)] = True
+                    for i in idxs:
+                        for j in idxs:
+                            if i != j:
+                                y[i, j] = 1.0
 
                 if y.sum() == 0:
                     chosen_polytomies.append(torch.tensor(0.0))
@@ -904,13 +931,15 @@ class TrainingModule(LightningModule):
 
                     losses.append(loss)
 
-            for i in found:
-                if not found[i]:
+            for (batch_index, split_mask), was_found in found.items():
+                if not was_found:
                     print(
                         "Missing split: ",
-                        [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1],
+                        [j for j in range(int(split_mask).bit_length()) if (int(split_mask) >> j) & 1],
                     )
-                    raise Exception(f"Did not find merge for split {i}!")
+                    raise Exception(
+                        f"Did not find merge for split {split_mask} in batch element {batch_index}!"
+                    )
 
             L_polytomy_choosing = None
 
@@ -1397,11 +1426,15 @@ class TrainingModule(LightningModule):
                             break
 
                         with torch.no_grad():
+                            autoregressive_component_groups = [
+                                get_structural_polytomy_groups_from_newick(td2_newick)
+                            ]
                             logit_outputs = self.forward(
                                 tokenized_trees,
                                 torch.tensor([num_merges / 63], device=self.device),
                                 phyla_embeddings,
                                 autoregressive=True,
+                                autoregressive_component_groups=autoregressive_component_groups,
                             )
                         
                         if len(logit_outputs) == 1:
@@ -1466,12 +1499,9 @@ class TrainingModule(LightningModule):
                                 to_print = [i for i in range(new_split.bit_length()) if (new_split >> i) & 1]
                                 logger.info(f"Merging splits {split_masks[0]}, {split_masks[1]} to create this split {new_split}: {to_print}")
 
-                                # New length is average of merged splits
-                                curr_lens = list(td2.values())
-                                if len(curr_lens) > 0:
-                                    td2[new_split] = float(np.percentile(curr_lens, 10))
-                                else:
-                                    td2[new_split] = 1e-3
+                                # Keep merge-length initialization aligned with
+                                # boundary-decision oracle construction.
+                                td2[new_split] = 0.1
                                 top_change = True
                                 logger.info("Merge performed time to break out")
                                 num_merges += 1

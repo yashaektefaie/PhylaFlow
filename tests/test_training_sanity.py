@@ -220,6 +220,7 @@ def _make_batch_from_tree_pair_with_autoregressive(
         "batched_velocity": [velocity],
         "num_leaves": [Tree(sampled_newick).n_leaves],
         "tokenized_autoregressive_trees": tokenized_ar,
+        "newick_autoregressive_trees": [chosen_boundary["newick"]],
         "batched_autoregressive_time": torch.tensor([0.0], dtype=torch.float32),
         "batched_autoregressive_labels": [chosen_boundary["labels"]],
     }

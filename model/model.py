@@ -10,7 +10,10 @@ from model.tree_transformer_layers import (
     MultiheadPerformerAttention,
 )
 from model.treeTokenizer import TreeFeatureTokenizer
-from utils.utils import get_batch_polytomy_indices
+from utils.bhv_utils import (
+    get_batch_explicit_structural_group_indices,
+    get_batch_structural_polytomy_indices,
+)
 
 
 # TokenGT parameter initialization
@@ -314,6 +317,7 @@ class TreeDenoiserTokenGT(nn.Module):
         return_leafs_only=False,
         return_edges_only=False,
         autoregressive=False,
+        autoregressive_component_groups=None,
     ):
         # Tree is this format now: (children, root_idx[, branch_lengths][, edge_types])
         # Handle both single tree and batch of trees
@@ -506,24 +510,27 @@ class TreeDenoiserTokenGT(nn.Module):
 
             all_group_logits = []
 
-            # Derive per-sample split universe from actual edge masks.
-            # This keeps polytomy grouping in the exact same bit-space used by tokenizer splits.
-            num_leaves = []
-            for splits_b in edge_split_masks:
-                max_bit = 0
-                for s in splits_b:
-                    s_int = int(s)
-                    if s_int != 0:
-                        max_bit = max(max_bit, s_int.bit_length())
-                num_leaves.append(max_bit)
+            # Tokenizer leaf tokens exclude the distinguished root/outgroup leaf
+            # that the BHV structural code keeps in its split space.
+            num_leaves = [
+                int(leaf_mask[b].sum().item()) + 1
+                for b in range(B)
+            ]
 
-            batch_polytomy_index, batch_polytomy_splits = get_batch_polytomy_indices(
-                edge_split_masks,
-                edge_mask,
-                min_children=3,
-                include_root=True,
-                num_leaves=num_leaves,
-            )
+            if autoregressive_component_groups is None:
+                batch_polytomy_index, batch_polytomy_splits = get_batch_structural_polytomy_indices(
+                    edge_split_masks,
+                    edge_mask,
+                    min_children=3,
+                    num_leaves=num_leaves,
+                )
+            else:
+                batch_polytomy_index, batch_polytomy_splits = get_batch_explicit_structural_group_indices(
+                    edge_split_masks,
+                    edge_mask,
+                    autoregressive_component_groups,
+                    num_leaves=num_leaves,
+                )
                                                                                     
             for b, groups in enumerate(batch_polytomy_index):
                 for num, group in enumerate(groups):

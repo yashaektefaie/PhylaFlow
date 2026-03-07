@@ -1,10 +1,10 @@
 """
 Test that TrainingModule.step(autoregressive=True) does not crash with
-'Did not find merge for split' when BHV boundary-decision labels use
-canonical split orientation while the tokenizer uses directed masks.
+'Did not find merge for split' when boundary-decision labels use
+exact structural component groups.
 
 Exercises the real TrainingModule.step() code path end-to-end so the
-complement-matching fix is validated against the actual training loop.
+structural-group alignment is validated against the actual training loop.
 """
 
 import random
@@ -96,7 +96,7 @@ class TestAutoRegressiveSplitAlignment(unittest.TestCase):
     @patch.object(TreeDataset, "build_index", return_value=None)
     def test_step_autoregressive_does_not_crash(self, _mock):
         """End-to-end: build the exact batch the sanity config produces
-        and call step(autoregressive=True).  Before the complement fix
+        and call step(autoregressive=True).  Before the structural-group fix
         this raised 'Did not find merge for split …'."""
         random.seed(42)
         torch.manual_seed(42)
@@ -165,6 +165,7 @@ class TestAutoRegressiveSplitAlignment(unittest.TestCase):
 
                 batch = {
                     "tokenized_autoregressive_trees": tokenized_ar,
+                    "newick_autoregressive_trees": [autoregressive_newick],
                     "batched_autoregressive_time": torch.tensor([0.0]),
                     "batched_autoregressive_labels": [autoregressive_labels],
                     "phyla_embeddings": None,
@@ -177,7 +178,7 @@ class TestAutoRegressiveSplitAlignment(unittest.TestCase):
                     if "Did not find merge" in str(e):
                         self.fail(
                             f"step(autoregressive=True) raised split-mismatch error "
-                            f"that the complement fix should prevent: {e}"
+                            f"that the structural-group fix should prevent: {e}"
                         )
                     raise  # re-raise unexpected errors
 
