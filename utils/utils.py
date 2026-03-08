@@ -497,76 +497,87 @@ def binary_auprc(scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _decode_merge_subsets_from_adjacency(adjacency: torch.Tensor) -> set[tuple[int, ...]]:
+    adjacency = adjacency.detach().cpu().bool()
+    n = int(adjacency.size(0))
+    visited = [False] * n
+    subsets = set()
+
+    for start in range(n):
+        if visited[start]:
+            continue
+
+        stack = [start]
+        component = []
+        while stack:
+            node = stack.pop()
+            if visited[node]:
+                continue
+            visited[node] = True
+            component.append(node)
+            neighbors = torch.nonzero(adjacency[node], as_tuple=False).flatten().tolist()
+            for nb in neighbors:
+                if not visited[int(nb)]:
+                    stack.append(int(nb))
+
+        if len(component) >= 2:
+            subsets.add(tuple(sorted(component)))
+
+    return subsets
+
+
 def compute_merge_metrics(
-    logits_vec: torch.Tensor,
-    y_vec: torch.Tensor,
-    threshold_logit: float = 0.0,   # 0.0 <=> sigmoid=0.5
-    topk=(1, 5, 10),
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    threshold_logit: float = 0.0,
 ) -> dict:
     """
-    logits_vec: [N]
-    y_vec: [N] float or bool (positives are y>0.5)
+    Computes fast subset-decoding metrics from a group-level pairwise logit matrix.
+
+    logits: [G, G] pairwise logits
+    y: [G, G] binary adjacency of true merge cliques
     """
-    scores = logits_vec.detach().flatten()
-    labels = (y_vec.detach().flatten() > 0.5)
+    if logits.dim() != 2 or y.dim() != 2:
+        raise ValueError(
+            f"logits and y must both be [G, G]; got {tuple(logits.shape)} and {tuple(y.shape)}"
+        )
 
-    n = labels.numel()
-    n_pos = int(labels.sum().item())
-    n_neg = n - n_pos
+    pred_adj = torch.isfinite(logits) & (logits > float(threshold_logit))
+    true_adj = y > 0.5
 
-    out = {
-        "autoregressive_stats/n_candidates": float(n),
-        "autoregressive_stats/n_pos": float(n_pos),
-        "autoregressive_stats/pos_frac": float(n_pos / max(n, 1)),
+    pred_adj.fill_diagonal_(False)
+    true_adj.fill_diagonal_(False)
+
+    pred_subsets = _decode_merge_subsets_from_adjacency(pred_adj)
+    true_subsets = _decode_merge_subsets_from_adjacency(true_adj)
+
+    tp = len(pred_subsets & true_subsets)
+    fp = len(pred_subsets - true_subsets)
+    fn = len(true_subsets - pred_subsets)
+
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    jaccard = tp / max(len(pred_subsets | true_subsets), 1)
+
+    true_subset_sizes = [len(subset) for subset in true_subsets]
+    pred_subset_sizes = [len(subset) for subset in pred_subsets]
+
+    return {
+        "autoregressive_stats/subset_exact_match": float(pred_subsets == true_subsets),
+        "autoregressive_stats/subset_precision": float(precision),
+        "autoregressive_stats/subset_recall": float(recall),
+        "autoregressive_stats/subset_f1": float(f1),
+        "autoregressive_stats/subset_jaccard": float(jaccard),
+        "autoregressive_stats/n_true_subsets": float(len(true_subsets)),
+        "autoregressive_stats/n_pred_subsets": float(len(pred_subsets)),
+        "autoregressive_stats/avg_true_subset_size": float(
+            np.mean(true_subset_sizes) if true_subset_sizes else 0.0
+        ),
+        "autoregressive_stats/avg_pred_subset_size": float(
+            np.mean(pred_subset_sizes) if pred_subset_sizes else 0.0
+        ),
     }
-
-    # # Classification metrics at a fixed threshold (note: can be misleading with imbalance)
-    # pred = scores > threshold_logit
-    # out["acc"] = float((pred == labels).float().mean().item())
-
-    # # precision/recall/f1 (defined only if denominators non-zero)
-    # tp = ((pred == 1) & (labels == 1)).sum().item()
-    # fp = ((pred == 1) & (labels == 0)).sum().item()
-    # fn = ((pred == 0) & (labels == 1)).sum().item()
-
-    # prec = tp / max(tp + fp, 1)
-    # rec  = tp / max(tp + fn, 1)
-    # f1   = 2 * prec * rec / max(prec + rec, 1e-12)
-
-    # out["precision"] = float(prec)
-    # out["recall"] = float(rec)
-    # out["f1"] = float(f1)
-
-    # Ranking metrics (usually what you care about for “choose next merge”)
-    if n_pos == 0:
-        # undefined for ranking-based “did we pick a positive?”
-        out["hit@1"] = float("nan")
-        for k in topk:
-            out[f"hit@{k}"] = float("nan")
-        out["mrr_pos"] = float("nan")
-    else:
-        order = torch.argsort(scores, descending=True)
-        y_sorted = labels[order]
-
-        out["autoregressive_stats/hit@1"] = float(y_sorted[0].float().item())
-        for k in topk:
-            k = min(k, n)
-            out[f"autoregressive_stats/hit@{k}"] = float(y_sorted[:k].any().float().item())
-
-        # MRR of the first positive (1 / rank)
-        first_pos = torch.nonzero(y_sorted, as_tuple=False)[0].item()  # 0-index
-        out["autoregressive_stats/mrr_pos"] = float(1.0 / (first_pos + 1))
-    # AUCs
-    out["autoregressive_stats/auroc"] = float(binary_auc_roc(scores, labels).item())
-    # out["autoregressive_stats/auprc"] = float(binary_auprc(scores, labels).item())
-
-    # # Optional: separation diagnostics
-    # if n_pos > 0 and n_neg > 0:
-    #     out["mean_pos_logit"] = float(scores[labels].mean().item())
-    #     out["mean_neg_logit"] = float(scores[~labels].mean().item())
-    #     out["gap_pos_neg"] = out["mean_pos_logit"] - out["mean_neg_logit"]
-
-    return out
 
 
 class RunningAvg:

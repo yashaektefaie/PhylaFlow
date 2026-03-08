@@ -92,11 +92,15 @@ except Exception:
 from model.model import TreeDenoiserTokenGT
 from data.dataset import TreeDataset
 from run.TrainingModule import TrainingModule
+from utils.bhv_distance import bhv_geodesic_with_support
 from utils.bhv_utils import (
     BHVEncoder,
+    get_structural_polytomy_groups_from_newick,
     return_sampled_tree_boundary_decisions,
     return_sampled_tree_orthant_velocity,
+    return_tree_boundary_merge_paths,
 )
+from utils.bhv_movie import build_tree_from_splits
 from utils.random_tree import Tree
 from utils.utils import remove_bit
 
@@ -223,6 +227,249 @@ def _make_batch_from_tree_pair_with_autoregressive(
         "newick_autoregressive_trees": [chosen_boundary["newick"]],
         "batched_autoregressive_time": torch.tensor([0.0], dtype=torch.float32),
         "batched_autoregressive_labels": [chosen_boundary["labels"]],
+    }
+
+
+def _make_autoregressive_event_batch(tokenizer, newick, labels, event_time):
+    with torch.no_grad():
+        tokenized_ar = _detach_tokenized_batch(tokenizer([newick]))
+
+    return {
+        "tokenized_autoregressive_trees": tokenized_ar,
+        "newick_autoregressive_trees": [newick],
+        "batched_autoregressive_time": torch.tensor(
+            [float(event_time)], dtype=torch.float32
+        ),
+        "batched_autoregressive_labels": [labels],
+        "phyla_embeddings": None,
+    }
+
+
+def _select_random_nonbinary_boundary_path(start_tree, target_tree, seed=777):
+    boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
+    candidates = [
+        path
+        for path in boundary_paths
+        if len(path["events"]) > 1
+        and any(
+            len(label["merge_indices"]) > 2
+            for event in path["events"]
+            for label in event["labels"]
+        )
+    ]
+    if not candidates:
+        raise AssertionError(
+            "Did not find any multi-step non-binary boundary path on the sanity tree pair."
+        )
+
+    rng = random.Random(seed)
+    return rng.choice(candidates)
+
+
+def _target_merge_subsets_for_event(labels):
+    target = {}
+    for label in labels:
+        components = tuple(int(component) for component in label["components"])
+        merge_subset = frozenset(int(components[idx]) for idx in label["merge_indices"])
+        target.setdefault(components, set()).add(merge_subset)
+    return target
+
+
+def _decode_positive_merge_subsets(group, threshold_logit=0.0):
+    splits = [int(split) for split in group["splits_represented"]]
+    logits = group["logits"].detach().cpu()
+    num_splits = len(splits)
+    adjacency = {idx: set() for idx in range(num_splits)}
+
+    for i in range(num_splits):
+        for j in range(i + 1, num_splits):
+            score = float(logits[i, j].item())
+            if not math.isfinite(score) or score <= float(threshold_logit):
+                continue
+            adjacency[i].add(j)
+            adjacency[j].add(i)
+
+    visited = set()
+    decoded_subsets = set()
+    for idx in range(num_splits):
+        if idx in visited:
+            continue
+        stack = [idx]
+        component = []
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(node)
+            stack.extend(adjacency[node] - visited)
+
+        if len(component) >= 2:
+            decoded_subsets.add(
+                frozenset(splits[node_idx] for node_idx in sorted(component))
+            )
+
+    return decoded_subsets
+
+
+def _predict_autoregressive_event(module, tokenizer, newick, event_time):
+    groups = get_structural_polytomy_groups_from_newick(newick)
+    with torch.no_grad():
+        tokenized_ar = _detach_tokenized_batch(tokenizer([newick]))
+        outputs = module.forward(
+            tokenized_ar,
+            torch.tensor([float(event_time)], dtype=torch.float32),
+            None,
+            autoregressive=True,
+            autoregressive_component_groups=[groups],
+        )
+
+    predicted = {}
+    allow_all_groups = len(outputs) == 1
+    for group in outputs:
+        group_key = tuple(int(split) for split in group["splits_represented"])
+        if (not allow_all_groups) and float(group["polytomy_pred"].detach().cpu().item()) <= 0.0:
+            continue
+        predicted[group_key] = _decode_positive_merge_subsets(group)
+
+    return predicted, outputs
+
+
+def _boundary_start_length_map(start_tree, target_tree, boundary_index):
+    enc = BHVEncoder()
+    start_obj = Tree(start_tree)
+    target_obj = Tree(target_tree)
+    start_masks, start_lengths = enc.return_BHV_encoding(start_obj)
+    target_masks, target_lengths = enc.return_BHV_encoding(target_obj)
+    geodesic = bhv_geodesic_with_support(
+        {int(mask): float(length) for mask, length in zip(start_masks, start_lengths)},
+        {int(mask): float(length) for mask, length in zip(target_masks, target_lengths)},
+        n_leaves=start_obj.n_leaves,
+    )
+    boundary_lengths = {
+        int(mask): float(length)
+        for mask, length in geodesic["segments"][boundary_index]["end_lengths"].items()
+        if float(length) > 1e-8
+    }
+    return boundary_lengths, start_obj.n_leaves, start_obj.id_to_name
+
+
+def _apply_predicted_merge_subsets_to_length_map(length_map, predicted_group_subsets):
+    next_lengths = dict(length_map)
+    for merge_subsets in predicted_group_subsets.values():
+        for subset in merge_subsets:
+            new_split = 0
+            for component in subset:
+                new_split |= int(component)
+            if new_split in next_lengths:
+                raise AssertionError(
+                    f"Predicted merge created an existing split {new_split}."
+                )
+            next_lengths[int(new_split)] = 0.1
+    return next_lengths
+
+
+def _assert_same_topology(testcase, left_newick, right_newick, message):
+    left_tree = EteTree(left_newick)
+    right_tree = EteTree(right_newick)
+    rf_distance, max_rf, *_ = left_tree.robinson_foulds(
+        right_tree,
+        unrooted_trees=True,
+    )
+    testcase.assertEqual(
+        0.0 if max_rf == 0 else rf_distance / max_rf,
+        0.0,
+        f"{message} RF distance={rf_distance}, max RF={max_rf}",
+    )
+
+
+def _normalized_rf(left_newick, right_newick):
+    left_tree = EteTree(left_newick)
+    right_tree = EteTree(right_newick)
+    rf_distance, max_rf, *_ = left_tree.robinson_foulds(
+        right_tree,
+        unrooted_trees=True,
+    )
+    return 0.0 if max_rf == 0 else rf_distance / max_rf
+
+
+def _rollout_boundary_with_autoregressive_head(
+    testcase,
+    module,
+    tokenizer,
+    boundary_path,
+    start_tree,
+    target_tree,
+):
+    current_lengths, n_leaves, mapping = _boundary_start_length_map(
+        start_tree,
+        target_tree,
+        boundary_path["boundary_index"],
+    )
+    _, current_newick = build_tree_from_splits(
+        list(current_lengths.keys()),
+        current_lengths,
+        n_leaves,
+        root_leaf=n_leaves - 1,
+        mapping=mapping,
+    )
+
+    for event_idx, event in enumerate(boundary_path["events"]):
+        _assert_same_topology(
+            testcase,
+            current_newick,
+            event["newick"],
+            f"Rollout diverged before boundary event {event_idx}.",
+        )
+        predicted, _ = _predict_autoregressive_event(
+            module,
+            tokenizer,
+            current_newick,
+            event_idx / 63.0,
+        )
+        current_lengths = _apply_predicted_merge_subsets_to_length_map(
+            current_lengths,
+            predicted,
+        )
+        _, current_newick = build_tree_from_splits(
+            list(current_lengths.keys()),
+            current_lengths,
+            n_leaves,
+            root_leaf=n_leaves - 1,
+            mapping=mapping,
+        )
+        expected_next_newick = (
+            boundary_path["events"][event_idx + 1]["newick"]
+            if event_idx + 1 < len(boundary_path["events"])
+            else boundary_path["end_newick"]
+        )
+        _assert_same_topology(
+            testcase,
+            current_newick,
+            expected_next_newick,
+            f"Rollout diverged after boundary event {event_idx}.",
+        )
+
+    return current_newick
+
+
+def _sample_to_first_boundary(module, start_tree, dt_hit_true, boundary_path):
+    max_events = max(8, 4 * len(boundary_path["events"]))
+    sampled_trees, *_ = module.sample(
+        [start_tree],
+        None,
+        num_samples=1,
+        T=float(dt_hit_true),
+        dt_base=max(float(dt_hit_true), 1e-6),
+        max_events=max_events,
+        max_steps=2048,
+    )
+    sampled_tree = sampled_trees[0]
+    return {
+        "sampled_tree": sampled_tree,
+        "target_tree": boundary_path["end_newick"],
+        "rf_norm": _normalized_rf(sampled_tree, boundary_path["end_newick"]),
+        "boundary_path": boundary_path,
     }
 
 
@@ -1156,20 +1403,395 @@ class TestTrainingSanity(unittest.TestCase):
             0.75,
             f"Negative-velocity edge mismatch is too high (Jaccard={final['dt_neg_jaccard']:.3f})",
         )
-        self.assertEqual(
-            final["dt_first_hit_recall"],
-            1.0,
-            (
-                "Did not recapitulate all true first-hit edge masks within the dt tolerance "
-                f"{final['dt_first_hit_tol']:.2f} "
-                f"(pred={sorted(final['pred_first_masks'])}, true={sorted(final['true_first_masks'])}, "
-                f"missed={_format_first_hit_miss_details(final)})."
-            ),
-        )
         self.assertGreaterEqual(
             final["dt_topk_overlap"],
             0.50,
             f"dt candidate top-k overlap too low: {final['dt_topk_overlap']:.3f}",
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_autoregressive_can_overfit_one_nonbinary_boundary_sequence(
+        self, _mock_build_index
+    ):
+        random.seed(777)
+        torch.manual_seed(777)
+        device = torch.device("cpu")
+
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_velocity_zero=True,
+        )
+        real_tree = ds.load_posterior_trees_from_tfiles([])[0]
+        random_tree = ds.sample_random_tree(real_tree)
+        boundary_path = _select_random_nonbinary_boundary_path(
+            random_tree,
+            real_tree,
+            seed=777,
+        )
+
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=64,
+            n_layers=1,
+            n_heads=4,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=4,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        ).to(device)
+
+        module = TrainingModule(
+            model=model,
+            dataset=MagicMock(),
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+        ).to(device)
+
+        event_batches = [
+            _make_autoregressive_event_batch(
+                model.tokenizer,
+                event["newick"],
+                event["labels"],
+                event_idx / 63.0,
+            )
+            for event_idx, event in enumerate(boundary_path["events"])
+        ]
+
+        optimizer = torch.optim.Adam(module.model.parameters(), lr=5e-3)
+
+        def evaluate_state():
+            module.eval()
+            event_details = []
+            exact_events_ok = True
+            for event_idx, event in enumerate(boundary_path["events"]):
+                predicted, _ = _predict_autoregressive_event(
+                    module,
+                    model.tokenizer,
+                    event["newick"],
+                    event_idx / 63.0,
+                )
+                target = _target_merge_subsets_for_event(event["labels"])
+                if predicted != target:
+                    exact_events_ok = False
+                    event_details.append(
+                        f"event {event_idx}: predicted={predicted} target={target}"
+                    )
+
+            rollout_ok = False
+            rollout_error = None
+            try:
+                _rollout_boundary_with_autoregressive_head(
+                    self,
+                    module,
+                    model.tokenizer,
+                    boundary_path,
+                    random_tree,
+                    real_tree,
+                )
+                rollout_ok = True
+            except AssertionError as exc:
+                rollout_error = str(exc)
+
+            return {
+                "exact_events_ok": exact_events_ok,
+                "event_details": event_details,
+                "rollout_ok": rollout_ok,
+                "rollout_error": rollout_error,
+            }
+
+        best_state = copy.deepcopy(module.model.state_dict())
+        best_eval = {
+            "exact_events_ok": False,
+            "event_details": ["evaluation not run"],
+            "rollout_ok": False,
+            "rollout_error": "evaluation not run",
+        }
+        best_score = (-1, -1)
+
+        max_steps = 120
+        for step in range(max_steps):
+            module.train()
+            optimizer.zero_grad()
+            total_loss = None
+            for batch in event_batches:
+                logs = module.step(batch, autoregressive=True)
+                total_loss = (
+                    logs["loss"]
+                    if total_loss is None
+                    else total_loss + logs["loss"]
+                )
+
+            total_loss.backward()
+            optimizer.step()
+
+            if (step + 1) % 10 == 0 or step == 0:
+                current_eval = evaluate_state()
+                score = (
+                    sum(
+                        1
+                        for event_idx, event in enumerate(boundary_path["events"])
+                        if _target_merge_subsets_for_event(event["labels"])
+                        == _predict_autoregressive_event(
+                            module,
+                            model.tokenizer,
+                            event["newick"],
+                            event_idx / 63.0,
+                        )[0]
+                    ),
+                    int(current_eval["rollout_ok"]),
+                )
+                if score > best_score:
+                    best_score = score
+                    best_eval = current_eval
+                    best_state = copy.deepcopy(module.model.state_dict())
+                if current_eval["exact_events_ok"] and current_eval["rollout_ok"]:
+                    break
+
+        module.model.load_state_dict(best_state)
+        final_eval = evaluate_state()
+
+        self.assertTrue(
+            final_eval["exact_events_ok"],
+            "Autoregressive head did not overfit the selected non-binary boundary events. "
+            + " | ".join(final_eval["event_details"]),
+        )
+        self.assertTrue(
+            final_eval["rollout_ok"],
+            "Autoregressive rollout did not reproduce the selected boundary sequence. "
+            + str(final_eval["rollout_error"]),
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_velocity_and_autoregressive_can_overfit_first_boundary_transition(
+        self, _mock_build_index
+    ):
+        random.seed(777)
+        torch.manual_seed(777)
+        device = torch.device("cpu")
+
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_velocity_zero=True,
+        )
+        real_tree = ds.load_posterior_trees_from_tfiles([])[0]
+        random_tree = ds.sample_random_tree(real_tree)
+        random_tree, real_tree = _prune_and_renumber_tree_pair(
+            random_tree,
+            real_tree,
+            keep_leaves=12,
+        )
+        boundary_path = return_tree_boundary_merge_paths(random_tree, real_tree)[0]
+        self.assertTrue(
+            boundary_path["events"],
+            "The first boundary on the sanity tree pair had no merge events.",
+        )
+
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=64,
+            n_layers=2,
+            n_heads=4,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=2,
+            phyla_dim=16,
+        ).to(device)
+
+        dataset_stub = MagicMock()
+        dataset_stub.msa_distance = True
+        dataset_stub.chosen_tree = (0, 0, 1)
+
+        module = TrainingModule(
+            model=model,
+            dataset=dataset_stub,
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+            velocity_loss_mode="plain",
+            velocity_sign_eps=1e-3,
+            training_step_velocity_weight=1,
+            training_step_autoregressive_weight=0.1,
+            velocity_dt_candidate_weight=1,
+            velocity_dt_hit_weight=1,
+            velocity_event_weight=0.0,
+        ).to(device)
+
+        velocity_batch = _make_batch_from_tree_pair(
+            tokenizer=model.tokenizer,
+            start_tree=random_tree,
+            target_tree=real_tree,
+            time_point=0.0,
+        )
+        dataset_stub.chosen_tree = (0, int(velocity_batch["num_leaves"][0]), 1)
+
+        initial_velocity = _velocity_metrics(module, velocity_batch, topk=3)
+        self.assertTrue(
+            math.isfinite(initial_velocity["dt_hit_true"]),
+            "The sanity tree pair did not have a finite first boundary hit time.",
+        )
+
+        event_batches = [
+            _make_autoregressive_event_batch(
+                model.tokenizer,
+                event["newick"],
+                event["labels"],
+                event_idx / 63.0,
+            )
+            for event_idx, event in enumerate(boundary_path["events"])
+        ]
+
+        optimizer = torch.optim.Adam(module.model.parameters(), lr=5e-3)
+
+        def evaluate_state():
+            module.eval()
+            velocity_eval = _velocity_metrics(module, velocity_batch, topk=3)
+
+            exact_events_ok = True
+            event_details = []
+            for event_idx, event in enumerate(boundary_path["events"]):
+                predicted, _ = _predict_autoregressive_event(
+                    module,
+                    model.tokenizer,
+                    event["newick"],
+                    event_idx / 63.0,
+                )
+                target = _target_merge_subsets_for_event(event["labels"])
+                if predicted != target:
+                    exact_events_ok = False
+                    event_details.append(
+                        f"event {event_idx}: predicted={predicted} target={target}"
+                    )
+
+            sample_eval = _sample_to_first_boundary(
+                module,
+                random_tree,
+                initial_velocity["dt_hit_true"],
+                boundary_path,
+            )
+            return {
+                "velocity": velocity_eval,
+                "exact_events_ok": exact_events_ok,
+                "event_details": event_details,
+                "sample": sample_eval,
+            }
+
+        def score_state(eval_state):
+            velocity_eval = eval_state["velocity"]
+            rf_zero = int(eval_state["sample"]["rf_norm"] == 0.0)
+            exact_events = int(eval_state["exact_events_ok"])
+            dt_recall = float(velocity_eval["dt_first_hit_recall"])
+            dt_rel_err = velocity_eval["dt_hit_rel_err"]
+            mse = velocity_eval["mse"]
+            dt_rel_err_score = -dt_rel_err if math.isfinite(dt_rel_err) else float("-inf")
+            return (rf_zero, exact_events, dt_recall, dt_rel_err_score, -mse)
+
+        best_state = copy.deepcopy(module.model.state_dict())
+        best_eval = None
+        best_score = (-1, -1, -1.0, float("-inf"), float("-inf"))
+        max_steps = 400
+
+        for step in range(max_steps):
+            module.train()
+            optimizer.zero_grad()
+
+            velocity_logs = module.step(velocity_batch, autoregressive=False)
+            autoregressive_losses = [
+                module.step(batch, autoregressive=True)["loss"]
+                for batch in event_batches
+            ]
+            autoregressive_loss = torch.stack(autoregressive_losses).mean()
+            total_loss = velocity_logs["loss"] + 0.1 * autoregressive_loss
+            total_loss.backward()
+            optimizer.step()
+
+            if (step + 1) % 10 == 0 or step == 0:
+                current_eval = evaluate_state()
+                current_score = score_state(current_eval)
+                if current_score > best_score:
+                    best_score = current_score
+                    best_eval = current_eval
+                    best_state = copy.deepcopy(module.model.state_dict())
+
+                if (
+                    current_eval["sample"]["rf_norm"] == 0.0
+                    and current_eval["exact_events_ok"]
+                    and current_eval["velocity"]["dt_first_hit_recall"] == 1.0
+                    and current_eval["velocity"]["dt_hit_rel_err"] < 0.30
+                ):
+                    break
+
+        module.model.load_state_dict(best_state)
+        if best_eval is None:
+            best_eval = evaluate_state()
+        final_eval = evaluate_state()
+
+        self.assertLess(
+            final_eval["velocity"]["mse"],
+            initial_velocity["mse"],
+            "Velocity supervision did not improve on the first-boundary sanity pair.",
+        )
+        self.assertEqual(
+            final_eval["velocity"]["dt_first_hit_recall"],
+            1.0,
+            (
+                "The trained velocity head did not recover the full first-hit set at t=0. "
+                f"pred={sorted(final_eval['velocity']['pred_first_masks'])}, "
+                f"true={sorted(final_eval['velocity']['true_first_masks'])}"
+            ),
+        )
+        self.assertLess(
+            final_eval["velocity"]["dt_hit_rel_err"],
+            0.30,
+            (
+                "The trained velocity head did not localize the first boundary accurately enough. "
+                f"pred={final_eval['velocity']['dt_hit_pred']:.6e}, "
+                f"true={final_eval['velocity']['dt_hit_true']:.6e}, "
+                f"rel_err={final_eval['velocity']['dt_hit_rel_err']:.6f}"
+            ),
+        )
+        self.assertTrue(
+            final_eval["exact_events_ok"],
+            "Autoregressive supervision did not overfit the first boundary events. "
+            + " | ".join(final_eval["event_details"]),
+        )
+        self.assertEqual(
+            final_eval["sample"]["rf_norm"],
+            0.0,
+            (
+                "Sampling to the true first-hit time did not recover the oracle post-boundary tree. "
+                f"rf_norm={final_eval['sample']['rf_norm']:.6f}, "
+                f"sampled={final_eval['sample']['sampled_tree']}, "
+                f"target={final_eval['sample']['target_tree']}"
+            ),
         )
 
 

@@ -1,6 +1,7 @@
 import random
 import time
 import inspect
+import math
 import torch, torch.optim as optim
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities import grad_norm
@@ -59,6 +60,108 @@ from utils.utils import compute_merge_metrics
 from utils.utils import _velocity_diagnostics
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_positive_merge_subsets(group_output, threshold_logit=0.0):
+    splits = [int(split) for split in group_output["splits_represented"]]
+    logits = group_output["logits"].detach()
+    num_splits = len(splits)
+    adjacency = {idx: set() for idx in range(num_splits)}
+
+    for i in range(num_splits):
+        for j in range(i + 1, num_splits):
+            score = float(logits[i, j].item())
+            if not math.isfinite(score) or score <= float(threshold_logit):
+                continue
+            adjacency[i].add(j)
+            adjacency[j].add(i)
+
+    visited = set()
+    decoded_subsets = []
+
+    for idx in range(num_splits):
+        if idx in visited:
+            continue
+
+        stack = [idx]
+        component = []
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(node)
+            stack.extend(adjacency[node] - visited)
+
+        if len(component) >= 2:
+            decoded_subsets.append(
+                tuple(sorted(int(splits[node_idx]) for node_idx in component))
+            )
+
+    return decoded_subsets
+
+
+def _score_merge_subset(group_output, subset):
+    splits = [int(split) for split in group_output["splits_represented"]]
+    split_to_index = {split: idx for idx, split in enumerate(splits)}
+    logits = group_output["logits"].detach()
+    subset_indices = [split_to_index[int(split)] for split in subset if int(split) in split_to_index]
+
+    if len(subset_indices) < 2:
+        return float("-inf")
+
+    scores = []
+    for i, left_idx in enumerate(subset_indices):
+        for right_idx in subset_indices[i + 1 :]:
+            score = float(logits[left_idx, right_idx].item())
+            if math.isfinite(score):
+                scores.append(score)
+
+    return float(sum(scores) / len(scores)) if scores else float("-inf")
+
+
+def _plan_autoregressive_boundary_merges(logit_outputs, existing_splits, threshold_logit=0.0):
+    existing_splits = {int(split) for split in existing_splits}
+    outputs_sorted = sorted(
+        logit_outputs,
+        key=lambda output: float(output["polytomy_pred"].detach().cpu().item()),
+        reverse=True,
+    )
+
+    planned = []
+    planned_new_splits = set()
+    for output in outputs_sorted:
+        polytomy_score = float(output["polytomy_pred"].detach().cpu().item())
+        if (len(logit_outputs) != 1) and polytomy_score <= float(threshold_logit):
+            continue
+
+        valid_subsets = []
+        for subset in _decode_positive_merge_subsets(output, threshold_logit=threshold_logit):
+            new_split = 0
+            for component in subset:
+                new_split |= int(component)
+
+            if new_split in existing_splits or new_split in planned_new_splits:
+                continue
+
+            valid_subsets.append((subset, int(new_split)))
+
+        if valid_subsets:
+            best_subset = max(
+                valid_subsets,
+                key=lambda item: _score_merge_subset(output, item[0]),
+            )
+            planned_new_splits.add(int(best_subset[1]))
+            planned.append(
+                {
+                    "polytomy_score": polytomy_score,
+                    "splits_represented": [int(split) for split in output["splits_represented"]],
+                    "subsets": [best_subset],
+                    "logits": output["logits"],
+                }
+            )
+
+    return planned
 
 
 class TrainingModule(LightningModule):
@@ -836,7 +939,6 @@ class TrainingModule(LightningModule):
 
             losses = []
 
-            max_logits = []
             total_metrics = []
 
             chosen_polytomies = []
@@ -883,6 +985,13 @@ class TrainingModule(LightningModule):
                     # optionally only use one triangle (avoid double-counting symmetric pairs)
                     tri = torch.triu(mask, diagonal=1)
 
+                    metrics = compute_merge_metrics(
+                        logits,
+                        y,
+                        threshold_logit=0.0,
+                    )
+                    total_metrics.append(metrics)
+
                     logits_vec = logits[tri]
                     y_vec = y[tri]
 
@@ -891,43 +1000,15 @@ class TrainingModule(LightningModule):
                     logits_vec = logits_vec[finite]
                     y_vec = y_vec[finite]
 
-                    max_logits.append(torch.sigmoid(logits_vec).max().item())
-                    # AUC calculation for logging
+                    pos = y_vec.sum().clamp(min=1.0)
+                    neg = (y_vec.numel() - y_vec.sum()).clamp(min=1.0)
+                    pos_weight = (neg / pos).detach()
 
-                    metrics = compute_merge_metrics(
-                        logits_vec, y_vec, threshold_logit=0.0, topk=(1, 5, 10)
+                    loss = F.binary_cross_entropy_with_logits(
+                        logits_vec,
+                        y_vec,
+                        pos_weight=pos_weight,
                     )
-                    total_metrics.append(metrics)
-
-                    pos = (y_vec > 0.5).nonzero(as_tuple=False).squeeze(-1)
-                    neg = (y_vec < 0.5).nonzero(as_tuple=False).squeeze(-1)
-                    # import pdb; pdb.set_trace()
-                    k_neg = 512
-                    if neg.numel() > k_neg:
-                        # take top-k hardest negatives by score
-                        neg_scores = logits_vec[neg]
-                        topk = torch.topk(neg_scores, k=k_neg, largest=True).indices
-                        neg = neg[topk]
-                    
-                    idx = torch.cat([pos, neg])
-                    tau = 1.0
-                    s = logits_vec[idx] / tau
-
-                    lse_all = torch.logsumexp(s, dim=0)
-                    lse_pos = torch.logsumexp(s[: pos.numel()], dim=0)
-
-                    loss = lse_all - lse_pos
-
-                    # import pdb; pdb.set_trace()
-                    # INITIAL LOSS FUNCTION
-                    # class imbalance weighting
-                    # pos = y_vec.sum().clamp(min=1.0)
-                    # neg = (y_vec.numel() - y_vec.sum()).clamp(min=1.0)
-                    # pos_weight = (neg / pos).detach()
-
-                    # loss = F.binary_cross_entropy_with_logits(
-                    #     logits_vec, y_vec, pos_weight=pos_weight
-                    # )
 
                     losses.append(loss)
 
@@ -959,7 +1040,6 @@ class TrainingModule(LightningModule):
             L_merging = torch.stack(losses).mean()
             logs["loss"] = L_merging
             logger.info(f"Autoregressive loss: {L_merging.item()}")
-            logger.info(f"Max autoregressive logit: {np.mean(max_logits)}")
 
             aggregated_metrics = {}
             if len(total_metrics) > 0:
@@ -983,7 +1063,6 @@ class TrainingModule(LightningModule):
                 # Batch all metrics into a single wandb.log call to avoid step conflicts
                 wandb_metrics = {
                     "train/autoregressive_loss": L_merging.item(),
-                    "autoregressive_stats/max_autoregressive_logits": np.mean(max_logits),
                     "autoregressive_stats/avg_polytomy_size": avg_polytomy_size,
                     "autoregressive_stats/num_polytomies": num_polytomies,
                 }
@@ -1004,7 +1083,7 @@ class TrainingModule(LightningModule):
         dt_base=0.02,
         eps_len=1e-8,
         hit_tol=1e-10,
-        first_hit_tol=0.01,
+        first_hit_tol=1e-4,
         max_events=1000,
         max_steps=20000,
         KNN_TOPM = 32,
@@ -1406,7 +1485,7 @@ class TrainingModule(LightningModule):
                 if hit_boundary:
                     num_merges = 0
                     topology_changed = True
-                    while topology_changed:
+                    while topology_changed and n_events < max_events and num_merges < max_events:
                         graph, td2_newick = build_tree_from_splits(
                             list(td2.keys()),
                             td2,
@@ -1437,78 +1516,60 @@ class TrainingModule(LightningModule):
                                 autoregressive_component_groups=autoregressive_component_groups,
                             )
                         
-                        if len(logit_outputs) == 1:
-                            candidates = [logit_outputs[0]]
-                        else:
-                            scores = torch.stack([o["polytomy_pred"].squeeze() for o in logit_outputs])
-                            order = torch.argsort(scores, descending=True)
-                            candidates = [logit_outputs[int(order[0])]]
+                        planned_merges = _plan_autoregressive_boundary_merges(
+                            logit_outputs,
+                            td2.keys(),
+                        )
+                        if planned_merges:
+                            planned_merges = planned_merges[:1]
 
                         top_change = False
-                        for output in candidates:
-                            # Track polytomy size
-                            polytomy_sizes.append(len(output["splits_represented"]))
-                            
-                            # if torch.sigmoid(output["polytomy_pred"]).item() > 0.5 or len(logit_outputs) == 1:
-                            #else:
-                            logits = output["logits"]
-                            G = logits.size(0)
-                            mask = ~torch.eye(
-                                G, dtype=torch.bool, device=logits.device
-                            )  # off-diagonal only
+                        if not planned_merges:
+                            logger.info("No valid merges found!")
+                        else:
+                            for planned in planned_merges:
+                                polytomy_sizes.append(len(planned["splits_represented"]))
 
-                            # optionally only use one triangle (avoid double-counting symmetric pairs)
-                            tri = torch.triu(mask, diagonal=1)
-                            ii, jj = torch.triu_indices(G, G, offset=1, device=logits.device)
+                                logits = planned["logits"]
+                                G = logits.size(0)
+                                tri = torch.triu(
+                                    ~torch.eye(G, dtype=torch.bool, device=logits.device),
+                                    diagonal=1,
+                                )
+                                logits_vec = logits[tri]
+                                finite_logits = logits_vec[torch.isfinite(logits_vec)]
+                                if finite_logits.numel() > 0:
+                                    max_logits.append(
+                                        float(torch.sigmoid(finite_logits).max().item())
+                                    )
 
-                            logits_vec = logits[tri]
-                            finite = torch.isfinite(logits_vec)
-                            res = None
-                            new_split = None
-                            full = (1 << (n_leaves - 1)) - 1
+                                for subset, new_split in planned["subsets"]:
+                                    to_print = [
+                                        i
+                                        for i in range(new_split.bit_length())
+                                        if (new_split >> i) & 1
+                                    ]
+                                    logger.info(
+                                        f"Merging subset {list(subset)} to create split {new_split}: {to_print}"
+                                    )
 
-                            if finite.sum() > 0:
-                                logits_vec_f = logits_vec[finite]
-                                ii_f, jj_f = ii[finite], jj[finite]
-                                order = torch.argsort(logits_vec_f, descending=True)
-                                k = order.tolist()[0]
-                                i_try, j_try = ii_f[k].item(), jj_f[k].item()
-                                split_masks_try = [
-                                    output["splits_represented"][i_try],
-                                    output["splits_represented"][j_try],
-                                ]
+                                    # New splits are born at the boundary; seed them
+                                    # with a small positive length to avoid an
+                                    # immediate re-collapse while keeping geometry local.
+                                    td2[new_split] = 1e-3
+                                    n_events += 1
+                                    num_topology_changes += 1
+                                    top_change = True
 
-                                candidate_split = int(split_masks_try[0]) | int(split_masks_try[1])
-
-                                if candidate_split in td2:
-                                    import pdb; pdb.set_trace()
-                                    raise Exception("Trying to merge into a split that already exists in the tree, this should not happen!")
-
-                                res = [i_try, j_try]
-                                new_split = candidate_split
-
-                            if res is None:
-                                logger.info("No valid merges found!")
-                            else:
-                                logger.info(f"Merges found: {res}")
-                                split_masks = [
-                                    output["splits_represented"][idx]
-                                    for idx in res
-                                ]
-
-                                to_print = [i for i in range(new_split.bit_length()) if (new_split >> i) & 1]
-                                logger.info(f"Merging splits {split_masks[0]}, {split_masks[1]} to create this split {new_split}: {to_print}")
-
-                                # Keep merge-length initialization aligned with
-                                # boundary-decision oracle construction.
-                                td2[new_split] = 0.1
-                                top_change = True
-                                logger.info("Merge performed time to break out")
+                            if top_change:
                                 num_merges += 1
-                                n_events += 1
-                                num_topology_changes += 1
-                                break
+                                logger.info("Merge step performed from decoded subsets")
                         topology_changed = top_change
+
+                    if topology_changed and (n_events >= max_events or num_merges >= max_events):
+                        logger.info(
+                            "Stopping boundary-resolution loop after hitting the merge-event cap."
+                        )
 
                         # if not top_change:
                         #     logger.info("No more merges possible, pick a random polytomy and do a KNN merge")
