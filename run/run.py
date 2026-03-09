@@ -12,11 +12,23 @@ from pytorch_lightning import Trainer
 import multiprocessing
 import os
 import torch
+from datetime import datetime
 
 import logging
 
 # Global variables to hold the model in worker processes
 worker_model = None
+
+
+def _configure_torch_runtime():
+    if not torch.cuda.is_available():
+        return
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True
 
 
 def init_worker(config_file, device_id):
@@ -32,6 +44,8 @@ def init_worker(config_file, device_id):
     # Load config
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
+
+    _configure_torch_runtime()
 
     # Initialize Dataset (needed for embeddings calculation in sample)
     ids = get_possible_ids(config["data"]["nexus_root"])
@@ -105,6 +119,8 @@ def run_test():
 
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
+
+    _configure_torch_runtime()
 
     ids = get_possible_ids(config["data"]["nexus_root"])
     # Random 80-20 train-test split for now
@@ -240,6 +256,8 @@ def run_overfit():
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
 
+    _configure_torch_runtime()
+
     # --- Start Overrides ---
     print("Running OVERFIT mode (Single Tree)")
     config["data"]["batch_size"] = 1
@@ -307,8 +325,13 @@ def run_overfit():
         verbose=True,  # Enable verbose logging for overfitting
     )
 
+    checkpoint_base = config["trainer"]["checkpoint_dir"]
+    checkpoint_dir = os.path.join(checkpoint_base, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Saving checkpoints to: {checkpoint_dir}")
+
     save_callback = ModelCheckpoint(
-        dirpath=config["trainer"]["checkpoint_dir"],
+        dirpath=checkpoint_dir,
         filename="overfit-{epoch:02d}",
         every_n_epochs=50,
         save_top_k=-1,
@@ -344,6 +367,8 @@ def main():
 
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
+
+    _configure_torch_runtime()
 
     ids = get_possible_ids(config["data"]["nexus_root"])
     # Random 80-20 train-test split for now
@@ -399,8 +424,13 @@ def main():
         ),
     )
 
+    checkpoint_base = config["trainer"]["checkpoint_dir"]
+    checkpoint_dir = os.path.join(checkpoint_base, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Saving checkpoints to: {checkpoint_dir}")
+
     save_callback = ModelCheckpoint(
-        dirpath=config["trainer"]["checkpoint_dir"],
+        dirpath=checkpoint_dir,
         filename="{epoch:02d}-{step:06d}",  # Include metric value in the filename
         every_n_train_steps=config["trainer"]["steps_callback"],  # Save every N steps
         save_top_k=-1,  # Save all checkpoints

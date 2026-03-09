@@ -473,6 +473,24 @@ def _sample_to_first_boundary(module, start_tree, dt_hit_true, boundary_path):
     }
 
 
+def _boundary_prefix_time(start_tree, target_tree, boundary_index):
+    enc = BHVEncoder()
+    start_obj = Tree(start_tree)
+    target_obj = Tree(target_tree)
+    start_masks, start_lengths = enc.return_BHV_encoding(start_obj)
+    target_masks, target_lengths = enc.return_BHV_encoding(target_obj)
+    geodesic = bhv_geodesic_with_support(
+        {int(mask): float(length) for mask, length in zip(start_masks, start_lengths)},
+        {int(mask): float(length) for mask, length in zip(target_masks, target_lengths)},
+        n_leaves=start_obj.n_leaves,
+    )
+    segment_lengths = [float(segment["length"]) for segment in geodesic["segments"]]
+    total_length = sum(segment_lengths)
+    if total_length <= 0.0:
+        raise AssertionError("Degenerate geodesic length for sanity tree pair.")
+    return sum(segment_lengths[: boundary_index + 1]) / total_length
+
+
 def _gather_supervised_velocity(module, batch, eps_len=1e-8):
     with torch.no_grad():
         v_pred, edge_split_masks, _ = module.forward(
@@ -1474,7 +1492,7 @@ class TestTrainingSanity(unittest.TestCase):
 
         optimizer = torch.optim.Adam(module.model.parameters(), lr=5e-3)
 
-        def evaluate_state():
+        def evaluate_state(include_sample=False):
             module.eval()
             event_details = []
             exact_events_ok = True
@@ -1671,7 +1689,7 @@ class TestTrainingSanity(unittest.TestCase):
 
         optimizer = torch.optim.Adam(module.model.parameters(), lr=5e-3)
 
-        def evaluate_state():
+        def evaluate_state(include_sample=False):
             module.eval()
             velocity_eval = _velocity_metrics(module, velocity_batch, topk=3)
 
@@ -1788,6 +1806,277 @@ class TestTrainingSanity(unittest.TestCase):
             0.0,
             (
                 "Sampling to the true first-hit time did not recover the oracle post-boundary tree. "
+                f"rf_norm={final_eval['sample']['rf_norm']:.6f}, "
+                f"sampled={final_eval['sample']['sampled_tree']}, "
+                f"target={final_eval['sample']['target_tree']}"
+            ),
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_velocity_and_autoregressive_multi_boundary_prefix_overfit_sanity_pair(
+        self, _mock_build_index
+    ):
+        random.seed(777)
+        torch.manual_seed(777)
+        device = torch.device("cpu")
+
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_velocity_zero=True,
+        )
+        real_tree = ds.load_posterior_trees_from_tfiles([])[0]
+        random_tree = ds.sample_random_tree(real_tree)
+
+        boundary_paths = return_tree_boundary_merge_paths(random_tree, real_tree)
+        prefix_last_boundary = 11
+        self.assertGreater(
+            len(boundary_paths),
+            prefix_last_boundary,
+            "Sanity tree pair did not expose enough boundaries for the multi-boundary overfit test.",
+        )
+        prefix_paths = boundary_paths[: prefix_last_boundary + 1]
+        prefix_time = _boundary_prefix_time(
+            random_tree,
+            real_tree,
+            prefix_last_boundary,
+        )
+
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=64,
+            n_layers=2,
+            n_heads=4,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=2,
+            phyla_dim=16,
+        ).to(device)
+
+        dataset_stub = MagicMock()
+        dataset_stub.msa_distance = True
+        dataset_stub.chosen_tree = (0, 0, 1)
+
+        module = TrainingModule(
+            model=model,
+            dataset=dataset_stub,
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+            velocity_loss_mode="plain",
+            velocity_sign_eps=1e-3,
+            training_step_velocity_weight=1,
+            training_step_autoregressive_weight=0.1,
+            velocity_dt_candidate_weight=1,
+            velocity_dt_hit_weight=1,
+            velocity_event_weight=0.0,
+        ).to(device)
+
+        velocity_times = [prefix_time * i / 8.0 for i in range(8)]
+        velocity_batches = [
+            _make_batch_from_tree_pair(
+                tokenizer=model.tokenizer,
+                start_tree=random_tree,
+                target_tree=real_tree,
+                time_point=time_point,
+            )
+            for time_point in velocity_times
+        ]
+        dataset_stub.chosen_tree = (0, int(velocity_batches[0]["num_leaves"][0]), 1)
+
+        event_records = []
+        global_event_idx = 0
+        for path in prefix_paths:
+            for event in path["events"]:
+                event_records.append((path["boundary_index"], global_event_idx, event))
+                global_event_idx += 1
+
+        event_batches = [
+            _make_autoregressive_event_batch(
+                model.tokenizer,
+                event["newick"],
+                event["labels"],
+                global_event_idx / 63.0,
+            )
+            for _, global_event_idx, event in event_records
+        ]
+
+        optimizer = torch.optim.Adam(module.model.parameters(), lr=5e-3)
+
+        def evaluate_state(include_sample=False):
+            module.eval()
+
+            exact_events = 0
+            first_failure = None
+            for boundary_index, global_event_index, event in event_records:
+                predicted, _ = _predict_autoregressive_event(
+                    module,
+                    model.tokenizer,
+                    event["newick"],
+                    global_event_index / 63.0,
+                )
+                target = _target_merge_subsets_for_event(event["labels"])
+                if predicted == target:
+                    exact_events += 1
+                elif first_failure is None:
+                    first_failure = (
+                        boundary_index,
+                        global_event_index,
+                        predicted,
+                        target,
+                    )
+
+            velocity_metrics = [
+                _velocity_metrics(module, batch, topk=3) for batch in velocity_batches
+            ]
+            mean_velocity_mse = sum(m["mse"] for m in velocity_metrics) / len(
+                velocity_metrics
+            )
+            min_dt_recall = min(m["dt_first_hit_recall"] for m in velocity_metrics)
+            max_dt_rel_err = max(m["dt_hit_rel_err"] for m in velocity_metrics)
+
+            sample_eval = {
+                "rf_norm": float("inf"),
+                "sampled_tree": None,
+                "target_tree": prefix_paths[-1]["end_newick"],
+                "exception": None,
+            }
+            if include_sample:
+                try:
+                    sampled_trees, *_ = module.sample(
+                        [random_tree],
+                        None,
+                        num_samples=1,
+                        T=float(prefix_time),
+                        dt_base=min(float(prefix_time), 0.02),
+                        max_events=1024,
+                        max_steps=4096,
+                    )
+                    sample_eval["sampled_tree"] = sampled_trees[0]
+                    sample_eval["rf_norm"] = _normalized_rf(
+                        sampled_trees[0],
+                        prefix_paths[-1]["end_newick"],
+                    )
+                except Exception as exc:
+                    sample_eval["exception"] = f"{type(exc).__name__}: {exc}"
+
+            return {
+                "exact_events": exact_events,
+                "first_failure": first_failure,
+                "mean_velocity_mse": mean_velocity_mse,
+                "min_dt_recall": min_dt_recall,
+                "max_dt_rel_err": max_dt_rel_err,
+                "sample": sample_eval,
+            }
+
+        def score_state(eval_state):
+            sample = eval_state["sample"]
+            rf = sample["rf_norm"]
+            rf_score = -rf if math.isfinite(rf) else float("-inf")
+            return (
+                eval_state["exact_events"],
+                eval_state["min_dt_recall"],
+                -eval_state["mean_velocity_mse"],
+                rf_score,
+            )
+
+        best_state = copy.deepcopy(module.model.state_dict())
+        best_eval = None
+        best_score = (
+            -1,
+            -1.0,
+            float("-inf"),
+            float("-inf"),
+        )
+
+        max_steps = 40
+        for step in range(max_steps):
+            module.train()
+            optimizer.zero_grad(set_to_none=True)
+
+            velocity_losses = [
+                module.step(batch, autoregressive=False)["loss"]
+                for batch in velocity_batches
+            ]
+            autoregressive_losses = [
+                module.step(batch, autoregressive=True)["loss"]
+                for batch in event_batches
+            ]
+            total_loss = torch.stack(velocity_losses).mean() + 0.1 * torch.stack(
+                autoregressive_losses
+            ).mean()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(module.model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            if (step + 1) % 10 == 0 or step == 0:
+                current_eval = evaluate_state(include_sample=False)
+                current_score = score_state(current_eval)
+                if current_score > best_score:
+                    best_score = current_score
+                    best_eval = current_eval
+                    best_state = copy.deepcopy(module.model.state_dict())
+
+                if (
+                    current_eval["exact_events"] == len(event_records)
+                    and current_eval["min_dt_recall"] == 1.0
+                    and current_eval["max_dt_rel_err"] < 0.30
+                ):
+                    break
+
+        module.model.load_state_dict(best_state)
+        if best_eval is None:
+            best_eval = evaluate_state(include_sample=False)
+        final_eval = evaluate_state(include_sample=True)
+
+        self.assertEqual(
+            final_eval["exact_events"],
+            len(event_records),
+            (
+                "Joint overfit did not memorize the flattened multi-boundary oracle events "
+                f"through boundary {prefix_last_boundary}. "
+                f"first_failure={final_eval['first_failure']}"
+            ),
+        )
+        self.assertEqual(
+            final_eval["min_dt_recall"],
+            1.0,
+            (
+                "Velocity supervision did not recover the full first-hit set across the sampled prefix times. "
+                f"best_eval={best_eval}"
+            ),
+        )
+        self.assertLess(
+            final_eval["max_dt_rel_err"],
+            0.30,
+            (
+                "Velocity supervision did not localize the prefix boundary hits accurately enough. "
+                f"best_eval={best_eval}"
+            ),
+        )
+        self.assertIsNone(
+            final_eval["sample"]["exception"],
+            "Sampling through the multi-boundary prefix raised an exception. "
+            + str(final_eval["sample"]["exception"]),
+        )
+        self.assertEqual(
+            final_eval["sample"]["rf_norm"],
+            0.0,
+            (
+                "Sampling to the end of the multi-boundary prefix did not recover the oracle topology. "
                 f"rf_norm={final_eval['sample']['rf_norm']:.6f}, "
                 f"sampled={final_eval['sample']['sampled_tree']}, "
                 f"target={final_eval['sample']['target_tree']}"

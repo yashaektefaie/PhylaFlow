@@ -1008,6 +1008,7 @@ class TrainingModule(LightningModule):
                         logits_vec,
                         y_vec,
                         pos_weight=pos_weight,
+                        reduction="mean",
                     )
 
                     losses.append(loss)

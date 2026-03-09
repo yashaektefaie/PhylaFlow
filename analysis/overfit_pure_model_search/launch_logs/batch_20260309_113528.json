@@ -1,0 +1,193 @@
+{
+  "launched_at": "20260309_113528",
+  "python": "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+  "experiments": [
+    {
+      "name": "baseline-tf32-arw-0_2",
+      "pid": 3027728,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/baseline-tf32-arw-0_2-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "baseline-tf32-arw-0_2",
+        "--note",
+        "Fresh 3k baseline after enabling TF32/high matmul runtime; autoregressive_weight 0.2",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "arw-0_1-tf32",
+      "pid": 3027768,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/arw-0_1-tf32-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "arw-0_1-tf32",
+        "--note",
+        "Lower autoregressive_weight to 0.1 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.1"
+      ]
+    },
+    {
+      "name": "arw-0_15-tf32",
+      "pid": 3027823,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/arw-0_15-tf32-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "arw-0_15-tf32",
+        "--note",
+        "Intermediate autoregressive_weight 0.15 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.15"
+      ]
+    },
+    {
+      "name": "lr-0_0025-tf32",
+      "pid": 3027923,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/lr-0_0025-tf32-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "lr-0_0025-tf32",
+        "--note",
+        "Halve learning rate to 0.0025 under TF32 runtime with autoregressive_weight 0.2",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "trainer.lr=0.0025",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "lr-0_01-tf32",
+      "pid": 3028133,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/lr-0_01-tf32-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "lr-0_01-tf32",
+        "--note",
+        "Double learning rate to 0.01 under TF32 runtime with autoregressive_weight 0.2",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "trainer.lr=0.01",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "width-128-tf32",
+      "pid": 3028231,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/width-128-tf32-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "width-128-tf32",
+        "--note",
+        "Widen hidden_dim/embed_dim to 128 with n_heads 8 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "model.hidden_dim=128",
+        "--set",
+        "model.embed_dim=128",
+        "--set",
+        "model.n_heads=8",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "depth-4-tf32",
+      "pid": 3028267,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/depth-4-tf32-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "depth-4-tf32",
+        "--note",
+        "Increase transformer depth to 4 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "model.n_layers=4",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "tokdepth-4-tf32",
+      "pid": 3028350,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/tokdepth-4-tf32-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "tokdepth-4-tf32",
+        "--note",
+        "Increase tokenizer depth to 4 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "model.tokenizer_n_layers=4",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "velw-50-tf32",
+      "pid": 3028466,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/velw-50-tf32-20260309_113528.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "velw-50-tf32",
+        "--note",
+        "Lower training_step_velocity_weight to 50 under TF32 runtime with autoregressive_weight 0.2",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--set",
+        "trainer.training_step_velocity_weight=50",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    }
+  ]
+}

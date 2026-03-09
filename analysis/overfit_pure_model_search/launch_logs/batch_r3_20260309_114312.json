@@ -1,0 +1,203 @@
+{
+  "launched_at": "20260309_114312",
+  "python": "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+  "cuda_home": "/n/sw/helmod-rocky8/apps/Core/cuda/12.4.1-fasrc01/cuda",
+  "experiments": [
+    {
+      "name": "baseline-tf32-r3-arw-0_2",
+      "pid": 3032854,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/baseline-tf32-r3-arw-0_2-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "baseline-tf32-r3-arw-0_2",
+        "--note",
+        "Retry with explicit CUDA env; fresh 3k baseline under TF32 runtime, autoregressive_weight 0.2",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "arw-0_1-tf32-r3",
+      "pid": 3032881,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/arw-0_1-tf32-r3-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "arw-0_1-tf32-r3",
+        "--note",
+        "Retry with explicit CUDA env; lower autoregressive_weight to 0.1 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.1"
+      ]
+    },
+    {
+      "name": "arw-0_15-tf32-r3",
+      "pid": 3032950,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/arw-0_15-tf32-r3-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "arw-0_15-tf32-r3",
+        "--note",
+        "Retry with explicit CUDA env; intermediate autoregressive_weight 0.15 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.15"
+      ]
+    },
+    {
+      "name": "lr-0_0025-tf32-r3",
+      "pid": 3033108,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/lr-0_0025-tf32-r3-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "lr-0_0025-tf32-r3",
+        "--note",
+        "Retry with explicit CUDA env; halve learning rate to 0.0025 under TF32 runtime with autoregressive_weight 0.2",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "trainer.lr=0.0025",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "lr-0_01-tf32-r3",
+      "pid": 3033193,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/lr-0_01-tf32-r3-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "lr-0_01-tf32-r3",
+        "--note",
+        "Retry with explicit CUDA env; double learning rate to 0.01 under TF32 runtime with autoregressive_weight 0.2",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "trainer.lr=0.01",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "width-128-tf32-r3",
+      "pid": 3033445,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/width-128-tf32-r3-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "width-128-tf32-r3",
+        "--note",
+        "Retry with explicit CUDA env; widen hidden_dim/embed_dim to 128 with n_heads 8 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "model.hidden_dim=128",
+        "--set",
+        "model.embed_dim=128",
+        "--set",
+        "model.n_heads=8",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "depth-4-tf32-r3",
+      "pid": 3033628,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/depth-4-tf32-r3-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "depth-4-tf32-r3",
+        "--note",
+        "Retry with explicit CUDA env; increase transformer depth to 4 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "model.n_layers=4",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "tokdepth-4-tf32-r3",
+      "pid": 3033873,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/tokdepth-4-tf32-r3-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "tokdepth-4-tf32-r3",
+        "--note",
+        "Retry with explicit CUDA env; increase tokenizer depth to 4 under TF32 runtime",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "model.tokenizer_n_layers=4",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    },
+    {
+      "name": "velw-50-tf32-r3",
+      "pid": 3033958,
+      "log_path": "/n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/PhylaFlow/analysis/overfit_pure_model_search/launch_logs/velw-50-tf32-r3-20260309_114312.log",
+      "cmd": [
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "tests/hard_test_overfit_pure_model_recovery.py",
+        "--epochs",
+        "3000",
+        "--name",
+        "velw-50-tf32-r3",
+        "--note",
+        "Retry with explicit CUDA env; lower training_step_velocity_weight to 50 under TF32 runtime with autoregressive_weight 0.2",
+        "--python",
+        "/n/home03/yektefaie/miniconda3/envs/pgt/bin/python",
+        "--force",
+        "--set",
+        "trainer.training_step_velocity_weight=50",
+        "--set",
+        "trainer.training_step_autoregressive_weight=0.2"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+ M configs/sanity_train.yaml
+ M run/TrainingModule.py
+ M run/run.py
+ M run_train.sh
+ M tests/test_training_sanity.py
+?? analysis/overfit_pure_model_search/
+?? checkpoint_dir/
+?? logs/
+?? samples/
+?? tests/hard_test_overfit_pure_model_recovery.py
+?? tests/hard_test_training_sanity.py
+?? wandb/
