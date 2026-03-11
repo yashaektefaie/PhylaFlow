@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH -c 1
-#SBATCH -t 8:00:00
-#SBATCH --mem=50G
+set -euo pipefail
 
-#SBATCH -p kempner
-#SBATCH --account kempner_mzitnik_lab
-#SBATCH --gres=gpu:1
+CONFIG_PATH="${1:-configs/sanity_train.yaml}"
 
-#SBATCH -o  logs/3_8/experiment_1_0_weight.out
-#SBATCH -e logs/3_8/experiment_1_0_weight.err
+if command -v module >/dev/null 2>&1; then
+    module load cuda/12.4
+fi
 
-module load cuda/12.4
-python -m run.run configs/sanity_train.yaml
+python -m run.run "${CONFIG_PATH}"

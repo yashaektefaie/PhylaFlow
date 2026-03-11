@@ -91,7 +91,11 @@ except Exception:
 
 from model.model import TreeDenoiserTokenGT
 from data.dataset import TreeDataset
-from run.TrainingModule import TrainingModule
+from run.TrainingModule import (
+    TrainingModule,
+    _oracle_training_topology_keys,
+    _topology_key,
+)
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.bhv_utils import (
     BHVEncoder,
@@ -243,6 +247,10 @@ def _make_autoregressive_event_batch(tokenizer, newick, labels, event_time):
         "batched_autoregressive_labels": [labels],
         "phyla_embeddings": None,
     }
+
+
+def _normalized_event_time(event_index, num_events):
+    return 0.0 if num_events <= 1 else float(event_index) / float(num_events - 1)
 
 
 def _select_random_nonbinary_boundary_path(start_tree, target_tree, seed=777):
@@ -425,7 +433,7 @@ def _rollout_boundary_with_autoregressive_head(
             module,
             tokenizer,
             current_newick,
-            event_idx / 63.0,
+            _normalized_event_time(event_idx, len(boundary_path["events"])),
         )
         current_lengths = _apply_predicted_merge_subsets_to_length_map(
             current_lengths,
@@ -1485,7 +1493,7 @@ class TestTrainingSanity(unittest.TestCase):
                 model.tokenizer,
                 event["newick"],
                 event["labels"],
-                event_idx / 63.0,
+                _normalized_event_time(event_idx, len(boundary_path["events"])),
             )
             for event_idx, event in enumerate(boundary_path["events"])
         ]
@@ -1501,7 +1509,7 @@ class TestTrainingSanity(unittest.TestCase):
                     module,
                     model.tokenizer,
                     event["newick"],
-                    event_idx / 63.0,
+                    _normalized_event_time(event_idx, len(boundary_path["events"])),
                 )
                 target = _target_merge_subsets_for_event(event["labels"])
                 if predicted != target:
@@ -1568,7 +1576,7 @@ class TestTrainingSanity(unittest.TestCase):
                             module,
                             model.tokenizer,
                             event["newick"],
-                            event_idx / 63.0,
+                            _normalized_event_time(event_idx, len(boundary_path["events"])),
                         )[0]
                     ),
                     int(current_eval["rollout_ok"]),
@@ -1682,7 +1690,7 @@ class TestTrainingSanity(unittest.TestCase):
                 model.tokenizer,
                 event["newick"],
                 event["labels"],
-                event_idx / 63.0,
+                _normalized_event_time(event_idx, len(boundary_path["events"])),
             )
             for event_idx, event in enumerate(boundary_path["events"])
         ]
@@ -1700,7 +1708,7 @@ class TestTrainingSanity(unittest.TestCase):
                     module,
                     model.tokenizer,
                     event["newick"],
-                    event_idx / 63.0,
+                    _normalized_event_time(event_idx, len(boundary_path["events"])),
                 )
                 target = _target_merge_subsets_for_event(event["labels"])
                 if predicted != target:
@@ -1813,6 +1821,45 @@ class TestTrainingSanity(unittest.TestCase):
         )
 
     @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_oracle_training_topology_keys_cover_full_boundary_path(
+        self, _mock_build_index
+    ):
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_velocity_zero=True,
+        )
+        target_tree = ds.load_posterior_trees_from_tfiles([])[0]
+        start_tree = ds.sample_random_tree(target_tree)
+
+        oracle_keys = set(_oracle_training_topology_keys(start_tree, target_tree))
+        boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
+
+        self.assertGreater(
+            len(boundary_paths),
+            0,
+            "Sanity tree pair did not expose any boundary paths.",
+        )
+
+        missing = []
+        for boundary_path in boundary_paths:
+            candidate_newicks = [boundary_path["start_newick"], boundary_path["end_newick"]]
+            candidate_newicks.extend(
+                event["newick"] for event in boundary_path["events"]
+            )
+            for newick in candidate_newicks:
+                topo_key = _topology_key(newick)
+                if topo_key not in oracle_keys:
+                    missing.append(newick)
+
+        self.assertEqual(
+            missing,
+            [],
+            "Oracle topology whitelist missed valid boundary-path states.",
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
     def test_velocity_and_autoregressive_multi_boundary_prefix_overfit_sanity_pair(
         self, _mock_build_index
     ):
@@ -1909,7 +1956,7 @@ class TestTrainingSanity(unittest.TestCase):
                 model.tokenizer,
                 event["newick"],
                 event["labels"],
-                global_event_idx / 63.0,
+                _normalized_event_time(global_event_idx, len(event_records)),
             )
             for _, global_event_idx, event in event_records
         ]
@@ -1926,7 +1973,7 @@ class TestTrainingSanity(unittest.TestCase):
                     module,
                     model.tokenizer,
                     event["newick"],
-                    global_event_index / 63.0,
+                    _normalized_event_time(global_event_index, len(event_records)),
                 )
                 target = _target_merge_subsets_for_event(event["labels"])
                 if predicted == target:

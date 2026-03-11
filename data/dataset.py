@@ -276,8 +276,11 @@ class TreeDataset(Dataset):
         random_index = random.randrange(len(final_labels))
         chosen_autoregressive_event = final_labels[random_index]
 
-        #autoregressive_time = 0.0 if len(final_labels) <= 1 else random_index / (len(final_labels) - 1)
-        autoregressive_time = random_index / (64 - 1)  # FIXED to see if we can sample better
+        autoregressive_time = (
+            0.0
+            if len(final_labels) <= 1
+            else random_index / float(len(final_labels) - 1)
+        )
 
         num_to_name = self.return_nexus_number_to_name(index)
         sample = {
@@ -288,6 +291,7 @@ class TreeDataset(Dataset):
             "sequences": new_seqs,
             "taxa_order": list(new_seqs.keys()),  # e.g. ["0", "1", ...]
             "newick_tree": newick,
+            "target_tree": real_tree_newick,
             "velocity": velocity,
             "timepoint": timepoint,
             "autoregressive_newick": chosen_autoregressive_event["newick"],
@@ -750,6 +754,7 @@ class PhylaDataModule(pl.LightningDataModule):
             "nexus_filepaths": [item["nexus_path"] for item in batch],
             "tree_paths": [item["tree_paths"] for item in batch],
             "original_trees": [item["newick_tree"] for item in batch],
+            "target_trees": [item["target_tree"] for item in batch],
             "batched_velocity": [item["velocity"] for item in batch],
             "batched_autoregressive_time": batched_autoregressive_time,
             "batched_autoregressive_labels": [

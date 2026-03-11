@@ -105,6 +105,11 @@ def _parse_args() -> argparse.Namespace:
         help="Run even if an identical recorded experiment already exists.",
     )
     parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Keep trainer.record enabled during training so W&B/sample logging stays on.",
+    )
+    parser.add_argument(
         "--evaluate-checkpoint",
         default="",
         help=(
@@ -418,7 +423,7 @@ def main() -> int:
     explicit_overrides = dict(_parse_override(item) for item in args.set)
     harness_overrides = dict(explicit_overrides)
     harness_overrides["trainer.epochs"] = args.epochs
-    harness_overrides["trainer.record"] = False
+    harness_overrides["trainer.record"] = bool(args.record)
     evaluate_checkpoint = (
         str(Path(args.evaluate_checkpoint).resolve()) if args.evaluate_checkpoint else ""
     )

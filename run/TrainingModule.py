@@ -2,11 +2,12 @@ import random
 import time
 import inspect
 import math
+import json
+import functools
 import torch, torch.optim as optim
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities import grad_norm
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
-from deepspeed.ops.adam import FusedAdam
 import wandb
 import logging
 import gc
@@ -21,19 +22,15 @@ from ete3 import Tree as EteTree
 # Ensure the current directory is in sys.path to import 'phyla'
 sys.path.append(os.getcwd())
 # Import utilities from the provided codebase
-from phyla.utils.utils import load_config
 from utils.utils import remove_bit, has_polytomy_fast
-from phyla.eval.evo_reasoning_eval import (
-Config,
-load_model,
-_encode_sequences_openfold_style,
-)
 
 from utils.random_tree import Tree
 from utils.bhv_utils import (
     BHVEncoder,
     get_structural_polytomy_groups_from_newick,
+    return_sampled_tree_boundary_decisions,
     return_sampled_tree_orthant_velocity,
+    return_tree_boundary_merge_paths,
 )
 from utils.bhv_movie import build_tree_from_splits
 from utils.utils import (
@@ -60,6 +57,22 @@ from utils.utils import compute_merge_metrics
 from utils.utils import _velocity_diagnostics
 
 logger = logging.getLogger(__name__)
+
+try:
+    from deepspeed.ops.adam import FusedAdam
+except Exception:
+    FusedAdam = optim.Adam
+
+
+def _load_phyla_runtime():
+    from phyla.utils.utils import load_config
+    from phyla.eval.evo_reasoning_eval import (
+        Config,
+        load_model,
+        _encode_sequences_openfold_style,
+    )
+
+    return load_config, Config, load_model, _encode_sequences_openfold_style
 
 
 def _decode_positive_merge_subsets(group_output, threshold_logit=0.0):
@@ -164,6 +177,449 @@ def _plan_autoregressive_boundary_merges(logit_outputs, existing_splits, thresho
     return planned
 
 
+def _is_strict_subset_mask(mask, region):
+    mask = int(mask)
+    region = int(region)
+    return mask != region and (mask & ~region) == 0
+
+
+def _move_tokenized_batch_to_device(tokenized, device):
+    moved = []
+    for item in tokenized:
+        if torch.is_tensor(item):
+            moved.append(item.to(device))
+        else:
+            moved.append(item)
+    return tuple(moved)
+
+
+def _extract_edge_splits_from_tokenized(tokenized, batch_index=0):
+    edge_masks = tokenized[-1][batch_index]
+    return [int(split) for split in edge_masks if int(split) != 0]
+
+
+def _subset_target_matrix(group_splits, subset, device):
+    subset = {int(split) for split in subset}
+    size = len(group_splits)
+    target = torch.zeros(size, size, dtype=torch.float32, device=device)
+    subset_indices = [
+        idx for idx, split in enumerate(group_splits) if int(split) in subset
+    ]
+    for i in subset_indices:
+        for j in subset_indices:
+            if i != j:
+                target[i, j] = 1.0
+    return target
+
+
+def _ready_target_merge_subsets_for_group(group_splits, target_newick, n_leaves):
+    group_splits = tuple(sorted({int(split) for split in group_splits}))
+    if len(group_splits) < 2:
+        return []
+
+    biological_bits = max(int(n_leaves) - 1, 0)
+    if biological_bits <= 0:
+        return []
+    full_mask = (1 << biological_bits) - 1
+
+    parent_mask = 0
+    for split in group_splits:
+        parent_mask |= int(split)
+
+    target_tree = Tree(target_newick)
+    enc = BHVEncoder()
+    target_masks, target_lengths = enc.return_BHV_encoding(target_tree)
+    dummy_bit_idx = target_tree.n_leaves - 1
+
+    target_clusters = set()
+    for raw_mask, raw_length in zip(target_masks, target_lengths):
+        if raw_length is None or float(raw_length) <= 0.0:
+            continue
+
+        mask = int(raw_mask)
+        if biological_bits > 0 and ((mask >> dummy_bit_idx) & 1):
+            mask = remove_bit(mask, dummy_bit_idx)
+        elif biological_bits > 0 and mask.bit_length() > biological_bits:
+            continue
+
+        oriented = None
+        candidates = [mask]
+        if full_mask:
+            candidates.append(full_mask ^ mask)
+        for candidate in candidates:
+            candidate = int(candidate)
+            if candidate in (0, full_mask, parent_mask):
+                continue
+            if (candidate & ~parent_mask) == 0:
+                oriented = candidate
+                break
+        if oriented is not None:
+            target_clusters.add(oriented)
+
+    atoms = tuple(sorted(group_splits))
+    atom_set = set(atoms)
+    relevant_clusters = sorted(
+        [cluster for cluster in target_clusters if cluster not in atom_set],
+        key=lambda cluster: (int(cluster).bit_count(), int(cluster)),
+    )
+
+    child_map = {}
+    for cluster in relevant_clusters:
+        candidates = [atom for atom in atoms if (int(atom) & ~int(cluster)) == 0]
+        candidates.extend(
+            other
+            for other in relevant_clusters
+            if _is_strict_subset_mask(other, cluster)
+        )
+
+        maximal_children = []
+        for candidate in candidates:
+            dominated = False
+            for other in candidates:
+                if _is_strict_subset_mask(candidate, other) and _is_strict_subset_mask(
+                    other, cluster
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                maximal_children.append(int(candidate))
+
+        maximal_children = tuple(sorted(set(maximal_children)))
+        union = 0
+        for child in maximal_children:
+            union |= int(child)
+
+        if union == int(cluster) and len(maximal_children) >= 2:
+            child_map[int(cluster)] = maximal_children
+
+    ready_subsets = sorted(
+        {
+            children
+            for children in child_map.values()
+            if all(int(child) in atom_set for child in children)
+        },
+        key=lambda subset: (len(subset), tuple(int(split) for split in subset)),
+    )
+    return ready_subsets
+
+
+def _apply_merge_subset_to_newick(tokenizer, current_newick, subset, new_split=None):
+    if tokenizer is None:
+        tree = Tree(current_newick)
+        existing_splits, _ = BHVEncoder().return_BHV_encoding(tree)
+        existing_splits = [int(split) for split in existing_splits if int(split) != 0]
+    else:
+        tokenized = tokenizer([current_newick])
+        existing_splits = _extract_edge_splits_from_tokenized(tokenized, batch_index=0)
+
+    if new_split is None:
+        new_split = 0
+        for component in subset:
+            new_split |= int(component)
+
+    new_split = int(new_split)
+    if new_split in existing_splits:
+        return None
+
+    split_lengths = {int(split): 0.1 for split in existing_splits}
+    split_lengths[new_split] = 0.1
+
+    tree = Tree(current_newick)
+    _, newick = build_tree_from_splits(
+        list(split_lengths.keys()),
+        split_lengths,
+        tree.n_leaves,
+        root_leaf=tree.n_leaves - 1,
+        mapping=tree.id_to_name,
+    )
+    return newick
+
+
+def _jitter_internal_lengths_newick(current_newick, jitter_scale, min_length=1e-4):
+    tree = EteTree(current_newick, format=1)
+    internal_nodes = [
+        node
+        for node in tree.traverse("postorder")
+        if not node.is_leaf() and not node.is_root()
+    ]
+    if not internal_nodes:
+        return None
+
+    changed = False
+    lower = max(0.0, 1.0 - float(jitter_scale))
+    upper = 1.0 + float(jitter_scale)
+    for node in internal_nodes:
+        dist = float(node.dist)
+        if not math.isfinite(dist) or dist <= 0.0:
+            continue
+        factor = random.uniform(lower, upper)
+        new_dist = max(float(min_length), dist * factor)
+        if abs(new_dist - dist) > 1e-12:
+            node.dist = new_dist
+            changed = True
+
+    if not changed:
+        return None
+    return tree.write(format=1)
+
+
+def _normalize_tree_like_dataset(tree_newick):
+    t_obj = EteTree(tree_newick, format=1)
+    leaves = t_obj.get_leaves()
+    leaves.sort(key=lambda leaf: leaf.name)
+
+    seq_ordering_map = {}
+    for i, leaf in enumerate(leaves):
+        original_name = leaf.name
+        mapped_name = str(i)
+        leaf.name = mapped_name
+        seq_ordering_map[original_name] = mapped_name
+
+    return t_obj.write(format=1), seq_ordering_map
+
+
+def _topology_key(newick_tree, eps_len=1e-8):
+    masks, lengths = BHVEncoder().return_BHV_encoding(Tree(newick_tree))
+    active_masks = [
+        int(mask)
+        for mask, length in zip(masks, lengths)
+        if length is not None and float(length) > eps_len
+    ]
+    return tuple(sorted(active_masks))
+
+
+@functools.lru_cache(maxsize=None)
+def _oracle_training_topology_keys(current_newick, target_newick):
+    keys = {_topology_key(current_newick)}
+    boundary_paths = return_tree_boundary_merge_paths(current_newick, target_newick)
+    for boundary_path in boundary_paths:
+        keys.add(_topology_key(boundary_path["start_newick"]))
+        keys.add(_topology_key(boundary_path["end_newick"]))
+        for event in boundary_path["events"]:
+            keys.add(_topology_key(event["newick"]))
+    return tuple(sorted(keys))
+
+
+def _remap_tree_with_sequence_ordering(
+    tree_newick, seq_ordering_map, offset=0, tree_kind="tree"
+):
+    t_obj = EteTree(tree_newick, format=1)
+    for leaf in t_obj.get_leaves():
+        lookup_name = leaf.name
+        if offset:
+            try:
+                lookup_name = str(int(lookup_name) + offset)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Non-integer leaf name '{leaf.name}' encountered in "
+                    f"{tree_kind} while applying offset {offset}."
+                ) from exc
+
+        mapped_name = seq_ordering_map.get(lookup_name)
+        if mapped_name is None:
+            raise ValueError(
+                f"Leaf name '{lookup_name}' in {tree_kind} not found in "
+                "sequence ordering map."
+            )
+        leaf.name = mapped_name
+
+    return t_obj.write(format=1)
+
+
+def _choose_wrong_pair_merge_subset(current_newick, target_newick, tokenizer):
+    current_tree = Tree(current_newick)
+    current_groups = get_structural_polytomy_groups_from_newick(current_newick)
+    if not current_groups:
+        return None
+
+    n_leaves = current_tree.n_leaves
+    shuffled_groups = [tuple(int(component) for component in group) for group in current_groups]
+    random.shuffle(shuffled_groups)
+
+    for group_splits in shuffled_groups:
+        if len(group_splits) < 3:
+            continue
+
+        ready_subsets = {
+            tuple(sorted(int(split) for split in subset))
+            for subset in _ready_target_merge_subsets_for_group(
+                group_splits,
+                target_newick,
+                n_leaves,
+            )
+        }
+
+        candidates = []
+        for left_idx in range(len(group_splits)):
+            for right_idx in range(left_idx + 1, len(group_splits)):
+                subset = tuple(
+                    sorted(
+                        (
+                            int(group_splits[left_idx]),
+                            int(group_splits[right_idx]),
+                        )
+                    )
+                )
+                if subset in ready_subsets:
+                    continue
+                candidates.append(subset)
+
+        random.shuffle(candidates)
+        for subset in candidates:
+            perturbed_newick = _apply_merge_subset_to_newick(
+                tokenizer,
+                current_newick,
+                subset,
+            )
+            if perturbed_newick is None or perturbed_newick == current_newick:
+                continue
+            return subset
+
+    return None
+
+
+def _choose_model_wrong_pair_merge_subset(
+    module,
+    current_newick,
+    target_newick,
+    current_time,
+    phyla_embedding=None,
+):
+    current_tree = Tree(current_newick)
+    current_groups = get_structural_polytomy_groups_from_newick(current_newick)
+    if not current_groups:
+        return None
+
+    tokenized = _move_tokenized_batch_to_device(
+        module.model.tokenizer([current_newick]),
+        module.device,
+    )
+    existing_splits = set(_extract_edge_splits_from_tokenized(tokenized, batch_index=0))
+    time_tensor = torch.tensor(
+        [float(current_time)],
+        dtype=torch.float32,
+        device=module.device,
+    )
+
+    with torch.no_grad():
+        logit_outputs = module.forward(
+            tokenized,
+            time_tensor,
+            phyla_embedding,
+            autoregressive=True,
+            autoregressive_component_groups=[current_groups],
+        )
+
+    if not logit_outputs:
+        return None
+
+    n_leaves = current_tree.n_leaves
+    ready_subsets_by_group = {}
+    for group_splits in current_groups:
+        normalized_group = tuple(sorted(int(component) for component in group_splits))
+        ready_subsets_by_group[normalized_group] = {
+            tuple(sorted(int(split) for split in subset))
+            for subset in _ready_target_merge_subsets_for_group(
+                normalized_group,
+                target_newick,
+                n_leaves,
+            )
+        }
+
+    planned_merges = _plan_autoregressive_boundary_merges(
+        logit_outputs,
+        existing_splits,
+    )
+    for planned in planned_merges:
+        group_splits = tuple(sorted(int(split) for split in planned["splits_represented"]))
+        ready_subsets = ready_subsets_by_group.get(group_splits, set())
+        subset, new_split = planned["subsets"][0]
+        normalized_subset = tuple(sorted(int(split) for split in subset))
+        if normalized_subset in ready_subsets or int(new_split) in existing_splits:
+            continue
+        return {
+            "subset": normalized_subset,
+            "new_split": int(new_split),
+            "source": "planned_wrong",
+        }
+
+    best_candidate = None
+    best_rank = None
+    for output in logit_outputs:
+        group_splits = tuple(sorted(int(split) for split in output["splits_represented"]))
+        if len(group_splits) < 3:
+            continue
+
+        ready_subsets = ready_subsets_by_group.get(group_splits, set())
+        polytomy_score = float(output["polytomy_pred"].detach().cpu().item())
+        logits = output["logits"].detach()
+        splits = [int(split) for split in output["splits_represented"]]
+
+        for left_idx in range(len(splits)):
+            for right_idx in range(left_idx + 1, len(splits)):
+                subset = tuple(sorted((int(splits[left_idx]), int(splits[right_idx]))))
+                if subset in ready_subsets:
+                    continue
+
+                new_split = int(subset[0]) | int(subset[1])
+                if new_split in existing_splits:
+                    continue
+
+                score = float(logits[left_idx, right_idx].item())
+                if not math.isfinite(score):
+                    continue
+
+                rank = (score, polytomy_score)
+                if best_rank is None or rank > best_rank:
+                    best_rank = rank
+                    best_candidate = {
+                        "subset": subset,
+                        "new_split": new_split,
+                        "source": "top_wrong_pair",
+                    }
+
+    return best_candidate
+
+
+def _plan_first_autoregressive_model_merge(
+    module,
+    current_newick,
+    current_time,
+    phyla_embedding=None,
+):
+    tokenized = _move_tokenized_batch_to_device(
+        module.model.tokenizer([current_newick]),
+        module.device,
+    )
+    groups = [get_structural_polytomy_groups_from_newick(current_newick)]
+    if not groups[0]:
+        return None
+
+    time_tensor = module._effective_autoregressive_time_tensor(current_time)
+
+    with torch.no_grad():
+        logit_outputs = module.forward(
+            tokenized,
+            time_tensor,
+            phyla_embedding,
+            autoregressive=True,
+            autoregressive_component_groups=groups,
+        )
+
+    planned_merges = _plan_autoregressive_boundary_merges(
+        logit_outputs,
+        _extract_edge_splits_from_tokenized(tokenized, batch_index=0),
+    )
+    if not planned_merges:
+        return None
+
+    subset, new_split = planned_merges[0]["subsets"][0]
+    return {
+        "subset": tuple(int(split) for split in subset),
+        "new_split": int(new_split),
+    }
+
+
 class TrainingModule(LightningModule):
     def __init__(
         self,
@@ -180,6 +636,8 @@ class TrainingModule(LightningModule):
         max_num_timesteps: int = 20,
         training_sampling_frequency: int = 200,
         training_sampling_start: int = 500,
+        training_sampling_mode: str = "batch_compare",
+        training_sampling_dt_base: float = 0.02,
         num_samples: int = 10,
         dt: float = 0.1,
         # Figure out how to do typing here
@@ -193,6 +651,15 @@ class TrainingModule(LightningModule):
         training_step_velocity_weight: float = 1.0,
         training_step_autoregressive_weight: float = 1.0,
         training_step_autoregressive_grad_ratio = None,
+        autoregressive_use_time: bool = False,
+        autoregressive_target_mode: str = "scheduled",
+        autoregressive_rollin_prob: float = 0.0,
+        autoregressive_dagger_prob: float = 0.0,
+        autoregressive_dagger_max_steps: int = 4,
+        autoregressive_structure_perturb_prob: float = 0.0,
+        autoregressive_structure_perturb_mode: str = "random_wrong_pair",
+        velocity_length_jitter_prob: float = 0.0,
+        velocity_length_jitter_scale: float = 0.0,
         velocity_dt_candidate_weight: float = 0.0,
         velocity_dt_hit_weight: float = 0.0,
         velocity_dt_eps: float = 1e-6,
@@ -200,6 +667,7 @@ class TrainingModule(LightningModule):
         velocity_event_temp: float = 0.5,
         velocity_event_rate_beta: float = 5.0,
         velocity_event_normalize_by_log_candidates: bool = True,
+        sample_metrics_trace_path: str | None = None,
     ):
         super().__init__()
         self.model = model
@@ -218,11 +686,14 @@ class TrainingModule(LightningModule):
         self.verbose = verbose
         self.training_sampling_frequency = training_sampling_frequency
         self.training_sampling_start = training_sampling_start
+        self.training_sampling_mode = str(training_sampling_mode)
+        self.training_sampling_dt_base = float(training_sampling_dt_base)
         self.num_samples = num_samples
         self.dt = dt
         self.train_tokenized_trees = None
         self.train_batched_time = None
         self.train_tree = None
+        self._cached_harness_sampling_pairs = {}
 
         self.automatic_optimization = False
         self.deepspeed = deepspeed
@@ -271,6 +742,63 @@ class TrainingModule(LightningModule):
                 "training_step_autoregressive_grad_ratio must be non-negative "
                 f"or None, got {training_step_autoregressive_grad_ratio}."
             )
+        valid_autoregressive_target_modes = {"scheduled", "ready_alternatives"}
+        if autoregressive_target_mode not in valid_autoregressive_target_modes:
+            raise ValueError(
+                f"Invalid autoregressive_target_mode={autoregressive_target_mode!r}. "
+                f"Expected one of {sorted(valid_autoregressive_target_modes)}."
+            )
+        valid_training_sampling_modes = {"batch_compare", "harness_sanity"}
+        if self.training_sampling_mode not in valid_training_sampling_modes:
+            raise ValueError(
+                f"Invalid training_sampling_mode={self.training_sampling_mode!r}. "
+                f"Expected one of {sorted(valid_training_sampling_modes)}."
+            )
+        if self.training_sampling_dt_base <= 0.0:
+            raise ValueError(
+                "training_sampling_dt_base must be > 0, "
+                f"got {training_sampling_dt_base}."
+            )
+        valid_structure_perturb_modes = {"random_wrong_pair", "model_wrong_pair"}
+        if (
+            autoregressive_structure_perturb_mode
+            not in valid_structure_perturb_modes
+        ):
+            raise ValueError(
+                "Invalid autoregressive_structure_perturb_mode="
+                f"{autoregressive_structure_perturb_mode!r}. Expected one of "
+                f"{sorted(valid_structure_perturb_modes)}."
+            )
+        if not (0.0 <= float(autoregressive_rollin_prob) <= 1.0):
+            raise ValueError(
+                "autoregressive_rollin_prob must be in [0, 1], "
+                f"got {autoregressive_rollin_prob}."
+            )
+        if not (0.0 <= float(autoregressive_dagger_prob) <= 1.0):
+            raise ValueError(
+                "autoregressive_dagger_prob must be in [0, 1], "
+                f"got {autoregressive_dagger_prob}."
+            )
+        if int(autoregressive_dagger_max_steps) < 1:
+            raise ValueError(
+                "autoregressive_dagger_max_steps must be >= 1, "
+                f"got {autoregressive_dagger_max_steps}."
+            )
+        if not (0.0 <= float(autoregressive_structure_perturb_prob) <= 1.0):
+            raise ValueError(
+                "autoregressive_structure_perturb_prob must be in [0, 1], "
+                f"got {autoregressive_structure_perturb_prob}."
+            )
+        if not (0.0 <= float(velocity_length_jitter_prob) <= 1.0):
+            raise ValueError(
+                "velocity_length_jitter_prob must be in [0, 1], "
+                f"got {velocity_length_jitter_prob}."
+            )
+        if float(velocity_length_jitter_scale) < 0.0:
+            raise ValueError(
+                "velocity_length_jitter_scale must be non-negative, "
+                f"got {velocity_length_jitter_scale}."
+            )
         if float(velocity_dt_candidate_weight) < 0.0:
             raise ValueError(
                 "velocity_dt_candidate_weight must be non-negative, "
@@ -311,6 +839,19 @@ class TrainingModule(LightningModule):
             self.training_step_autoregressive_grad_ratio = float(
                 training_step_autoregressive_grad_ratio
             )
+        self.autoregressive_use_time = bool(autoregressive_use_time)
+        self.autoregressive_target_mode = str(autoregressive_target_mode)
+        self.autoregressive_rollin_prob = float(autoregressive_rollin_prob)
+        self.autoregressive_dagger_prob = float(autoregressive_dagger_prob)
+        self.autoregressive_dagger_max_steps = int(autoregressive_dagger_max_steps)
+        self.autoregressive_structure_perturb_prob = float(
+            autoregressive_structure_perturb_prob
+        )
+        self.autoregressive_structure_perturb_mode = str(
+            autoregressive_structure_perturb_mode
+        )
+        self.velocity_length_jitter_prob = float(velocity_length_jitter_prob)
+        self.velocity_length_jitter_scale = float(velocity_length_jitter_scale)
         self.velocity_dt_candidate_weight = float(velocity_dt_candidate_weight)
         self.velocity_dt_hit_weight = float(velocity_dt_hit_weight)
         self.velocity_dt_eps = float(velocity_dt_eps)
@@ -319,6 +860,11 @@ class TrainingModule(LightningModule):
         self.velocity_event_rate_beta = float(velocity_event_rate_beta)
         self.velocity_event_normalize_by_log_candidates = bool(
             velocity_event_normalize_by_log_candidates
+        )
+        self.sample_metrics_trace_path = (
+            str(sample_metrics_trace_path).strip()
+            if sample_metrics_trace_path
+            else None
         )
 
         phyla_config_path = "configs/sample_eval_config.yaml"
@@ -332,6 +878,7 @@ class TrainingModule(LightningModule):
                         f"Phyla configuration file not found at {phyla_config_path}"
                     )
 
+                load_config, Config, load_model, _ = _load_phyla_runtime()
                 config = load_config(Config)
                 config.trainer.checkpoint_path = self.phyla_checkpoint_path
                 config.eval.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -345,6 +892,424 @@ class TrainingModule(LightningModule):
             finally:
                 sys.argv = original_argv
 
+    def _effective_autoregressive_time_value(self, time_value):
+        if not self.autoregressive_use_time:
+            return 0.0
+        return float(time_value)
+
+    def _effective_autoregressive_time_tensor(self, time_value):
+        if torch.is_tensor(time_value):
+            if self.autoregressive_use_time:
+                return time_value
+            return torch.zeros_like(time_value, dtype=torch.float32, device=time_value.device)
+        return torch.tensor(
+            [self._effective_autoregressive_time_value(time_value)],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def _rollin_single_autoregressive_state(
+        self,
+        current_newick,
+        target_newick,
+        current_time,
+        phyla_embedding=None,
+    ):
+        planned_merge = _plan_first_autoregressive_model_merge(
+            self,
+            current_newick=current_newick,
+            current_time=current_time,
+            phyla_embedding=phyla_embedding,
+        )
+        if planned_merge is None:
+            return None
+
+        rolled_newick = _apply_merge_subset_to_newick(
+            self.model.tokenizer,
+            current_newick,
+            planned_merge["subset"],
+            new_split=planned_merge["new_split"],
+        )
+        if rolled_newick is None:
+            return None
+
+        corrective_events = return_sampled_tree_boundary_decisions(
+            rolled_newick,
+            target_newick,
+        )
+        if not corrective_events:
+            return None
+
+        next_event = corrective_events[0]
+        return {
+            "newick": rolled_newick,
+            "labels": next_event["labels"],
+            "time": self._effective_autoregressive_time_value(current_time),
+        }
+
+    def _dagger_rollin_single_autoregressive_state(
+        self,
+        current_newick,
+        target_newick,
+        current_time,
+        phyla_embedding=None,
+    ):
+        oracle_training_topologies = set(
+            _oracle_training_topology_keys(current_newick, target_newick)
+        )
+        state_newick = current_newick
+        state_time = float(current_time)
+
+        for rollout_step in range(self.autoregressive_dagger_max_steps):
+            planned_merge = _plan_first_autoregressive_model_merge(
+                self,
+                current_newick=state_newick,
+                current_time=state_time,
+                phyla_embedding=phyla_embedding,
+            )
+            if planned_merge is None:
+                return None
+
+            next_newick = _apply_merge_subset_to_newick(
+                self.model.tokenizer,
+                state_newick,
+                planned_merge["subset"],
+                new_split=planned_merge["new_split"],
+            )
+            if next_newick is None or next_newick == state_newick:
+                return None
+
+            if _topology_key(next_newick) not in oracle_training_topologies:
+                corrective_events = return_sampled_tree_boundary_decisions(
+                    next_newick,
+                    target_newick,
+                )
+                if not corrective_events:
+                    return None
+
+                next_event = corrective_events[0]
+                return {
+                    "newick": next_newick,
+                    "labels": next_event["labels"],
+                    "time": self._effective_autoregressive_time_value(state_time),
+                    "rollout_steps": rollout_step + 1,
+                }
+
+            state_newick = next_newick
+
+        return None
+
+    def _perturb_autoregressive_single_state(
+        self,
+        current_newick,
+        target_newick,
+        current_time,
+        phyla_embedding=None,
+    ):
+        if self.autoregressive_structure_perturb_mode == "model_wrong_pair":
+            chosen_merge = _choose_model_wrong_pair_merge_subset(
+                self,
+                current_newick=current_newick,
+                target_newick=target_newick,
+                current_time=current_time,
+                phyla_embedding=phyla_embedding,
+            )
+        else:
+            subset = _choose_wrong_pair_merge_subset(
+                current_newick,
+                target_newick,
+                self.model.tokenizer,
+            )
+            chosen_merge = None if subset is None else {"subset": subset, "new_split": None}
+
+        if chosen_merge is None:
+            return None
+
+        perturbed_newick = _apply_merge_subset_to_newick(
+            self.model.tokenizer,
+            current_newick,
+            chosen_merge["subset"],
+            new_split=chosen_merge.get("new_split"),
+        )
+        if perturbed_newick is None:
+            return None
+
+        corrective_events = return_sampled_tree_boundary_decisions(
+            perturbed_newick,
+            target_newick,
+        )
+        if not corrective_events:
+            return None
+
+        next_event = corrective_events[0]
+        return {
+            "newick": perturbed_newick,
+            "labels": next_event["labels"],
+            "time": self._effective_autoregressive_time_value(current_time),
+        }
+
+    def _prepare_velocity_training_batch(self, batch):
+        if (
+            self.velocity_length_jitter_prob <= 0.0
+            or self.velocity_length_jitter_scale <= 0.0
+            or "original_trees" not in batch
+            or "target_trees" not in batch
+        ):
+            return batch, {"attempted": 0.0, "applied": 0.0}
+
+        newicks = list(batch["original_trees"])
+        velocity_labels = list(batch["batched_velocity"])
+        batched_time = batch.get("batched_time")
+        attempted = 0
+        applied = 0
+
+        for batch_index, (current_newick, target_newick) in enumerate(
+            zip(newicks, batch["target_trees"])
+        ):
+            if random.random() > self.velocity_length_jitter_prob:
+                continue
+            attempted += 1
+
+            perturbed_newick = _jitter_internal_lengths_newick(
+                current_newick,
+                self.velocity_length_jitter_scale,
+            )
+            if perturbed_newick is None:
+                continue
+
+            try:
+                time_point = (
+                    float(batched_time[batch_index].item())
+                    if batched_time is not None
+                    else 0.0
+                )
+                _, perturbed_velocity = return_sampled_tree_orthant_velocity(
+                    perturbed_newick,
+                    target_newick,
+                    time_point,
+                )
+            except Exception:
+                continue
+
+            newicks[batch_index] = perturbed_newick
+            velocity_labels[batch_index] = perturbed_velocity
+            applied += 1
+
+        if applied == 0:
+            return batch, {"attempted": float(attempted), "applied": 0.0}
+
+        updated_batch = dict(batch)
+        updated_batch["original_trees"] = newicks
+        updated_batch["batched_velocity"] = velocity_labels
+        updated_batch["tokenized_trees"] = _move_tokenized_batch_to_device(
+            self.model.tokenizer(newicks),
+            self.device,
+        )
+        return updated_batch, {"attempted": float(attempted), "applied": float(applied)}
+
+    def _prepare_autoregressive_training_batch(self, batch):
+        if (
+            self.autoregressive_rollin_prob <= 0.0
+            and self.autoregressive_dagger_prob <= 0.0
+            and self.autoregressive_structure_perturb_prob <= 0.0
+            or "target_trees" not in batch
+            or "newick_autoregressive_trees" not in batch
+        ):
+            return batch, {
+                "rollin_attempted": 0.0,
+                "rollin_applied": 0.0,
+                "dagger_attempted": 0.0,
+                "dagger_applied": 0.0,
+                "dagger_rollout_steps": 0.0,
+                "structure_perturb_attempted": 0.0,
+                "structure_perturb_applied": 0.0,
+            }
+
+        newicks = list(batch["newick_autoregressive_trees"])
+        labels = list(batch["batched_autoregressive_labels"])
+        times = batch["batched_autoregressive_time"].detach().clone()
+
+        rollin_attempted = 0
+        rollin_applied = 0
+        dagger_attempted = 0
+        dagger_applied = 0
+        dagger_rollout_steps = 0
+        structure_attempted = 0
+        structure_applied = 0
+        for batch_index, (current_newick, target_newick) in enumerate(
+            zip(newicks, batch["target_trees"])
+        ):
+            if self.autoregressive_rollin_prob > 0.0:
+                if random.random() <= self.autoregressive_rollin_prob:
+                    rollin_attempted += 1
+
+                    phyla_embedding = None
+                    if batch["phyla_embeddings"] is not None:
+                        phyla_embedding = batch["phyla_embeddings"][batch_index : batch_index + 1]
+
+                    rolled = self._rollin_single_autoregressive_state(
+                        current_newick=current_newick,
+                        target_newick=target_newick,
+                        current_time=float(times[batch_index].item()),
+                        phyla_embedding=phyla_embedding,
+                    )
+                    if rolled is not None:
+                        current_newick = rolled["newick"]
+                        newicks[batch_index] = rolled["newick"]
+                        labels[batch_index] = rolled["labels"]
+                        times[batch_index] = float(rolled["time"])
+                        rollin_applied += 1
+
+            if self.autoregressive_dagger_prob > 0.0:
+                if random.random() <= self.autoregressive_dagger_prob:
+                    dagger_attempted += 1
+
+                    phyla_embedding = None
+                    if batch["phyla_embeddings"] is not None:
+                        phyla_embedding = batch["phyla_embeddings"][
+                            batch_index : batch_index + 1
+                        ]
+
+                    dagger = self._dagger_rollin_single_autoregressive_state(
+                        current_newick=current_newick,
+                        target_newick=target_newick,
+                        current_time=float(times[batch_index].item()),
+                        phyla_embedding=phyla_embedding,
+                    )
+                    if dagger is not None:
+                        current_newick = dagger["newick"]
+                        newicks[batch_index] = dagger["newick"]
+                        labels[batch_index] = dagger["labels"]
+                        times[batch_index] = float(dagger["time"])
+                        dagger_applied += 1
+                        dagger_rollout_steps += int(dagger["rollout_steps"])
+
+            if self.autoregressive_structure_perturb_prob > 0.0:
+                if random.random() <= self.autoregressive_structure_perturb_prob:
+                    structure_attempted += 1
+                    phyla_embedding = None
+                    if batch["phyla_embeddings"] is not None:
+                        phyla_embedding = batch["phyla_embeddings"][batch_index : batch_index + 1]
+                    perturbed = self._perturb_autoregressive_single_state(
+                        current_newick=current_newick,
+                        target_newick=target_newick,
+                        current_time=float(times[batch_index].item()),
+                        phyla_embedding=phyla_embedding,
+                    )
+                    if perturbed is not None:
+                        newicks[batch_index] = perturbed["newick"]
+                        labels[batch_index] = perturbed["labels"]
+                        times[batch_index] = float(perturbed["time"])
+                        structure_applied += 1
+
+        if rollin_applied == 0 and dagger_applied == 0 and structure_applied == 0:
+            return batch, {
+                "rollin_attempted": float(rollin_attempted),
+                "rollin_applied": 0.0,
+                "dagger_attempted": float(dagger_attempted),
+                "dagger_applied": 0.0,
+                "dagger_rollout_steps": float(dagger_rollout_steps),
+                "structure_perturb_attempted": float(structure_attempted),
+                "structure_perturb_applied": 0.0,
+            }
+
+        updated_batch = dict(batch)
+        updated_batch["newick_autoregressive_trees"] = newicks
+        updated_batch["batched_autoregressive_labels"] = labels
+        updated_batch["batched_autoregressive_time"] = times
+        updated_batch["tokenized_autoregressive_trees"] = _move_tokenized_batch_to_device(
+            self.model.tokenizer(newicks),
+            self.device,
+        )
+        return updated_batch, {
+            "rollin_attempted": float(rollin_attempted),
+            "rollin_applied": float(rollin_applied),
+            "dagger_attempted": float(dagger_attempted),
+            "dagger_applied": float(dagger_applied),
+            "dagger_rollout_steps": float(dagger_rollout_steps),
+            "structure_perturb_attempted": float(structure_attempted),
+            "structure_perturb_applied": float(structure_applied),
+        }
+
+    def _append_sample_metrics_trace(self, metrics):
+        if not self.sample_metrics_trace_path:
+            return
+
+        payload = {
+            "global_step": int(self.global_step),
+            "stepper": int(self.stepper),
+            "timestamp": time.time(),
+        }
+        for key, value in metrics.items():
+            if torch.is_tensor(value):
+                payload[key] = float(value.detach().cpu().item())
+            elif isinstance(value, np.generic):
+                payload[key] = float(value)
+            elif isinstance(value, (int, float, bool)):
+                payload[key] = float(value) if isinstance(value, bool) else value
+            else:
+                payload[key] = value
+
+        os.makedirs(os.path.dirname(self.sample_metrics_trace_path), exist_ok=True)
+        with open(self.sample_metrics_trace_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    def _get_harness_sampling_pair(self, train=True):
+        cache_key = "train" if train else "val"
+        cached = self._cached_harness_sampling_pairs.get(cache_key)
+        if cached is not None:
+            return cached
+
+        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        random_state = random.getstate()
+        try:
+            random.seed(13)
+            real_tree_raw = dataset_split.return_posterior_trees(0)[0]
+            target_tree, seq_ordering_map = _normalize_tree_like_dataset(real_tree_raw)
+            random_tree_raw = dataset_split.sample_random_tree(real_tree_raw)
+        finally:
+            random.setstate(random_state)
+
+        start_tree = _remap_tree_with_sequence_ordering(
+            random_tree_raw,
+            seq_ordering_map,
+            offset=0,
+            tree_kind="start tree",
+        )
+        pair = {
+            "start_tree": start_tree,
+            "target_tree": target_tree,
+            "n_leaves": len(EteTree(target_tree, format=1).get_leaves()),
+        }
+        self._cached_harness_sampling_pairs[cache_key] = pair
+        return pair
+
+    def sample_compare_harness(self, train=True):
+        pair = self._get_harness_sampling_pair(train=train)
+        phyla_dim = int(self.model.phyla_proj.in_features)
+        phyla_embeddings = torch.zeros(
+            (1, pair["n_leaves"], phyla_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        sampled_trees, _, _, _, _ = self.sample(
+            [pair["start_tree"]],
+            phyla_embeddings=phyla_embeddings,
+            num_samples=1,
+            T=1.0,
+            dt_base=self.training_sampling_dt_base,
+            max_steps=256,
+            max_events=1024,
+        )
+        sampled_tree = sampled_trees[0]
+        return {
+            "rf_norm": float(calculate_norm_rf(sampled_tree, pair["target_tree"])),
+            "start_rf_norm": float(
+                calculate_norm_rf(pair["start_tree"], pair["target_tree"])
+            ),
+        }
+
     def compute_phyla_embeddings(self, sequences, names, device="cuda"):
         """
         Generates Phyla embeddings for a batch of sequences.
@@ -353,6 +1318,7 @@ class TrainingModule(LightningModule):
             raise ValueError("Phyla model not loaded.")
 
         # This utility handles tokenization, padding, and CLS token placement
+        _, _, _, _encode_sequences_openfold_style = _load_phyla_runtime()
         batch, _ = _encode_sequences_openfold_style(sequences, names)
 
         # Generate Embeddings
@@ -466,6 +1432,7 @@ class TrainingModule(LightningModule):
             batch["phyla_embeddings"] = phyla_embeddings_list
 
         if not autoregressive:
+            batch, velocity_perturb_stats = self._prepare_velocity_training_batch(batch)
             v_pred, edge_split_masks, edge_mask = self.forward(
                 batch["tokenized_trees"],
                 batch["batched_time"],
@@ -648,6 +1615,14 @@ class TrainingModule(LightningModule):
                         "velocity/dt_neg_jaccard": torch.tensor(
                             vel_metrics["dt_neg_jaccard"], device=v_pred.device
                         ),
+                        "velocity/length_jitter_attempted": torch.tensor(
+                            velocity_perturb_stats["attempted"],
+                            device=v_pred.device,
+                        ),
+                        "velocity/length_jitter_applied": torch.tensor(
+                            velocity_perturb_stats["applied"],
+                            device=v_pred.device,
+                        ),
                     }
                 )
 
@@ -812,9 +1787,8 @@ class TrainingModule(LightningModule):
                 #     + self.velocity_dt_hit_weight * first_hit_velocity_loss
                 # )
 
-                loss = (
-                    loss 
-                    + first_hit_velocity_loss
+                loss = loss + (
+                    self.velocity_dt_hit_weight * first_hit_velocity_loss
                 )
 
                 # loss = (
@@ -869,34 +1843,33 @@ class TrainingModule(LightningModule):
                     vel_wandb.update({
                         "velocity/loss_plain_mse": plain_mse.item(),
                         "velocity/loss_weighted_mse": weighted_mse.item(),
-                    "velocity/mse": vel_metrics["mse"],
-                    "velocity/mse_vs_zero": vel_metrics["mse_vs_zero"],
-                    "velocity/mse_vs_mean": vel_metrics["mse_vs_mean"],
-                    "velocity/zero_baseline_mse": vel_metrics["zero_baseline_mse"],
-                    "velocity/mean_baseline_mse": vel_metrics["mean_baseline_mse"],
-                    "velocity/cosine": vel_metrics["cosine"],
-                    "velocity/pearson": vel_metrics["pearson"],
-                    "velocity/spearman": vel_metrics["spearman"],
-                    "velocity/sign_acc": vel_metrics["sign_acc"],
-                    "velocity/topk_overlap": vel_metrics["topk_overlap"],
-                    "velocity/dt_hit_pred": dt_hit_pred_log,
-                    "velocity/dt_hit_true": dt_hit_true_log,
-                    "velocity/dt_hit_abs_err": dt_hit_abs_err_log,
-                    "velocity/dt_hit_rel_err": dt_hit_rel_err_log,
-                    # "velocity/dt_neg_jaccard": vel_metrics["dt_neg_jaccard"],
-                    "velocity/dt_first_hit_match": vel_metrics["dt_first_hit_match"],
-                    "velocity/dt_first_hit_recall": vel_metrics["dt_first_hit_recall"],
-                    "velocity/dt_first_hit_precision": vel_metrics["dt_first_hit_precision"],
-                    "velocity/dt_topk_overlap": vel_metrics["dt_topk_overlap"],
-                    # "velocity/n_pred_dt_candidates": vel_metrics["n_pred_dt_candidates"],
-                    # "velocity/n_true_dt_candidates": vel_metrics["n_true_dt_candidates"],
-                    # "velocity/n_edges": vel_metrics["n_edges"],
+                        "velocity/mse": vel_metrics["mse"],
+                        "velocity/mse_vs_zero": vel_metrics["mse_vs_zero"],
+                        "velocity/mse_vs_mean": vel_metrics["mse_vs_mean"],
+                        "velocity/zero_baseline_mse": vel_metrics["zero_baseline_mse"],
+                        "velocity/mean_baseline_mse": vel_metrics["mean_baseline_mse"],
+                        "velocity/cosine": vel_metrics["cosine"],
+                        "velocity/pearson": vel_metrics["pearson"],
+                        "velocity/spearman": vel_metrics["spearman"],
+                        "velocity/sign_acc": vel_metrics["sign_acc"],
+                        "velocity/topk_overlap": vel_metrics["topk_overlap"],
+                        "velocity/dt_hit_pred": dt_hit_pred_log,
+                        "velocity/dt_hit_true": dt_hit_true_log,
+                        "velocity/dt_hit_abs_err": dt_hit_abs_err_log,
+                        "velocity/dt_hit_rel_err": dt_hit_rel_err_log,
+                        "velocity/dt_first_hit_match": vel_metrics["dt_first_hit_match"],
+                        "velocity/dt_first_hit_recall": vel_metrics["dt_first_hit_recall"],
+                        "velocity/dt_first_hit_precision": vel_metrics["dt_first_hit_precision"],
+                        "velocity/dt_topk_overlap": vel_metrics["dt_topk_overlap"],
+                        "velocity/length_jitter_attempted": velocity_perturb_stats["attempted"],
+                        "velocity/length_jitter_applied": velocity_perturb_stats["applied"],
                     })
                 wandb.log(vel_wandb, step=self.stepper)
             # import pdb
 
             # pdb.set_trace()
         else:
+            batch, ar_prep_stats = self._prepare_autoregressive_training_batch(batch)
             if "newick_autoregressive_trees" in batch:
                 autoregressive_component_groups = [
                     get_structural_polytomy_groups_from_newick(newick_tree)
@@ -915,9 +1888,12 @@ class TrainingModule(LightningModule):
                         groups.append(list(components))
                     autoregressive_component_groups.append(groups)
 
+            autoregressive_times = self._effective_autoregressive_time_tensor(
+                batch["batched_autoregressive_time"]
+            )
             all_group_logits = self.forward(
                 batch["tokenized_autoregressive_trees"],
-                batch["batched_autoregressive_time"],
+                autoregressive_times,
                 batch["phyla_embeddings"],
                 autoregressive=True,
                 autoregressive_component_groups=autoregressive_component_groups,
@@ -940,6 +1916,7 @@ class TrainingModule(LightningModule):
             losses = []
 
             total_metrics = []
+            alternative_target_counts = []
 
             chosen_polytomies = []
             polytomy_logits = []
@@ -953,30 +1930,41 @@ class TrainingModule(LightningModule):
                 # Track polytomy size (number of splits in the polytomy)
                 polytomy_sizes.append(len(splits_in_polytomy))
 
-                y = torch.zeros(logits.size(0), logits.size(1), dtype=torch.long).to(
-                    logits.device
-                )
-
+                explicit_subsets = []
                 for resulting_split, idxs in label_targets_by_batch[batch_index].get(
                     splits_in_polytomy,
                     [],
                 ):
                     found[(batch_index, resulting_split)] = True
-                    for i in idxs:
-                        for j in idxs:
-                            if i != j:
-                                y[i, j] = 1.0
+                    explicit_subsets.append(
+                        tuple(sorted(int(splits_in_polytomy[i]) for i in idxs))
+                    )
 
-                if y.sum() == 0:
+                candidate_subsets = list(dict.fromkeys(explicit_subsets))
+                if (
+                    self.autoregressive_target_mode == "ready_alternatives"
+                    and "target_trees" in batch
+                ):
+                    ready_subsets = _ready_target_merge_subsets_for_group(
+                        splits_in_polytomy,
+                        batch["target_trees"][batch_index],
+                        Tree(batch["newick_autoregressive_trees"][batch_index]).n_leaves,
+                    )
+                    for subset in ready_subsets:
+                        subset = tuple(sorted(int(split) for split in subset))
+                        if subset not in candidate_subsets:
+                            candidate_subsets.append(subset)
+
+                alternative_target_counts.append(float(len(candidate_subsets)))
+
+                if not candidate_subsets:
                     chosen_polytomies.append(torch.tensor(0.0))
                 else:
                     chosen_polytomies.append(torch.tensor(1.0))
 
                 polytomy_logits.append(group["polytomy_pred"])
 
-                if y.sum() > 0:
-                    y = y.float()
-
+                if candidate_subsets:
                     G = logits.size(0)
                     mask = ~torch.eye(
                         G, dtype=torch.bool, device=logits.device
@@ -985,31 +1973,46 @@ class TrainingModule(LightningModule):
                     # optionally only use one triangle (avoid double-counting symmetric pairs)
                     tri = torch.triu(mask, diagonal=1)
 
+                    logits_vec = logits[tri]
+                    finite = torch.isfinite(logits_vec)
+                    candidate_losses = []
+                    candidate_targets = []
+                    for subset in candidate_subsets:
+                        y = _subset_target_matrix(
+                            splits_in_polytomy,
+                            subset,
+                            logits.device,
+                        )
+                        y_vec = y[tri]
+                        candidate_targets.append(y)
+
+                        logits_vec_f = logits_vec[finite]
+                        y_vec_f = y_vec[finite]
+
+                        pos = y_vec_f.sum().clamp(min=1.0)
+                        neg = (y_vec_f.numel() - y_vec_f.sum()).clamp(min=1.0)
+                        pos_weight = (neg / pos).detach()
+
+                        candidate_losses.append(
+                            F.binary_cross_entropy_with_logits(
+                                logits_vec_f,
+                                y_vec_f,
+                                pos_weight=pos_weight,
+                                reduction="mean",
+                            )
+                        )
+
+                    loss_stack = torch.stack(candidate_losses)
+                    best_candidate_index = int(torch.argmin(loss_stack).item())
+                    loss = loss_stack[best_candidate_index]
+                    best_target = candidate_targets[best_candidate_index]
+
                     metrics = compute_merge_metrics(
                         logits,
-                        y,
+                        best_target,
                         threshold_logit=0.0,
                     )
                     total_metrics.append(metrics)
-
-                    logits_vec = logits[tri]
-                    y_vec = y[tri]
-
-                    # ignore any -inf (if any sneak in beyond diagonal)
-                    finite = torch.isfinite(logits_vec)
-                    logits_vec = logits_vec[finite]
-                    y_vec = y_vec[finite]
-
-                    pos = y_vec.sum().clamp(min=1.0)
-                    neg = (y_vec.numel() - y_vec.sum()).clamp(min=1.0)
-                    pos_weight = (neg / pos).detach()
-
-                    loss = F.binary_cross_entropy_with_logits(
-                        logits_vec,
-                        y_vec,
-                        pos_weight=pos_weight,
-                        reduction="mean",
-                    )
 
                     losses.append(loss)
 
@@ -1058,7 +2061,52 @@ class TrainingModule(LightningModule):
             # Calculate average polytomy size
             avg_polytomy_size = np.mean(polytomy_sizes) if polytomy_sizes else 0.0
             num_polytomies = len(polytomy_sizes)
+            avg_alternative_targets = (
+                float(np.mean(alternative_target_counts))
+                if alternative_target_counts
+                else 0.0
+            )
             logger.info(f"Average polytomy size: {avg_polytomy_size}")
+            logger.info(
+                f"Average alternative autoregressive targets: {avg_alternative_targets}"
+            )
+            logs["autoregressive_stats/avg_candidate_targets"] = torch.tensor(
+                avg_alternative_targets,
+                device=all_group_logits[0]["logits"].device if all_group_logits else self.device,
+            )
+            logs["autoregressive_stats/rollin_attempted"] = torch.tensor(
+                ar_prep_stats["rollin_attempted"],
+                device=all_group_logits[0]["logits"].device if all_group_logits else self.device,
+            )
+            logs["autoregressive_stats/rollin_applied"] = torch.tensor(
+                ar_prep_stats["rollin_applied"],
+                device=all_group_logits[0]["logits"].device if all_group_logits else self.device,
+            )
+            logs["autoregressive_stats/dagger_attempted"] = torch.tensor(
+                ar_prep_stats["dagger_attempted"],
+                device=all_group_logits[0]["logits"].device if all_group_logits else self.device,
+            )
+            logs["autoregressive_stats/dagger_applied"] = torch.tensor(
+                ar_prep_stats["dagger_applied"],
+                device=all_group_logits[0]["logits"].device if all_group_logits else self.device,
+            )
+            dagger_avg_steps = (
+                ar_prep_stats["dagger_rollout_steps"] / ar_prep_stats["dagger_applied"]
+                if ar_prep_stats["dagger_applied"] > 0.0
+                else 0.0
+            )
+            logs["autoregressive_stats/dagger_avg_rollout_steps"] = torch.tensor(
+                dagger_avg_steps,
+                device=all_group_logits[0]["logits"].device if all_group_logits else self.device,
+            )
+            logs["autoregressive_stats/structure_perturb_attempted"] = torch.tensor(
+                ar_prep_stats["structure_perturb_attempted"],
+                device=all_group_logits[0]["logits"].device if all_group_logits else self.device,
+            )
+            logs["autoregressive_stats/structure_perturb_applied"] = torch.tensor(
+                ar_prep_stats["structure_perturb_applied"],
+                device=all_group_logits[0]["logits"].device if all_group_logits else self.device,
+            )
 
             if self.record:
                 # Batch all metrics into a single wandb.log call to avoid step conflicts
@@ -1066,6 +2114,14 @@ class TrainingModule(LightningModule):
                     "train/autoregressive_loss": L_merging.item(),
                     "autoregressive_stats/avg_polytomy_size": avg_polytomy_size,
                     "autoregressive_stats/num_polytomies": num_polytomies,
+                    "autoregressive_stats/avg_candidate_targets": avg_alternative_targets,
+                    "autoregressive_stats/rollin_attempted": ar_prep_stats["rollin_attempted"],
+                    "autoregressive_stats/rollin_applied": ar_prep_stats["rollin_applied"],
+                    "autoregressive_stats/dagger_attempted": ar_prep_stats["dagger_attempted"],
+                    "autoregressive_stats/dagger_applied": ar_prep_stats["dagger_applied"],
+                    "autoregressive_stats/dagger_avg_rollout_steps": dagger_avg_steps,
+                    "autoregressive_stats/structure_perturb_attempted": ar_prep_stats["structure_perturb_attempted"],
+                    "autoregressive_stats/structure_perturb_applied": ar_prep_stats["structure_perturb_applied"],
                 }
                 wandb_metrics.update(
                     {f"{key}": aggregated_metrics[key] for key in aggregated_metrics}
@@ -1511,7 +2567,9 @@ class TrainingModule(LightningModule):
                             ]
                             logit_outputs = self.forward(
                                 tokenized_trees,
-                                torch.tensor([num_merges / 63], device=self.device),
+                                self._effective_autoregressive_time_tensor(
+                                    t
+                                ),
                                 phyla_embeddings,
                                 autoregressive=True,
                                 autoregressive_component_groups=autoregressive_component_groups,
@@ -1771,6 +2829,7 @@ class TrainingModule(LightningModule):
 
         if save:
             import pickle
+            os.makedirs("samples", exist_ok=True)
             with open(f"samples/sample_trees_{self.global_step}.pkl", "wb") as f:
                 pickle.dump((sampled, posterior_trees), f)
 
@@ -2320,10 +3379,14 @@ class TrainingModule(LightningModule):
             # ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
 
             if self.global_step >= self.training_sampling_start and (self.global_step - self.training_sampling_start) % self.training_sampling_frequency == 0:
-                metrics = self.sample_compare(batch, train=True, dt=self.dt)
+                if self.training_sampling_mode == "harness_sanity":
+                    metrics = self.sample_compare_harness(train=True)
+                else:
+                    metrics = self.sample_compare(batch, train=True, dt=self.dt)
                 
                 for k, v in metrics.items():
                     self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
+                self._append_sample_metrics_trace(metrics)
                 if self.record:
                     wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.stepper)
                 print(metrics)

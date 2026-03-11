@@ -7,6 +7,7 @@ import numpy as np
 import math
 import random
 import subprocess, tempfile, re, pathlib
+import logging
 from Bio import AlignIO
 from utils.utils import (
 	jensenshannon_loglh_divergence,
@@ -18,16 +19,18 @@ from ete3 import Tree as EteTree
 _LOGLH_RE = re.compile(r"final logLikelihood:\s*([-0-9.eE]+)")
 
 enc = BHVEncoder()
+logger = logging.getLogger(__name__)
 
 
 def calculate_norm_rf(t1_nw: str, t2_nw: str) -> float:
 	try:
-		t1 = EteTree(t1_nw)
-		t2 = EteTree(t2_nw)
+		t1 = EteTree(t1_nw, format=1)
+		t2 = EteTree(t2_nw, format=1)
 		rf, max_rf, _, _, _, _, _ = t1.robinson_foulds(t2, unrooted_trees=True)
 		return rf / max_rf if max_rf > 0 else 0.0
 	except Exception as e:
-		return 0.0
+		logger.warning("calculate_norm_rf failed: %s", e)
+		return float("nan")
 
 
 def kl_divergence_topological_distributions(

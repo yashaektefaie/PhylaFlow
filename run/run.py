@@ -20,6 +20,16 @@ import logging
 worker_model = None
 
 
+def _set_global_seed(seed):
+    if seed is None:
+        return
+    seed = int(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _configure_torch_runtime():
     if not torch.cuda.is_available():
         return
@@ -29,6 +39,62 @@ def _configure_torch_runtime():
         torch.backends.cuda.matmul.allow_tf32 = True
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.allow_tf32 = True
+
+
+def _init_wandb_run(config, default_project):
+    trainer_cfg = config.get("trainer", {})
+    wandb_kwargs = {
+        "project": trainer_cfg.get("wandb_project", default_project),
+        "name": trainer_cfg.get("wandb_name"),
+        "group": trainer_cfg.get("wandb_group"),
+        "job_type": trainer_cfg.get("wandb_job_type"),
+        "notes": trainer_cfg.get("wandb_notes"),
+        "tags": trainer_cfg.get("wandb_tags"),
+        "config": {
+            "seed": trainer_cfg.get("seed"),
+            "epochs": trainer_cfg.get("epochs"),
+            "training_step_autoregressive_weight": trainer_cfg.get(
+                "training_step_autoregressive_weight"
+            ),
+            "training_step_velocity_weight": trainer_cfg.get(
+                "training_step_velocity_weight"
+            ),
+            "training_step_autoregressive_grad_ratio": trainer_cfg.get(
+                "training_step_autoregressive_grad_ratio"
+            ),
+            "autoregressive_use_time": trainer_cfg.get("autoregressive_use_time"),
+            "autoregressive_target_mode": trainer_cfg.get(
+                "autoregressive_target_mode"
+            ),
+            "autoregressive_rollin_prob": trainer_cfg.get(
+                "autoregressive_rollin_prob"
+            ),
+            "autoregressive_dagger_prob": trainer_cfg.get(
+                "autoregressive_dagger_prob"
+            ),
+            "autoregressive_dagger_max_steps": trainer_cfg.get(
+                "autoregressive_dagger_max_steps"
+            ),
+            "autoregressive_structure_perturb_prob": trainer_cfg.get(
+                "autoregressive_structure_perturb_prob"
+            ),
+            "autoregressive_structure_perturb_mode": trainer_cfg.get(
+                "autoregressive_structure_perturb_mode"
+            ),
+            "velocity_length_jitter_prob": trainer_cfg.get(
+                "velocity_length_jitter_prob"
+            ),
+            "velocity_length_jitter_scale": trainer_cfg.get(
+                "velocity_length_jitter_scale"
+            ),
+            "training_sampling_start": trainer_cfg.get("training_sampling_start"),
+            "training_sampling_frequency": trainer_cfg.get(
+                "training_sampling_frequency"
+            ),
+        },
+    }
+    wandb_kwargs = {k: v for k, v in wandb_kwargs.items() if v is not None}
+    return wandb.init(**wandb_kwargs)
 
 
 def init_worker(config_file, device_id):
@@ -46,6 +112,7 @@ def init_worker(config_file, device_id):
         config = yaml.safe_load(f)
 
     _configure_torch_runtime()
+    _set_global_seed(config["trainer"].get("seed"))
 
     # Initialize Dataset (needed for embeddings calculation in sample)
     ids = get_possible_ids(config["data"]["nexus_root"])
@@ -87,6 +154,33 @@ def init_worker(config_file, device_id):
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
         ),
+        autoregressive_use_time=config["trainer"].get(
+            "autoregressive_use_time", False
+        ),
+        autoregressive_target_mode=config["trainer"].get(
+            "autoregressive_target_mode", "scheduled"
+        ),
+        autoregressive_rollin_prob=config["trainer"].get(
+            "autoregressive_rollin_prob", 0.0
+        ),
+        autoregressive_dagger_prob=config["trainer"].get(
+            "autoregressive_dagger_prob", 0.0
+        ),
+        autoregressive_dagger_max_steps=config["trainer"].get(
+            "autoregressive_dagger_max_steps", 4
+        ),
+        autoregressive_structure_perturb_prob=config["trainer"].get(
+            "autoregressive_structure_perturb_prob", 0.0
+        ),
+        autoregressive_structure_perturb_mode=config["trainer"].get(
+            "autoregressive_structure_perturb_mode", "random_wrong_pair"
+        ),
+        velocity_length_jitter_prob=config["trainer"].get(
+            "velocity_length_jitter_prob", 0.0
+        ),
+        velocity_length_jitter_scale=config["trainer"].get(
+            "velocity_length_jitter_scale", 0.0
+        ),
         velocity_dt_candidate_weight=config["trainer"].get(
             "velocity_dt_candidate_weight", 0.0
         ),
@@ -98,6 +192,13 @@ def init_worker(config_file, device_id):
         velocity_event_normalize_by_log_candidates=config["trainer"].get(
             "velocity_event_normalize_by_log_candidates", True
         ),
+        training_sampling_mode=config["trainer"].get(
+            "training_sampling_mode", "batch_compare"
+        ),
+        training_sampling_dt_base=config["trainer"].get(
+            "training_sampling_dt_base", 0.02
+        ),
+        sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
     )
     model.to(device)
     model.eval()
@@ -121,6 +222,7 @@ def run_test():
         config = yaml.safe_load(f)
 
     _configure_torch_runtime()
+    _set_global_seed(config["trainer"].get("seed"))
 
     ids = get_possible_ids(config["data"]["nexus_root"])
     # Random 80-20 train-test split for now
@@ -164,6 +266,33 @@ def run_test():
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
         ),
+        autoregressive_use_time=config["trainer"].get(
+            "autoregressive_use_time", False
+        ),
+        autoregressive_target_mode=config["trainer"].get(
+            "autoregressive_target_mode", "scheduled"
+        ),
+        autoregressive_rollin_prob=config["trainer"].get(
+            "autoregressive_rollin_prob", 0.0
+        ),
+        autoregressive_dagger_prob=config["trainer"].get(
+            "autoregressive_dagger_prob", 0.0
+        ),
+        autoregressive_dagger_max_steps=config["trainer"].get(
+            "autoregressive_dagger_max_steps", 4
+        ),
+        autoregressive_structure_perturb_prob=config["trainer"].get(
+            "autoregressive_structure_perturb_prob", 0.0
+        ),
+        autoregressive_structure_perturb_mode=config["trainer"].get(
+            "autoregressive_structure_perturb_mode", "random_wrong_pair"
+        ),
+        velocity_length_jitter_prob=config["trainer"].get(
+            "velocity_length_jitter_prob", 0.0
+        ),
+        velocity_length_jitter_scale=config["trainer"].get(
+            "velocity_length_jitter_scale", 0.0
+        ),
         velocity_dt_candidate_weight=config["trainer"].get(
             "velocity_dt_candidate_weight", 0.0
         ),
@@ -175,6 +304,13 @@ def run_test():
         velocity_event_normalize_by_log_candidates=config["trainer"].get(
             "velocity_event_normalize_by_log_candidates", True
         ),
+        training_sampling_mode=config["trainer"].get(
+            "training_sampling_mode", "batch_compare"
+        ),
+        training_sampling_dt_base=config["trainer"].get(
+            "training_sampling_dt_base", 0.02
+        ),
+        sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
     )
     # res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
     # This fails now btw non-autoregressive LOL NEED TO FIX!
@@ -257,6 +393,7 @@ def run_overfit():
         config = yaml.safe_load(f)
 
     _configure_torch_runtime()
+    _set_global_seed(config["trainer"].get("seed"))
 
     # --- Start Overrides ---
     print("Running OVERFIT mode (Single Tree)")
@@ -310,6 +447,33 @@ def run_overfit():
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
         ),
+        autoregressive_use_time=config["trainer"].get(
+            "autoregressive_use_time", False
+        ),
+        autoregressive_target_mode=config["trainer"].get(
+            "autoregressive_target_mode", "scheduled"
+        ),
+        autoregressive_rollin_prob=config["trainer"].get(
+            "autoregressive_rollin_prob", 0.0
+        ),
+        autoregressive_dagger_prob=config["trainer"].get(
+            "autoregressive_dagger_prob", 0.0
+        ),
+        autoregressive_dagger_max_steps=config["trainer"].get(
+            "autoregressive_dagger_max_steps", 4
+        ),
+        autoregressive_structure_perturb_prob=config["trainer"].get(
+            "autoregressive_structure_perturb_prob", 0.0
+        ),
+        autoregressive_structure_perturb_mode=config["trainer"].get(
+            "autoregressive_structure_perturb_mode", "random_wrong_pair"
+        ),
+        velocity_length_jitter_prob=config["trainer"].get(
+            "velocity_length_jitter_prob", 0.0
+        ),
+        velocity_length_jitter_scale=config["trainer"].get(
+            "velocity_length_jitter_scale", 0.0
+        ),
         velocity_dt_candidate_weight=config["trainer"].get(
             "velocity_dt_candidate_weight", 0.0
         ),
@@ -321,7 +485,20 @@ def run_overfit():
         velocity_event_normalize_by_log_candidates=config["trainer"].get(
             "velocity_event_normalize_by_log_candidates", True
         ),
-        training_sampling_start = config["trainer"].get("training_sampling_start", 500),  # Start sampling from the beginning for overfitting
+        training_sampling_frequency=config["trainer"].get(
+            "training_sampling_frequency", 200
+        ),
+        training_sampling_start=config["trainer"].get(
+            "training_sampling_start", 500
+        ),
+        training_sampling_mode=config["trainer"].get(
+            "training_sampling_mode", "harness_sanity"
+        ),
+        training_sampling_dt_base=config["trainer"].get(
+            "training_sampling_dt_base", 0.02
+        ),
+        dt=config["trainer"].get("dt", 0.1),
+        sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         verbose=True,  # Enable verbose logging for overfitting
     )
 
@@ -339,7 +516,9 @@ def run_overfit():
 
     trainer_args = {}
     if config["trainer"]["record"]:
-        wandb.init(project="phylaflow_overfit")
+        _init_wandb_run(config, default_project="phylaflow_overfit")
+    else:
+        trainer_args["logger"] = False
 
     trainer_args["max_epochs"] = config["trainer"]["epochs"]
     trainer_args["callbacks"] = [save_callback]
@@ -369,6 +548,7 @@ def main():
         config = yaml.safe_load(f)
 
     _configure_torch_runtime()
+    _set_global_seed(config["trainer"].get("seed"))
 
     ids = get_possible_ids(config["data"]["nexus_root"])
     # Random 80-20 train-test split for now
@@ -411,6 +591,33 @@ def main():
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
         ),
+        autoregressive_use_time=config["trainer"].get(
+            "autoregressive_use_time", False
+        ),
+        autoregressive_target_mode=config["trainer"].get(
+            "autoregressive_target_mode", "scheduled"
+        ),
+        autoregressive_rollin_prob=config["trainer"].get(
+            "autoregressive_rollin_prob", 0.0
+        ),
+        autoregressive_dagger_prob=config["trainer"].get(
+            "autoregressive_dagger_prob", 0.0
+        ),
+        autoregressive_dagger_max_steps=config["trainer"].get(
+            "autoregressive_dagger_max_steps", 4
+        ),
+        autoregressive_structure_perturb_prob=config["trainer"].get(
+            "autoregressive_structure_perturb_prob", 0.0
+        ),
+        autoregressive_structure_perturb_mode=config["trainer"].get(
+            "autoregressive_structure_perturb_mode", "random_wrong_pair"
+        ),
+        velocity_length_jitter_prob=config["trainer"].get(
+            "velocity_length_jitter_prob", 0.0
+        ),
+        velocity_length_jitter_scale=config["trainer"].get(
+            "velocity_length_jitter_scale", 0.0
+        ),
         velocity_dt_candidate_weight=config["trainer"].get(
             "velocity_dt_candidate_weight", 0.0
         ),
@@ -422,6 +629,20 @@ def main():
         velocity_event_normalize_by_log_candidates=config["trainer"].get(
             "velocity_event_normalize_by_log_candidates", True
         ),
+        training_sampling_frequency=config["trainer"].get(
+            "training_sampling_frequency", 200
+        ),
+        training_sampling_start=config["trainer"].get(
+            "training_sampling_start", 500
+        ),
+        training_sampling_mode=config["trainer"].get(
+            "training_sampling_mode", "batch_compare"
+        ),
+        training_sampling_dt_base=config["trainer"].get(
+            "training_sampling_dt_base", 0.02
+        ),
+        dt=config["trainer"].get("dt", 0.1),
+        sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
     )
 
     checkpoint_base = config["trainer"]["checkpoint_dir"]
@@ -438,9 +659,9 @@ def main():
 
     trainer_args = {}
     if config["trainer"]["record"]:
-        # run_name = "test_run"
-        wandb.init(project="phylaflow")
-        # wandb.watch(model, log_freq=100)
+        _init_wandb_run(config, default_project="phylaflow")
+    else:
+        trainer_args["logger"] = False
 
     trainer_args["max_epochs"] = config["trainer"]["epochs"]
     trainer_args["callbacks"] = [save_callback]  # For validation callback runs
@@ -459,6 +680,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # main()
-    # run_test()
-    run_overfit()
+    main()

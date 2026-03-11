@@ -20,10 +20,10 @@ model:
   phyla_dim: 16
 
 trainer:
-  record: True
-  epochs: 10000000
-  checkpoint_dir: /n/netscratch/mzitnik_lab/Lab/yektefaie/PhylaFlowCheckpoints/
-  phyla_checkpoint_path: checkpoints/chkpts/epoch%3D00-step%3D004000-treefam_avg_normrf%3D0.6721.ckpt
+  record: False
+  epochs: 1
+  checkpoint_dir: ./checkpoints/smoke_test
+  phyla_checkpoint_path: null
   lr: 0.005
   steps_callback: 100
   val_callback_freq: 0
@@ -34,6 +34,7 @@ trainer:
   training_step_velocity_weight: 100
   training_step_autoregressive_weight: 0.2
   training_step_autoregressive_grad_ratio: 0.05
+  autoregressive_use_time: false
   velocity_dt_candidate_weight: 1.0
   velocity_dt_hit_weight: 1.0
   velocity_event_weight: 0.0
