@@ -53,6 +53,73 @@ def _init_wandb_run(config, default_project):
         "config": {
             "seed": trainer_cfg.get("seed"),
             "epochs": trainer_cfg.get("epochs"),
+            "autoregressive_head_mode": config.get("model", {}).get(
+                "autoregressive_head_mode"
+            ),
+            "autoregressive_group_refinement_layers": config.get(
+                "model", {}
+            ).get("autoregressive_group_refinement_layers"),
+            "autoregressive_max_subset_size": config.get("model", {}).get(
+                "autoregressive_max_subset_size"
+            ),
+            "velocity_first_hit_head_weight": trainer_cfg.get(
+                "velocity_first_hit_head_weight"
+            ),
+            "velocity_first_hit_head_use_at_sampling": trainer_cfg.get(
+                "velocity_first_hit_head_use_at_sampling"
+            ),
+            "velocity_first_hit_predictor_mode": trainer_cfg.get(
+                "velocity_first_hit_predictor_mode"
+            ),
+            "velocity_first_hit_use_geometry_features": trainer_cfg.get(
+                "velocity_first_hit_use_geometry_features"
+            ),
+            "velocity_first_hit_geometry_hidden_dim": trainer_cfg.get(
+                "velocity_first_hit_geometry_hidden_dim"
+            ),
+            "velocity_first_hit_edge_length_hidden_dim": trainer_cfg.get(
+                "velocity_first_hit_edge_length_hidden_dim"
+            ),
+            "velocity_boundary_vanish_head_weight": trainer_cfg.get(
+                "velocity_boundary_vanish_head_weight"
+            ),
+            "velocity_boundary_vanish_head_use_at_sampling": trainer_cfg.get(
+                "velocity_boundary_vanish_head_use_at_sampling"
+            ),
+            "velocity_boundary_vanish_one_step_use_at_sampling": trainer_cfg.get(
+                "velocity_boundary_vanish_one_step_use_at_sampling"
+            ),
+            "rollout_replay_velocity_weight": trainer_cfg.get(
+                "rollout_replay_velocity_weight"
+            ),
+            "rollout_replay_autoregressive_weight": trainer_cfg.get(
+                "rollout_replay_autoregressive_weight"
+            ),
+            "rollout_replay_start_step": trainer_cfg.get(
+                "rollout_replay_start_step"
+            ),
+            "rollout_replay_frequency": trainer_cfg.get(
+                "rollout_replay_frequency"
+            ),
+            "rollout_replay_max_velocity_states": trainer_cfg.get(
+                "rollout_replay_max_velocity_states"
+            ),
+            "rollout_replay_max_autoregressive_states": trainer_cfg.get(
+                "rollout_replay_max_autoregressive_states"
+            ),
+            "rollout_replay_max_steps": trainer_cfg.get(
+                "rollout_replay_max_steps"
+            ),
+            "rollout_replay_anchor_states": trainer_cfg.get(
+                "rollout_replay_anchor_states"
+            ),
+            "rollout_replay_oracle_horizon": trainer_cfg.get(
+                "rollout_replay_oracle_horizon"
+            ),
+            "rollout_replay_mode": trainer_cfg.get("rollout_replay_mode"),
+            "rollout_replay_bank_max_polytomy_size": trainer_cfg.get(
+                "rollout_replay_bank_max_polytomy_size"
+            ),
             "training_step_autoregressive_weight": trainer_cfg.get(
                 "training_step_autoregressive_weight"
             ),
@@ -61,6 +128,9 @@ def _init_wandb_run(config, default_project):
             ),
             "training_step_autoregressive_grad_ratio": trainer_cfg.get(
                 "training_step_autoregressive_grad_ratio"
+            ),
+            "training_step_separate_optimizer_steps": trainer_cfg.get(
+                "training_step_separate_optimizer_steps"
             ),
             "autoregressive_use_time": trainer_cfg.get("autoregressive_use_time"),
             "autoregressive_target_mode": trainer_cfg.get(
@@ -91,10 +161,57 @@ def _init_wandb_run(config, default_project):
             "training_sampling_frequency": trainer_cfg.get(
                 "training_sampling_frequency"
             ),
+            "init_checkpoint_path": trainer_cfg.get("init_checkpoint_path"),
+            "resume_ckpt_path": trainer_cfg.get("resume_ckpt_path"),
+            "overfit_event_horizon": config.get("data", {}).get(
+                "overfit_event_horizon"
+            ),
+            "overfit_velocity_event_states": config.get("data", {}).get(
+                "overfit_velocity_event_states"
+            ),
+            "overfit_velocity_orthant_start_states": config.get("data", {}).get(
+                "overfit_velocity_orthant_start_states"
+            ),
+            "overfit_velocity_explicit_boundary_end_states": config.get(
+                "data", {}
+            ).get("overfit_velocity_explicit_boundary_end_states"),
+            "overfit_velocity_fixed_timepoints": config.get("data", {}).get(
+                "overfit_velocity_fixed_timepoints"
+            ),
+            "overfit_fixed_pair": config.get("data", {}).get("overfit_fixed_pair"),
+            "overfit_split_multi_subset_events": config.get("data", {}).get(
+                "overfit_split_multi_subset_events"
+            ),
         },
     }
     wandb_kwargs = {k: v for k, v in wandb_kwargs.items() if v is not None}
     return wandb.init(**wandb_kwargs)
+
+
+def _load_model_init_checkpoint(model, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    model_state = {
+        k[len("model.") :]: v for k, v in state_dict.items() if k.startswith("model.")
+    }
+    if not model_state:
+        model_state = state_dict
+    model.load_state_dict(model_state, strict=True)
+    return model
+
+
+def _resolve_checkpoint_paths(trainer_cfg):
+    init_checkpoint_path = trainer_cfg.get("init_checkpoint_path")
+    resume_ckpt_path = trainer_cfg.get("resume_ckpt_path")
+    if init_checkpoint_path and resume_ckpt_path:
+        raise ValueError(
+            "Use either trainer.init_checkpoint_path or trainer.resume_ckpt_path, not both."
+        )
+    if init_checkpoint_path:
+        init_checkpoint_path = os.path.abspath(init_checkpoint_path)
+    if resume_ckpt_path:
+        resume_ckpt_path = os.path.abspath(resume_ckpt_path)
+    return init_checkpoint_path, resume_ckpt_path
 
 
 def init_worker(config_file, device_id):
@@ -140,6 +257,9 @@ def init_worker(config_file, device_id):
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
+        phyla_precomputed_embeddings_path=config["trainer"].get(
+            "phyla_precomputed_embeddings_path"
+        ),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -151,14 +271,29 @@ def init_worker(config_file, device_id):
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
         ),
+        training_step_gradient_clip_val=config["trainer"].get(
+            "training_step_gradient_clip_val", 1.0
+        ),
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
+        ),
+        training_step_separate_optimizer_steps=config["trainer"].get(
+            "training_step_separate_optimizer_steps", False
         ),
         autoregressive_use_time=config["trainer"].get(
             "autoregressive_use_time", False
         ),
         autoregressive_target_mode=config["trainer"].get(
             "autoregressive_target_mode", "scheduled"
+        ),
+        autoregressive_polytomy_choosing_weight=config["trainer"].get(
+            "autoregressive_polytomy_choosing_weight", 1.0
+        ),
+        autoregressive_stop_after_merge_weight=config["trainer"].get(
+            "autoregressive_stop_after_merge_weight", 0.0
+        ),
+        autoregressive_stop_after_merge_use_at_sampling=config["trainer"].get(
+            "autoregressive_stop_after_merge_use_at_sampling", False
         ),
         autoregressive_rollin_prob=config["trainer"].get(
             "autoregressive_rollin_prob", 0.0
@@ -192,13 +327,100 @@ def init_worker(config_file, device_id):
         velocity_event_normalize_by_log_candidates=config["trainer"].get(
             "velocity_event_normalize_by_log_candidates", True
         ),
+        velocity_event_precision_weight=config["trainer"].get(
+            "velocity_event_precision_weight", 0.0
+        ),
+        velocity_event_precision_margin=config["trainer"].get(
+            "velocity_event_precision_margin", 0.0
+        ),
+        velocity_first_hit_head_weight=config["trainer"].get(
+            "velocity_first_hit_head_weight", 0.0
+        ),
+        velocity_first_hit_head_use_at_sampling=config["trainer"].get(
+            "velocity_first_hit_head_use_at_sampling", False
+        ),
+        velocity_first_hit_predictor_mode=config["trainer"].get(
+            "velocity_first_hit_predictor_mode", "base"
+        ),
+        velocity_first_hit_use_geometry_features=config["trainer"].get(
+            "velocity_first_hit_use_geometry_features", False
+        ),
+        velocity_first_hit_geometry_hidden_dim=config["trainer"].get(
+            "velocity_first_hit_geometry_hidden_dim", 32
+        ),
+        velocity_first_hit_edge_length_hidden_dim=config["trainer"].get(
+            "velocity_first_hit_edge_length_hidden_dim", 64
+        ),
+        velocity_boundary_vanish_head_weight=config["trainer"].get(
+            "velocity_boundary_vanish_head_weight", 0.0
+        ),
+        velocity_boundary_vanish_head_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_vanish_head_use_at_sampling", False
+        ),
+        velocity_boundary_vanish_one_step_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_vanish_one_step_use_at_sampling", False
+        ),
+        skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
+            "skip_repeated_no_valid_boundary_use_at_sampling", False
+        ),
         training_sampling_mode=config["trainer"].get(
             "training_sampling_mode", "batch_compare"
         ),
         training_sampling_dt_base=config["trainer"].get(
             "training_sampling_dt_base", 0.02
         ),
+        training_sampling_stop_on_zero_rf=config["trainer"].get(
+            "training_sampling_stop_on_zero_rf", False
+        ),
+        training_sampling_stop_rf_threshold=config["trainer"].get(
+            "training_sampling_stop_rf_threshold"
+        ),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
+        rollout_replay_velocity_weight=config["trainer"].get(
+            "rollout_replay_velocity_weight", 0.0
+        ),
+        rollout_replay_autoregressive_weight=config["trainer"].get(
+            "rollout_replay_autoregressive_weight", 0.0
+        ),
+        rollout_replay_start_step=config["trainer"].get(
+            "rollout_replay_start_step", 0
+        ),
+        rollout_replay_frequency=config["trainer"].get(
+            "rollout_replay_frequency", 1
+        ),
+        rollout_replay_max_velocity_states=config["trainer"].get(
+            "rollout_replay_max_velocity_states", 0
+        ),
+        rollout_replay_max_autoregressive_states=config["trainer"].get(
+            "rollout_replay_max_autoregressive_states", 0
+        ),
+        rollout_replay_max_steps=config["trainer"].get(
+            "rollout_replay_max_steps", 256
+        ),
+        rollout_replay_anchor_states=config["trainer"].get(
+            "rollout_replay_anchor_states", 4
+        ),
+        rollout_replay_oracle_horizon=config["trainer"].get(
+            "rollout_replay_oracle_horizon", 2
+        ),
+        rollout_replay_mode=config["trainer"].get(
+            "rollout_replay_mode", "anchor_oracle"
+        ),
+        rollout_replay_pairwise_max_group_size=config["trainer"].get(
+            "rollout_replay_pairwise_max_group_size", 0
+        ),
+        rollout_replay_bank_max_polytomy_size=config["trainer"].get(
+            "rollout_replay_bank_max_polytomy_size", -1
+        ),
+        rollout_replay_topology_repeat_cap=config["trainer"].get(
+            "rollout_replay_topology_repeat_cap", 0
+        ),
+        rollout_replay_dump_refreshes=config["trainer"].get(
+            "rollout_replay_dump_refreshes", False
+        ),
+        rollout_replay_dump_dir=config["trainer"].get(
+            "rollout_replay_dump_dir"
+        ),
     )
     model.to(device)
     model.eval()
@@ -252,6 +474,9 @@ def run_test():
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
+        phyla_precomputed_embeddings_path=config["trainer"].get(
+            "phyla_precomputed_embeddings_path"
+        ),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -263,14 +488,29 @@ def run_test():
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
         ),
+        training_step_gradient_clip_val=config["trainer"].get(
+            "training_step_gradient_clip_val", 1.0
+        ),
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
+        ),
+        training_step_separate_optimizer_steps=config["trainer"].get(
+            "training_step_separate_optimizer_steps", False
         ),
         autoregressive_use_time=config["trainer"].get(
             "autoregressive_use_time", False
         ),
         autoregressive_target_mode=config["trainer"].get(
             "autoregressive_target_mode", "scheduled"
+        ),
+        autoregressive_polytomy_choosing_weight=config["trainer"].get(
+            "autoregressive_polytomy_choosing_weight", 1.0
+        ),
+        autoregressive_stop_after_merge_weight=config["trainer"].get(
+            "autoregressive_stop_after_merge_weight", 0.0
+        ),
+        autoregressive_stop_after_merge_use_at_sampling=config["trainer"].get(
+            "autoregressive_stop_after_merge_use_at_sampling", False
         ),
         autoregressive_rollin_prob=config["trainer"].get(
             "autoregressive_rollin_prob", 0.0
@@ -304,13 +544,100 @@ def run_test():
         velocity_event_normalize_by_log_candidates=config["trainer"].get(
             "velocity_event_normalize_by_log_candidates", True
         ),
+        velocity_event_precision_weight=config["trainer"].get(
+            "velocity_event_precision_weight", 0.0
+        ),
+        velocity_event_precision_margin=config["trainer"].get(
+            "velocity_event_precision_margin", 0.0
+        ),
+        velocity_first_hit_head_weight=config["trainer"].get(
+            "velocity_first_hit_head_weight", 0.0
+        ),
+        velocity_first_hit_head_use_at_sampling=config["trainer"].get(
+            "velocity_first_hit_head_use_at_sampling", False
+        ),
+        velocity_first_hit_predictor_mode=config["trainer"].get(
+            "velocity_first_hit_predictor_mode", "base"
+        ),
+        velocity_first_hit_use_geometry_features=config["trainer"].get(
+            "velocity_first_hit_use_geometry_features", False
+        ),
+        velocity_first_hit_geometry_hidden_dim=config["trainer"].get(
+            "velocity_first_hit_geometry_hidden_dim", 32
+        ),
+        velocity_first_hit_edge_length_hidden_dim=config["trainer"].get(
+            "velocity_first_hit_edge_length_hidden_dim", 64
+        ),
+        velocity_boundary_vanish_head_weight=config["trainer"].get(
+            "velocity_boundary_vanish_head_weight", 0.0
+        ),
+        velocity_boundary_vanish_head_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_vanish_head_use_at_sampling", False
+        ),
+        velocity_boundary_vanish_one_step_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_vanish_one_step_use_at_sampling", False
+        ),
+        skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
+            "skip_repeated_no_valid_boundary_use_at_sampling", False
+        ),
         training_sampling_mode=config["trainer"].get(
             "training_sampling_mode", "batch_compare"
         ),
         training_sampling_dt_base=config["trainer"].get(
             "training_sampling_dt_base", 0.02
         ),
+        training_sampling_stop_on_zero_rf=config["trainer"].get(
+            "training_sampling_stop_on_zero_rf", False
+        ),
+        training_sampling_stop_rf_threshold=config["trainer"].get(
+            "training_sampling_stop_rf_threshold"
+        ),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
+        rollout_replay_velocity_weight=config["trainer"].get(
+            "rollout_replay_velocity_weight", 0.0
+        ),
+        rollout_replay_autoregressive_weight=config["trainer"].get(
+            "rollout_replay_autoregressive_weight", 0.0
+        ),
+        rollout_replay_start_step=config["trainer"].get(
+            "rollout_replay_start_step", 0
+        ),
+        rollout_replay_frequency=config["trainer"].get(
+            "rollout_replay_frequency", 1
+        ),
+        rollout_replay_max_velocity_states=config["trainer"].get(
+            "rollout_replay_max_velocity_states", 0
+        ),
+        rollout_replay_max_autoregressive_states=config["trainer"].get(
+            "rollout_replay_max_autoregressive_states", 0
+        ),
+        rollout_replay_max_steps=config["trainer"].get(
+            "rollout_replay_max_steps", 256
+        ),
+        rollout_replay_anchor_states=config["trainer"].get(
+            "rollout_replay_anchor_states", 4
+        ),
+        rollout_replay_oracle_horizon=config["trainer"].get(
+            "rollout_replay_oracle_horizon", 2
+        ),
+        rollout_replay_mode=config["trainer"].get(
+            "rollout_replay_mode", "anchor_oracle"
+        ),
+        rollout_replay_pairwise_max_group_size=config["trainer"].get(
+            "rollout_replay_pairwise_max_group_size", 0
+        ),
+        rollout_replay_bank_max_polytomy_size=config["trainer"].get(
+            "rollout_replay_bank_max_polytomy_size", -1
+        ),
+        rollout_replay_topology_repeat_cap=config["trainer"].get(
+            "rollout_replay_topology_repeat_cap", 0
+        ),
+        rollout_replay_dump_refreshes=config["trainer"].get(
+            "rollout_replay_dump_refreshes", False
+        ),
+        rollout_replay_dump_dir=config["trainer"].get(
+            "rollout_replay_dump_dir"
+        ),
     )
     # res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
     # This fails now btw non-autoregressive LOL NEED TO FIX!
@@ -419,6 +746,17 @@ def run_overfit():
     dataset = PhylaDataModule(config, train_ids=train_ids, test_ids=test_ids)
 
     phyla_flow = return_model(config)
+    init_checkpoint_path, resume_ckpt_path = _resolve_checkpoint_paths(
+        config["trainer"]
+    )
+    if init_checkpoint_path:
+        print(f"Initializing model weights from checkpoint: {init_checkpoint_path}")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        phyla_flow = _load_model_init_checkpoint(
+            phyla_flow, init_checkpoint_path, device
+        )
+    if resume_ckpt_path:
+        print(f"Resuming full trainer state from checkpoint: {resume_ckpt_path}")
 
     model = TrainingModule(
         model=phyla_flow,
@@ -433,6 +771,9 @@ def run_overfit():
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
+        phyla_precomputed_embeddings_path=config["trainer"].get(
+            "phyla_precomputed_embeddings_path"
+        ),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -444,14 +785,29 @@ def run_overfit():
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
         ),
+        training_step_gradient_clip_val=config["trainer"].get(
+            "training_step_gradient_clip_val", 1.0
+        ),
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
+        ),
+        training_step_separate_optimizer_steps=config["trainer"].get(
+            "training_step_separate_optimizer_steps", False
         ),
         autoregressive_use_time=config["trainer"].get(
             "autoregressive_use_time", False
         ),
         autoregressive_target_mode=config["trainer"].get(
             "autoregressive_target_mode", "scheduled"
+        ),
+        autoregressive_polytomy_choosing_weight=config["trainer"].get(
+            "autoregressive_polytomy_choosing_weight", 1.0
+        ),
+        autoregressive_stop_after_merge_weight=config["trainer"].get(
+            "autoregressive_stop_after_merge_weight", 0.0
+        ),
+        autoregressive_stop_after_merge_use_at_sampling=config["trainer"].get(
+            "autoregressive_stop_after_merge_use_at_sampling", False
         ),
         autoregressive_rollin_prob=config["trainer"].get(
             "autoregressive_rollin_prob", 0.0
@@ -485,6 +841,42 @@ def run_overfit():
         velocity_event_normalize_by_log_candidates=config["trainer"].get(
             "velocity_event_normalize_by_log_candidates", True
         ),
+        velocity_event_precision_weight=config["trainer"].get(
+            "velocity_event_precision_weight", 0.0
+        ),
+        velocity_event_precision_margin=config["trainer"].get(
+            "velocity_event_precision_margin", 0.0
+        ),
+        velocity_first_hit_head_weight=config["trainer"].get(
+            "velocity_first_hit_head_weight", 0.0
+        ),
+        velocity_first_hit_head_use_at_sampling=config["trainer"].get(
+            "velocity_first_hit_head_use_at_sampling", False
+        ),
+        velocity_first_hit_predictor_mode=config["trainer"].get(
+            "velocity_first_hit_predictor_mode", "base"
+        ),
+        velocity_first_hit_use_geometry_features=config["trainer"].get(
+            "velocity_first_hit_use_geometry_features", False
+        ),
+        velocity_first_hit_geometry_hidden_dim=config["trainer"].get(
+            "velocity_first_hit_geometry_hidden_dim", 32
+        ),
+        velocity_first_hit_edge_length_hidden_dim=config["trainer"].get(
+            "velocity_first_hit_edge_length_hidden_dim", 64
+        ),
+        velocity_boundary_vanish_head_weight=config["trainer"].get(
+            "velocity_boundary_vanish_head_weight", 0.0
+        ),
+        velocity_boundary_vanish_head_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_vanish_head_use_at_sampling", False
+        ),
+        velocity_boundary_vanish_one_step_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_vanish_one_step_use_at_sampling", False
+        ),
+        skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
+            "skip_repeated_no_valid_boundary_use_at_sampling", False
+        ),
         training_sampling_frequency=config["trainer"].get(
             "training_sampling_frequency", 200
         ),
@@ -497,8 +889,59 @@ def run_overfit():
         training_sampling_dt_base=config["trainer"].get(
             "training_sampling_dt_base", 0.02
         ),
+        training_sampling_stop_on_zero_rf=config["trainer"].get(
+            "training_sampling_stop_on_zero_rf", False
+        ),
+        training_sampling_stop_rf_threshold=config["trainer"].get(
+            "training_sampling_stop_rf_threshold"
+        ),
         dt=config["trainer"].get("dt", 0.1),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
+        rollout_replay_velocity_weight=config["trainer"].get(
+            "rollout_replay_velocity_weight", 0.0
+        ),
+        rollout_replay_autoregressive_weight=config["trainer"].get(
+            "rollout_replay_autoregressive_weight", 0.0
+        ),
+        rollout_replay_start_step=config["trainer"].get(
+            "rollout_replay_start_step", 0
+        ),
+        rollout_replay_frequency=config["trainer"].get(
+            "rollout_replay_frequency", 1
+        ),
+        rollout_replay_max_velocity_states=config["trainer"].get(
+            "rollout_replay_max_velocity_states", 0
+        ),
+        rollout_replay_max_autoregressive_states=config["trainer"].get(
+            "rollout_replay_max_autoregressive_states", 0
+        ),
+        rollout_replay_max_steps=config["trainer"].get(
+            "rollout_replay_max_steps", 256
+        ),
+        rollout_replay_anchor_states=config["trainer"].get(
+            "rollout_replay_anchor_states", 4
+        ),
+        rollout_replay_oracle_horizon=config["trainer"].get(
+            "rollout_replay_oracle_horizon", 2
+        ),
+        rollout_replay_mode=config["trainer"].get(
+            "rollout_replay_mode", "anchor_oracle"
+        ),
+        rollout_replay_pairwise_max_group_size=config["trainer"].get(
+            "rollout_replay_pairwise_max_group_size", 0
+        ),
+        rollout_replay_bank_max_polytomy_size=config["trainer"].get(
+            "rollout_replay_bank_max_polytomy_size", -1
+        ),
+        rollout_replay_topology_repeat_cap=config["trainer"].get(
+            "rollout_replay_topology_repeat_cap", 0
+        ),
+        rollout_replay_dump_refreshes=config["trainer"].get(
+            "rollout_replay_dump_refreshes", False
+        ),
+        rollout_replay_dump_dir=config["trainer"].get(
+            "rollout_replay_dump_dir"
+        ),
         verbose=True,  # Enable verbose logging for overfitting
     )
 
@@ -537,6 +980,7 @@ def run_overfit():
         model,
         train_dataloaders=dataset.train_dataloader(),
         val_dataloaders=dataset.val_dataloader(),
+        ckpt_path=resume_ckpt_path,
     )
 
 
@@ -564,6 +1008,17 @@ def main():
     dataset = PhylaDataModule(config, train_ids=train_ids, test_ids=test_ids)
 
     phyla_flow = return_model(config)
+    init_checkpoint_path, resume_ckpt_path = _resolve_checkpoint_paths(
+        config["trainer"]
+    )
+    if init_checkpoint_path:
+        print(f"Initializing model weights from checkpoint: {init_checkpoint_path}")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        phyla_flow = _load_model_init_checkpoint(
+            phyla_flow, init_checkpoint_path, device
+        )
+    if resume_ckpt_path:
+        print(f"Resuming full trainer state from checkpoint: {resume_ckpt_path}")
 
     model = TrainingModule(
         model=phyla_flow,
@@ -577,6 +1032,9 @@ def main():
         deepspeed=False,
         logger=None,
         phyla_checkpoint_path=config["trainer"].get("phyla_checkpoint_path"),
+        phyla_precomputed_embeddings_path=config["trainer"].get(
+            "phyla_precomputed_embeddings_path"
+        ),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -588,14 +1046,29 @@ def main():
         training_step_autoregressive_weight=config["trainer"].get(
             "training_step_autoregressive_weight", 1.0
         ),
+        training_step_gradient_clip_val=config["trainer"].get(
+            "training_step_gradient_clip_val", 1.0
+        ),
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
+        ),
+        training_step_separate_optimizer_steps=config["trainer"].get(
+            "training_step_separate_optimizer_steps", False
         ),
         autoregressive_use_time=config["trainer"].get(
             "autoregressive_use_time", False
         ),
         autoregressive_target_mode=config["trainer"].get(
             "autoregressive_target_mode", "scheduled"
+        ),
+        autoregressive_polytomy_choosing_weight=config["trainer"].get(
+            "autoregressive_polytomy_choosing_weight", 1.0
+        ),
+        autoregressive_stop_after_merge_weight=config["trainer"].get(
+            "autoregressive_stop_after_merge_weight", 0.0
+        ),
+        autoregressive_stop_after_merge_use_at_sampling=config["trainer"].get(
+            "autoregressive_stop_after_merge_use_at_sampling", False
         ),
         autoregressive_rollin_prob=config["trainer"].get(
             "autoregressive_rollin_prob", 0.0
@@ -629,6 +1102,42 @@ def main():
         velocity_event_normalize_by_log_candidates=config["trainer"].get(
             "velocity_event_normalize_by_log_candidates", True
         ),
+        velocity_event_precision_weight=config["trainer"].get(
+            "velocity_event_precision_weight", 0.0
+        ),
+        velocity_event_precision_margin=config["trainer"].get(
+            "velocity_event_precision_margin", 0.0
+        ),
+        velocity_first_hit_head_weight=config["trainer"].get(
+            "velocity_first_hit_head_weight", 0.0
+        ),
+        velocity_first_hit_head_use_at_sampling=config["trainer"].get(
+            "velocity_first_hit_head_use_at_sampling", False
+        ),
+        velocity_first_hit_predictor_mode=config["trainer"].get(
+            "velocity_first_hit_predictor_mode", "base"
+        ),
+        velocity_first_hit_use_geometry_features=config["trainer"].get(
+            "velocity_first_hit_use_geometry_features", False
+        ),
+        velocity_first_hit_geometry_hidden_dim=config["trainer"].get(
+            "velocity_first_hit_geometry_hidden_dim", 32
+        ),
+        velocity_first_hit_edge_length_hidden_dim=config["trainer"].get(
+            "velocity_first_hit_edge_length_hidden_dim", 64
+        ),
+        velocity_boundary_vanish_head_weight=config["trainer"].get(
+            "velocity_boundary_vanish_head_weight", 0.0
+        ),
+        velocity_boundary_vanish_head_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_vanish_head_use_at_sampling", False
+        ),
+        velocity_boundary_vanish_one_step_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_vanish_one_step_use_at_sampling", False
+        ),
+        skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
+            "skip_repeated_no_valid_boundary_use_at_sampling", False
+        ),
         training_sampling_frequency=config["trainer"].get(
             "training_sampling_frequency", 200
         ),
@@ -641,8 +1150,59 @@ def main():
         training_sampling_dt_base=config["trainer"].get(
             "training_sampling_dt_base", 0.02
         ),
+        training_sampling_stop_on_zero_rf=config["trainer"].get(
+            "training_sampling_stop_on_zero_rf", False
+        ),
+        training_sampling_stop_rf_threshold=config["trainer"].get(
+            "training_sampling_stop_rf_threshold"
+        ),
         dt=config["trainer"].get("dt", 0.1),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
+        rollout_replay_velocity_weight=config["trainer"].get(
+            "rollout_replay_velocity_weight", 0.0
+        ),
+        rollout_replay_autoregressive_weight=config["trainer"].get(
+            "rollout_replay_autoregressive_weight", 0.0
+        ),
+        rollout_replay_start_step=config["trainer"].get(
+            "rollout_replay_start_step", 0
+        ),
+        rollout_replay_frequency=config["trainer"].get(
+            "rollout_replay_frequency", 1
+        ),
+        rollout_replay_max_velocity_states=config["trainer"].get(
+            "rollout_replay_max_velocity_states", 0
+        ),
+        rollout_replay_max_autoregressive_states=config["trainer"].get(
+            "rollout_replay_max_autoregressive_states", 0
+        ),
+        rollout_replay_max_steps=config["trainer"].get(
+            "rollout_replay_max_steps", 256
+        ),
+        rollout_replay_anchor_states=config["trainer"].get(
+            "rollout_replay_anchor_states", 4
+        ),
+        rollout_replay_oracle_horizon=config["trainer"].get(
+            "rollout_replay_oracle_horizon", 2
+        ),
+        rollout_replay_mode=config["trainer"].get(
+            "rollout_replay_mode", "anchor_oracle"
+        ),
+        rollout_replay_pairwise_max_group_size=config["trainer"].get(
+            "rollout_replay_pairwise_max_group_size", 0
+        ),
+        rollout_replay_bank_max_polytomy_size=config["trainer"].get(
+            "rollout_replay_bank_max_polytomy_size", -1
+        ),
+        rollout_replay_topology_repeat_cap=config["trainer"].get(
+            "rollout_replay_topology_repeat_cap", 0
+        ),
+        rollout_replay_dump_refreshes=config["trainer"].get(
+            "rollout_replay_dump_refreshes", False
+        ),
+        rollout_replay_dump_dir=config["trainer"].get(
+            "rollout_replay_dump_dir"
+        ),
     )
 
     checkpoint_base = config["trainer"]["checkpoint_dir"]
@@ -676,6 +1236,7 @@ def main():
         model,
         train_dataloaders=dataset.train_dataloader(),
         val_dataloaders=dataset.val_dataloader(),
+        ckpt_path=resume_ckpt_path,
     )
 
 

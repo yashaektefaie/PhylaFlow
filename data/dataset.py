@@ -24,6 +24,7 @@ import pytorch_lightning as pl
 from utils.bhv_utils import (
     return_sampled_tree_orthant_velocity,
     return_sampled_tree_boundary_decisions,
+    return_tree_boundary_merge_paths,
 )
 import random
 from model.treeTokenizer import TreeFeatureTokenizer
@@ -37,6 +38,89 @@ class SizeDetector:
 
     def update_max_aa(self, new_max_aa):
         self.max_aa = new_max_aa
+
+
+def resolve_training_target_tree_for_prefix(
+    start_tree_newick: str,
+    target_tree_newick: str,
+    prefix_k: int,
+) -> str:
+    if int(prefix_k) < 0:
+        return target_tree_newick
+
+    boundary_paths = return_tree_boundary_merge_paths(
+        start_tree_newick,
+        target_tree_newick,
+    )
+    if not boundary_paths:
+        return target_tree_newick
+
+    prefix_idx = min(int(prefix_k), len(boundary_paths) - 1)
+    return boundary_paths[prefix_idx]["end_newick"]
+
+
+def resolve_training_target_tree_for_event_prefix(
+    start_tree_newick: str,
+    target_tree_newick: str,
+    event_prefix_count: int,
+) -> str:
+    event_prefix_count = int(event_prefix_count)
+    if event_prefix_count < 0:
+        return target_tree_newick
+    if event_prefix_count == 0:
+        return start_tree_newick
+
+    boundary_paths = return_tree_boundary_merge_paths(
+        start_tree_newick,
+        target_tree_newick,
+    )
+    if not boundary_paths:
+        return target_tree_newick
+
+    remaining_events = event_prefix_count
+    current_tree = start_tree_newick
+    for path in boundary_paths:
+        events = path["events"]
+        if remaining_events == 0:
+            return current_tree
+        if remaining_events < len(events):
+            return path["events"][remaining_events]["newick"]
+        if remaining_events == len(events):
+            return path["end_newick"]
+        remaining_events -= len(events)
+        current_tree = path["end_newick"]
+
+    return target_tree_newick
+
+
+def _remap_tree_leaf_names_to_match_reference(
+    tree_newick: str,
+    reference_tree_newick: str,
+) -> str:
+    tree = EteTree(tree_newick, format=1)
+    reference_tree = EteTree(reference_tree_newick, format=1)
+
+    tree_leaves = sorted((leaf.name for leaf in tree.get_leaves()), key=lambda x: int(x))
+    reference_leaves = sorted(
+        (leaf.name for leaf in reference_tree.get_leaves()),
+        key=lambda x: int(x),
+    )
+
+    if tree_leaves == reference_leaves:
+        return tree_newick
+
+    if len(tree_leaves) != len(reference_leaves):
+        raise ValueError(
+            "Cannot remap tree leaf names: leaf counts differ between tree and reference."
+        )
+
+    remap = {src: dst for src, dst in zip(tree_leaves, reference_leaves)}
+    for leaf in tree.get_leaves():
+        if leaf.name not in remap:
+            raise ValueError(f"Leaf {leaf.name} missing from remap dictionary.")
+        leaf.name = remap[leaf.name]
+
+    return tree.write(format=1)
 
 
 class TreeDataset(Dataset):
@@ -67,12 +151,42 @@ class TreeDataset(Dataset):
         sanity_check: bool = False,
         random_sanity_check: bool = False,
         overfit_velocity_zero: bool = False,
+        overfit_velocity_event_states: bool = False,
+        overfit_velocity_orthant_start_states: bool = False,
+        overfit_velocity_explicit_boundary_end_states: bool = False,
+        overfit_velocity_fixed_timepoints: Optional[List[float]] = None,
+        overfit_boundary_prefix_k: int = -1,
+        overfit_start_boundary_prefix_k: int = -1,
+        overfit_event_prefix_count: int = -1,
+        overfit_event_horizon: int = 1,
+        overfit_fixed_pair: bool = False,
+        overfit_split_multi_subset_events: bool = False,
     ) -> None:
         self.nexus_root = nexus_root
         self.mrbayes_root = mrbayes_root
         self.filter_ids = filter_ids
         self.validation = validation
         self.overfit_velocity_zero = overfit_velocity_zero
+        self.overfit_velocity_event_states = bool(overfit_velocity_event_states)
+        self.overfit_velocity_orthant_start_states = bool(
+            overfit_velocity_orthant_start_states
+        )
+        self.overfit_velocity_explicit_boundary_end_states = bool(
+            overfit_velocity_explicit_boundary_end_states
+        )
+        self.overfit_velocity_fixed_timepoints = (
+            [float(t) for t in overfit_velocity_fixed_timepoints]
+            if overfit_velocity_fixed_timepoints
+            else None
+        )
+        self.overfit_boundary_prefix_k = int(overfit_boundary_prefix_k)
+        self.overfit_start_boundary_prefix_k = int(overfit_start_boundary_prefix_k)
+        self.overfit_event_prefix_count = int(overfit_event_prefix_count)
+        self.overfit_event_horizon = max(1, int(overfit_event_horizon))
+        self.overfit_fixed_pair = bool(overfit_fixed_pair)
+        self.overfit_split_multi_subset_events = bool(
+            overfit_split_multi_subset_events
+        )
         self.size_detector = SizeDetector()
         # State tracker for adaptive batching (index, subtree_size, num_subtrees)
         # Default initialization
@@ -83,6 +197,7 @@ class TreeDataset(Dataset):
         self._ids: List[str] = []  # populated by build_index()
         self._index: List[Dict[str, Any]] = []  # list of sample metadata dicts
         self._id_to_idx: Dict[str, int] = {}
+        self._cached_overfit_pairs: Dict[int, Dict[str, Any]] = {}
         self.random_tree = None
         self.sanity_check = sanity_check
         self.random_sanity_check = random_sanity_check
@@ -92,6 +207,73 @@ class TreeDataset(Dataset):
 
         # Build index immediately; optionally preload
         self.build_index()
+
+    def resolve_training_target_tree(
+        self,
+        start_tree_newick: str,
+        target_tree_newick: str,
+        base_start_tree_newick: Optional[str] = None,
+    ) -> str:
+        resolved_target_tree = target_tree_newick
+        if (
+            self.overfit_start_boundary_prefix_k >= 0
+            and self.overfit_boundary_prefix_k >= 0
+            and (self.sanity_check or self.random_sanity_check)
+        ):
+            if base_start_tree_newick is None:
+                original_prefix = self.overfit_start_boundary_prefix_k
+                self.overfit_start_boundary_prefix_k = -1
+                try:
+                    base_start_tree = self.sample_random_tree(target_tree_newick)
+                finally:
+                    self.overfit_start_boundary_prefix_k = original_prefix
+            else:
+                base_start_tree = base_start_tree_newick
+            resolved_target_tree = resolve_training_target_tree_for_prefix(
+                base_start_tree,
+                target_tree_newick,
+                self.overfit_boundary_prefix_k,
+            )
+        else:
+            resolved_target_tree = resolve_training_target_tree_for_prefix(
+                start_tree_newick,
+                target_tree_newick,
+                self.overfit_boundary_prefix_k,
+            )
+
+        resolved_target_tree = resolve_training_target_tree_for_event_prefix(
+            start_tree_newick,
+            resolved_target_tree,
+            self.overfit_event_prefix_count,
+        )
+        return _remap_tree_leaf_names_to_match_reference(
+            resolved_target_tree,
+            start_tree_newick,
+        )
+
+    def sample_random_tree_with_base(
+        self,
+        real_tree,
+        subtree_size: Optional[int] = None,
+    ) -> Tuple[str, str]:
+        if self.overfit_start_boundary_prefix_k < 0:
+            start_tree = self.sample_random_tree(real_tree, subtree_size=subtree_size)
+            return start_tree, start_tree
+
+        original_prefix = self.overfit_start_boundary_prefix_k
+        self.overfit_start_boundary_prefix_k = -1
+        try:
+            base_random_tree = self.sample_random_tree(real_tree, subtree_size=subtree_size)
+        finally:
+            self.overfit_start_boundary_prefix_k = original_prefix
+
+        target_tree_newick = real_tree if isinstance(real_tree, str) else real_tree.write(format=1)
+        start_tree = resolve_training_target_tree_for_prefix(
+            base_random_tree,
+            target_tree_newick,
+            original_prefix,
+        )
+        return base_random_tree, start_tree
 
     def __len__(self) -> int:  # Required for torch Dataset
         return len(self._ids)
@@ -182,6 +364,8 @@ class TreeDataset(Dataset):
             # Update leaves for size tracking
             leaves = t.get_leaves()
 
+        real_tree_original_label_newick = t.write(format=1)
+
         current_size = len(leaves)
         self.chosen_tree = (index, current_size, 1)  # (index, size, num_subtrees)
 
@@ -217,91 +401,241 @@ class TreeDataset(Dataset):
         # Re-parse purely to ensure we are passing consistent objects
         # (Though prune modifies in-place, let's keep it safe)
         t_pruned = EteTree(real_tree_newick, format=1)
-        random_tree = self.sample_random_tree(t_pruned)
-        t_random = EteTree(random_tree, format=1)
+        def _remap_random_tree_to_dataset_indexing(random_tree_newick: str) -> str:
+            t_random = EteTree(random_tree_newick, format=1)
 
-        #Now remap the random tree to make the indices match up with the real tree
-        if self.sanity_check:
-            for leaf in t_random.get_leaves():
-                name = leaf.name
-                # direct match (most likely)
-                if name in seq_ordering_map:
-                    leaf.name = seq_ordering_map[name]
-                else:
-                    import pdb; pdb.set_trace()
-                    raise Exception("Leaf name in random tree not found in original names map!")
-            random_tree = t_random.write(format=1)
-        else:
-            for leaf in t_random.get_leaves():
-                name = str(int(leaf.name))
-                # direct match (most likely)
-                if name in seq_ordering_map:
-                    leaf.name = seq_ordering_map[name]
-                else:
-                    import pdb; pdb.set_trace()
-                    raise Exception("Leaf name in random tree not found in original names map!")
-            random_tree = t_random.write(format=1)
-        
-        # from utils.metric_utils import calculate_norm_rf
-        # print("Normalized RF distance between real and random tree:", calculate_norm_rf(real_tree_newick, random_tree))
-        # import pdb; pdb.set_trace()
-        #### DEBUG CHANGE LATER MADE ONE TIMEPOINT ####
-        if self.overfit_velocity_zero:
-            timepoint = 0.0
-        else:
-            timepoint = random.uniform(0, 1)
-        # timepoint = 0
-        # timepoint = 0.5
+            # Now remap the random tree to make the indices match up with the real tree.
+            if self.sanity_check:
+                for leaf in t_random.get_leaves():
+                    name = leaf.name
+                    if name in seq_ordering_map:
+                        leaf.name = seq_ordering_map[name]
+                    else:
+                        raise Exception(
+                            "Leaf name in random tree not found in original names map!"
+                        )
+            else:
+                for leaf in t_random.get_leaves():
+                    name = str(int(leaf.name))
+                    if name in seq_ordering_map:
+                        leaf.name = seq_ordering_map[name]
+                    else:
+                        raise Exception(
+                            "Leaf name in random tree not found in original names map!"
+                        )
+            return t_random.write(format=1)
 
-        # Both trees now use "0".."N-1" names, so bhv utils will work happily
-        newick, velocity = return_sampled_tree_orthant_velocity(
-            random_tree, real_tree_newick, timepoint
-        )
+        sample_source_tree = t_pruned
+        if self.overfit_start_boundary_prefix_k >= 0 and (
+            self.sanity_check or self.random_sanity_check
+        ):
+            # Keep start/target prefix resolution in the original leaf-name space,
+            # then remap both together into dataset indexing.
+            sample_source_tree = real_tree_original_label_newick
 
-        final_labels = return_sampled_tree_boundary_decisions(
-            random_tree, real_tree_newick
-        )
+        def _build_pair() -> Dict[str, Any]:
+            base_random_tree_raw, random_tree_raw = self.sample_random_tree_with_base(
+                sample_source_tree
+            )
+            base_random_tree = _remap_random_tree_to_dataset_indexing(
+                base_random_tree_raw
+            )
+            random_tree = _remap_random_tree_to_dataset_indexing(random_tree_raw)
 
-        
-        # If final_labels is empty, resample random tree until we get valid labels
-        while not final_labels:
-            random_tree = self.sample_random_tree(t_pruned)
-            newick, velocity = return_sampled_tree_orthant_velocity(
-                random_tree, real_tree_newick, timepoint
+            # Both trees now use "0".."N-1" names, so bhv utils will work happily
+            effective_target_tree = self.resolve_training_target_tree(
+                random_tree,
+                real_tree_newick,
+                base_start_tree_newick=base_random_tree,
+            )
+            boundary_paths = return_tree_boundary_merge_paths(
+                random_tree, effective_target_tree
             )
             final_labels = return_sampled_tree_boundary_decisions(
-                random_tree, real_tree_newick
+                random_tree,
+                effective_target_tree,
+                split_multi_label_events=self.overfit_split_multi_subset_events,
             )
 
-        random_index = random.randrange(len(final_labels))
-        chosen_autoregressive_event = final_labels[random_index]
+            # If final_labels is empty, resample random tree until we get valid labels
+            while not final_labels:
+                base_random_tree_raw, random_tree_raw = self.sample_random_tree_with_base(
+                    sample_source_tree
+                )
+                base_random_tree = _remap_random_tree_to_dataset_indexing(
+                    base_random_tree_raw
+                )
+                random_tree = _remap_random_tree_to_dataset_indexing(random_tree_raw)
+                effective_target_tree = self.resolve_training_target_tree(
+                    random_tree,
+                    real_tree_newick,
+                    base_start_tree_newick=base_random_tree,
+                )
+                boundary_paths = return_tree_boundary_merge_paths(
+                    random_tree, effective_target_tree
+                )
+                final_labels = return_sampled_tree_boundary_decisions(
+                    random_tree,
+                    effective_target_tree,
+                    split_multi_label_events=self.overfit_split_multi_subset_events,
+                )
 
-        autoregressive_time = (
-            0.0
-            if len(final_labels) <= 1
-            else random_index / float(len(final_labels) - 1)
-        )
+            return {
+                "base_random_tree": base_random_tree,
+                "random_tree": random_tree,
+                "effective_target_tree": effective_target_tree,
+                "boundary_paths": boundary_paths,
+                "final_labels": final_labels,
+            }
+
+        if self.overfit_fixed_pair:
+            pair = self._cached_overfit_pairs.get(index)
+            if pair is None:
+                random_state = random.getstate()
+                try:
+                    random.seed(13)
+                    pair = _build_pair()
+                finally:
+                    random.setstate(random_state)
+                self._cached_overfit_pairs[index] = pair
+        else:
+            pair = _build_pair()
+
+        base_random_tree = pair["base_random_tree"]
+        random_tree = pair["random_tree"]
+        effective_target_tree = pair["effective_target_tree"]
+        boundary_paths = pair["boundary_paths"]
+        final_labels = pair["final_labels"]
+
+        horizon = min(self.overfit_event_horizon, len(final_labels))
+        max_start_index = max(0, len(final_labels) - horizon)
+        random_index = random.randint(0, max_start_index)
+
+        def _build_step_sample(event_index: int) -> Dict[str, Any]:
+            chosen_autoregressive_event = final_labels[event_index]
+            autoregressive_time = (
+                0.0
+                if len(final_labels) <= 1
+                else event_index / float(len(final_labels) - 1)
+            )
+            velocity_next_boundary_tree = None
+            if self.overfit_velocity_explicit_boundary_end_states:
+                explicit_velocity_trees = [random_tree]
+                explicit_velocity_trees.extend(
+                    path["end_newick"] for path in boundary_paths[:-1]
+                )
+                if self.overfit_velocity_fixed_timepoints:
+                    explicit_velocity_timepoints = list(
+                        self.overfit_velocity_fixed_timepoints
+                    )
+                else:
+                    explicit_velocity_timepoints = [0.0]
+                    explicit_velocity_timepoints.extend(
+                        float(path["global_time"]) for path in boundary_paths[:-1]
+                    )
+                if len(explicit_velocity_trees) != len(explicit_velocity_timepoints):
+                    raise ValueError(
+                        "Explicit boundary-end velocity supervision requires one "
+                        "global timepoint per orthant-start state. "
+                        f"Got {len(explicit_velocity_timepoints)} "
+                        f"timepoints for {len(explicit_velocity_trees)} states."
+                    )
+
+                explicit_velocity_options = list(
+                    zip(
+                        explicit_velocity_trees,
+                        [path["start_newick"] for path in boundary_paths],
+                        explicit_velocity_timepoints,
+                    )
+                )
+                (
+                    velocity_source_tree,
+                    velocity_next_boundary_tree,
+                    model_timepoint,
+                ) = random.choice(
+                    explicit_velocity_options
+                )
+                newick, velocity = return_sampled_tree_orthant_velocity(
+                    velocity_source_tree,
+                    effective_target_tree,
+                    0.0,
+                )
+                timepoint = float(model_timepoint)
+            elif self.overfit_velocity_orthant_start_states:
+                orthant_start_trees = [random_tree]
+                orthant_start_trees.extend(
+                    path["end_newick"] for path in boundary_paths[:-1]
+                )
+                (
+                    velocity_source_tree,
+                    velocity_next_boundary_tree,
+                ) = random.choice(
+                    list(zip(orthant_start_trees, [path["start_newick"] for path in boundary_paths]))
+                )
+                timepoint = 0.0
+                newick, velocity = return_sampled_tree_orthant_velocity(
+                    velocity_source_tree, effective_target_tree, timepoint
+                )
+            elif self.overfit_velocity_event_states:
+                velocity_source_tree = chosen_autoregressive_event["newick"]
+                timepoint = 0.0
+                newick, velocity = return_sampled_tree_orthant_velocity(
+                    velocity_source_tree, effective_target_tree, timepoint
+                )
+            else:
+                velocity_source_tree = random_tree
+                if self.overfit_velocity_fixed_timepoints is not None:
+                    timepoint = float(random.choice(self.overfit_velocity_fixed_timepoints))
+                elif self.overfit_velocity_zero:
+                    timepoint = 0.0
+                else:
+                    timepoint = random.uniform(0, 1)
+                newick, velocity = return_sampled_tree_orthant_velocity(
+                    velocity_source_tree, effective_target_tree, timepoint
+                )
+
+            return {
+                "id": meta["id"],
+                "nexus_path": meta["nexus_path"],
+                "tree_paths": meta["tree_paths"],
+                "sequences": new_seqs,
+                "taxa_order": list(new_seqs.keys()),
+                "newick_tree": newick,
+                "target_tree": effective_target_tree,
+                "velocity": velocity,
+                "velocity_next_boundary_tree": velocity_next_boundary_tree,
+                "timepoint": timepoint,
+                "autoregressive_newick": chosen_autoregressive_event["newick"],
+                "autoregressive_labels": chosen_autoregressive_event["labels"],
+                "autoregressive_stop_after_merge": bool(
+                    chosen_autoregressive_event.get("stop_after_merge", False)
+                ),
+                "autoregressive_event_index": int(event_index),
+                "autoregressive_newick_time": autoregressive_time,
+                "num_to_name": original_names_map,
+                "seq_ordering_map": seq_ordering_map,
+            }
+
+        step_samples = [
+            _build_step_sample(event_index)
+            for event_index in range(random_index, random_index + horizon)
+        ]
 
         num_to_name = self.return_nexus_number_to_name(index)
-        sample = {
-            "id": meta["id"],
-            "nexus_path": meta["nexus_path"],
-            "tree_paths": meta["tree_paths"],  # list of .t files, may be 1
-            # Placeholders for parsed content:
-            "sequences": new_seqs,
-            "taxa_order": list(new_seqs.keys()),  # e.g. ["0", "1", ...]
-            "newick_tree": newick,
-            "target_tree": real_tree_newick,
-            "velocity": velocity,
-            "timepoint": timepoint,
-            "autoregressive_newick": chosen_autoregressive_event["newick"],
-            "autoregressive_labels": chosen_autoregressive_event["labels"],
-            "autoregressive_newick_time": autoregressive_time,
-            "num_to_name": original_names_map,
-            "seq_ordering_map": seq_ordering_map,
-        }
+        sample = dict(step_samples[0])
+        sample["num_to_name"] = original_names_map
+        sample["seq_ordering_map"] = seq_ordering_map
+        if len(step_samples) > 1:
+            sample["multi_step_samples"] = step_samples
 
         return sample
+
+    def get_overfit_fixed_pair(self, index: int) -> Optional[Dict[str, Any]]:
+        if not self.overfit_fixed_pair:
+            return None
+        if index not in self._cached_overfit_pairs:
+            _ = self[index]
+        return self._cached_overfit_pairs.get(index)
 
     def parse_translate_block(self, path: str) -> Dict[str, str]:
         """Extract 'translate' block from a Nexus/MrBayes file to map IDs to Taxon names."""
@@ -359,6 +693,20 @@ class TreeDataset(Dataset):
         real_tree: Newick string or an ETE Tree.
         Returns: Newick string for a random tree with the same leaf names.
         """
+        if self.overfit_start_boundary_prefix_k >= 0:
+            original_prefix = self.overfit_start_boundary_prefix_k
+            self.overfit_start_boundary_prefix_k = -1
+            try:
+                base_random_tree = self.sample_random_tree(real_tree, subtree_size=subtree_size)
+            finally:
+                self.overfit_start_boundary_prefix_k = original_prefix
+            target_tree_newick = real_tree if isinstance(real_tree, str) else real_tree.write(format=1)
+            return resolve_training_target_tree_for_prefix(
+                base_random_tree,
+                target_tree_newick,
+                original_prefix,
+            )
+
         ###DEBUG PURPOSES ONLY RETURN THE SAME TREE###
         # if self.random_tree is not None:
         #     return self.random_tree
@@ -620,11 +968,47 @@ class PhylaDataModule(pl.LightningDataModule):
 
         self.dataset_train = TreeDataset(
             self.nexus_dir, self.mrbayes_dir, filter_ids=self.train_ids, sanity_check=config["data"].get("sanity_check", False), random_sanity_check=config["data"].get("random_sanity_check", False),
-            overfit_velocity_zero=config["data"].get("overfit_velocity_zero", False)
+            overfit_velocity_zero=config["data"].get("overfit_velocity_zero", False),
+            overfit_velocity_event_states=config["data"].get("overfit_velocity_event_states", False),
+            overfit_velocity_orthant_start_states=config["data"].get(
+                "overfit_velocity_orthant_start_states", False
+            ),
+            overfit_velocity_explicit_boundary_end_states=config["data"].get(
+                "overfit_velocity_explicit_boundary_end_states", False
+            ),
+            overfit_velocity_fixed_timepoints=config["data"].get(
+                "overfit_velocity_fixed_timepoints"
+            ),
+            overfit_boundary_prefix_k=config["data"].get("overfit_boundary_prefix_k", -1),
+            overfit_start_boundary_prefix_k=config["data"].get("overfit_start_boundary_prefix_k", -1),
+            overfit_event_prefix_count=config["data"].get("overfit_event_prefix_count", -1),
+            overfit_event_horizon=config["data"].get("overfit_event_horizon", 1),
+            overfit_fixed_pair=config["data"].get("overfit_fixed_pair", False),
+            overfit_split_multi_subset_events=config["data"].get(
+                "overfit_split_multi_subset_events", False
+            ),
         )
         self.dataset_val = TreeDataset(
             self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, validation=True, sanity_check=config["data"].get("sanity_check", False), random_sanity_check=config["data"].get("random_sanity_check", False),
-            overfit_velocity_zero=config["data"].get("overfit_velocity_zero", False)
+            overfit_velocity_zero=config["data"].get("overfit_velocity_zero", False),
+            overfit_velocity_event_states=config["data"].get("overfit_velocity_event_states", False),
+            overfit_velocity_orthant_start_states=config["data"].get(
+                "overfit_velocity_orthant_start_states", False
+            ),
+            overfit_velocity_explicit_boundary_end_states=config["data"].get(
+                "overfit_velocity_explicit_boundary_end_states", False
+            ),
+            overfit_velocity_fixed_timepoints=config["data"].get(
+                "overfit_velocity_fixed_timepoints"
+            ),
+            overfit_boundary_prefix_k=config["data"].get("overfit_boundary_prefix_k", -1),
+            overfit_start_boundary_prefix_k=config["data"].get("overfit_start_boundary_prefix_k", -1),
+            overfit_event_prefix_count=config["data"].get("overfit_event_prefix_count", -1),
+            overfit_event_horizon=config["data"].get("overfit_event_horizon", 1),
+            overfit_fixed_pair=config["data"].get("overfit_fixed_pair", False),
+            overfit_split_multi_subset_events=config["data"].get(
+                "overfit_split_multi_subset_events", False
+            ),
         )
         self.tree_tokenizer = TreeFeatureTokenizer(
             config["model"]["num_node_types"],
@@ -697,6 +1081,17 @@ class PhylaDataModule(pl.LightningDataModule):
 
     def collate_fn(self, batch, preset_subtree_num=None):
         """Custom collate function if needed."""
+        flat_batch = []
+        for item in batch:
+            if item is None:
+                continue
+            multi_step_samples = item.get("multi_step_samples")
+            if multi_step_samples:
+                flat_batch.extend(multi_step_samples)
+            else:
+                flat_batch.append(item)
+        batch = flat_batch
+
         if "posterior_trees" in batch[0]:
             ids = [item["id"] for item in batch]
             posterior_trees = [item["posterior_trees"] for item in batch]
@@ -756,10 +1151,20 @@ class PhylaDataModule(pl.LightningDataModule):
             "original_trees": [item["newick_tree"] for item in batch],
             "target_trees": [item["target_tree"] for item in batch],
             "batched_velocity": [item["velocity"] for item in batch],
+            "velocity_next_boundary_trees": [
+                item.get("velocity_next_boundary_tree") for item in batch
+            ],
             "batched_autoregressive_time": batched_autoregressive_time,
             "batched_autoregressive_labels": [
                 item["autoregressive_labels"] for item in batch
             ],
+            "batched_autoregressive_stop_after_merge": torch.tensor(
+                [
+                    1.0 if item.get("autoregressive_stop_after_merge", False) else 0.0
+                    for item in batch
+                ],
+                dtype=torch.float32,
+            ),
             "batched_time": torch.tensor(
                 [item["timepoint"] for item in batch], dtype=torch.float32
             ),

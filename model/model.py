@@ -63,6 +63,162 @@ class PairwiseMergeHead(nn.Module):
         return logits
 
 
+class StructuredSubsetMergeHead(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        hidden: int = 256,
+        dropout: float = 0.1,
+        max_subset_size: int = 64,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.max_subset_size = int(max_subset_size)
+        pair_in_dim = 4 * d_model
+        self.pair_mlp = nn.Sequential(
+            nn.Linear(pair_in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.pair_logit = nn.Linear(hidden, 1)
+        self.pair_context_proj = nn.Sequential(
+            nn.Linear(hidden + d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        member_in_dim = 4 * d_model
+        self.member_mlp = nn.Sequential(
+            nn.Linear(member_in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        self.subset_size_head = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, self.max_subset_size + 1),
+        )
+        self.stop_after_merge_head = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, H: torch.Tensor) -> dict:
+        """
+        H: [G, D]
+        Returns:
+          starter_pair_logits: [P]
+          starter_pair_indices: list[(i, j)] for unordered pairs
+          member_logits: [P, G] logits for including each component in the subset
+          logits: [G, G] symmetric starter-pair score matrix for compatibility
+        """
+        H = self.norm(H)
+        G, D = H.shape
+        if G <= 1:
+            empty_logits = H.new_empty((0,))
+            return {
+                "starter_pair_logits": empty_logits,
+                "starter_pair_indices": [],
+                "member_logits": H.new_empty((0, G)),
+                "logits": H.new_full((G, G), float("-inf")),
+                "subset_size_logits": H.new_full(
+                    (self.max_subset_size + 1,),
+                    float("-inf"),
+                ),
+                "stop_after_merge_logit": H.new_zeros(()),
+            }
+
+        pair_indices = torch.triu_indices(G, G, offset=1, device=H.device)
+        left_idx, right_idx = pair_indices[0], pair_indices[1]
+        hi = H[left_idx]
+        hj = H[right_idx]
+        pair_feats = torch.cat([hi, hj, (hi - hj).abs(), hi * hj], dim=-1)
+        pair_hidden = self.pair_mlp(pair_feats)
+        starter_pair_logits = self.pair_logit(pair_hidden).squeeze(-1)
+
+        pair_summary = 0.5 * (hi + hj)
+        pair_context = self.pair_context_proj(
+            torch.cat([pair_hidden, pair_summary], dim=-1)
+        )
+
+        node_expand = H.unsqueeze(0).expand(pair_context.size(0), G, D)
+        pair_expand = pair_context.unsqueeze(1).expand(pair_context.size(0), G, D)
+        member_feats = torch.cat(
+            [
+                node_expand,
+                pair_expand,
+                (node_expand - pair_expand).abs(),
+                node_expand * pair_expand,
+            ],
+            dim=-1,
+        )
+        member_logits = self.member_mlp(member_feats).squeeze(-1)
+
+        pair_matrix = H.new_full((G, G), float("-inf"))
+        pair_matrix[left_idx, right_idx] = starter_pair_logits
+        pair_matrix[right_idx, left_idx] = starter_pair_logits
+
+        return {
+            "starter_pair_logits": starter_pair_logits,
+            "starter_pair_indices": [
+                (int(i.item()), int(j.item()))
+                for i, j in zip(left_idx, right_idx)
+            ],
+            "member_logits": member_logits,
+            "logits": pair_matrix,
+            "subset_size_logits": self.subset_size_head(H.mean(dim=0)),
+            "stop_after_merge_logit": self.stop_after_merge_head(H.mean(dim=0)).squeeze(-1),
+        }
+
+
+class AutoregressiveGroupRefinementBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        ffn_mult: int = 4,
+        n_layers: int = 12,
+    ):
+        super().__init__()
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.attn = MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            n_layers=n_layers,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_mult * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_mult * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        self.apply(lambda m: init_params(m, n_layers))
+
+    def forward(self, H: torch.Tensor) -> torch.Tensor:
+        if H.size(0) <= 1:
+            return H
+
+        attn_input = self.attn_norm(H).unsqueeze(0)
+        attn_output, _ = self.attn(attn_input)
+        H = H + self.attn_dropout(attn_output.squeeze(0))
+        H = H + self.ffn(self.ffn_norm(H))
+        return H
+
+
 class TreeGraphEncoderLayer(nn.Module):
     def __init__(
         self,
@@ -166,6 +322,13 @@ class TreeDenoiserTokenGT(nn.Module):
         tokenizer_lap_dropout=0.2,  # TreeFeatureTokenizer
         tokenizer_n_layers=6,  # TreeFeatureTokenizer
         phyla_dim=256,
+        phyla_use_leaf_tokens=True,
+        phyla_use_split_tokens=True,
+        phyla_leaf_scale=1.0,
+        phyla_split_scale=1.0,
+        autoregressive_head_mode="pairwise_threshold",
+        autoregressive_group_refinement_layers=0,
+        autoregressive_max_subset_size=64,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -189,6 +352,15 @@ class TreeDenoiserTokenGT(nn.Module):
 
         # Phyla projection
         self.phyla_proj = nn.Linear(phyla_dim, embed_dim)
+        self.phyla_split_proj = nn.Sequential(
+            nn.Linear(2 * phyla_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.phyla_use_leaf_tokens = bool(phyla_use_leaf_tokens)
+        self.phyla_use_split_tokens = bool(phyla_use_split_tokens)
+        self.phyla_leaf_scale = float(phyla_leaf_scale)
+        self.phyla_split_scale = float(phyla_split_scale)
 
         # Time projection
         self.time_embed_dim = embed_dim * 4
@@ -232,6 +404,20 @@ class TreeDenoiserTokenGT(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(embed_dim, output_dim), # Final layer is LINEAR
         )
+        self.first_hit_edge_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, 1),
+        )
+        self.boundary_vanish_edge_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, 1),
+        )
         #This used to be 0.2
         self.edge_output_scale = 2
         self.max_split_bits = 256
@@ -249,9 +435,40 @@ class TreeDenoiserTokenGT(nn.Module):
         self.split_identity_scale = 0.75
         self.split_output_scale = 0.5
         self.dropout = nn.Dropout(dropout)
-        self.pairwise_head = PairwiseMergeHead(
-            d_model=embed_dim, hidden=embed_dim, dropout=dropout
+        self.autoregressive_head_mode = str(autoregressive_head_mode)
+        self.autoregressive_group_refinement_layers = int(
+            autoregressive_group_refinement_layers
         )
+        self.autoregressive_max_subset_size = int(autoregressive_max_subset_size)
+        self.autoregressive_group_refinement = nn.ModuleList(
+            [
+                AutoregressiveGroupRefinementBlock(
+                    d_model=embed_dim,
+                    num_heads=n_heads,
+                    dropout=dropout,
+                    ffn_mult=4,
+                    n_layers=n_layers,
+                )
+                for _ in range(self.autoregressive_group_refinement_layers)
+            ]
+        )
+        if self.autoregressive_head_mode == "pairwise_threshold":
+            self.pairwise_head = PairwiseMergeHead(
+                d_model=embed_dim, hidden=embed_dim, dropout=dropout
+            )
+            self.structured_subset_head = None
+        elif self.autoregressive_head_mode == "structured_subset":
+            self.pairwise_head = None
+            self.structured_subset_head = StructuredSubsetMergeHead(
+                d_model=embed_dim,
+                hidden=embed_dim,
+                dropout=dropout,
+                max_subset_size=self.autoregressive_max_subset_size,
+            )
+        else:
+            raise ValueError(
+                f"Unknown autoregressive_head_mode={self.autoregressive_head_mode!r}"
+            )
         self.group_head = nn.Linear(embed_dim, 1)
 
         self.apply(lambda m: init_params(m, n_layers))
@@ -308,6 +525,122 @@ class TreeDenoiserTokenGT(nn.Module):
 
         return self.split_mask_proj(binary_masks)
 
+    def _normalize_phyla_embeddings(self, phyla_embeddings, batch_size):
+        if phyla_embeddings is None:
+            return None
+        if isinstance(phyla_embeddings, list):
+            max_len = max(emb.shape[0] for emb in phyla_embeddings)
+            padded_embeddings = []
+            for emb in phyla_embeddings:
+                if emb.shape[0] < max_len:
+                    padding = torch.zeros(
+                        max_len - emb.shape[0],
+                        emb.shape[1],
+                        device=emb.device,
+                        dtype=emb.dtype,
+                    )
+                    emb = torch.cat([emb, padding], dim=0)
+                padded_embeddings.append(emb)
+            phyla_embeddings = torch.stack(padded_embeddings, dim=0)
+        elif phyla_embeddings.dim() == 2:
+            phyla_embeddings = phyla_embeddings.unsqueeze(0)
+
+        if phyla_embeddings.size(0) == 1 and batch_size > 1:
+            phyla_embeddings = phyla_embeddings.expand(batch_size, -1, -1)
+        if phyla_embeddings.size(0) != batch_size:
+            raise ValueError(
+                f"phyla_embeddings batch mismatch: got {phyla_embeddings.size(0)} expected {batch_size}"
+            )
+        return phyla_embeddings
+
+    def _compute_leaf_phyla_token_additions(
+        self,
+        phyla_proj_full,
+        leaf_idx_list,
+        num_tokens,
+        device,
+        dtype,
+    ):
+        additions = torch.zeros(
+            phyla_proj_full.size(0),
+            num_tokens,
+            self.embed_dim,
+            device=device,
+            dtype=dtype,
+        )
+        for b, leaf_indices in enumerate(leaf_idx_list):
+            if leaf_indices.numel() == 0:
+                continue
+            leaf_count = leaf_indices.numel()
+            if phyla_proj_full.size(1) < leaf_count:
+                raise ValueError(
+                    f"Need {leaf_count} phyla embeddings, got {phyla_proj_full.size(1)}"
+                )
+            additions[b, leaf_indices] = phyla_proj_full[b, :leaf_count].to(dtype)
+        return additions
+
+    def _compute_split_phyla_token_additions(
+        self,
+        phyla_embeddings,
+        leaf_idx_list,
+        edge_mask,
+        edge_split_masks,
+        num_tokens,
+        device,
+        dtype,
+    ):
+        additions = torch.zeros(
+            phyla_embeddings.size(0),
+            num_tokens,
+            self.embed_dim,
+            device=device,
+            dtype=dtype,
+        )
+        zero_raw = torch.zeros(
+            phyla_embeddings.size(-1), device=device, dtype=phyla_embeddings.dtype
+        )
+
+        for b, leaf_indices in enumerate(leaf_idx_list):
+            if leaf_indices.numel() == 0:
+                continue
+
+            leaf_count = leaf_indices.numel()
+            if phyla_embeddings.size(1) < leaf_count:
+                raise ValueError(
+                    f"Need {leaf_count} phyla embeddings, got {phyla_embeddings.size(1)}"
+                )
+
+            raw_leaf_embeddings = phyla_embeddings[b, :leaf_count]
+            leaf_bits = [int(idx.item()) for idx in leaf_indices]
+            edge_positions = torch.nonzero(edge_mask[b], as_tuple=True)[0]
+            split_masks_b = edge_split_masks[b]
+            edge_count = min(edge_positions.numel(), len(split_masks_b))
+
+            for edge_idx in range(edge_count):
+                split_mask = int(split_masks_b[edge_idx])
+                if split_mask == 0:
+                    continue
+                select = torch.tensor(
+                    [bool((split_mask >> bit) & 1) for bit in leaf_bits],
+                    device=device,
+                    dtype=torch.bool,
+                )
+                inside = (
+                    raw_leaf_embeddings[select].mean(dim=0)
+                    if select.any()
+                    else zero_raw
+                )
+                outside = (
+                    raw_leaf_embeddings[~select].mean(dim=0)
+                    if (~select).any()
+                    else zero_raw
+                )
+                split_feature = torch.cat([inside, outside], dim=0)
+                additions[b, edge_positions[edge_idx]] = self.phyla_split_proj(
+                    split_feature
+                ).to(dtype)
+        return additions
+
     def forward(
         self,
         tokenized_tree_batch,
@@ -316,6 +649,9 @@ class TreeDenoiserTokenGT(nn.Module):
         return_all_tokens=True,
         return_leafs_only=False,
         return_edges_only=False,
+        return_edge_features=False,
+        return_first_hit_logits=False,
+        return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
     ):
@@ -345,80 +681,37 @@ class TreeDenoiserTokenGT(nn.Module):
         x = padded_feature
         B, T_raw, D = x.shape
 
-        # Add phyla embedding to leaf nodes only
+        phyla_embeddings = self._normalize_phyla_embeddings(phyla_embeddings, B)
         if phyla_embeddings is not None:
-            # Handle list of embeddings with different shapes
-            if isinstance(phyla_embeddings, list):
-                # Find max length across all embeddings in the list
-                max_len = max(emb.shape[0] for emb in phyla_embeddings)
-
-                padded_embeddings = []
-
-                for emb in phyla_embeddings:
-                    # Pad each embedding to max_len
-                    if emb.shape[0] < max_len:
-                        padding = torch.zeros(
-                            max_len - emb.shape[0],
-                            emb.shape[1],
-                            device=emb.device,
-                            dtype=emb.dtype,
-                        )
-                        padded_emb = torch.cat([emb, padding], dim=0)
-                    else:
-                        padded_emb = emb
-                    padded_embeddings.append(padded_emb)
-
-                # Stack into tensor (B, max_len, embed_dim)
-                phyla_embeddings = torch.stack(padded_embeddings, dim=0)
-            # Expected shapes:
-            #   phyla_embedding: (B, N_leaves_max, phyla_dim) OR (1, N_leaves, phyla_dim)
-            elif phyla_embeddings.dim() == 2:  # (N,D) -> treat as (1,N,D) and broadcast
-                phyla_embeddings = phyla_embeddings.unsqueeze(0)
-
-            if phyla_embeddings.size(0) == 1 and B > 1:
-                # Broadcast same embedding set across batch
-                phyla_embeddings = phyla_embeddings.expand(B, -1, -1)
-                if phyla_embeddings.size(0) != B:
-                    raise ValueError(
-                        f"phyla_embeddings batch mismatch: got {phyla_embeddings.size(0)} expected {B}"
+            if self.phyla_use_leaf_tokens:
+                phyla_proj_full = self.phyla_proj(phyla_embeddings)
+                x = x + (
+                    self.phyla_leaf_scale
+                    * self._compute_leaf_phyla_token_additions(
+                        phyla_proj_full,
+                        leaf_idx,
+                        T_raw,
+                        x.device,
+                        x.dtype,
                     )
-            # Project all embeddings once: (B, N, D_model)
-            phyla_proj_full = self.phyla_proj(phyla_embeddings)  # (B,N,D)
-
-            # We'll store phyla_proj_full and leaf_idx_list for use post-concat
-            phyla_info = (phyla_proj_full, leaf_idx)
-        else:
-            phyla_info = None
+                )
+            if self.phyla_use_split_tokens:
+                x = x + (
+                    self.phyla_split_scale
+                    * self._compute_split_phyla_token_additions(
+                        phyla_embeddings,
+                        leaf_idx,
+                        edge_mask.bool(),
+                        edge_split_masks,
+                        T_raw,
+                        x.device,
+                        x.dtype,
+                    )
+                )
 
         # Prepend [graph] token
         graph_token = self.graph_token.expand(B, 1, D)
         x = torch.cat([graph_token, x], dim=1)  # [B, T_raw+1, D]
-
-        # If we have phyla embeddings, add them now at adjusted indices
-        if phyla_info is not None:
-            phyla_proj_full, leaf_idx_list = phyla_info
-            for b in range(B):
-                if len(leaf_idx_list[b]) == 0:
-                    continue
-                leaf_indices = leaf_idx_list[b]
-                if leaf_indices.numel() == 0:
-                    continue
-                L_b = leaf_indices.numel()
-                max_available = phyla_proj_full.size(1)
-                adjusted = leaf_indices + 1  # +1 for [graph] token
-
-                # Ensure we have at least L_b phyla embeddings
-                if phyla_proj_full.size(1) < L_b:
-                    import pdb
-
-                    pdb.set_trace()
-                    raise ValueError(
-                        f"Need {L_b} phyla embeddings, got {phyla_proj_full.size(1)}"
-                    )
-
-                # Scatter-add the first L_b phyla embeddings onto those leaf token positions
-                # x[b]: [T_raw+1, D]; adjusted: [L_b]; phyla_proj_full[b, :L_b]: [L_b, D]
-                x[b, adjusted] += phyla_proj_full[b, :L_b]
 
         if padding_mask is not None:
             special_tokens_mask = torch.zeros(
@@ -542,10 +835,16 @@ class TreeDenoiserTokenGT(nn.Module):
                     group_identity = self.create_split_identity_embedding(group_splits, x.device)
 
                     group_embeddings = group_embeddings + (self.split_identity_scale * group_identity)
-
-                    logits = self.pairwise_head(group_embeddings)  # [G, G]
+                    for refinement_block in self.autoregressive_group_refinement:
+                        group_embeddings = refinement_block(group_embeddings)
+                    if self.autoregressive_head_mode == "structured_subset":
+                        head_outputs = self.structured_subset_head(group_embeddings)
+                        logits = head_outputs["logits"]
+                    else:
+                        head_outputs = {}
+                        logits = self.pairwise_head(group_embeddings)  # [G, G]
                     
-                    all_group_logits.append({
+                    group_output = {
                         "batch_index": b,
                         "group_indices": group,
                         # Pass through the norm for the group head as well
@@ -553,7 +852,10 @@ class TreeDenoiserTokenGT(nn.Module):
                         "logits": logits,
                         "splits_represented": group_splits,
                         "group_embeddings": group_embeddings,
-                    })
+                        "decoder_mode": self.autoregressive_head_mode,
+                    }
+                    group_output.update(head_outputs)
+                    all_group_logits.append(group_output)
             # if not all_group_logits:
             #     raise ValueError("No polytomies found for autoregressive processing.")
             # import pdb; pdb.set_trace()
@@ -588,7 +890,40 @@ class TreeDenoiserTokenGT(nn.Module):
             # 3. Pass through the head. 
             # No tanh on the outside. The LayerNorm inside the MLP provides the stability.
             edge_outputs = self.edge_output_layer(padded_edges) 
-            
+            if return_first_hit_logits or return_boundary_vanish_logits:
+                first_hit_logits = None
+                boundary_vanish_logits = None
+                if return_first_hit_logits:
+                    first_hit_logits = self.first_hit_edge_head(padded_edges)
+                if return_boundary_vanish_logits:
+                    boundary_vanish_logits = self.boundary_vanish_edge_head(
+                        padded_edges
+                    )
+                if return_first_hit_logits and return_boundary_vanish_logits:
+                    if return_edge_features:
+                        return (
+                            edge_outputs,
+                            edge_pad_mask,
+                            padded_edges,
+                            first_hit_logits,
+                            boundary_vanish_logits,
+                        )
+                    return (
+                        edge_outputs,
+                        edge_pad_mask,
+                        first_hit_logits,
+                        boundary_vanish_logits,
+                    )
+                if return_first_hit_logits:
+                    if return_edge_features:
+                        return edge_outputs, edge_pad_mask, padded_edges, first_hit_logits
+                    return edge_outputs, edge_pad_mask, first_hit_logits
+                if return_edge_features:
+                    return edge_outputs, edge_pad_mask, padded_edges, boundary_vanish_logits
+                return edge_outputs, edge_pad_mask, boundary_vanish_logits
+
+            if return_edge_features:
+                return edge_outputs, edge_pad_mask, padded_edges
             return edge_outputs, edge_pad_mask
         elif return_all_tokens:
             return x  # [B, T, D]
@@ -619,6 +954,19 @@ def return_model(config):
         tokenizer_lap_dropout=config["model"]["tokenizer_lap_dropout"],
         tokenizer_n_layers=config["model"]["tokenizer_n_layers"],
         phyla_dim=config["model"]["phyla_dim"],
+        phyla_use_leaf_tokens=config["model"].get("phyla_use_leaf_tokens", True),
+        phyla_use_split_tokens=config["model"].get("phyla_use_split_tokens", True),
+        phyla_leaf_scale=config["model"].get("phyla_leaf_scale", 1.0),
+        phyla_split_scale=config["model"].get("phyla_split_scale", 1.0),
+        autoregressive_head_mode=config["model"].get(
+            "autoregressive_head_mode", "pairwise_threshold"
+        ),
+        autoregressive_group_refinement_layers=config["model"].get(
+            "autoregressive_group_refinement_layers", 0
+        ),
+        autoregressive_max_subset_size=config["model"].get(
+            "autoregressive_max_subset_size", 64
+        ),
     )
 
     return model

@@ -2,10 +2,12 @@ import random
 import sys
 import types
 import unittest
+import itertools
 from unittest.mock import MagicMock
 from unittest.mock import patch
 import copy
 import math
+import numpy as np
 
 import torch
 from ete3 import Tree as EteTree
@@ -93,18 +95,39 @@ from model.model import TreeDenoiserTokenGT
 from data.dataset import TreeDataset
 from run.TrainingModule import (
     TrainingModule,
+    _apply_boundary_vanish_one_step,
+    _best_pairwise_merge_label_for_current_tree,
+    _build_autoregressive_replay_batch,
+    _build_velocity_replay_batch,
+    _collect_oracle_replay_samples_from_anchors,
+    _boundary_event_distribution_loss,
+    _boundary_event_precision_margin_loss,
+    _tree_to_model_split_lengths,
+    _combine_autoregressive_losses,
+    _decode_structured_merge_subset,
+    _edge_set_bce_loss,
     _oracle_training_topology_keys,
+    _plan_autoregressive_boundary_merges,
+    _predict_boundary_vanish_mask_from_logits,
+    _record_repeated_topology_visit,
+    _select_replay_samples_across_rollout,
+    _select_rollout_replay_anchors,
+    _summarize_trace_topology_repeats,
+    _summarize_fixed_pair_eval_rows,
     _topology_key,
 )
 from utils.bhv_distance import bhv_geodesic_with_support
 from utils.bhv_utils import (
     BHVEncoder,
+    _filter_training_boundary_events,
+    _split_multi_label_training_events,
     get_structural_polytomy_groups_from_newick,
     return_sampled_tree_boundary_decisions,
     return_sampled_tree_orthant_velocity,
     return_tree_boundary_merge_paths,
 )
 from utils.bhv_movie import build_tree_from_splits
+from utils.metric_utils import calculate_norm_rf
 from utils.random_tree import Tree
 from utils.utils import remove_bit
 
@@ -338,7 +361,15 @@ def _predict_autoregressive_event(module, tokenizer, newick, event_time):
         group_key = tuple(int(split) for split in group["splits_represented"])
         if (not allow_all_groups) and float(group["polytomy_pred"].detach().cpu().item()) <= 0.0:
             continue
-        predicted[group_key] = _decode_positive_merge_subsets(group)
+        if str(group.get("decoder_mode", "pairwise_threshold")) == "structured_subset":
+            decoded = _decode_structured_merge_subset(group)
+            predicted[group_key] = (
+                {frozenset(int(component) for component in decoded["subset"])}
+                if decoded is not None
+                else set()
+            )
+        else:
+            predicted[group_key] = _decode_positive_merge_subsets(group)
 
     return predicted, outputs
 
@@ -822,6 +853,576 @@ def _tensor_to_cpu_for_cuda(self, *args, **kwargs):
 
 
 class TestTrainingSanity(unittest.TestCase):
+    def test_combine_autoregressive_losses_respects_polytomy_weight(self):
+        merge_loss = torch.tensor(2.0)
+        polytomy_loss = torch.tensor(3.0)
+
+        self.assertEqual(
+            float(
+                _combine_autoregressive_losses(
+                    merge_loss,
+                    polytomy_loss,
+                    polytomy_choosing_weight=0.0,
+                ).item()
+            ),
+            2.0,
+        )
+        self.assertEqual(
+            float(
+                _combine_autoregressive_losses(
+                    merge_loss,
+                    polytomy_loss,
+                    polytomy_choosing_weight=0.5,
+                ).item()
+            ),
+            3.5,
+        )
+
+    def test_filter_training_boundary_events_marks_last_structural_event_stop(self):
+        boundary_paths = [
+            {
+                "events": [
+                    {
+                        "newick": "event0",
+                        "labels": [{"components": [1, 2, 4]}],
+                    },
+                    {
+                        "newick": "event1",
+                        "labels": [{"components": [1, 2]}],
+                    },
+                    {
+                        "newick": "event2",
+                        "labels": [{"components": [8, 16, 32]}],
+                    },
+                ]
+            }
+        ]
+
+        events = _filter_training_boundary_events(boundary_paths)
+
+        self.assertEqual(len(events), 2)
+        self.assertFalse(events[0]["stop_after_merge"])
+        self.assertTrue(events[1]["stop_after_merge"])
+
+    def test_filter_training_boundary_events_keeps_stop_false_for_multi_merge_event(self):
+        boundary_paths = [
+            {
+                "events": [
+                    {
+                        "newick": "event0",
+                        "labels": [
+                            {"components": [1, 2, 4]},
+                            {"components": [8, 16, 32]},
+                        ],
+                    }
+                ]
+            }
+        ]
+
+        events = _filter_training_boundary_events(boundary_paths)
+
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0]["stop_after_merge"])
+
+    def test_planner_falls_back_to_best_structured_subset_when_threshold_blocks_group(self):
+        output = {
+            "polytomy_pred": torch.tensor([-0.2], dtype=torch.float32),
+            "splits_represented": [1, 2, 4],
+            "decoder_mode": "structured_subset",
+            "starter_pair_logits": torch.tensor([3.0, -1.0, -2.0], dtype=torch.float32),
+            "starter_pair_indices": [(0, 1), (0, 2), (1, 2)],
+            "member_logits": torch.tensor(
+                [
+                    [-10.0, -10.0, -10.0],
+                    [-10.0, -10.0, -10.0],
+                    [-10.0, -10.0, -10.0],
+                ],
+                dtype=torch.float32,
+            ),
+        }
+        blocked_output = {
+            "polytomy_pred": torch.tensor([-0.5], dtype=torch.float32),
+            "splits_represented": [8, 16, 32],
+            "decoder_mode": "structured_subset",
+            "starter_pair_logits": torch.tensor([0.1, -1.0, -2.0], dtype=torch.float32),
+            "starter_pair_indices": [(0, 1), (0, 2), (1, 2)],
+            "member_logits": torch.full((3, 3), -10.0, dtype=torch.float32),
+        }
+
+        planned = _plan_autoregressive_boundary_merges(
+            [blocked_output, output],
+            existing_splits=set(),
+            threshold_logit=0.0,
+        )
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(tuple(planned[0]["subsets"][0][0]), (1, 2))
+        self.assertEqual(int(planned[0]["subsets"][0][1]), 3)
+        self.assertEqual(planned[0].get("decoder_mode"), "structured_subset")
+        self.assertTrue(planned[0].get("fallback"))
+
+    def test_structured_planner_propagates_stop_after_merge_logit(self):
+        output = {
+            "polytomy_pred": torch.tensor([0.5], dtype=torch.float32),
+            "splits_represented": [1, 2, 4],
+            "decoder_mode": "structured_subset",
+            "starter_pair_logits": torch.tensor([3.0, -1.0, -2.0], dtype=torch.float32),
+            "starter_pair_indices": [(0, 1), (0, 2), (1, 2)],
+            "member_logits": torch.full((3, 3), -10.0, dtype=torch.float32),
+            "stop_after_merge_logit": torch.tensor(2.0, dtype=torch.float32),
+        }
+
+        planned = _plan_autoregressive_boundary_merges(
+            [output],
+            existing_splits=set(),
+            threshold_logit=0.0,
+        )
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].get("decoder_mode"), "structured_subset")
+        self.assertAlmostEqual(planned[0]["stop_after_merge_logit"], 2.0)
+
+    def test_planner_falls_back_to_best_pair_when_pairwise_has_no_positive_edges(self):
+        logits = torch.tensor(
+            [
+                [float("-inf"), -0.1, -0.5],
+                [-0.1, float("-inf"), -0.3],
+                [-0.5, -0.3, float("-inf")],
+            ],
+            dtype=torch.float32,
+        )
+        output = {
+            "polytomy_pred": torch.tensor([-0.2], dtype=torch.float32),
+            "splits_represented": [1, 2, 4],
+            "decoder_mode": "pairwise_threshold",
+            "logits": logits,
+        }
+        blocked_output = {
+            "polytomy_pred": torch.tensor([-0.5], dtype=torch.float32),
+            "splits_represented": [8, 16, 32],
+            "decoder_mode": "pairwise_threshold",
+            "logits": torch.tensor(
+                [
+                    [float("-inf"), -2.0, -3.0],
+                    [-2.0, float("-inf"), -4.0],
+                    [-3.0, -4.0, float("-inf")],
+                ],
+                dtype=torch.float32,
+            ),
+        }
+
+        planned = _plan_autoregressive_boundary_merges(
+            [blocked_output, output],
+            existing_splits=set(),
+            threshold_logit=0.0,
+        )
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(tuple(planned[0]["subsets"][0][0]), (1, 2))
+        self.assertEqual(int(planned[0]["subsets"][0][1]), 3)
+        self.assertEqual(planned[0].get("decoder_mode"), "pairwise_threshold")
+        self.assertTrue(planned[0].get("fallback"))
+
+    def test_sample_compare_harness_respects_overfit_event_prefix_cap(self):
+        module = object.__new__(TrainingModule)
+        module.model = types.SimpleNamespace(
+            phyla_proj=types.SimpleNamespace(in_features=8)
+        )
+        module.training_sampling_dt_base = 0.02
+
+        captured = {}
+
+        def fake_pair(train=True):
+            return {
+                "start_tree": "((0:0.1,1:0.1):0.1,(2:0.1,3:0.1):0.1);",
+                "target_tree": "((0:0.1,2:0.1):0.1,(1:0.1,3:0.1):0.1);",
+                "n_leaves": 4,
+                "max_events": 1,
+            }
+
+        def fake_sample(*args, **kwargs):
+            captured["max_events"] = kwargs.get("max_events")
+            return (
+                [fake_pair()["target_tree"]],
+                None,
+                None,
+                None,
+                None,
+                {"velocity": [], "autoregressive": []},
+            )
+
+        module._get_harness_sampling_pair = fake_pair
+        module.sample = fake_sample
+
+        with patch.object(
+            TrainingModule,
+            "device",
+            new=property(lambda self: torch.device("cpu")),
+        ):
+            metrics = TrainingModule.sample_compare_harness(module, train=True)
+
+        self.assertEqual(captured["max_events"], 1)
+        self.assertEqual(metrics["rf_norm"], 0.0)
+        self.assertGreater(metrics["start_rf_norm"], 0.0)
+
+    def test_sample_compare_harness_includes_fixed_pair_path_metrics(self):
+        module = object.__new__(TrainingModule)
+        module.model = types.SimpleNamespace(
+            phyla_proj=types.SimpleNamespace(in_features=8)
+        )
+        module.training_sampling_dt_base = 0.02
+
+        def fake_pair(train=True):
+            return {
+                "start_tree": "((0:0.1,1:0.1):0.1,(2:0.1,3:0.1):0.1);",
+                "target_tree": "((0:0.1,2:0.1):0.1,(1:0.1,3:0.1):0.1);",
+                "n_leaves": 4,
+                "max_events": 1,
+            }
+
+        def fake_sample(*args, **kwargs):
+            return (
+                [fake_pair()["target_tree"]],
+                None,
+                None,
+                None,
+                None,
+                {"velocity": [], "autoregressive": []},
+            )
+
+        module._get_harness_sampling_pair = fake_pair
+        module.sample = fake_sample
+        module._evaluate_fixed_pair_path_metrics = lambda train=True: {
+            "fixed_path_velocity_joint_exact_frac": 0.5,
+            "fixed_path_autoregressive_exact_frac": 0.75,
+        }
+
+        with patch.object(
+            TrainingModule,
+            "device",
+            new=property(lambda self: torch.device("cpu")),
+        ):
+            metrics = TrainingModule.sample_compare_harness(module, train=True)
+
+        self.assertEqual(metrics["fixed_path_velocity_joint_exact_frac"], 0.5)
+        self.assertEqual(metrics["fixed_path_autoregressive_exact_frac"], 0.75)
+
+    def test_sample_compare_harness_reports_skipped_no_valid_boundary_revisits(self):
+        module = object.__new__(TrainingModule)
+        module.model = types.SimpleNamespace(
+            phyla_proj=types.SimpleNamespace(in_features=8)
+        )
+        module.training_sampling_dt_base = 0.02
+        module._evaluate_fixed_pair_path_metrics = lambda train=True: {}
+
+        def fake_pair(train=True):
+            return {
+                "start_tree": "((0:0.1,1:0.1):0.1,(2:0.1,3:0.1):0.1);",
+                "target_tree": "((0:0.1,2:0.1):0.1,(1:0.1,3:0.1):0.1);",
+                "n_leaves": 4,
+                "max_events": 1,
+            }
+
+        def fake_sample(*args, **kwargs):
+            return (
+                [fake_pair()["target_tree"]],
+                None,
+                None,
+                None,
+                None,
+                {
+                    "velocity": [],
+                    "autoregressive": [],
+                    "skipped_no_valid_boundary_revisits": 7.0,
+                },
+            )
+
+        module._get_harness_sampling_pair = fake_pair
+        module.sample = fake_sample
+
+        with patch.object(
+            TrainingModule,
+            "device",
+            new=property(lambda self: torch.device("cpu")),
+        ):
+            metrics = TrainingModule.sample_compare_harness(module, train=True)
+
+        self.assertEqual(metrics["skipped_no_valid_boundary_revisits"], 7.0)
+
+    def test_summarize_fixed_pair_eval_rows_reports_exact_fractions(self):
+        velocity_rows = [
+            {
+                "index": 0,
+                "first_hit_precision": 1.0,
+                "first_hit_recall": 1.0,
+                "vanish_precision": 1.0,
+                "vanish_recall": 1.0,
+            },
+            {
+                "index": 1,
+                "first_hit_precision": 1.0,
+                "first_hit_recall": 1.0,
+                "vanish_precision": 0.5,
+                "vanish_recall": 1.0,
+            },
+        ]
+        ar_rows = [
+            {"event_index": 0, "exact_match": True},
+            {"event_index": 1, "exact_match": False},
+            {"event_index": 2, "exact_match": True},
+        ]
+
+        metrics = _summarize_fixed_pair_eval_rows(velocity_rows, ar_rows)
+
+        self.assertEqual(metrics["fixed_path_num_velocity_states"], 2.0)
+        self.assertEqual(metrics["fixed_path_num_autoregressive_events"], 3.0)
+        self.assertEqual(metrics["fixed_path_velocity_first_hit_exact_frac"], 1.0)
+        self.assertEqual(metrics["fixed_path_velocity_vanish_exact_frac"], 0.5)
+        self.assertEqual(metrics["fixed_path_velocity_joint_exact_frac"], 0.5)
+        self.assertAlmostEqual(
+            metrics["fixed_path_autoregressive_exact_frac"], 2.0 / 3.0
+        )
+        self.assertEqual(metrics["fixed_path_first_wrong_velocity_index"], 1.0)
+        self.assertEqual(metrics["fixed_path_first_wrong_autoregressive_index"], 1.0)
+
+    def test_get_harness_sampling_pair_infers_full_transition_event_cap(self):
+        module = object.__new__(TrainingModule)
+        module._cached_harness_sampling_pairs = {}
+
+        start_tree = "((0:0.1,1:0.1):0.1,(2:0.1,3:0.1):0.1);"
+        target_tree = "(((0:0.1,1:0.1):0.1,2:0.1):0.1,3:0.1);"
+
+        dataset_split = types.SimpleNamespace(
+            overfit_event_prefix_count=-1,
+            return_posterior_trees=lambda idx: [target_tree],
+            sample_random_tree_with_base=lambda real_tree: (start_tree, start_tree),
+            resolve_training_target_tree=lambda random_tree, real_tree, base_start_tree_newick=None: target_tree,
+        )
+        module.dataset = types.SimpleNamespace(
+            dataset_train=dataset_split,
+            dataset_val=dataset_split,
+        )
+
+        fake_boundary_paths = [{"events": [{} for _ in range(11)]}]
+        with patch(
+            "run.TrainingModule.return_tree_boundary_merge_paths",
+            return_value=fake_boundary_paths,
+        ):
+            pair = TrainingModule._get_harness_sampling_pair(module, train=True)
+
+        self.assertEqual(pair["max_events"], 11)
+        self.assertEqual(pair["start_tree"], start_tree)
+        self.assertEqual(pair["target_tree"], target_tree)
+
+    def test_get_harness_sampling_pair_uses_cached_overfit_pair_when_enabled(self):
+        module = object.__new__(TrainingModule)
+        module._cached_harness_sampling_pairs = {}
+
+        fixed_pair = {
+            "random_tree": "((0:0.1,1:0.1):0.1,(2:0.1,3:0.1):0.1);",
+            "effective_target_tree": "(((0:0.1,1:0.1):0.1,2:0.1):0.1,3:0.1);",
+            "final_labels": [{"labels": []}, {"labels": []}],
+        }
+        dataset_split = types.SimpleNamespace(
+            overfit_fixed_pair=True,
+            overfit_event_prefix_count=-1,
+            get_overfit_fixed_pair=lambda idx: fixed_pair,
+        )
+        module.dataset = types.SimpleNamespace(
+            dataset_train=dataset_split,
+            dataset_val=dataset_split,
+        )
+
+        pair = TrainingModule._get_harness_sampling_pair(module, train=True)
+
+        self.assertEqual(pair["start_tree"], fixed_pair["random_tree"])
+        self.assertEqual(pair["target_tree"], fixed_pair["effective_target_tree"])
+        self.assertEqual(pair["max_events"], 2)
+
+    def test_autoregressive_group_refinement_block_runs(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=10,
+            num_edge_types=10,
+            embed_dim=32,
+            n_layers=2,
+            n_heads=4,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            tokenizer_n_layers=2,
+            phyla_dim=8,
+            autoregressive_head_mode="pairwise_threshold",
+            autoregressive_group_refinement_layers=1,
+        )
+        model.eval()
+        newick = "((0:0.1,1:0.1,2:0.1):0.1,3:0.1);"
+        groups = [get_structural_polytomy_groups_from_newick(newick)]
+        self.assertTrue(groups[0], "Expected a structural polytomy group.")
+        tokenized = model.tokenizer([newick])
+        phyla_embeddings = torch.zeros((1, 4, 8), dtype=torch.float32)
+
+        with torch.no_grad():
+            outputs = model(
+                tokenized,
+                torch.zeros(1, dtype=torch.float32),
+                phyla_embeddings=phyla_embeddings,
+                autoregressive=True,
+                autoregressive_component_groups=groups,
+            )
+
+        self.assertEqual(len(outputs), 1)
+        logits = outputs[0]["logits"]
+        self.assertEqual(tuple(logits.shape), (3, 3))
+        finite_mask = ~torch.eye(3, dtype=torch.bool)
+        self.assertTrue(torch.isfinite(logits[finite_mask]).all())
+
+    def test_edge_head_can_return_first_hit_logits(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=10,
+            num_edge_types=10,
+            embed_dim=32,
+            n_layers=2,
+            n_heads=4,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            tokenizer_n_layers=2,
+            phyla_dim=8,
+        )
+        model.eval()
+        newick = "((0:0.1,1:0.1,2:0.1):0.1,3:0.1);"
+        tokenized = model.tokenizer([newick])
+        phyla_embeddings = torch.zeros((1, 4, 8), dtype=torch.float32)
+
+        with torch.no_grad():
+            velocity, edge_pad_mask, first_hit_logits = model(
+                tokenized,
+                torch.zeros(1, dtype=torch.float32),
+                phyla_embeddings=phyla_embeddings,
+                return_leafs_only=False,
+                return_edges_only=True,
+                return_first_hit_logits=True,
+            )
+
+        self.assertEqual(tuple(velocity.shape), tuple(first_hit_logits.shape))
+        self.assertEqual(tuple(edge_pad_mask.shape[:2]), tuple(velocity.shape[:2]))
+
+    def test_boundary_event_distribution_loss_prefers_correct_event_order(self):
+        lengths = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+        y_true = torch.tensor([-1.0, -0.5, -0.25], dtype=torch.float32)
+        y_pred_good = torch.tensor([-1.0, -0.45, -0.2], dtype=torch.float32)
+        y_pred_bad = torch.tensor([-0.2, -1.0, -0.25], dtype=torch.float32)
+
+        good_loss, good_stats = _boundary_event_distribution_loss(
+            lengths=lengths,
+            y_true=y_true,
+            y_pred=y_pred_good,
+            velocity_sign_eps=1e-3,
+            dt_eps=1e-6,
+            temp=0.5,
+            rate_beta=5.0,
+            normalize_by_log_candidates=False,
+        )
+        bad_loss, bad_stats = _boundary_event_distribution_loss(
+            lengths=lengths,
+            y_true=y_true,
+            y_pred=y_pred_bad,
+            velocity_sign_eps=1e-3,
+            dt_eps=1e-6,
+            temp=0.5,
+            rate_beta=5.0,
+            normalize_by_log_candidates=False,
+        )
+
+        self.assertLess(
+            float(good_loss.item()),
+            float(bad_loss.item()),
+            "Boundary-event loss should prefer the velocity prediction with the correct first-hit ordering.",
+        )
+        self.assertEqual(good_stats["n_candidates"], 3)
+        self.assertEqual(good_stats["target_first_size"], 1)
+        self.assertGreater(good_stats["pred_first_mass"], bad_stats["pred_first_mass"])
+        self.assertEqual(good_stats["top1_hits_first_set"], 1.0)
+        self.assertEqual(bad_stats["top1_hits_first_set"], 0.0)
+
+    def test_boundary_event_distribution_loss_penalizes_spurious_wrong_edge(self):
+        lengths = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+        y_true = torch.tensor([-1.0, -0.5, 0.2], dtype=torch.float32)
+        y_pred_good = torch.tensor([-1.0, -0.4, 0.1], dtype=torch.float32)
+        y_pred_spurious = torch.tensor([-0.3, -0.2, -2.0], dtype=torch.float32)
+
+        good_loss, good_stats = _boundary_event_distribution_loss(
+            lengths=lengths,
+            y_true=y_true,
+            y_pred=y_pred_good,
+            velocity_sign_eps=1e-3,
+            dt_eps=1e-6,
+            temp=0.5,
+            rate_beta=5.0,
+            normalize_by_log_candidates=False,
+        )
+        bad_loss, bad_stats = _boundary_event_distribution_loss(
+            lengths=lengths,
+            y_true=y_true,
+            y_pred=y_pred_spurious,
+            velocity_sign_eps=1e-3,
+            dt_eps=1e-6,
+            temp=0.5,
+            rate_beta=5.0,
+            normalize_by_log_candidates=False,
+        )
+
+        self.assertLess(
+            float(good_loss.item()),
+            float(bad_loss.item()),
+            "Boundary-event loss should penalize mass placed on a truly non-contracting edge.",
+        )
+        self.assertEqual(good_stats["target_first_size"], 1)
+        self.assertEqual(good_stats["top1_hits_first_set"], 1.0)
+        self.assertEqual(bad_stats["top1_hits_first_set"], 0.0)
+
+    def test_boundary_event_precision_margin_loss_penalizes_fast_wrong_edge(self):
+        lengths = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+        y_true = torch.tensor([-1.0, -0.8, 0.2], dtype=torch.float32)
+        y_pred_good = torch.tensor([-1.0, -0.7, 0.1], dtype=torch.float32)
+        y_pred_bad = torch.tensor([-1.0, -0.7, -2.0], dtype=torch.float32)
+
+        good_loss, good_stats = _boundary_event_precision_margin_loss(
+            lengths=lengths,
+            y_true=y_true,
+            y_pred=y_pred_good,
+            velocity_sign_eps=1e-3,
+            dt_eps=1e-6,
+            temp=0.5,
+            rate_beta=5.0,
+            margin=0.25,
+        )
+        bad_loss, bad_stats = _boundary_event_precision_margin_loss(
+            lengths=lengths,
+            y_true=y_true,
+            y_pred=y_pred_bad,
+            velocity_sign_eps=1e-3,
+            dt_eps=1e-6,
+            temp=0.5,
+            rate_beta=5.0,
+            margin=0.25,
+        )
+
+        self.assertLess(
+            float(good_loss.item()),
+            float(bad_loss.item()),
+            "Precision margin loss should penalize a wrong edge outranking the true first-hit set.",
+        )
+        self.assertGreater(good_stats["margin_gap"], bad_stats["margin_gap"])
+        self.assertEqual(good_stats["violated"], 0.0)
+        self.assertEqual(bad_stats["violated"], 1.0)
+
     # def test_overfit_single_velocity_vector(self):
     #     random.seed(123)
     #     torch.manual_seed(123)
@@ -1857,6 +2458,1512 @@ class TestTrainingSanity(unittest.TestCase):
             missing,
             [],
             "Oracle topology whitelist missed valid boundary-path states.",
+        )
+
+    def test_separate_optimizer_steps_reject_grad_ratio(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "training_step_separate_optimizer_steps cannot be combined",
+        ):
+            TrainingModule(
+                model=model,
+                dataset=MagicMock(),
+                lr=1e-3,
+                record=False,
+                epochs=1,
+                deepspeed=False,
+                logger=None,
+                training_step_autoregressive_grad_ratio=0.05,
+                training_step_separate_optimizer_steps=True,
+            )
+
+    def test_rollout_replay_rejects_negative_weights(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "rollout_replay_velocity_weight must be non-negative",
+        ):
+            TrainingModule(
+                model=model,
+                dataset=MagicMock(),
+                lr=1e-3,
+                record=False,
+                epochs=1,
+                deepspeed=False,
+                logger=None,
+                rollout_replay_velocity_weight=-0.1,
+            )
+
+    def test_velocity_replay_batch_uses_module_device_and_marks_skip(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+        module = TrainingModule(
+            model=model,
+            dataset=MagicMock(),
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+        )
+
+        batch = _build_velocity_replay_batch(
+            module,
+            [
+                {
+                    "newick_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                    "target_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                    "velocity": {3: -0.1},
+                    "velocity_next_boundary_tree": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                    "timepoint": 0.25,
+                    "num_leaves": 4,
+                }
+            ],
+        )
+
+        self.assertTrue(batch["_is_replay_batch"])
+        self.assertTrue(batch["_skip_training_augmentations"])
+        self.assertEqual(batch["batched_time"].device.type, module.device.type)
+
+    def test_autoregressive_replay_batch_uses_module_device_and_marks_skip(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+        module = TrainingModule(
+            model=model,
+            dataset=MagicMock(),
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+        )
+
+        batch = _build_autoregressive_replay_batch(
+            module,
+            [
+                {
+                    "newick": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                    "target_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                    "labels": [{"components": [1, 2, 4], "merge_indices": [0, 1]}],
+                    "stop_after_merge": True,
+                    "time": 0.5,
+                }
+            ],
+        )
+
+        self.assertTrue(batch["_is_replay_batch"])
+        self.assertTrue(batch["_skip_training_augmentations"])
+        self.assertEqual(
+            batch["batched_autoregressive_time"].device.type,
+            module.device.type,
+        )
+        self.assertEqual(
+            batch["batched_autoregressive_stop_after_merge"].device.type,
+            module.device.type,
+        )
+
+    def test_prepare_training_batches_respect_skip_flag(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+        module = TrainingModule(
+            model=model,
+            dataset=MagicMock(),
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+            velocity_length_jitter_prob=1.0,
+            velocity_length_jitter_scale=0.5,
+            autoregressive_rollin_prob=1.0,
+        )
+        replay_batch = {"_skip_training_augmentations": True}
+
+        updated_velocity_batch, velocity_stats = module._prepare_velocity_training_batch(
+            replay_batch
+        )
+        updated_ar_batch, ar_stats = module._prepare_autoregressive_training_batch(
+            replay_batch
+        )
+
+        self.assertIs(updated_velocity_batch, replay_batch)
+        self.assertEqual(velocity_stats["attempted"], 0.0)
+        self.assertEqual(velocity_stats["applied"], 0.0)
+        self.assertIs(updated_ar_batch, replay_batch)
+        self.assertEqual(ar_stats["rollin_attempted"], 0.0)
+        self.assertEqual(ar_stats["dagger_attempted"], 0.0)
+        self.assertEqual(ar_stats["structure_perturb_attempted"], 0.0)
+
+    def test_collect_rollout_replay_batches_dedupes_sampled_states(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+        dataset = MagicMock()
+        dataset.dataset_train = types.SimpleNamespace(
+            overfit_split_multi_subset_events=True
+        )
+        module = TrainingModule(
+            model=model,
+            dataset=dataset,
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+            rollout_replay_velocity_weight=0.5,
+            rollout_replay_autoregressive_weight=0.5,
+            rollout_replay_anchor_states=2,
+            rollout_replay_oracle_horizon=1,
+            rollout_replay_max_velocity_states=2,
+            rollout_replay_max_autoregressive_states=1,
+        )
+
+        module._get_harness_sampling_pair = MagicMock(
+            return_value={
+                "start_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                "target_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                "n_leaves": 4,
+                "max_events": 4,
+            }
+        )
+        module.sample = MagicMock(
+            return_value=(
+                ["(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);"],
+                0,
+                0.0,
+                0.0,
+                0,
+                {
+                    "velocity": [
+                        {
+                            "newick_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                            "target_tree": "T",
+                            "velocity": {3: -0.1},
+                            "velocity_next_boundary_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                            "timepoint": 0.0,
+                            "num_leaves": 4,
+                        },
+                        {
+                            "newick_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                            "target_tree": "T",
+                            "velocity": {3: -0.1},
+                            "velocity_next_boundary_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                            "timepoint": 0.0,
+                            "num_leaves": 4,
+                        },
+                        {
+                            "newick_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                            "target_tree": "T",
+                            "velocity": {5: -0.2},
+                            "velocity_next_boundary_tree": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                            "timepoint": 0.5,
+                            "num_leaves": 4,
+                        },
+                        {
+                            "newick_tree": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                            "target_tree": "T",
+                            "velocity": {6: -0.3},
+                            "velocity_next_boundary_tree": "(1:0.1,2:0.1,3:0.1,4:0.1);",
+                            "timepoint": 0.9,
+                            "num_leaves": 4,
+                        },
+                    ],
+                    "autoregressive": [
+                        {
+                            "newick": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                            "target_tree": "T",
+                            "labels": [{"components": [1, 2, 4], "merge_indices": [0, 1]}],
+                            "stop_after_merge": False,
+                            "time": 0.1,
+                        },
+                        {
+                            "newick": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                            "target_tree": "T",
+                            "labels": [{"components": [1, 2, 4], "merge_indices": [0, 1]}],
+                            "stop_after_merge": False,
+                            "time": 0.1,
+                        },
+                        {
+                            "newick": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                            "target_tree": "T",
+                            "labels": [{"components": [1, 4], "merge_indices": [0, 1]}],
+                            "stop_after_merge": False,
+                            "time": 0.2,
+                        },
+                        {
+                            "newick": "(1:0.1,2:0.1,3:0.1,4:0.1);",
+                            "target_tree": "T",
+                            "labels": [
+                                {
+                                    "components": [1, 2, 3, 4],
+                                    "merge_indices": [1, 2],
+                                }
+                            ],
+                            "stop_after_merge": False,
+                            "time": 0.9,
+                        },
+                    ],
+                },
+            )
+        )
+
+        oracle_velocity_samples = [
+            {
+                "newick_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "velocity": {3: -0.1},
+                "velocity_next_boundary_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                "timepoint": 0.0,
+                "num_leaves": 4,
+            },
+            {
+                "newick_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "velocity": {3: -0.1},
+                "velocity_next_boundary_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                "timepoint": 0.0,
+                "num_leaves": 4,
+            },
+            {
+                "newick_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "velocity": {5: -0.2},
+                "velocity_next_boundary_tree": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                "timepoint": 0.5,
+                "num_leaves": 4,
+            },
+            {
+                "newick_tree": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "velocity": {6: -0.3},
+                "velocity_next_boundary_tree": "(1:0.1,2:0.1,3:0.1,4:0.1);",
+                "timepoint": 0.9,
+                "num_leaves": 4,
+            },
+        ]
+        oracle_autoregressive_samples = [
+            {
+                "newick": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "labels": [{"components": [1, 2, 4], "merge_indices": [0, 1]}],
+                "stop_after_merge": False,
+                "time": 0.1,
+            },
+            {
+                "newick": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "labels": [{"components": [1, 2, 4], "merge_indices": [0, 1]}],
+                "stop_after_merge": False,
+                "time": 0.1,
+            },
+            {
+                "newick": "(1:0.1,2:0.1,3:0.1,4:0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "labels": [
+                    {
+                        "components": [1, 2, 3, 4],
+                        "merge_indices": [1, 2],
+                    }
+                ],
+                "stop_after_merge": False,
+                "time": 0.9,
+            },
+        ]
+
+        with patch(
+            "run.TrainingModule._collect_oracle_replay_samples_from_anchors",
+            return_value=(oracle_velocity_samples, oracle_autoregressive_samples),
+        ) as mocked_collect:
+            velocity_batch, autoregressive_batch, replay_logs = (
+                module._collect_rollout_replay_batches(train=True)
+            )
+
+        mocked_collect.assert_called_once()
+
+        self.assertEqual(len(velocity_batch["original_trees"]), 2)
+        self.assertEqual(
+            velocity_batch["original_trees"],
+            [
+                "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+            ],
+        )
+        self.assertEqual(
+            float(replay_logs["replay/num_velocity_states"].item()),
+            2.0,
+        )
+        self.assertEqual(len(autoregressive_batch["newick_autoregressive_trees"]), 1)
+        self.assertEqual(
+            autoregressive_batch["newick_autoregressive_trees"],
+            ["((1:0.1,2:0.1,3:0.1):0.1,4:0.1);"],
+        )
+        self.assertEqual(
+            float(replay_logs["replay/num_autoregressive_states"].item()),
+            1.0,
+        )
+        self.assertEqual(
+            float(replay_logs["replay/num_invalid_autoregressive_states"].item()),
+            1.0,
+        )
+        self.assertEqual(
+            float(replay_logs["replay/num_anchor_states"].item()),
+            2.0,
+        )
+        self.assertEqual(
+            float(replay_logs["replay/cache_refreshed"].item()),
+            1.0,
+        )
+        self.assertEqual(
+            float(replay_logs["replay/cache_reused"].item()),
+            0.0,
+        )
+
+    def test_collect_rollout_replay_batches_reuses_cached_batches_between_refreshes(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+        dataset = MagicMock()
+        dataset.dataset_train = types.SimpleNamespace(
+            overfit_split_multi_subset_events=True
+        )
+        module = TrainingModule(
+            model=model,
+            dataset=dataset,
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+            rollout_replay_velocity_weight=0.5,
+            rollout_replay_autoregressive_weight=0.5,
+            rollout_replay_start_step=0,
+            rollout_replay_frequency=50,
+            rollout_replay_anchor_states=1,
+            rollout_replay_oracle_horizon=1,
+            rollout_replay_max_velocity_states=1,
+            rollout_replay_max_autoregressive_states=1,
+        )
+
+        module._get_harness_sampling_pair = MagicMock(
+            return_value={
+                "start_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                "target_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                "n_leaves": 4,
+                "max_events": 4,
+            }
+        )
+        module.sample = MagicMock(
+            return_value=(
+                ["(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);"],
+                0,
+                0.0,
+                0.0,
+                0,
+                {
+                    "velocity": [
+                        {
+                            "newick_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                            "target_tree": "T",
+                            "velocity": {3: -0.1},
+                            "velocity_next_boundary_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                            "timepoint": 0.0,
+                            "num_leaves": 4,
+                        },
+                    ],
+                    "autoregressive": [
+                        {
+                            "newick": "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+                            "target_tree": "T",
+                            "labels": [{"components": [1, 2, 4], "merge_indices": [0, 1]}],
+                            "stop_after_merge": False,
+                            "time": 0.1,
+                        },
+                    ],
+                },
+            )
+        )
+        oracle_velocity_samples = [
+            {
+                "newick_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "velocity": {3: -0.1},
+                "velocity_next_boundary_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                "timepoint": 0.0,
+                "num_leaves": 4,
+            },
+        ]
+        oracle_autoregressive_samples = [
+            {
+                "newick": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                "target_tree": module._get_harness_sampling_pair.return_value[
+                    "target_tree"
+                ],
+                "labels": [
+                    {
+                        "components": [3, 12],
+                        "merge_indices": [0, 1],
+                    }
+                ],
+                "stop_after_merge": False,
+                "time": 0.0,
+            },
+        ]
+
+        with patch(
+            "run.TrainingModule._collect_oracle_replay_samples_from_anchors",
+            return_value=(oracle_velocity_samples, oracle_autoregressive_samples),
+        ):
+            module.stepper = 50
+            velocity_batch_1, autoregressive_batch_1, replay_logs_1 = (
+                module._collect_rollout_replay_batches(train=True)
+            )
+            self.assertEqual(module.sample.call_count, 1)
+            self.assertEqual(float(replay_logs_1["replay/cache_refreshed"].item()), 1.0)
+            self.assertEqual(float(replay_logs_1["replay/cache_reused"].item()), 0.0)
+
+            module.stepper = 51
+            velocity_batch_2, autoregressive_batch_2, replay_logs_2 = (
+                module._collect_rollout_replay_batches(train=True)
+            )
+            self.assertEqual(module.sample.call_count, 1)
+            self.assertIs(velocity_batch_2, velocity_batch_1)
+            self.assertIs(autoregressive_batch_2, autoregressive_batch_1)
+            self.assertEqual(float(replay_logs_2["replay/cache_refreshed"].item()), 0.0)
+            self.assertEqual(float(replay_logs_2["replay/cache_reused"].item()), 1.0)
+
+            module.stepper = 100
+            velocity_batch_3, autoregressive_batch_3, replay_logs_3 = (
+                module._collect_rollout_replay_batches(train=True)
+            )
+            self.assertEqual(module.sample.call_count, 2)
+            self.assertEqual(float(replay_logs_3["replay/cache_refreshed"].item()), 1.0)
+            self.assertEqual(float(replay_logs_3["replay/cache_reused"].item()), 0.0)
+
+    def test_select_rollout_replay_anchors_includes_final_sampled_tree(self):
+        trace = {
+            "velocity": [
+                {
+                    "newick_tree": "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);",
+                    "target_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                    "timepoint": 0.0,
+                    "num_leaves": 4,
+                },
+                {
+                    "newick_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                    "target_tree": "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+                    "timepoint": 0.5,
+                    "num_leaves": 4,
+                },
+            ]
+        }
+
+        anchors = _select_rollout_replay_anchors(
+            trace,
+            "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+            "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);",
+            3,
+        )
+
+        self.assertEqual(len(anchors), 3)
+        self.assertEqual(
+            anchors[-1]["newick_tree"],
+            "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);",
+        )
+
+    def test_select_replay_samples_across_rollout_spans_trajectory(self):
+        samples = ["s0", "s1", "s2", "s3", "s4"]
+
+        self.assertEqual(
+            _select_replay_samples_across_rollout(samples, 2),
+            ["s0", "s4"],
+        )
+        self.assertEqual(
+            _select_replay_samples_across_rollout(samples, 3),
+            ["s0", "s2", "s4"],
+        )
+        self.assertEqual(
+            _select_replay_samples_across_rollout(samples, 1),
+            ["s4"],
+        )
+
+    def test_record_repeated_topology_visit_trips_after_cap(self):
+        counts = {}
+        topo = (1, 3, 7)
+
+        self.assertFalse(_record_repeated_topology_visit(counts, topo, 2))
+        self.assertFalse(_record_repeated_topology_visit(counts, topo, 2))
+        self.assertTrue(_record_repeated_topology_visit(counts, topo, 2))
+
+    def test_summarize_trace_topology_repeats_reports_repeat_counts(self):
+        tree_a = "((0:0.1,1:0.1):0.1,(2:0.1,3:0.1):0.1);"
+        tree_b = "((0:0.1,2:0.1):0.1,(1:0.1,3:0.1):0.1);"
+        trace = {
+            "velocity": [
+                {"newick_tree": tree_a},
+                {"newick_tree": tree_b},
+                {"newick_tree": tree_a},
+            ],
+            "autoregressive": [
+                {"newick": tree_b},
+                {"newick": tree_b},
+                {"newick": tree_a},
+                {"newick": tree_b},
+            ],
+        }
+
+        summary = _summarize_trace_topology_repeats(trace)
+
+        self.assertEqual(summary["velocity_num_states"], 3.0)
+        self.assertEqual(summary["velocity_num_unique_topologies"], 2.0)
+        self.assertEqual(summary["velocity_num_repeated_topologies"], 1.0)
+        self.assertEqual(summary["velocity_max_topology_repeat"], 2.0)
+        self.assertEqual(summary["autoregressive_num_states"], 4.0)
+        self.assertEqual(summary["autoregressive_num_unique_topologies"], 2.0)
+        self.assertEqual(summary["autoregressive_num_repeated_topologies"], 1.0)
+        self.assertEqual(summary["autoregressive_max_topology_repeat"], 3.0)
+
+    def test_best_pairwise_merge_label_for_current_tree_uses_current_group(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+        module = TrainingModule(
+            model=model,
+            dataset=MagicMock(),
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+        )
+
+        current_newick = "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);"
+        target_newick = "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);"
+
+        replay_event = _best_pairwise_merge_label_for_current_tree(
+            module,
+            current_newick,
+            target_newick,
+        )
+
+        self.assertIsNotNone(replay_event)
+        self.assertEqual(replay_event["newick"], current_newick)
+        self.assertEqual(len(replay_event["labels"]), 1)
+
+        label = replay_event["labels"][0]
+        structural_groups = {
+            tuple(int(component) for component in group)
+            for group in get_structural_polytomy_groups_from_newick(current_newick)
+        }
+        self.assertIn(tuple(int(component) for component in label["components"]), structural_groups)
+
+        merged_components = [
+            int(label["components"][idx]) for idx in label["merge_indices"]
+        ]
+        self.assertEqual(
+            int(label["result_split"]),
+            int(merged_components[0]) | int(merged_components[1]),
+        )
+
+        td, n_leaves, mapping = _tree_to_model_split_lengths(module, current_newick)
+        td[int(label["result_split"])] = 1e-3
+        _, candidate_newick = build_tree_from_splits(
+            list(td.keys()),
+            td,
+            n_leaves=n_leaves,
+            root_leaf=n_leaves - 1,
+            mapping=mapping,
+        )
+        chosen_rf = float(calculate_norm_rf(candidate_newick, target_newick))
+        self.assertLess(
+            chosen_rf,
+            float(calculate_norm_rf(current_newick, target_newick)),
+        )
+
+        exhaustive_best_rf = None
+        td_base, n_leaves, mapping = _tree_to_model_split_lengths(module, current_newick)
+        for group in get_structural_polytomy_groups_from_newick(current_newick):
+            group = tuple(int(component) for component in group)
+            for left_idx, right_idx in itertools.combinations(range(len(group)), 2):
+                result_split = int(group[left_idx]) | int(group[right_idx])
+                if result_split in td_base:
+                    continue
+                candidate_td = dict(td_base)
+                candidate_td[result_split] = 1e-3
+                _, exhaustive_newick = build_tree_from_splits(
+                    list(candidate_td.keys()),
+                    candidate_td,
+                    n_leaves=n_leaves,
+                    root_leaf=n_leaves - 1,
+                    mapping=mapping,
+                )
+                candidate_rf = float(calculate_norm_rf(exhaustive_newick, target_newick))
+                if exhaustive_best_rf is None or candidate_rf < exhaustive_best_rf:
+                    exhaustive_best_rf = candidate_rf
+
+        self.assertIsNotNone(exhaustive_best_rf)
+        self.assertAlmostEqual(chosen_rf, exhaustive_best_rf, places=7)
+
+    def test_best_pairwise_merge_label_for_current_tree_skips_large_groups(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+        module = TrainingModule(
+            model=model,
+            dataset=MagicMock(),
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+            rollout_replay_pairwise_max_group_size=2,
+        )
+
+        current_newick = "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);"
+        target_newick = "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);"
+
+        replay_event = _best_pairwise_merge_label_for_current_tree(
+            module,
+            current_newick,
+            target_newick,
+        )
+
+        self.assertIsNone(replay_event)
+
+    def test_sampling_autoregressive_time_uses_event_index_when_enabled(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=32,
+            n_layers=1,
+            n_heads=2,
+            output_dim=1,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            performer_nb_features=None,
+            performer_generalized_attention=False,
+            layernorm_style="prenorm",
+            tokenizer_lap_dim=8,
+            tokenizer_lap_dropout=0.0,
+            tokenizer_n_layers=1,
+            phyla_dim=16,
+        )
+        module = TrainingModule(
+            model=model,
+            dataset=MagicMock(),
+            lr=1e-3,
+            record=False,
+            epochs=1,
+            deepspeed=False,
+            logger=None,
+            autoregressive_use_time=True,
+        )
+
+        self.assertAlmostEqual(
+            module._sampling_autoregressive_time_value(
+                current_time=0.0,
+                event_index=1,
+                max_events=16,
+            ),
+            1.0 / 15.0,
+        )
+        self.assertAlmostEqual(
+            module._sampling_autoregressive_time_value(
+                current_time=0.42,
+                event_index=None,
+                max_events=None,
+            ),
+            0.42,
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_overfit_boundary_prefix_resolves_to_boundary_endpoint(self, _mock_build_index):
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_boundary_prefix_k=0,
+        )
+        target_tree = ds.load_posterior_trees_from_tfiles([])[0]
+        start_tree = ds.sample_random_tree(target_tree)
+        boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
+        self.assertGreater(
+            len(boundary_paths),
+            0,
+            "Sanity tree pair did not expose any boundaries for prefix truncation.",
+        )
+
+        resolved_target = ds.resolve_training_target_tree(start_tree, target_tree)
+        expected_target = boundary_paths[0]["end_newick"]
+        self.assertEqual(
+            _normalized_rf(resolved_target, expected_target),
+            0.0,
+            "Prefix truncation did not resolve to the first boundary endpoint.",
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_overfit_start_and_target_boundary_prefix_resolve_to_oracle_endpoints(
+        self, _mock_build_index
+    ):
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_boundary_prefix_k=11,
+            overfit_start_boundary_prefix_k=10,
+        )
+        target_tree = ds.load_posterior_trees_from_tfiles([])[0]
+        base_start_tree, start_tree = ds.sample_random_tree_with_base(target_tree)
+        resolved_target = ds.resolve_training_target_tree(
+            start_tree,
+            target_tree,
+            base_start_tree_newick=base_start_tree,
+        )
+
+        base_ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+        )
+        base_start_tree = base_ds.sample_random_tree(target_tree)
+        boundary_paths = return_tree_boundary_merge_paths(base_start_tree, target_tree)
+        self.assertGreater(
+            len(boundary_paths),
+            11,
+            "Sanity tree pair did not expose enough boundaries for the k10->k11 transition test.",
+        )
+
+        expected_start = boundary_paths[10]["end_newick"]
+        expected_target = boundary_paths[11]["end_newick"]
+        self.assertEqual(
+            _normalized_rf(start_tree, expected_start),
+            0.0,
+            "Direct transition start tree did not resolve to the oracle k10 endpoint.",
+        )
+        self.assertEqual(
+            _normalized_rf(resolved_target, expected_target),
+            0.0,
+            "Direct transition target tree did not resolve to the absolute oracle k11 endpoint.",
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_overfit_event_prefix_resolves_inside_direct_transition(
+        self, _mock_build_index
+    ):
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_boundary_prefix_k=11,
+            overfit_start_boundary_prefix_k=10,
+            overfit_event_prefix_count=1,
+        )
+        target_tree = ds.load_posterior_trees_from_tfiles([])[0]
+        base_start_tree, start_tree = ds.sample_random_tree_with_base(target_tree)
+        resolved_target = ds.resolve_training_target_tree(
+            start_tree,
+            target_tree,
+            base_start_tree_newick=base_start_tree,
+        )
+
+        base_ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+        )
+        base_start_tree = base_ds.sample_random_tree(target_tree)
+        boundary_paths = return_tree_boundary_merge_paths(base_start_tree, target_tree)
+        transition = boundary_paths[11]
+        self.assertGreater(
+            len(transition["events"]),
+            1,
+            "Expected the k10->k11 transition to expose multiple merge events.",
+        )
+
+        expected_target = transition["events"][1]["newick"]
+        self.assertEqual(
+            _normalized_rf(resolved_target, expected_target),
+            0.0,
+            "Event-prefix truncation did not resolve to the tree after the first merge event inside k10->k11.",
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_velocity_event_state_sampling_uses_oracle_event_newick(
+        self, _mock_build_index
+    ):
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_boundary_prefix_k=11,
+            overfit_velocity_zero=True,
+            overfit_velocity_event_states=True,
+        )
+        ds._index = [{"id": "mock", "nexus_path": "mock", "tree_paths": []}]
+        ds._id_to_idx = {"mock": 0}
+        ds.parse_nexus = lambda path: (
+            {str(i + 1): "A" for i in range(155)},
+            [str(i + 1) for i in range(155)],
+        )
+
+        sample = ds[0]
+
+        self.assertEqual(sample["timepoint"], 0.0)
+        self.assertEqual(
+            _normalized_rf(sample["newick_tree"], sample["autoregressive_newick"]),
+            0.0,
+            "Velocity state should be sampled from the same oracle event tree used for the autoregressive label.",
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    @patch("data.dataset.random.choice")
+    @patch("data.dataset.return_sampled_tree_orthant_velocity")
+    @patch("data.dataset.return_tree_boundary_merge_paths")
+    @patch("data.dataset.return_sampled_tree_boundary_decisions")
+    def test_velocity_orthant_start_sampling_uses_resolved_boundary_starts(
+        self,
+        mock_boundary_decisions,
+        mock_boundary_paths,
+        mock_velocity,
+        mock_choice,
+        _mock_build_index,
+    ):
+        start_tree = "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);"
+        after_first_boundary = "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);"
+        target_tree = "((1:0.1,3:0.1):0.1,(2:0.1,4:0.1):0.1);"
+        ar_event_tree = "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);"
+
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_velocity_orthant_start_states=True,
+        )
+        ds._index = [{"id": "mock", "nexus_path": "mock", "tree_paths": []}]
+        ds._id_to_idx = {"mock": 0}
+        ds.parse_nexus = lambda path: (
+            {str(i + 1): "A" for i in range(4)},
+            [str(i + 1) for i in range(4)],
+        )
+        ds.load_posterior_trees_from_tfiles = lambda paths: [target_tree]
+        ds.sample_random_tree_with_base = lambda target: (start_tree, start_tree)
+        ds.resolve_training_target_tree = (
+            lambda random_tree, real_tree_newick, base_start_tree_newick=None: target_tree
+        )
+
+        mock_boundary_decisions.return_value = [
+            {
+                "newick": ar_event_tree,
+                "labels": [{"components": [1, 2, 3], "merge_indices": [0, 1]}],
+            }
+        ]
+        mock_boundary_paths.return_value = [
+            {"end_newick": after_first_boundary, "events": [{}]},
+            {"end_newick": target_tree, "events": [{}]},
+        ]
+        mock_choice.return_value = after_first_boundary
+        mock_velocity.side_effect = lambda source_tree, _target_tree, timepoint: (
+            source_tree,
+            {"timepoint": timepoint},
+        )
+
+        sample = ds[0]
+
+        self.assertEqual(sample["timepoint"], 0.0)
+        self.assertEqual(sample["newick_tree"], after_first_boundary)
+        self.assertNotEqual(
+            sample["newick_tree"],
+            target_tree,
+            "Velocity orthant-start sampling should not supervise on the final target tree.",
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    @patch("data.dataset.return_sampled_tree_orthant_velocity")
+    def test_velocity_fixed_timepoints_use_global_time_choices(
+        self,
+        mock_velocity,
+        _mock_build_index,
+    ):
+        start_tree = "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);"
+        target_tree = "((1:0.1,3:0.1):0.1,(2:0.1,4:0.1):0.1);"
+        ar_event_tree = "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);"
+
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_velocity_fixed_timepoints=[0.0, 1.0],
+        )
+        ds._index = [{"id": "mock", "nexus_path": "mock", "tree_paths": []}]
+        ds._id_to_idx = {"mock": 0}
+        ds.parse_nexus = lambda path: (
+            {str(i + 1): "A" for i in range(4)},
+            [str(i + 1) for i in range(4)],
+        )
+        ds.load_posterior_trees_from_tfiles = lambda paths: [target_tree]
+        ds.sample_random_tree_with_base = lambda target: (start_tree, start_tree)
+        ds.resolve_training_target_tree = (
+            lambda random_tree, real_tree_newick, base_start_tree_newick=None: target_tree
+        )
+
+        with patch("data.dataset.random.choice", return_value=1.0), patch(
+            "data.dataset.return_sampled_tree_boundary_decisions",
+            return_value=[
+                {
+                    "newick": ar_event_tree,
+                    "labels": [{"components": [1, 2, 3], "merge_indices": [0, 1]}],
+                }
+            ],
+        ), patch(
+            "data.dataset.return_tree_boundary_merge_paths",
+            return_value=[{"end_newick": target_tree, "events": [{}]}],
+        ):
+            mock_velocity.side_effect = lambda source_tree, _target_tree, timepoint: (
+                f"time={timepoint}",
+                {"timepoint": timepoint},
+            )
+
+            sample = ds[0]
+        self.assertEqual(sample["timepoint"], 1.0)
+        self.assertEqual(sample["newick_tree"], "time=1.0")
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    @patch("data.dataset.random.choice")
+    @patch("data.dataset.return_sampled_tree_orthant_velocity")
+    @patch("data.dataset.return_tree_boundary_merge_paths")
+    @patch("data.dataset.return_sampled_tree_boundary_decisions")
+    def test_velocity_explicit_boundary_end_states_use_end_newick_with_global_time(
+        self,
+        mock_boundary_decisions,
+        mock_boundary_paths,
+        mock_velocity,
+        mock_choice,
+        _mock_build_index,
+        ):
+        start_tree = "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);"
+        boundary0_end = "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);"
+        boundary1_start = "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.2);"
+        target_tree = "((1:0.1,3:0.1):0.1,(2:0.1,4:0.1):0.1);"
+        ar_event_tree = "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);"
+
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_velocity_explicit_boundary_end_states=True,
+            overfit_velocity_fixed_timepoints=[0.0, 0.25],
+        )
+        ds._index = [{"id": "mock", "nexus_path": "mock", "tree_paths": []}]
+        ds._id_to_idx = {"mock": 0}
+        ds.parse_nexus = lambda path: (
+            {str(i + 1): "A" for i in range(4)},
+            [str(i + 1) for i in range(4)],
+        )
+        ds.load_posterior_trees_from_tfiles = lambda paths: [target_tree]
+        ds.sample_random_tree_with_base = lambda target: (start_tree, start_tree)
+        ds.resolve_training_target_tree = (
+            lambda random_tree, real_tree_newick, base_start_tree_newick=None: target_tree
+        )
+
+        mock_boundary_decisions.return_value = [
+            {
+                "newick": ar_event_tree,
+                "labels": [{"components": [1, 2, 3], "merge_indices": [0, 1]}],
+            }
+        ]
+        mock_boundary_paths.return_value = [
+            {"start_newick": start_tree, "end_newick": boundary0_end, "events": [{}]},
+            {
+                "start_newick": boundary1_start,
+                "end_newick": target_tree,
+                "events": [{}],
+            },
+        ]
+        mock_choice.return_value = (boundary0_end, boundary1_start, 0.25)
+        mock_velocity.side_effect = lambda source_tree, _target_tree, timepoint: (
+            f"{source_tree}|local_t={timepoint}",
+            {"timepoint": timepoint},
+        )
+
+        sample = ds[0]
+
+        self.assertEqual(sample["timepoint"], 0.25)
+        self.assertEqual(sample["newick_tree"], f"{boundary0_end}|local_t=0.0")
+        self.assertEqual(sample["velocity_next_boundary_tree"], boundary1_start)
+        mock_velocity.assert_called_once_with(boundary0_end, target_tree, 0.0)
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    @patch("data.dataset.random.choice")
+    @patch("data.dataset.return_sampled_tree_orthant_velocity")
+    @patch("data.dataset.return_tree_boundary_merge_paths")
+    @patch("data.dataset.return_sampled_tree_boundary_decisions")
+    def test_velocity_explicit_boundary_end_states_derive_global_timepoints_from_paths(
+        self,
+        mock_boundary_decisions,
+        mock_boundary_paths,
+        mock_velocity,
+        mock_choice,
+        _mock_build_index,
+    ):
+        start_tree = "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);"
+        boundary0_end = "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);"
+        boundary1_start = "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.2);"
+        target_tree = "((1:0.1,3:0.1):0.1,(2:0.1,4:0.1):0.1);"
+        ar_event_tree = "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);"
+
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_velocity_explicit_boundary_end_states=True,
+        )
+        ds._index = [{"id": "mock", "nexus_path": "mock", "tree_paths": []}]
+        ds._id_to_idx = {"mock": 0}
+        ds.parse_nexus = lambda path: (
+            {str(i + 1): "A" for i in range(4)},
+            [str(i + 1) for i in range(4)],
+        )
+        ds.load_posterior_trees_from_tfiles = lambda paths: [target_tree]
+        ds.sample_random_tree_with_base = lambda target: (start_tree, start_tree)
+        ds.resolve_training_target_tree = (
+            lambda random_tree, real_tree_newick, base_start_tree_newick=None: target_tree
+        )
+
+        mock_boundary_decisions.return_value = [
+            {
+                "newick": ar_event_tree,
+                "labels": [{"components": [1, 2, 3], "merge_indices": [0, 1]}],
+            }
+        ]
+        mock_boundary_paths.return_value = [
+            {
+                "global_time": 0.25,
+                "start_newick": start_tree,
+                "end_newick": boundary0_end,
+                "events": [{}],
+            },
+            {
+                "global_time": 0.75,
+                "start_newick": boundary1_start,
+                "end_newick": target_tree,
+                "events": [{}],
+            },
+        ]
+        mock_choice.return_value = (boundary0_end, boundary1_start, 0.25)
+        mock_velocity.side_effect = lambda source_tree, _target_tree, timepoint: (
+            f"{source_tree}|local_t={timepoint}",
+            {"timepoint": timepoint},
+        )
+
+        sample = ds[0]
+
+        self.assertEqual(sample["timepoint"], 0.25)
+        self.assertEqual(sample["newick_tree"], f"{boundary0_end}|local_t=0.0")
+        self.assertEqual(sample["velocity_next_boundary_tree"], boundary1_start)
+        mock_velocity.assert_called_once_with(boundary0_end, target_tree, 0.0)
+
+    def test_boundary_vanish_mask_decoder_falls_back_to_argmax(self):
+        logits = torch.tensor([-2.0, -1.0, -3.0], dtype=torch.float32)
+        candidate_mask = np.array([True, True, True], dtype=bool)
+        pred_mask = _predict_boundary_vanish_mask_from_logits(logits.numpy(), candidate_mask)
+        self.assertTrue(pred_mask[1])
+        self.assertEqual(int(pred_mask.sum()), 1)
+
+    def test_boundary_vanish_one_step_zeros_targets_and_clips_blocked_collapses(self):
+        lengths = np.array([0.1, 0.6, 0.2], dtype=np.float64)
+        velocities = np.array([-0.1, -0.2, -0.5], dtype=np.float64)
+        predicted_vanish_mask = np.array([True, True, False], dtype=bool)
+        supervised_mask = np.array([True, True, True], dtype=bool)
+
+        lengths_new, dt_boundary, used = _apply_boundary_vanish_one_step(
+            lengths=lengths,
+            velocities=velocities,
+            predicted_vanish_mask=predicted_vanish_mask,
+            supervised_mask=supervised_mask,
+            dt_cap=float("inf"),
+            eps_len=1e-8,
+        )
+
+        self.assertTrue(used)
+        self.assertAlmostEqual(dt_boundary, 3.0)
+        self.assertEqual(float(lengths_new[0]), 0.0)
+        self.assertEqual(float(lengths_new[1]), 0.0)
+        self.assertGreater(float(lengths_new[2]), 0.0)
+        self.assertAlmostEqual(float(lengths_new[2]), 1e-7)
+
+    def test_edge_set_bce_loss_reports_exact_match(self):
+        logits = torch.tensor([5.0, -5.0, 5.0], dtype=torch.float32)
+        target = torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32)
+        loss, stats = _edge_set_bce_loss(logits, target)
+        self.assertLess(float(loss.item()), 0.1)
+        self.assertEqual(stats["target_size"], 2)
+        self.assertEqual(stats["pred_size"], 2)
+        self.assertEqual(stats["recall"], 1.0)
+        self.assertEqual(stats["precision"], 1.0)
+        self.assertEqual(stats["jaccard"], 1.0)
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    @patch("data.dataset.return_sampled_tree_orthant_velocity")
+    @patch("data.dataset.return_tree_boundary_merge_paths")
+    @patch("data.dataset.return_sampled_tree_boundary_decisions")
+    def test_overfit_fixed_pair_reuses_same_start_target_pair(
+        self,
+        mock_boundary_decisions,
+        mock_boundary_paths,
+        mock_velocity,
+        _mock_build_index,
+    ):
+        real_tree = "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);"
+        start_tree_a = "((1:0.1,2:0.1):0.1,(3:0.1,4:0.1):0.1);"
+        start_tree_b = "((1:0.1,3:0.1):0.1,(2:0.1,4:0.1):0.1);"
+        target_tree_a = "(((1:0.1,2:0.1):0.1,3:0.1):0.1,4:0.1);"
+        target_tree_b = "(((1:0.1,3:0.1):0.1,2:0.1):0.1,4:0.1);"
+        ar_event_tree = "((1:0.1,2:0.1,3:0.1):0.1,4:0.1);"
+
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_start_boundary_prefix_k=10,
+            overfit_boundary_prefix_k=12,
+            overfit_velocity_fixed_timepoints=[0.0],
+            overfit_fixed_pair=True,
+        )
+        ds._index = [{"id": "mock", "nexus_path": "mock", "tree_paths": []}]
+        ds._id_to_idx = {"mock": 0}
+        ds.parse_nexus = lambda path: (
+            {str(i + 1): "A" for i in range(4)},
+            [str(i + 1) for i in range(4)],
+        )
+        ds.load_posterior_trees_from_tfiles = lambda paths: [real_tree]
+
+        call_counter = {"count": 0}
+
+        def sample_random_tree_with_base(_target):
+            call_counter["count"] += 1
+            if call_counter["count"] == 1:
+                return start_tree_a, start_tree_a
+            return start_tree_b, start_tree_b
+
+        ds.sample_random_tree_with_base = sample_random_tree_with_base
+        ds.resolve_training_target_tree = lambda random_tree, _real_tree, base_start_tree_newick=None: (
+            target_tree_a if random_tree == start_tree_a else target_tree_b
+        )
+
+        mock_boundary_decisions.return_value = [
+            {
+                "newick": ar_event_tree,
+                "labels": [{"components": [1, 2, 3], "merge_indices": [0, 1]}],
+            }
+        ]
+        mock_boundary_paths.return_value = [{"end_newick": target_tree_a, "events": [{}]}]
+        mock_velocity.side_effect = lambda source_tree, _target_tree, timepoint: (
+            source_tree,
+            {"timepoint": timepoint},
+        )
+
+        sample_one = ds[0]
+        sample_two = ds[0]
+
+        self.assertEqual(call_counter["count"], 1)
+        self.assertEqual(sample_one["newick_tree"], sample_two["newick_tree"])
+        self.assertEqual(sample_one["target_tree"], sample_two["target_tree"])
+
+    def test_split_multi_label_training_events_creates_sequential_singletons(self):
+        current_newick = "((0:0.1,1:0.1,2:0.1,3:0.1):0.1,4:0.1);"
+        filtered_events = [
+            {
+                "newick": current_newick,
+                "labels": [
+                    {
+                        "result_split": 3,
+                        "parent_split": 15,
+                        "components": [1, 2, 4, 8],
+                        "merge_indices": [0, 1],
+                    },
+                    {
+                        "result_split": 12,
+                        "parent_split": 15,
+                        "components": [1, 2, 4, 8],
+                        "merge_indices": [2, 3],
+                    },
+                ],
+            }
+        ]
+
+        split_events = _split_multi_label_training_events(filtered_events)
+
+        self.assertEqual(len(split_events), 2)
+        self.assertEqual(split_events[0]["newick"], current_newick)
+        self.assertNotEqual(split_events[1]["newick"], current_newick)
+        self.assertFalse(split_events[0]["stop_after_merge"])
+        self.assertTrue(split_events[1]["stop_after_merge"])
+        self.assertEqual(len(split_events[0]["labels"]), 1)
+        self.assertEqual(len(split_events[1]["labels"]), 1)
+        self.assertEqual(split_events[0]["labels"][0]["result_split"], 3)
+        self.assertEqual(split_events[1]["labels"][0]["result_split"], 12)
+        second_label = split_events[1]["labels"][0]
+        merged_components = {
+            int(second_label["components"][idx]) for idx in second_label["merge_indices"]
+        }
+        self.assertEqual(merged_components, {4, 8})
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_overfit_event_horizon_returns_consecutive_event_samples(
+        self, _mock_build_index
+    ):
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_boundary_prefix_k=11,
+            overfit_velocity_zero=True,
+            overfit_velocity_event_states=True,
+            overfit_event_horizon=2,
+        )
+        ds._index = [{"id": "mock", "nexus_path": "mock", "tree_paths": []}]
+        ds._id_to_idx = {"mock": 0}
+        ds.parse_nexus = lambda path: (
+            {str(i + 1): "A" for i in range(155)},
+            [str(i + 1) for i in range(155)],
+        )
+        ds.tree_tokenizer = lambda trees: trees
+
+        sample = ds[0]
+        self.assertIn("multi_step_samples", sample)
+        self.assertEqual(len(sample["multi_step_samples"]), 2)
+
+        first_index = sample["multi_step_samples"][0]["autoregressive_event_index"]
+        second_index = sample["multi_step_samples"][1]["autoregressive_event_index"]
+        self.assertEqual(
+            second_index,
+            first_index + 1,
+            "Multi-step overfit horizon did not return consecutive oracle event indices.",
+        )
+
+    @patch.object(TreeDataset, "build_index", return_value=None)
+    def test_harness_sampling_pair_for_direct_transition_uses_raw_prefix_resolution(
+        self, _mock_build_index
+    ):
+        ds = TreeDataset(
+            nexus_root="mock",
+            mrbayes_root="mock",
+            random_sanity_check=True,
+            overfit_boundary_prefix_k=11,
+            overfit_start_boundary_prefix_k=10,
+        )
+        real_tree_raw = ds.load_posterior_trees_from_tfiles([])[0]
+        target_obj = EteTree(real_tree_raw, format=1)
+        leaves = target_obj.get_leaves()
+        leaves.sort(key=lambda leaf: leaf.name)
+        seq_ordering_map = {}
+        for i, leaf in enumerate(leaves):
+            original_name = leaf.name
+            mapped_name = str(i)
+            leaf.name = mapped_name
+            seq_ordering_map[original_name] = mapped_name
+        base_start_tree_raw, start_tree_raw = ds.sample_random_tree_with_base(real_tree_raw)
+        target_tree_raw = ds.resolve_training_target_tree(
+            start_tree_raw,
+            real_tree_raw,
+            base_start_tree_newick=base_start_tree_raw,
+        )
+        start_tree_obj = EteTree(start_tree_raw, format=1)
+        for leaf in start_tree_obj.get_leaves():
+            leaf.name = seq_ordering_map[leaf.name]
+        start_tree = start_tree_obj.write(format=1)
+
+        target_tree_obj = EteTree(target_tree_raw, format=1)
+        for leaf in target_tree_obj.get_leaves():
+            leaf.name = seq_ordering_map[leaf.name]
+        target_tree = target_tree_obj.write(format=1)
+
+        self.assertAlmostEqual(
+            _normalized_rf(start_tree, target_tree),
+            0.09352517985611511,
+            places=9,
+            msg="Harness direct-transition pair did not preserve the oracle k10->k11 normalized RF.",
         )
 
     @patch.object(TreeDataset, "build_index", return_value=None)

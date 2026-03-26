@@ -528,6 +528,7 @@ def _current_parent_and_children_for_split(split, current_clusters, n_leaves):
 def _filter_training_boundary_events(boundary_paths):
     training_events = []
     for boundary_path in boundary_paths:
+        filtered_events = []
         for event in boundary_path["events"]:
             labels = [
                 label
@@ -535,13 +536,99 @@ def _filter_training_boundary_events(boundary_paths):
                 if len(label["components"]) >= 3
             ]
             if labels:
-                training_events.append(
+                filtered_events.append(
                     {
                         "newick": event["newick"],
                         "labels": labels,
                     }
                 )
+        for event_idx, event in enumerate(filtered_events):
+            event["stop_after_merge"] = bool(
+                event_idx == (len(filtered_events) - 1)
+                and len(event["labels"]) == 1
+            )
+            training_events.append(event)
     return training_events
+
+
+def _split_multi_label_training_events(filtered_events):
+    from utils.bhv_movie import build_tree_from_splits
+
+    split_events = []
+    encoder = BHVEncoder()
+
+    for event in filtered_events:
+        labels = list(event["labels"])
+        if len(labels) <= 1:
+            split_events.append(
+                {
+                    "newick": event["newick"],
+                    "labels": labels,
+                }
+            )
+            continue
+
+        current_newick = event["newick"]
+        current_tree = Tree(current_newick)
+        split_masks, split_lengths = encoder.return_BHV_encoding(current_tree)
+        current_lengths = {
+            int(mask): float(length)
+            for mask, length in zip(split_masks, split_lengths)
+            if length is not None and float(length) > 1e-8
+        }
+        n_leaves = current_tree.n_leaves
+        mapping = current_tree.id_to_name
+
+        for label in labels:
+            merge_components = tuple(
+                int(label["components"][idx]) for idx in label["merge_indices"]
+            )
+            result_split = int(label["result_split"])
+            current_clusters = _internal_bio_clusters_from_splits(
+                current_lengths.keys(),
+                n_leaves,
+            )
+            parent_split, polytomy_components = _current_parent_and_children_for_split(
+                result_split,
+                current_clusters,
+                n_leaves,
+            )
+            merge_indices = []
+            for component in merge_components:
+                if component not in polytomy_components:
+                    raise ValueError(
+                        f"Cannot split multi-label event: component {component} not "
+                        f"present in current polytomy {polytomy_components}."
+                    )
+                merge_indices.append(polytomy_components.index(component))
+
+            split_events.append(
+                {
+                    "newick": current_newick,
+                    "labels": [
+                        {
+                            "result_split": result_split,
+                            "parent_split": int(parent_split),
+                            "components": polytomy_components,
+                            "merge_indices": merge_indices,
+                        }
+                    ],
+                }
+            )
+
+            current_lengths[result_split] = 0.1
+            _, current_newick = build_tree_from_splits(
+                list(current_lengths.keys()),
+                current_lengths,
+                n_leaves,
+                root_leaf=n_leaves - 1,
+                mapping=mapping,
+            )
+
+    for event_idx, event in enumerate(split_events):
+        event["stop_after_merge"] = bool(event_idx == (len(split_events) - 1))
+
+    return split_events
 
 
 def return_tree_boundary_merge_paths(
@@ -672,6 +759,7 @@ def return_tree_boundary_merge_paths(
         boundary_paths.append(
             {
                 "boundary_index": bi,
+                "global_time": float(segments[bi]["lambda_end"]),
                 "start_newick": start_newick,
                 "end_newick": end_newick,
                 "births": new_clusters,
@@ -688,6 +776,7 @@ def return_sampled_tree_boundary_decisions(
     verbose=False,
     id_to_test=None,
     require_complete_boundary=False,
+    split_multi_label_events=False,
 ):
     _ = require_complete_boundary
     boundary_paths = return_tree_boundary_merge_paths(
@@ -696,7 +785,10 @@ def return_sampled_tree_boundary_decisions(
         verbose=verbose,
         id_to_test=id_to_test,
     )
-    return _filter_training_boundary_events(boundary_paths)
+    training_events = _filter_training_boundary_events(boundary_paths)
+    if split_multi_label_events:
+        training_events = _split_multi_label_training_events(training_events)
+    return training_events
 
 def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_point, extra = False):
     from utils.bhv_movie import sample_tree_along_geodesic
@@ -710,7 +802,12 @@ def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_
     tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
     tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
     geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
-    G, newick, info = sample_tree_along_geodesic(geodesic_result, t1.n_leaves, u=time_point)
+    G, newick, info = sample_tree_along_geodesic(
+        geodesic_result,
+        t1.n_leaves,
+        u=time_point,
+        mapping=t1.id_to_name,
+    )
 
     #This was debugging for a particular tree
     # # newick = '(((((((((((((((((((((((26:0.0,27:0.0,28:0.0,29:0.0):0.365231256756337,30:0.0,31:0.0):0.46562144283500395,32:0.0):0.13098585901031182,(33:0.0,34:0.0):0.5291394654659506):0.11776353850130768,35:0.0):0.26157583756205705,(24:0.0,25:0.0):0.36258921686734963):0.5033803018034739,36:0.0):0.20237942744692658,37:0.0):0.3963250321841045,38:0.0):0.3885226443458947,39:0.0):0.5347065021413112,40:0.0):0.1889407459500561,((41:0.0,42:0.0):0.3123941602336278,43:0.0):0.4617405890461322):0.4096061346588971,44:0.0):0.09230307198090551,45:0.0):0.3418153243061678,46:0.0):0.3554843469643267,47:0.0):0.10002600125544758,48:0.0,49:0.0):0.4654256573541056,(((16:0.0,17:0.0,18:0.0):0.0738641626933164,19:0.0):0.31399054621088424,(20:0.0,21:0.0,22:0.0):0.07592098916706257,23:0.0):0.3001943741954219):0.24382687114231433,((((((((((50:0.0,51:0.0):0.22142174476410542,52:0.0):0.17074685221592145,53:0.0):0.22838704277064867,(54:0.0,55:0.0,56:0.0):0.37569841866156367):0.13616650211948078,57:0.0):0.0641547613661573,58:0.0):0.5359239417814602,59:0.0):0.25989987338680104,((60:0.0,61:0.0,62:0.0):0.43040397244018275,(63:0.0,64:0.0):0.39425131617022474,65:0.0,66:0.0):0.5344297477988371):0.22352185160016247,67:0.0,68:0.0):0.5166211118827367,69:0.0,70:0.0):0.43780235312355326):0.4562863329696488,71:0.0):0.44293449831375736,72:0.0):0.15731748844500548,((((((((0:0.0,1:0.0):0.16131819778555037,2:0.0):0.1598279400172913,3:0.0):0.07150417342001554,4:0.0):0.4143589617385931,5:0.0):0.18956447983105795,6:0.0):0.26457093652387426,7:0.0):0.3509120493508661,(((((8:0.0,9:0.0,10:0.0):0.23219967414249623,11:0.0):0.47890150538212484,(12:0.0,13:0.0):0.5300847583428087):0.19037701078440555,14:0.0):0.4826082684585838,15:0.0):0.21491917547287828):0.24452064127567635):0.3516082338078238,(((((((((((((((((((((100:0.0,101:0.0):0.4075151593913468,98:0.0,99:0.0):0.35246140233112444,(102:0.0,103:0.0):0.31257845845204657,104:0.0):0.13875849332367882,105:0.0):0.3956641634593137,(106:0.0,107:0.0):0.3082347174751331):0.4173298184039069,108:0.0):0.1890248480912928,(96:0.0,97:0.0):0.4099729156249853):0.26452779741123134,109:0.0):0.4070499942463294,110:0.0):0.11205970478777688,(111:0.0,112:0.0):0.2561745153331085):0.49159967584084857,(((91:0.0,92:0.0):0.08362457977610852,89:0.0,90:0.0,93:0.0,94:0.0):0.18330279434802157,95:0.0):0.3493371033744729):0.3663038054950591,113:0.0):0.23649380819270865,114:0.0):0.4464045694170972,115:0.0):0.5178991085420517,(((((116:0.0,117:0.0):0.1626560063932636,118:0.0):0.22208903780237932,119:0.0):0.3658530512957051,120:0.0):0.1166761718242802,(121:0.0,122:0.0):0.32511291828552646):0.5020210696622494):0.07262859964821185,(((((((((81:0.0,82:0.0):0.4701788003557065,83:0.0):0.2838378314914868,84:0.0):0.36065683669899545,85:0.0):0.12577566798746628,86:0.0):0.327628012142499,87:0.0):0.11414385983118146,88:0.0):0.10439351856711432,78:0.0,79:0.0,80:0.0):0.2883345348574025,((((73:0.0,74:0.0):0.16959541461333827,75:0.0):0.3470113937468134,76:0.0):0.15024189043096217,77:0.0):0.3342242085245652):0.47486736798186163):0.4584589852726523,123:0.0):0.12823236347459735,124:0.0):0.4647828243748471,125:0.0):0.23519184935769752,(126:0.0,127:0.0):0.20818437562919903):0.22921477851937236,((((131:0.0,132:0.0,133:0.0):0.49818678251290305,(128:0.0,129:0.0,130:0.0):0.1081456116685175,134:0.0):0.374861791247522,135:0.0):0.0625760728935306,136:0.0):0.176919171345831):0.4956524440616365,((((((((139:0.0,140:0.0,141:0.0):0.2044406361563448,(137:0.0,138:0.0):0.24757861246008647):0.36496011409578083,142:0.0):0.3394472667518442,143:0.0):0.056707772310875176,144:0.0):0.15478537361656458,((((145:0.0,146:0.0):0.32455724511050016,147:0.0):0.15788405331664848,148:0.0):0.11136587699554824,149:0.0):0.4129118538256446):0.4299676167090581,150:0.0):0.07132799911059619,(((151:0.0,152:0.0):0.35895846909210893,153:0.0):0.15181817937207243,154:0.0):0.4425292371341138):0.24829617861092312);'

@@ -394,29 +394,41 @@ class TreeFeatureTokenizer(nn.Module):
         pad = torch.zeros((N, k - d), dtype=lap.dtype, device=lap.device)
         return torch.cat([lap, pad], dim=1)
 
-    def lap_pe_torch(self, children: torch.Tensor, k: int, device=None) -> torch.Tensor:
+    def lap_pe_from_edge_index(
+        self,
+        edge_index: torch.Tensor,
+        num_nodes: int,
+        k: int,
+        device=None,
+    ) -> torch.Tensor:
         """
-        children: Long[N,2], -1 for missing. Returns LapPE: Float[N,k].
-        Target: GPU-friendly implementation using torch.linalg.eigh
+        edge_index: Long[2,E] directed parent->child edges. Self-edges are ignored.
+        Returns LapPE: Float[N,k].
         """
-        dev = device or children.device
-        N = children.size(0)
+        dev = device or edge_index.device
+        N = int(num_nodes)
         if N == 0 or k == 0:
             return torch.zeros((N, k), dtype=torch.float32, device=dev)
 
-        # Build Adjacency (Dense)
-        # children has shape (N, 2)
-        mask = children >= 0
-        if not mask.any():
+        if edge_index.numel() == 0:
             return torch.zeros((N, k), dtype=torch.float32, device=dev)
 
-        row_idx = torch.arange(N, device=dev).unsqueeze(1).expand(-1, 2)
-        src = row_idx[mask]
-        dst = children[mask]
+        edge_index = edge_index.to(dev)
+        if edge_index.dim() != 2 or edge_index.size(0) != 2:
+            raise ValueError(
+                f"edge_index must have shape [2, E], got {tuple(edge_index.shape)}"
+            )
+
+        non_self = edge_index[0] != edge_index[1]
+        if not bool(non_self.any()):
+            return torch.zeros((N, k), dtype=torch.float32, device=dev)
+
+        src = edge_index[0, non_self].long()
+        dst = edge_index[1, non_self].long()
 
         # Create dense adjacency matrix
         # Note: For very large N, sparse would be better, but trees are usually manageable
-        A = torch.zeros((N, N), device=dev)
+        A = torch.zeros((N, N), device=dev, dtype=torch.float32)
         A[src, dst] = 1.0
         A[dst, src] = 1.0  # Symmetric
 
@@ -443,6 +455,26 @@ class TreeFeatureTokenizer(nn.Module):
 
         # Pad if needed to reach exactly k columns (handled by _ensure_lap_dim)
         return self._ensure_lap_dim(output_vecs)
+
+    def lap_pe_torch(self, children: torch.Tensor, k: int, device=None) -> torch.Tensor:
+        """
+        children: Long[N,2], -1 for missing. Returns LapPE: Float[N,k].
+        Backwards-compatible wrapper for binary-tree callers.
+        """
+        dev = device or children.device
+        N = children.size(0)
+        if N == 0 or k == 0:
+            return torch.zeros((N, k), dtype=torch.float32, device=dev)
+
+        mask = children >= 0
+        if not mask.any():
+            return torch.zeros((N, k), dtype=torch.float32, device=dev)
+
+        row_idx = torch.arange(N, device=dev).unsqueeze(1).expand_as(children)
+        src = row_idx[mask]
+        dst = children[mask]
+        edge_index = torch.stack([src, dst], dim=0)
+        return self.lap_pe_from_edge_index(edge_index, num_nodes=N, k=k, device=dev)
 
     def lap_pe_scipy(self, children: torch.Tensor, k: int, device=None) -> torch.Tensor:
         """
@@ -739,24 +771,15 @@ class TreeFeatureTokenizer(nn.Module):
         sin_embed_node = self.sinusoidal_pos_enc(N, self.encoder_embed_dim, device)
         sin_embed_edge = self.sinusoidal_pos_enc(E, self.encoder_embed_dim, device)
 
-        children = torch.full((N, 2), -1, dtype=torch.long, device=device)
-
-        # Fill from CSR in parent order (NOT sorted-by-child order; Laplacian doesn’t care about edge order)
-        for p in range(N):
-            s = child_ptr[p].item()
-            t = child_ptr[p + 1].item()
-            c = child_ids[s:t]
-            if c.numel() > 0:
-                children[p, 0] = c[0]
-            if c.numel() > 1:
-                children[p, 1] = c[1]
-            if c.numel() > 2:
-                # non-binary node; we decide for purposes of laplacian to only keep first two children
-                children[p, 1] = c[1]
-
-        # Laplacian PE (N x lap_dim) from children
-        # lap_eigvecs = self.compute_laplacian_eigvecs_from_children(children, k=self.lap_dim, device=device)
-        lap_eigvecs = self.lap_pe_torch(children, k=self.lap_dim, device=device)
+        # Laplacian PE (N x lap_dim) from the full tree adjacency.
+        # This preserves non-binary structure instead of truncating polytomies
+        # down to two children for positional encoding.
+        lap_eigvecs = self.lap_pe_from_edge_index(
+            edge_index=edge_index,
+            num_nodes=N,
+            k=self.lap_dim,
+            device=device,
+        )
         lap_eigvecs = self._ensure_lap_dim(lap_eigvecs)
 
         # Leaf mask for tokens: you had nodes first then edges.

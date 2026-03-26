@@ -55,3 +55,4 @@ data:
   sanity_check: False
   random_sanity_check: True
   overfit_velocity_zero: False
+  overfit_boundary_prefix_k: -1

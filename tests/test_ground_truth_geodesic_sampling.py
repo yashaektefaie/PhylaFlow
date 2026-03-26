@@ -14,6 +14,7 @@ from utils.bhv_utils import (
 )
 import numpy as np
 from utils.utils import has_polytomy_fast
+from utils.metric_utils import calculate_norm_rf
 
 
 def encode_newick(newick: str):
@@ -280,6 +281,66 @@ def geodesic_state_at_time(
 
 
 class TestGroundTruthGeodesicSampling(unittest.TestCase):
+    def test_return_sampled_tree_orthant_velocity_preserves_leaf_mapping(self):
+        random.seed(123)
+        np.random.seed(123)
+
+        data_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "example_data")
+        )
+        dataset = TreeDataset(
+            nexus_root=os.path.join(data_root, "nexus"),
+            mrbayes_root=os.path.join(data_root, "runs"),
+            random_sanity_check=True,
+            overfit_start_boundary_prefix_k=10,
+            overfit_boundary_prefix_k=11,
+        )
+
+        real_tree = dataset.return_posterior_trees(0)[0]
+        start_tree = dataset.sample_random_tree(real_tree)
+        target_tree = dataset.resolve_training_target_tree(start_tree, real_tree)
+
+        sampled_start, _ = return_sampled_tree_orthant_velocity(
+            start_tree, target_tree, 0.0
+        )
+        sampled_end, _ = return_sampled_tree_orthant_velocity(
+            start_tree, target_tree, 1.0
+        )
+
+        self.assertLess(calculate_norm_rf(sampled_start, start_tree), 1e-8)
+        self.assertLess(calculate_norm_rf(sampled_end, target_tree), 1e-8)
+
+    def test_direct_transition_target_uses_same_leaf_mapping_as_sampled_tree(self):
+        random.seed(123)
+        np.random.seed(123)
+
+        data_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "example_data")
+        )
+        dataset = TreeDataset(
+            nexus_root=os.path.join(data_root, "nexus"),
+            mrbayes_root=os.path.join(data_root, "runs"),
+            random_sanity_check=True,
+            overfit_velocity_zero=True,
+            overfit_start_boundary_prefix_k=10,
+            overfit_boundary_prefix_k=11,
+        )
+
+        sample = dataset[0]
+
+        sampled_tree = Tree(sample["newick_tree"])
+        target_tree = Tree(sample["target_tree"])
+        sampled_labels = sorted(
+            [name for name in sampled_tree.id_to_name.values() if str(name).isdigit()],
+            key=lambda x: int(x),
+        )
+        target_labels = sorted(
+            [name for name in target_tree.id_to_name.values() if str(name).isdigit()],
+            key=lambda x: int(x),
+        )
+
+        self.assertEqual(sampled_labels, target_labels)
+
     def test_ground_truth_geodesic_sampler(self):
         random.seed(0)
         data_root = os.path.abspath(
