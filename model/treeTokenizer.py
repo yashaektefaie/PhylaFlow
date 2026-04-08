@@ -332,13 +332,40 @@ class TreeFeatureTokenizer(nn.Module):
         max_nodes=100,
         identifier=["orf", "lap"],
         concat_features=False,
+        branch_length_mode="linear",
+        branch_length_num_buckets=64,
+        branch_length_log_min=-8.0,
+        branch_length_log_max=1.0,
     ):
         super().__init__()
         self.encoder_embed_dim = hidden_dim
         self.node_encoder = nn.Embedding(num_node_types, hidden_dim, padding_idx=0)
         self.edge_encoder = nn.Embedding(num_edge_types, hidden_dim, padding_idx=0)
 
+        self.branch_length_mode = str(branch_length_mode)
+        if self.branch_length_mode not in {"linear", "bucket"}:
+            raise ValueError(
+                "branch_length_mode must be one of {'linear', 'bucket'}, "
+                f"got {branch_length_mode!r}."
+            )
+        self.branch_length_num_buckets = int(branch_length_num_buckets)
+        if self.branch_length_num_buckets < 2:
+            raise ValueError(
+                "branch_length_num_buckets must be >= 2, "
+                f"got {branch_length_num_buckets}."
+            )
+        self.branch_length_log_min = float(branch_length_log_min)
+        self.branch_length_log_max = float(branch_length_log_max)
+        if self.branch_length_log_max <= self.branch_length_log_min:
+            raise ValueError(
+                "branch_length_log_max must be > branch_length_log_min, "
+                f"got {branch_length_log_min} and {branch_length_log_max}."
+            )
         self.branch_length_encoder = nn.Linear(1, hidden_dim, bias=False)
+        self.branch_length_bucket_embedding = nn.Embedding(
+            self.branch_length_num_buckets,
+            hidden_dim,
+        )
 
         self.lap_dim = lap_dim
         self.lap_dropout = lap_dropout
@@ -362,6 +389,29 @@ class TreeFeatureTokenizer(nn.Module):
         self.register_buffer("orf_matrix", q)
 
         self.apply(lambda module: self.init_params(module, n_layers=n_layers))
+
+    def _branch_length_bucket_ids(self, branch_lengths: torch.Tensor) -> torch.Tensor:
+        lengths = branch_lengths.float()
+        bucket_ids = torch.zeros_like(lengths, dtype=torch.long)
+        positive = lengths > 0.0
+        if not bool(positive.any()):
+            return bucket_ids
+
+        log_lengths = torch.log(lengths[positive].clamp_min(1e-12))
+        scaled = (log_lengths - self.branch_length_log_min) / (
+            self.branch_length_log_max - self.branch_length_log_min
+        )
+        max_nonzero_bucket = self.branch_length_num_buckets - 2
+        clipped = torch.clamp(scaled, 0.0, 1.0)
+        bucket_vals = torch.floor(clipped * max_nonzero_bucket).to(torch.long) + 1
+        bucket_ids[positive] = bucket_vals
+        return bucket_ids
+
+    def encode_branch_lengths(self, branch_lengths: torch.Tensor) -> torch.Tensor:
+        if self.branch_length_mode == "bucket":
+            bucket_ids = self._branch_length_bucket_ids(branch_lengths)
+            return self.branch_length_bucket_embedding(bucket_ids.to(branch_lengths.device))
+        return self.branch_length_encoder(branch_lengths.unsqueeze(-1).to(branch_lengths.device))
 
     @staticmethod
     def init_params(module, n_layers):
@@ -1105,9 +1155,7 @@ class TreeFeatureTokenizer(nn.Module):
 
         edge_attr_embedding = self.edge_encoder(edge_data)
         if edge_attr_embedding.size(0) > 0:
-            branch_length_feat = self.branch_length_encoder(
-                branch_lengths.unsqueeze(1).to(device)
-            )
+            branch_length_feat = self.encode_branch_lengths(branch_lengths.to(device))
             edge_attr_embedding = (
                 edge_attr_embedding + branch_length_feat + sin_embed_edge
             )
@@ -1344,7 +1392,7 @@ class TreeFeatureTokenizer(nn.Module):
                 lengths_tensor[i, : len(t)] = t
 
         # Embed
-        branch_emb = self.branch_length_encoder(lengths_tensor.unsqueeze(-1))
+        branch_emb = self.encode_branch_lengths(lengths_tensor)
 
         # Clone static tokens
         out_tokens = batched_cache.static_tokens.clone()

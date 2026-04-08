@@ -319,6 +319,9 @@ def sample_tree_along_geodesic(geodesic_result, n_leaves, u=None, root=None, map
         info: dict with where we are along the path
     """
     segments = geodesic_result["segments"]
+    motion_segments = [seg for seg in segments if float(seg.get("length", 0.0)) > 1e-12]
+    if motion_segments:
+        segments = motion_segments
     if u is None:
         u = random.random()
 

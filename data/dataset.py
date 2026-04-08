@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from utils.bhv_utils import (
+    BHVEncoder,
     return_sampled_tree_orthant_velocity,
     return_sampled_tree_boundary_decisions,
     return_tree_boundary_merge_paths,
@@ -30,6 +34,7 @@ import random
 from model.treeTokenizer import TreeFeatureTokenizer
 from utils.random_tree import Tree
 from ete3 import Tree as EteTree
+from utils.utils import remove_bit
 
 
 class SizeDetector:
@@ -51,6 +56,7 @@ def resolve_training_target_tree_for_prefix(
     boundary_paths = return_tree_boundary_merge_paths(
         start_tree_newick,
         target_tree_newick,
+        legacy_training_semantics=False,
     )
     if not boundary_paths:
         return target_tree_newick
@@ -73,6 +79,7 @@ def resolve_training_target_tree_for_event_prefix(
     boundary_paths = return_tree_boundary_merge_paths(
         start_tree_newick,
         target_tree_newick,
+        legacy_training_semantics=False,
     )
     if not boundary_paths:
         return target_tree_newick
@@ -160,7 +167,15 @@ class TreeDataset(Dataset):
         overfit_event_prefix_count: int = -1,
         overfit_event_horizon: int = 1,
         overfit_fixed_pair: bool = False,
+        overfit_fixed_pair_start_tree_newick: Optional[str] = None,
+        overfit_fixed_pair_start_tree_json_path: Optional[str] = None,
+        overfit_fixed_pair_start_tree_json_paths: Optional[List[str]] = None,
+        overfit_fixed_pair_target_tree_newick: Optional[str] = None,
+        overfit_fixed_pair_target_tree_json_path: Optional[str] = None,
+        overfit_fixed_pair_target_tree_json_paths: Optional[List[str]] = None,
         overfit_split_multi_subset_events: bool = False,
+        overfit_oracle_prefix_start_prob: float = 0.0,
+        overfit_oracle_prefix_max_fraction: float = 0.5,
     ) -> None:
         self.nexus_root = nexus_root
         self.mrbayes_root = mrbayes_root
@@ -184,6 +199,67 @@ class TreeDataset(Dataset):
         self.overfit_event_prefix_count = int(overfit_event_prefix_count)
         self.overfit_event_horizon = max(1, int(overfit_event_horizon))
         self.overfit_fixed_pair = bool(overfit_fixed_pair)
+        self.overfit_oracle_prefix_start_prob = float(
+            overfit_oracle_prefix_start_prob
+        )
+        self.overfit_oracle_prefix_max_fraction = float(
+            overfit_oracle_prefix_max_fraction
+        )
+        override_start_tree = None
+        override_start_tree_bank: List[str] = []
+        if overfit_fixed_pair_start_tree_newick:
+            override_start_tree = str(overfit_fixed_pair_start_tree_newick)
+        elif overfit_fixed_pair_start_tree_json_path:
+            override_payload = json.loads(
+                Path(overfit_fixed_pair_start_tree_json_path).read_text()
+            )
+            override_start_tree = str(
+                override_payload.get("final_tree")
+                or override_payload.get("start_tree")
+            )
+        if overfit_fixed_pair_start_tree_json_paths:
+            for raw_path in overfit_fixed_pair_start_tree_json_paths:
+                override_payload = json.loads(Path(raw_path).read_text())
+                override_tree = str(
+                    override_payload.get("final_tree")
+                    or override_payload.get("start_tree")
+                )
+                if override_tree:
+                    override_start_tree_bank.append(override_tree)
+        if override_start_tree is not None and override_start_tree not in override_start_tree_bank:
+            override_start_tree_bank.append(str(override_start_tree))
+        self.overfit_fixed_pair_start_tree_newick = override_start_tree
+        self.overfit_fixed_pair_start_tree_newick_bank = list(override_start_tree_bank)
+        override_target_tree = None
+        override_target_tree_bank: List[str] = []
+        if overfit_fixed_pair_target_tree_newick:
+            override_target_tree = str(overfit_fixed_pair_target_tree_newick)
+        elif overfit_fixed_pair_target_tree_json_path:
+            override_payload = json.loads(
+                Path(overfit_fixed_pair_target_tree_json_path).read_text()
+            )
+            override_target_tree = str(
+                override_payload.get("target_tree")
+                or override_payload.get("final_tree")
+                or override_payload.get("start_tree")
+            )
+        if overfit_fixed_pair_target_tree_json_paths:
+            for raw_path in overfit_fixed_pair_target_tree_json_paths:
+                override_payload = json.loads(Path(raw_path).read_text())
+                override_tree = str(
+                    override_payload.get("target_tree")
+                    or override_payload.get("final_tree")
+                    or override_payload.get("start_tree")
+                )
+                if override_tree:
+                    override_target_tree_bank.append(override_tree)
+        if (
+            override_target_tree is not None
+            and override_target_tree not in override_target_tree_bank
+        ):
+            override_target_tree_bank.append(str(override_target_tree))
+        self.overfit_fixed_pair_target_tree_newick = override_target_tree
+        self.overfit_fixed_pair_target_tree_newick_bank = list(override_target_tree_bank)
         self.overfit_split_multi_subset_events = bool(
             overfit_split_multi_subset_events
         )
@@ -198,6 +274,7 @@ class TreeDataset(Dataset):
         self._index: List[Dict[str, Any]] = []  # list of sample metadata dicts
         self._id_to_idx: Dict[str, int] = {}
         self._cached_overfit_pairs: Dict[int, Dict[str, Any]] = {}
+        self._cached_overfit_pair_banks: Dict[int, List[Dict[str, Any]]] = {}
         self.random_tree = None
         self.sanity_check = sanity_check
         self.random_sanity_check = random_sanity_check
@@ -207,6 +284,102 @@ class TreeDataset(Dataset):
 
         # Build index immediately; optionally preload
         self.build_index()
+
+    def _normalize_start_tree_bank(self, start_tree_bank: List[str]) -> List[str]:
+        normalized: List[str] = []
+        seen = set()
+        for raw_tree in start_tree_bank:
+            tree = str(raw_tree).strip()
+            if not tree or tree in seen:
+                continue
+            seen.add(tree)
+            normalized.append(tree)
+        return normalized
+
+    def set_overfit_fixed_pair_start_tree_bank(
+        self,
+        start_tree_bank: List[str],
+    ) -> List[str]:
+        normalized = self._normalize_start_tree_bank(start_tree_bank)
+        self.overfit_fixed_pair_start_tree_newick_bank = list(normalized)
+        self.overfit_fixed_pair_start_tree_newick = (
+            normalized[0] if normalized else None
+        )
+        self._cached_overfit_pairs.clear()
+        self._cached_overfit_pair_banks.clear()
+        return list(self.overfit_fixed_pair_start_tree_newick_bank)
+
+    def _normalize_target_tree_bank(self, target_tree_bank: List[str]) -> List[str]:
+        normalized: List[str] = []
+        seen = set()
+        for raw_tree in target_tree_bank:
+            tree = str(raw_tree).strip()
+            if not tree or tree in seen:
+                continue
+            seen.add(tree)
+            normalized.append(tree)
+        return normalized
+
+    def set_overfit_fixed_pair_target_tree_bank(
+        self,
+        target_tree_bank: List[str],
+    ) -> List[str]:
+        normalized = self._normalize_target_tree_bank(target_tree_bank)
+        self.overfit_fixed_pair_target_tree_newick_bank = list(normalized)
+        self.overfit_fixed_pair_target_tree_newick = (
+            normalized[0] if normalized else None
+        )
+        self._cached_overfit_pairs.clear()
+        self._cached_overfit_pair_banks.clear()
+        return list(self.overfit_fixed_pair_target_tree_newick_bank)
+
+    def _oracle_prefix_candidates(
+        self,
+        start_tree_newick: str,
+        target_tree_newick: str,
+    ) -> List[str]:
+        boundary_paths = return_tree_boundary_merge_paths(
+            start_tree_newick,
+            target_tree_newick,
+            legacy_training_semantics=False,
+        )
+        candidates = [str(path["end_newick"]) for path in boundary_paths[:-1]]
+        if not candidates:
+            return []
+        max_fraction = float(self.overfit_oracle_prefix_max_fraction)
+        if 0.0 < max_fraction < 1.0:
+            keep = max(1, int(math.ceil(len(candidates) * max_fraction)))
+            candidates = candidates[:keep]
+        return candidates
+
+    def set_overfit_fixed_pair_best_start_tree(
+        self,
+        start_tree_newick: str,
+        *,
+        max_bank_size: int = 2,
+        keep_first: bool = True,
+    ) -> List[str]:
+        candidate = str(start_tree_newick).strip()
+        if not candidate:
+            return list(self.overfit_fixed_pair_start_tree_newick_bank)
+
+        current_bank = list(self.overfit_fixed_pair_start_tree_newick_bank)
+        if not current_bank:
+            current_bank = [candidate]
+        elif keep_first:
+            anchor = current_bank[0]
+            new_bank = [anchor]
+            if candidate != anchor:
+                new_bank.append(candidate)
+            if int(max_bank_size) > 0:
+                new_bank = new_bank[: max(1, int(max_bank_size))]
+            return self.set_overfit_fixed_pair_start_tree_bank(new_bank)
+        else:
+            current_bank.append(candidate)
+
+        if int(max_bank_size) > 0 and len(current_bank) > int(max_bank_size):
+            current_bank = current_bank[-int(max_bank_size) :]
+        return self.set_overfit_fixed_pair_start_tree_bank(current_bank)
 
     def resolve_training_target_tree(
         self,
@@ -433,32 +606,22 @@ class TreeDataset(Dataset):
             # then remap both together into dataset indexing.
             sample_source_tree = real_tree_original_label_newick
 
-        def _build_pair() -> Dict[str, Any]:
-            base_random_tree_raw, random_tree_raw = self.sample_random_tree_with_base(
-                sample_source_tree
+        def _build_pair(
+            forced_start_tree_newick: Optional[str] = None,
+            forced_target_tree_newick: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            chosen_start_tree_newick = (
+                str(forced_start_tree_newick)
+                if forced_start_tree_newick is not None
+                else None
             )
-            base_random_tree = _remap_random_tree_to_dataset_indexing(
-                base_random_tree_raw
-            )
-            random_tree = _remap_random_tree_to_dataset_indexing(random_tree_raw)
+            if chosen_start_tree_newick is None and self.overfit_fixed_pair_start_tree_newick:
+                chosen_start_tree_newick = str(self.overfit_fixed_pair_start_tree_newick)
 
-            # Both trees now use "0".."N-1" names, so bhv utils will work happily
-            effective_target_tree = self.resolve_training_target_tree(
-                random_tree,
-                real_tree_newick,
-                base_start_tree_newick=base_random_tree,
-            )
-            boundary_paths = return_tree_boundary_merge_paths(
-                random_tree, effective_target_tree
-            )
-            final_labels = return_sampled_tree_boundary_decisions(
-                random_tree,
-                effective_target_tree,
-                split_multi_label_events=self.overfit_split_multi_subset_events,
-            )
-
-            # If final_labels is empty, resample random tree until we get valid labels
-            while not final_labels:
+            if chosen_start_tree_newick is not None:
+                random_tree = chosen_start_tree_newick
+                base_random_tree = random_tree
+            else:
                 base_random_tree_raw, random_tree_raw = self.sample_random_tree_with_base(
                     sample_source_tree
                 )
@@ -466,18 +629,64 @@ class TreeDataset(Dataset):
                     base_random_tree_raw
                 )
                 random_tree = _remap_random_tree_to_dataset_indexing(random_tree_raw)
+
+            target_tree_newick = (
+                str(forced_target_tree_newick)
+                if forced_target_tree_newick is not None
+                else real_tree_newick
+            )
+            # Both trees now use "0".."N-1" names, so bhv utils will work happily
+            effective_target_tree = self.resolve_training_target_tree(
+                random_tree,
+                target_tree_newick,
+                base_start_tree_newick=base_random_tree,
+            )
+            boundary_paths = return_tree_boundary_merge_paths(
+                random_tree,
+                effective_target_tree,
+                legacy_training_semantics=False,
+            )
+            final_labels = return_sampled_tree_boundary_decisions(
+                random_tree,
+                effective_target_tree,
+                split_multi_label_events=self.overfit_split_multi_subset_events,
+                legacy_training_semantics=False,
+            )
+
+            # If final_labels is empty, resample random tree until we get valid labels
+            while not final_labels:
+                if chosen_start_tree_newick is not None:
+                    raise ValueError(
+                        "Configured overfit_fixed_pair_start_tree_newick did not "
+                        "yield any valid boundary decisions."
+                    )
+                base_random_tree_raw, random_tree_raw = self.sample_random_tree_with_base(
+                    sample_source_tree
+                )
+                base_random_tree = _remap_random_tree_to_dataset_indexing(
+                    base_random_tree_raw
+                )
+                random_tree = _remap_random_tree_to_dataset_indexing(random_tree_raw)
+                target_tree_newick = (
+                    str(forced_target_tree_newick)
+                    if forced_target_tree_newick is not None
+                    else real_tree_newick
+                )
                 effective_target_tree = self.resolve_training_target_tree(
                     random_tree,
-                    real_tree_newick,
+                    target_tree_newick,
                     base_start_tree_newick=base_random_tree,
                 )
                 boundary_paths = return_tree_boundary_merge_paths(
-                    random_tree, effective_target_tree
+                    random_tree,
+                    effective_target_tree,
+                    legacy_training_semantics=False,
                 )
                 final_labels = return_sampled_tree_boundary_decisions(
                     random_tree,
                     effective_target_tree,
                     split_multi_label_events=self.overfit_split_multi_subset_events,
+                    legacy_training_semantics=False,
                 )
 
             return {
@@ -489,15 +698,77 @@ class TreeDataset(Dataset):
             }
 
         if self.overfit_fixed_pair:
-            pair = self._cached_overfit_pairs.get(index)
-            if pair is None:
-                random_state = random.getstate()
-                try:
-                    random.seed(13)
-                    pair = _build_pair()
-                finally:
-                    random.setstate(random_state)
-                self._cached_overfit_pairs[index] = pair
+            if (
+                not self.validation
+                and self.overfit_oracle_prefix_start_prob > 0.0
+                and random.random() < self.overfit_oracle_prefix_start_prob
+            ):
+                start_bank = list(self.overfit_fixed_pair_start_tree_newick_bank or [])
+                target_bank = list(
+                    self.overfit_fixed_pair_target_tree_newick_bank or []
+                )
+                if start_bank and target_bank:
+                    chosen_start_tree = random.choice(start_bank)
+                    chosen_target_tree = random.choice(target_bank)
+                    oracle_prefix_candidates = self._oracle_prefix_candidates(
+                        chosen_start_tree,
+                        chosen_target_tree,
+                    )
+                    if oracle_prefix_candidates:
+                        oracle_start_tree = random.choice(oracle_prefix_candidates)
+                        pair = _build_pair(
+                            forced_start_tree_newick=oracle_start_tree,
+                            forced_target_tree_newick=chosen_target_tree,
+                        )
+                        pair["oracle_prefix_start_tree"] = str(oracle_start_tree)
+                        pair["oracle_prefix_base_start_tree"] = str(
+                            chosen_start_tree
+                        )
+                        pair["oracle_prefix_target_tree"] = str(chosen_target_tree)
+                    else:
+                        pair = None
+                else:
+                    pair = None
+            else:
+                pair = None
+
+            if pair is None and len(self.overfit_fixed_pair_target_tree_newick_bank) > 1:
+                forced_start_tree_newick = (
+                    random.choice(self.overfit_fixed_pair_start_tree_newick_bank)
+                    if self.overfit_fixed_pair_start_tree_newick_bank
+                    else None
+                )
+                forced_target_tree_newick = random.choice(
+                    self.overfit_fixed_pair_target_tree_newick_bank
+                )
+                pair = _build_pair(
+                    forced_start_tree_newick=forced_start_tree_newick,
+                    forced_target_tree_newick=forced_target_tree_newick,
+                )
+            elif pair is None and len(self.overfit_fixed_pair_start_tree_newick_bank) > 1:
+                pair_bank = self._cached_overfit_pair_banks.get(index)
+                if pair_bank is None:
+                    random_state = random.getstate()
+                    try:
+                        random.seed(13)
+                        pair_bank = [
+                            _build_pair(forced_start_tree_newick=start_tree_newick)
+                            for start_tree_newick in self.overfit_fixed_pair_start_tree_newick_bank
+                        ]
+                    finally:
+                        random.setstate(random_state)
+                    self._cached_overfit_pair_banks[index] = pair_bank
+                pair = random.choice(pair_bank)
+            elif pair is None:
+                pair = self._cached_overfit_pairs.get(index)
+                if pair is None:
+                    random_state = random.getstate()
+                    try:
+                        random.seed(13)
+                        pair = _build_pair()
+                    finally:
+                        random.setstate(random_state)
+                    self._cached_overfit_pairs[index] = pair
         else:
             pair = _build_pair()
 
@@ -528,6 +799,10 @@ class TreeDataset(Dataset):
                     explicit_velocity_timepoints = list(
                         self.overfit_velocity_fixed_timepoints
                     )
+                    if len(explicit_velocity_timepoints) == 1:
+                        explicit_velocity_timepoints = explicit_velocity_timepoints * len(
+                            explicit_velocity_trees
+                        )
                 else:
                     explicit_velocity_timepoints = [0.0]
                     explicit_velocity_timepoints.extend(
@@ -559,6 +834,7 @@ class TreeDataset(Dataset):
                     velocity_source_tree,
                     effective_target_tree,
                     0.0,
+                    legacy_training_semantics=False,
                 )
                 timepoint = float(model_timepoint)
             elif self.overfit_velocity_orthant_start_states:
@@ -566,21 +842,36 @@ class TreeDataset(Dataset):
                 orthant_start_trees.extend(
                     path["end_newick"] for path in boundary_paths[:-1]
                 )
-                (
-                    velocity_source_tree,
-                    velocity_next_boundary_tree,
-                ) = random.choice(
-                    list(zip(orthant_start_trees, [path["start_newick"] for path in boundary_paths]))
-                )
+                next_boundary_trees = [
+                    path.get("start_newick", path["end_newick"])
+                    for path in boundary_paths
+                ]
+                if all("start_newick" in path for path in boundary_paths):
+                    (
+                        velocity_source_tree,
+                        velocity_next_boundary_tree,
+                    ) = random.choice(
+                        list(zip(orthant_start_trees, next_boundary_trees))
+                    )
+                else:
+                    velocity_source_tree = random.choice(orthant_start_trees)
+                    source_index = orthant_start_trees.index(velocity_source_tree)
+                    velocity_next_boundary_tree = next_boundary_trees[source_index]
                 timepoint = 0.0
                 newick, velocity = return_sampled_tree_orthant_velocity(
-                    velocity_source_tree, effective_target_tree, timepoint
+                    velocity_source_tree,
+                    effective_target_tree,
+                    timepoint,
+                    legacy_training_semantics=False,
                 )
             elif self.overfit_velocity_event_states:
                 velocity_source_tree = chosen_autoregressive_event["newick"]
                 timepoint = 0.0
                 newick, velocity = return_sampled_tree_orthant_velocity(
-                    velocity_source_tree, effective_target_tree, timepoint
+                    velocity_source_tree,
+                    effective_target_tree,
+                    timepoint,
+                    legacy_training_semantics=False,
                 )
             else:
                 velocity_source_tree = random_tree
@@ -591,7 +882,10 @@ class TreeDataset(Dataset):
                 else:
                     timepoint = random.uniform(0, 1)
                 newick, velocity = return_sampled_tree_orthant_velocity(
-                    velocity_source_tree, effective_target_tree, timepoint
+                    velocity_source_tree,
+                    effective_target_tree,
+                    timepoint,
+                    legacy_training_semantics=False,
                 )
 
             return {
@@ -600,8 +894,10 @@ class TreeDataset(Dataset):
                 "tree_paths": meta["tree_paths"],
                 "sequences": new_seqs,
                 "taxa_order": list(new_seqs.keys()),
+                "start_tree": random_tree,
                 "newick_tree": newick,
                 "target_tree": effective_target_tree,
+                "fixed_pair_num_events": int(len(final_labels)),
                 "velocity": velocity,
                 "velocity_next_boundary_tree": velocity_next_boundary_tree,
                 "timepoint": timepoint,
@@ -624,6 +920,12 @@ class TreeDataset(Dataset):
         num_to_name = self.return_nexus_number_to_name(index)
         sample = dict(step_samples[0])
         sample["num_to_name"] = original_names_map
+        if "oracle_prefix_start_tree" in pair:
+            sample["oracle_prefix_start_tree"] = pair["oracle_prefix_start_tree"]
+            sample["oracle_prefix_base_start_tree"] = pair[
+                "oracle_prefix_base_start_tree"
+            ]
+            sample["oracle_prefix_target_tree"] = pair["oracle_prefix_target_tree"]
         sample["seq_ordering_map"] = seq_ordering_map
         if len(step_samples) > 1:
             sample["multi_step_samples"] = step_samples
@@ -633,9 +935,56 @@ class TreeDataset(Dataset):
     def get_overfit_fixed_pair(self, index: int) -> Optional[Dict[str, Any]]:
         if not self.overfit_fixed_pair:
             return None
+        if len(self.overfit_fixed_pair_target_tree_newick_bank) > 1:
+            return None
+        if len(self.overfit_fixed_pair_start_tree_newick_bank) > 1:
+            if index not in self._cached_overfit_pair_banks:
+                _ = self[index]
+            pair_bank = self._cached_overfit_pair_banks.get(index)
+            if pair_bank:
+                return pair_bank[0]
+            return None
         if index not in self._cached_overfit_pairs:
             _ = self[index]
         return self._cached_overfit_pairs.get(index)
+
+    def sample_overfit_fixed_pair_bank_pair(self) -> Optional[Dict[str, Any]]:
+        if not self.overfit_fixed_pair:
+            return None
+        start_bank = list(self.overfit_fixed_pair_start_tree_newick_bank or [])
+        target_bank = list(self.overfit_fixed_pair_target_tree_newick_bank or [])
+        if not start_bank or not target_bank:
+            return None
+
+        chosen_start_tree = random.choice(start_bank)
+        chosen_target_tree = (
+            random.choice(target_bank) if len(target_bank) > 1 else target_bank[0]
+        )
+        base_random_tree = str(chosen_start_tree)
+        random_tree = str(chosen_start_tree)
+        effective_target_tree = self.resolve_training_target_tree(
+            random_tree,
+            str(chosen_target_tree),
+            base_start_tree_newick=base_random_tree,
+        )
+        boundary_paths = return_tree_boundary_merge_paths(
+            random_tree,
+            effective_target_tree,
+            legacy_training_semantics=False,
+        )
+        final_labels = return_sampled_tree_boundary_decisions(
+            random_tree,
+            effective_target_tree,
+            split_multi_label_events=self.overfit_split_multi_subset_events,
+            legacy_training_semantics=False,
+        )
+        return {
+            "base_random_tree": base_random_tree,
+            "random_tree": random_tree,
+            "effective_target_tree": effective_target_tree,
+            "boundary_paths": boundary_paths,
+            "final_labels": final_labels,
+        }
 
     def parse_translate_block(self, path: str) -> Dict[str, str]:
         """Extract 'translate' block from a Nexus/MrBayes file to map IDs to Taxon names."""
@@ -962,6 +1311,10 @@ class PhylaDataModule(pl.LightningDataModule):
         self.batch_size = config["data"]["batch_size"]
         self.num_workers = config["data"]["num_workers"]
         self.pin_memory = config["data"]["pin_memory"]
+        self.loader_seed = config["data"].get(
+            "loader_seed",
+            config.get("trainer", {}).get("seed"),
+        )
 
         self.train_ids = train_ids
         self.test_ids = test_ids
@@ -984,8 +1337,44 @@ class PhylaDataModule(pl.LightningDataModule):
             overfit_event_prefix_count=config["data"].get("overfit_event_prefix_count", -1),
             overfit_event_horizon=config["data"].get("overfit_event_horizon", 1),
             overfit_fixed_pair=config["data"].get("overfit_fixed_pair", False),
+            overfit_fixed_pair_start_tree_newick=config["data"].get(
+                "overfit_fixed_pair_start_tree_newick"
+            ),
+            overfit_fixed_pair_start_tree_json_path=config["data"].get(
+                "overfit_fixed_pair_start_tree_json_path"
+            ),
+            overfit_fixed_pair_start_tree_json_paths=config["data"].get(
+                "overfit_fixed_pair_start_tree_json_paths"
+            ),
+            overfit_fixed_pair_target_tree_newick=config["data"].get(
+                "overfit_fixed_pair_target_tree_newick"
+            ),
+            overfit_fixed_pair_target_tree_json_path=config["data"].get(
+                "overfit_fixed_pair_target_tree_json_path"
+            ),
+            overfit_fixed_pair_target_tree_json_paths=config["data"].get(
+                "overfit_fixed_pair_target_tree_json_paths"
+            ),
             overfit_split_multi_subset_events=config["data"].get(
                 "overfit_split_multi_subset_events", False
+            ),
+            overfit_oracle_prefix_start_prob=config["data"].get(
+                "overfit_oracle_prefix_start_prob",
+                config["data"].get(
+                    "analysis_oracle_prefix_start_prob",
+                    config.get("trainer", {}).get(
+                        "analysis_oracle_prefix_start_prob", 0.0
+                    ),
+                ),
+            ),
+            overfit_oracle_prefix_max_fraction=config["data"].get(
+                "overfit_oracle_prefix_max_fraction",
+                config["data"].get(
+                    "analysis_oracle_prefix_max_fraction",
+                    config.get("trainer", {}).get(
+                        "analysis_oracle_prefix_max_fraction", 0.5
+                    ),
+                ),
             ),
         )
         self.dataset_val = TreeDataset(
@@ -1006,14 +1395,53 @@ class PhylaDataModule(pl.LightningDataModule):
             overfit_event_prefix_count=config["data"].get("overfit_event_prefix_count", -1),
             overfit_event_horizon=config["data"].get("overfit_event_horizon", 1),
             overfit_fixed_pair=config["data"].get("overfit_fixed_pair", False),
+            overfit_fixed_pair_start_tree_newick=config["data"].get(
+                "overfit_fixed_pair_start_tree_newick"
+            ),
+            overfit_fixed_pair_start_tree_json_path=config["data"].get(
+                "overfit_fixed_pair_start_tree_json_path"
+            ),
+            overfit_fixed_pair_start_tree_json_paths=config["data"].get(
+                "overfit_fixed_pair_start_tree_json_paths"
+            ),
+            overfit_fixed_pair_target_tree_newick=config["data"].get(
+                "overfit_fixed_pair_target_tree_newick"
+            ),
+            overfit_fixed_pair_target_tree_json_path=config["data"].get(
+                "overfit_fixed_pair_target_tree_json_path"
+            ),
+            overfit_fixed_pair_target_tree_json_paths=config["data"].get(
+                "overfit_fixed_pair_target_tree_json_paths"
+            ),
             overfit_split_multi_subset_events=config["data"].get(
                 "overfit_split_multi_subset_events", False
+            ),
+            overfit_oracle_prefix_start_prob=config["data"].get(
+                "overfit_oracle_prefix_start_prob",
+                config["data"].get(
+                    "analysis_oracle_prefix_start_prob",
+                    config.get("trainer", {}).get(
+                        "analysis_oracle_prefix_start_prob", 0.0
+                    ),
+                ),
+            ),
+            overfit_oracle_prefix_max_fraction=config["data"].get(
+                "overfit_oracle_prefix_max_fraction",
+                config["data"].get(
+                    "analysis_oracle_prefix_max_fraction",
+                    config.get("trainer", {}).get(
+                        "analysis_oracle_prefix_max_fraction", 0.5
+                    ),
+                ),
             ),
         )
         self.tree_tokenizer = TreeFeatureTokenizer(
             config["model"]["num_node_types"],
             config["model"]["num_edge_types"],
             config["model"]["hidden_dim"],
+        )
+        self.use_historical_collate = bool(
+            config["data"].get("use_historical_collate", False)
         )
         self.msa_distance = True
 
@@ -1040,6 +1468,10 @@ class PhylaDataModule(pl.LightningDataModule):
         return self.dataset_train.__getitem__(*args, **kwargs)
 
     def train_dataloader(self) -> DataLoader:
+        generator = None
+        if self.loader_seed is not None:
+            generator = torch.Generator()
+            generator.manual_seed(int(self.loader_seed))
         return DataLoader(
             self.dataset_train,
             batch_size=self.batch_size,
@@ -1047,6 +1479,7 @@ class PhylaDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             collate_fn=self.collate_fn,
+            generator=generator,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -1081,6 +1514,81 @@ class PhylaDataModule(pl.LightningDataModule):
 
     def collate_fn(self, batch, preset_subtree_num=None):
         """Custom collate function if needed."""
+        if self.use_historical_collate:
+            flat_batch = []
+            for item in batch:
+                if item is None:
+                    continue
+                multi_step_samples = item.get("multi_step_samples")
+                if multi_step_samples:
+                    flat_batch.extend(multi_step_samples)
+                else:
+                    flat_batch.append(item)
+            batch = flat_batch
+
+            if "posterior_trees" in batch[0]:
+                ids = [item["id"] for item in batch]
+                posterior_trees = [item["posterior_trees"] for item in batch]
+                mappings = [item["num_to_name"] for item in batch]
+                return {
+                    "ids": ids,
+                    "posterior_trees": posterior_trees,
+                    "phyla_embeddings": None,
+                    "mappings": mappings,
+                    "nexus_filepaths": [item["nexus_path"] for item in batch],
+                    "tree_paths": [item["tree_paths"] for item in batch],
+                }
+
+            trees_to_tokenize = [item["newick_tree"] for item in batch]
+            tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
+            num_leaves = [len(batch[i]["sequences"]) for i in range(len(batch))]
+            autoregressive_trees_to_tokenize = [
+                item["autoregressive_newick"] for item in batch
+            ]
+            autoregressive_tokenized_trees = self.tree_tokenizer(
+                autoregressive_trees_to_tokenize
+            )
+            mappings = [item["num_to_name"] for item in batch]
+            ids = [item["id"] for item in batch]
+            batched_autoregressive_time = torch.tensor(
+                [item["autoregressive_newick_time"] for item in batch],
+                dtype=torch.float32,
+            )
+
+            return {
+                "tokenized_trees": tokenized_trees,
+                "tokenized_autoregressive_trees": autoregressive_tokenized_trees,
+                "newick_autoregressive_trees": autoregressive_trees_to_tokenize,
+                "nexus_filepaths": [item["nexus_path"] for item in batch],
+                "tree_paths": [item["tree_paths"] for item in batch],
+                "original_trees": [item["newick_tree"] for item in batch],
+                "target_trees": [item["target_tree"] for item in batch],
+                "batched_velocity": [item["velocity"] for item in batch],
+                "velocity_next_boundary_trees": [
+                    item.get("velocity_next_boundary_tree") for item in batch
+                ],
+                "batched_autoregressive_time": batched_autoregressive_time,
+                "batched_autoregressive_labels": [
+                    item["autoregressive_labels"] for item in batch
+                ],
+                "batched_autoregressive_stop_after_merge": torch.tensor(
+                    [
+                        1.0
+                        if item.get("autoregressive_stop_after_merge", False)
+                        else 0.0
+                        for item in batch
+                    ],
+                    dtype=torch.float32,
+                ),
+                "batched_time": torch.tensor(
+                    [item["timepoint"] for item in batch], dtype=torch.float32
+                ),
+                "phyla_embeddings": None,
+                "num_leaves": num_leaves,
+                "ids": ids,
+                "mappings": mappings,
+            }
+
         flat_batch = []
         for item in batch:
             if item is None:
@@ -1111,15 +1619,80 @@ class PhylaDataModule(pl.LightningDataModule):
         # Just ensuring signature matches call site
 
         trees_to_tokenize = [item["newick_tree"] for item in batch]
+        structural_trees = [
+            self.tree_tokenizer._newick_to_structural(tree)
+            for tree in trees_to_tokenize
+        ]
         # Tokenizer runs in worker if num_workers > 0, so must disable gradients
         # to avoid pickling errors (grad_fn cannot be pickled).
         
         try:
             with torch.no_grad():
-                tokenized_trees = self.tree_tokenizer(trees_to_tokenize)
+                tokenized_trees = self.tree_tokenizer(structural_trees)
         except Exception as e:
             print(f"Error in tree tokenization: {e}")
             return None 
+
+        def _aligned_true_edge_lengths(tree_newick, token_masks):
+            tree_obj = Tree(tree_newick)
+            split_masks, split_lengths = BHVEncoder().return_BHV_encoding(tree_obj)
+            true_length_map = {
+                int(mask): float(length)
+                for mask, length in zip(split_masks, split_lengths)
+                if length is not None and float(length) > 1e-8
+            }
+            biological_bits = max(tree_obj.n_leaves - 1, 0)
+            full_model_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
+            aligned_lengths = []
+            for raw_mask in token_masks:
+                raw_mask = int(raw_mask)
+                if raw_mask == 0:
+                    aligned_lengths.append(0.0)
+                    continue
+
+                edge_length = 0.0
+                if raw_mask in true_length_map:
+                    edge_length = float(true_length_map[raw_mask])
+                elif full_model_mask and (full_model_mask ^ raw_mask) in true_length_map:
+                    edge_length = float(true_length_map[int(full_model_mask ^ raw_mask)])
+                aligned_lengths.append(edge_length)
+            return torch.as_tensor(aligned_lengths, dtype=torch.float32)
+
+        tokenized_tree_edge_lengths = [
+            _aligned_true_edge_lengths(tree_newick, tokenized_trees[-1][idx])
+            for idx, tree_newick in enumerate(trees_to_tokenize)
+        ]
+
+        velocity_next_boundary_active_masks = []
+        for batch_idx, item in enumerate(batch):
+            next_boundary_tree = item.get("velocity_next_boundary_tree")
+            if not next_boundary_tree:
+                velocity_next_boundary_active_masks.append(None)
+                continue
+
+            current_tree_obj = Tree(item["newick_tree"])
+            boundary_tree_obj = Tree(next_boundary_tree)
+            boundary_masks, boundary_lengths = BHVEncoder().return_BHV_encoding(
+                boundary_tree_obj
+            )
+            boundary_length_map = {
+                int(mask): float(length)
+                for mask, length in zip(boundary_masks, boundary_lengths)
+                if length is not None and float(length) > 1e-8
+            }
+            biological_bits = max(current_tree_obj.n_leaves - 1, 0)
+            full_model_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
+            current_masks = [int(mask) for mask in tokenized_trees[-1][batch_idx]]
+            active_masks = set()
+            for raw_mask in current_masks:
+                raw_mask = int(raw_mask)
+                if raw_mask == 0:
+                    continue
+                if raw_mask in boundary_length_map or (
+                    full_model_mask and (full_model_mask ^ raw_mask) in boundary_length_map
+                ):
+                    active_masks.add(raw_mask)
+            velocity_next_boundary_active_masks.append(active_masks)
 
         num_leaves = [len(batch[i]["sequences"]) for i in range(len(batch))]
 
@@ -1151,9 +1724,11 @@ class PhylaDataModule(pl.LightningDataModule):
             "original_trees": [item["newick_tree"] for item in batch],
             "target_trees": [item["target_tree"] for item in batch],
             "batched_velocity": [item["velocity"] for item in batch],
+            "tokenized_tree_edge_lengths": tokenized_tree_edge_lengths,
             "velocity_next_boundary_trees": [
                 item.get("velocity_next_boundary_tree") for item in batch
             ],
+            "velocity_next_boundary_active_masks": velocity_next_boundary_active_masks,
             "batched_autoregressive_time": batched_autoregressive_time,
             "batched_autoregressive_labels": [
                 item["autoregressive_labels"] for item in batch

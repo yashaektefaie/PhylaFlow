@@ -71,6 +71,12 @@ def _init_wandb_run(config, default_project):
             "velocity_first_hit_predictor_mode": trainer_cfg.get(
                 "velocity_first_hit_predictor_mode"
             ),
+            "velocity_first_hit_false_positive_mass_weight": trainer_cfg.get(
+                "velocity_first_hit_false_positive_mass_weight"
+            ),
+            "velocity_first_hit_false_negative_mass_weight": trainer_cfg.get(
+                "velocity_first_hit_false_negative_mass_weight"
+            ),
             "velocity_first_hit_use_geometry_features": trainer_cfg.get(
                 "velocity_first_hit_use_geometry_features"
             ),
@@ -79,6 +85,37 @@ def _init_wandb_run(config, default_project):
             ),
             "velocity_first_hit_edge_length_hidden_dim": trainer_cfg.get(
                 "velocity_first_hit_edge_length_hidden_dim"
+            ),
+            "velocity_first_hit_attention_layers": trainer_cfg.get(
+                "velocity_first_hit_attention_layers"
+            ),
+            "velocity_first_hit_attention_heads": trainer_cfg.get(
+                "velocity_first_hit_attention_heads"
+            ),
+            "velocity_first_hit_bucket_count": trainer_cfg.get(
+                "velocity_first_hit_bucket_count"
+            ),
+            "velocity_first_hit_bucket_log_min": trainer_cfg.get(
+                "velocity_first_hit_bucket_log_min"
+            ),
+            "velocity_first_hit_bucket_log_max": trainer_cfg.get(
+                "velocity_first_hit_bucket_log_max"
+            ),
+            "velocity_refiner_mode": trainer_cfg.get("velocity_refiner_mode"),
+            "velocity_refiner_attention_layers": trainer_cfg.get(
+                "velocity_refiner_attention_layers"
+            ),
+            "velocity_refiner_attention_heads": trainer_cfg.get(
+                "velocity_refiner_attention_heads"
+            ),
+            "velocity_refiner_bucket_count": trainer_cfg.get(
+                "velocity_refiner_bucket_count"
+            ),
+            "velocity_refiner_bucket_log_min": trainer_cfg.get(
+                "velocity_refiner_bucket_log_min"
+            ),
+            "velocity_refiner_bucket_log_max": trainer_cfg.get(
+                "velocity_refiner_bucket_log_max"
             ),
             "velocity_boundary_vanish_head_weight": trainer_cfg.get(
                 "velocity_boundary_vanish_head_weight"
@@ -120,6 +157,102 @@ def _init_wandb_run(config, default_project):
             "rollout_replay_bank_max_polytomy_size": trainer_cfg.get(
                 "rollout_replay_bank_max_polytomy_size"
             ),
+            "sampling_fixed_dt_base": trainer_cfg.get("sampling_fixed_dt_base"),
+            "sampling_max_steps": trainer_cfg.get("sampling_max_steps"),
+            "sampling_max_events": trainer_cfg.get("sampling_max_events"),
+            "sampling_max_autoregressive_merges_per_boundary": trainer_cfg.get(
+                "sampling_max_autoregressive_merges_per_boundary"
+            ),
+            "rollout_replay_fixed_dt_base": trainer_cfg.get(
+                "rollout_replay_fixed_dt_base"
+            ),
+            "rollout_replay_max_events": trainer_cfg.get(
+                "rollout_replay_max_events"
+            ),
+            "rollout_replay_prefix_stop_early": trainer_cfg.get(
+                "rollout_replay_prefix_stop_early"
+            ),
+            "rollout_replay_cache_reuse_every_step": trainer_cfg.get(
+                "rollout_replay_cache_reuse_every_step"
+            ),
+            "rollout_replay_refresh_only_if_better_rf": trainer_cfg.get(
+                "rollout_replay_refresh_only_if_better_rf"
+            ),
+            "rollout_replay_legacy_loss_structure": trainer_cfg.get(
+                "rollout_replay_legacy_loss_structure"
+            ),
+            "dynamic_start_bank_mode": trainer_cfg.get(
+                "dynamic_start_bank_mode",
+                (
+                    "soft_hybrid"
+                    if (
+                        trainer_cfg.get("analysis_soft_hybrid_best_rf_repeat")
+                        is not None
+                        or trainer_cfg.get("analysis_soft_hybrid_best_multivel_repeat")
+                        is not None
+                    )
+                    else None
+                ),
+            ),
+            "dynamic_start_bank_min_velocity_states": trainer_cfg.get(
+                "dynamic_start_bank_min_velocity_states",
+                trainer_cfg.get("analysis_dynamic_start_bank_min_velocity_states"),
+            ),
+            "dynamic_start_bank_best_rf_repeat": trainer_cfg.get(
+                "dynamic_start_bank_best_rf_repeat",
+                trainer_cfg.get("analysis_soft_hybrid_best_rf_repeat"),
+            ),
+            "dynamic_start_bank_best_multivel_repeat": trainer_cfg.get(
+                "dynamic_start_bank_best_multivel_repeat",
+                trainer_cfg.get("analysis_soft_hybrid_best_multivel_repeat"),
+            ),
+            "overfit_oracle_prefix_start_prob": config.get("data", {}).get(
+                "overfit_oracle_prefix_start_prob",
+                config.get("data", {}).get("analysis_oracle_prefix_start_prob"),
+            ),
+            "overfit_oracle_prefix_max_fraction": config.get("data", {}).get(
+                "overfit_oracle_prefix_max_fraction",
+                config.get("data", {}).get("analysis_oracle_prefix_max_fraction"),
+            ),
+            "sampling_disable_inner_logging": trainer_cfg.get(
+                "sampling_disable_inner_logging"
+            ),
+            "sampling_only_first_hit_collapse": trainer_cfg.get(
+                "sampling_only_first_hit_collapse"
+            ),
+            "sampling_actual_event_boundary_use_at_sampling": trainer_cfg.get(
+                "sampling_actual_event_boundary_use_at_sampling"
+            ),
+            "sampling_actual_event_boundary_include_predicted_first_hit": trainer_cfg.get(
+                "sampling_actual_event_boundary_include_predicted_first_hit"
+            ),
+            "velocity_first_hit_sampling_max_edges": trainer_cfg.get(
+                "velocity_first_hit_sampling_max_edges"
+            ),
+            "velocity_first_hit_sampling_fallback_threshold": trainer_cfg.get(
+                "velocity_first_hit_sampling_fallback_threshold"
+            ),
+            "velocity_first_hit_sampling_fallback_top_k": trainer_cfg.get(
+                "velocity_first_hit_sampling_fallback_top_k"
+            ),
+            "legacy_first_hit_gather_only": trainer_cfg.get(
+                "legacy_first_hit_gather_only"
+            ),
+            "sampling_use_top_merge_planner": trainer_cfg.get(
+                "sampling_use_top_merge_planner"
+            ),
+            "sampling_use_inference_mode": trainer_cfg.get(
+                "sampling_use_inference_mode"
+            ),
+            "sampling_cache_tri_mask": trainer_cfg.get(
+                "sampling_cache_tri_mask"
+            ),
+            "sampling_cache_polytomy_groups": trainer_cfg.get(
+                "sampling_cache_polytomy_groups"
+            ),
+            "sampling_cache_autoregressive_state": trainer_cfg.get(
+                "sampling_cache_autoregressive_state"
+            ),
             "training_step_autoregressive_weight": trainer_cfg.get(
                 "training_step_autoregressive_weight"
             ),
@@ -132,6 +265,7 @@ def _init_wandb_run(config, default_project):
             "training_step_separate_optimizer_steps": trainer_cfg.get(
                 "training_step_separate_optimizer_steps"
             ),
+            "optimizer_name": trainer_cfg.get("optimizer_name"),
             "autoregressive_use_time": trainer_cfg.get("autoregressive_use_time"),
             "autoregressive_target_mode": trainer_cfg.get(
                 "autoregressive_target_mode"
@@ -248,6 +382,7 @@ def init_worker(config_file, device_id):
     model = TrainingModule(
         model=phyla_flow,
         lr=config["trainer"]["lr"],
+        optimizer_name=config["trainer"].get("optimizer_name", "adamw"),
         record=config["trainer"]["record"],
         epochs=config["trainer"]["epochs"],
         dataset=dataset,
@@ -342,6 +477,12 @@ def init_worker(config_file, device_id):
         velocity_first_hit_predictor_mode=config["trainer"].get(
             "velocity_first_hit_predictor_mode", "base"
         ),
+        velocity_first_hit_false_positive_mass_weight=config["trainer"].get(
+            "velocity_first_hit_false_positive_mass_weight", 0.0
+        ),
+        velocity_first_hit_false_negative_mass_weight=config["trainer"].get(
+            "velocity_first_hit_false_negative_mass_weight", 0.0
+        ),
         velocity_first_hit_use_geometry_features=config["trainer"].get(
             "velocity_first_hit_use_geometry_features", False
         ),
@@ -350,6 +491,39 @@ def init_worker(config_file, device_id):
         ),
         velocity_first_hit_edge_length_hidden_dim=config["trainer"].get(
             "velocity_first_hit_edge_length_hidden_dim", 64
+        ),
+        velocity_first_hit_attention_layers=config["trainer"].get(
+            "velocity_first_hit_attention_layers", 1
+        ),
+        velocity_first_hit_attention_heads=config["trainer"].get(
+            "velocity_first_hit_attention_heads", 4
+        ),
+        velocity_first_hit_bucket_count=config["trainer"].get(
+            "velocity_first_hit_bucket_count", 32
+        ),
+        velocity_first_hit_bucket_log_min=config["trainer"].get(
+            "velocity_first_hit_bucket_log_min", -8.0
+        ),
+        velocity_first_hit_bucket_log_max=config["trainer"].get(
+            "velocity_first_hit_bucket_log_max", 1.0
+        ),
+        velocity_refiner_mode=config["trainer"].get(
+            "velocity_refiner_mode", "base"
+        ),
+        velocity_refiner_attention_layers=config["trainer"].get(
+            "velocity_refiner_attention_layers", 1
+        ),
+        velocity_refiner_attention_heads=config["trainer"].get(
+            "velocity_refiner_attention_heads", 4
+        ),
+        velocity_refiner_bucket_count=config["trainer"].get(
+            "velocity_refiner_bucket_count", 32
+        ),
+        velocity_refiner_bucket_log_min=config["trainer"].get(
+            "velocity_refiner_bucket_log_min", -8.0
+        ),
+        velocity_refiner_bucket_log_max=config["trainer"].get(
+            "velocity_refiner_bucket_log_max", 1.0
         ),
         velocity_boundary_vanish_head_weight=config["trainer"].get(
             "velocity_boundary_vanish_head_weight", 0.0
@@ -360,6 +534,15 @@ def init_worker(config_file, device_id):
         velocity_boundary_vanish_one_step_use_at_sampling=config["trainer"].get(
             "velocity_boundary_vanish_one_step_use_at_sampling", False
         ),
+        velocity_boundary_time_head_weight=config["trainer"].get(
+            "velocity_boundary_time_head_weight", 0.0
+        ),
+        velocity_boundary_time_head_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_time_head_use_at_sampling", False
+        ),
+        velocity_boundary_time_hidden_dim=config["trainer"].get(
+            "velocity_boundary_time_hidden_dim", 64
+        ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
         ),
@@ -368,6 +551,54 @@ def init_worker(config_file, device_id):
         ),
         training_sampling_dt_base=config["trainer"].get(
             "training_sampling_dt_base", 0.02
+        ),
+        sampling_fixed_dt_base=config["trainer"].get("sampling_fixed_dt_base"),
+        sampling_max_steps=config["trainer"].get("sampling_max_steps", 256),
+        sampling_max_events=config["trainer"].get("sampling_max_events"),
+        sampling_max_autoregressive_merges_per_boundary=config["trainer"].get(
+            "sampling_max_autoregressive_merges_per_boundary", -1
+        ),
+        sampling_disable_inner_logging=config["trainer"].get(
+            "sampling_disable_inner_logging", False
+        ),
+        sampling_only_first_hit_collapse=config["trainer"].get(
+            "sampling_only_first_hit_collapse", False
+        ),
+        sampling_actual_event_boundary_use_at_sampling=config["trainer"].get(
+            "sampling_actual_event_boundary_use_at_sampling", False
+        ),
+        sampling_actual_event_boundary_include_predicted_first_hit=config["trainer"].get(
+            "sampling_actual_event_boundary_include_predicted_first_hit", False
+        ),
+        sampling_predsim_overrun_use_at_sampling=config["trainer"].get(
+            "sampling_predsim_overrun_use_at_sampling", False
+        ),
+        sampling_random_fixed_pair_bank_use_at_sampling=config["trainer"].get(
+            "sampling_random_fixed_pair_bank_use_at_sampling", False
+        ),
+        velocity_first_hit_sampling_max_edges=config["trainer"].get(
+            "velocity_first_hit_sampling_max_edges", -1
+        ),
+        velocity_first_hit_sampling_fallback_threshold=config["trainer"].get(
+            "velocity_first_hit_sampling_fallback_threshold", -1
+        ),
+        velocity_first_hit_sampling_fallback_top_k=config["trainer"].get(
+            "velocity_first_hit_sampling_fallback_top_k", -1
+        ),
+        sampling_use_top_merge_planner=config["trainer"].get(
+            "sampling_use_top_merge_planner", False
+        ),
+        sampling_use_inference_mode=config["trainer"].get(
+            "sampling_use_inference_mode", False
+        ),
+        sampling_cache_tri_mask=config["trainer"].get(
+            "sampling_cache_tri_mask", False
+        ),
+        sampling_cache_polytomy_groups=config["trainer"].get(
+            "sampling_cache_polytomy_groups", False
+        ),
+        sampling_cache_autoregressive_state=config["trainer"].get(
+            "sampling_cache_autoregressive_state", False
         ),
         training_sampling_stop_on_zero_rf=config["trainer"].get(
             "training_sampling_stop_on_zero_rf", False
@@ -397,6 +628,9 @@ def init_worker(config_file, device_id):
         rollout_replay_max_steps=config["trainer"].get(
             "rollout_replay_max_steps", 256
         ),
+        rollout_replay_max_events=config["trainer"].get(
+            "rollout_replay_max_events"
+        ),
         rollout_replay_anchor_states=config["trainer"].get(
             "rollout_replay_anchor_states", 4
         ),
@@ -421,6 +655,79 @@ def init_worker(config_file, device_id):
         rollout_replay_dump_dir=config["trainer"].get(
             "rollout_replay_dump_dir"
         ),
+        rollout_replay_fixed_dt_base=config["trainer"].get(
+            "rollout_replay_fixed_dt_base"
+        ),
+        rollout_replay_prefix_stop_early=config["trainer"].get(
+            "rollout_replay_prefix_stop_early", False
+        ),
+        rollout_replay_cache_reuse_every_step=config["trainer"].get(
+            "rollout_replay_cache_reuse_every_step", True
+        ),
+        rollout_replay_refresh_only_if_better_rf=config["trainer"].get(
+            "rollout_replay_refresh_only_if_better_rf", False
+        ),
+        rollout_replay_legacy_loss_structure=config["trainer"].get(
+            "rollout_replay_legacy_loss_structure", False
+        ),
+        dynamic_start_bank_enabled=config["trainer"].get(
+            "dynamic_start_bank_enabled", False
+        ),
+        dynamic_start_bank_start_step=config["trainer"].get(
+            "dynamic_start_bank_start_step", 0
+        ),
+        dynamic_start_bank_max_entries=config["trainer"].get(
+            "dynamic_start_bank_max_entries", 2
+        ),
+        dynamic_start_bank_min_rf_improvement=config["trainer"].get(
+            "dynamic_start_bank_min_rf_improvement", 0.0
+        ),
+        dynamic_start_bank_max_polytomy_size=config["trainer"].get(
+            "dynamic_start_bank_max_polytomy_size", -1
+        ),
+        dynamic_start_bank_mode=config["trainer"].get(
+            "dynamic_start_bank_mode",
+            (
+                "soft_hybrid"
+                if (
+                    config["trainer"].get("analysis_soft_hybrid_best_rf_repeat")
+                    is not None
+                    or config["trainer"].get(
+                        "analysis_soft_hybrid_best_multivel_repeat"
+                    )
+                    is not None
+                )
+                else "best_start"
+            ),
+        ),
+        dynamic_start_bank_min_velocity_states=config["trainer"].get(
+            "dynamic_start_bank_min_velocity_states",
+            config["trainer"].get(
+                "analysis_dynamic_start_bank_min_velocity_states", 2
+            ),
+        ),
+        dynamic_start_bank_best_rf_repeat=config["trainer"].get(
+            "dynamic_start_bank_best_rf_repeat",
+            config["trainer"].get("analysis_soft_hybrid_best_rf_repeat", 18),
+        ),
+        dynamic_start_bank_best_multivel_repeat=config["trainer"].get(
+            "dynamic_start_bank_best_multivel_repeat",
+            config["trainer"].get(
+                "analysis_soft_hybrid_best_multivel_repeat", 9
+            ),
+        ),
+        dynamic_start_bank_trace_path=config["trainer"].get(
+            "dynamic_start_bank_trace_path"
+        ),
+        dynamic_start_bank_artifact_dir=config["trainer"].get(
+            "dynamic_start_bank_artifact_dir"
+        ),
+        dynamic_start_bank_save_improved_checkpoint=config["trainer"].get(
+            "dynamic_start_bank_save_improved_checkpoint", False
+        ),
+    )
+    model.legacy_first_hit_gather_only = bool(
+        config["trainer"].get("legacy_first_hit_gather_only", False)
     )
     model.to(device)
     model.eval()
@@ -465,6 +772,7 @@ def run_test():
     model = TrainingModule(
         model=phyla_flow,
         lr=config["trainer"]["lr"],
+        optimizer_name=config["trainer"].get("optimizer_name", "adamw"),
         record=config["trainer"]["record"],
         epochs=config["trainer"]["epochs"],
         dataset=dataset,
@@ -559,6 +867,15 @@ def run_test():
         velocity_first_hit_predictor_mode=config["trainer"].get(
             "velocity_first_hit_predictor_mode", "base"
         ),
+        velocity_refiner_mode=config["trainer"].get(
+            "velocity_refiner_mode", "base"
+        ),
+        velocity_first_hit_false_positive_mass_weight=config["trainer"].get(
+            "velocity_first_hit_false_positive_mass_weight", 0.0
+        ),
+        velocity_first_hit_false_negative_mass_weight=config["trainer"].get(
+            "velocity_first_hit_false_negative_mass_weight", 0.0
+        ),
         velocity_first_hit_use_geometry_features=config["trainer"].get(
             "velocity_first_hit_use_geometry_features", False
         ),
@@ -567,6 +884,21 @@ def run_test():
         ),
         velocity_first_hit_edge_length_hidden_dim=config["trainer"].get(
             "velocity_first_hit_edge_length_hidden_dim", 64
+        ),
+        velocity_refiner_attention_layers=config["trainer"].get(
+            "velocity_refiner_attention_layers", 1
+        ),
+        velocity_refiner_attention_heads=config["trainer"].get(
+            "velocity_refiner_attention_heads", 4
+        ),
+        velocity_refiner_bucket_count=config["trainer"].get(
+            "velocity_refiner_bucket_count", 32
+        ),
+        velocity_refiner_bucket_log_min=config["trainer"].get(
+            "velocity_refiner_bucket_log_min", -8.0
+        ),
+        velocity_refiner_bucket_log_max=config["trainer"].get(
+            "velocity_refiner_bucket_log_max", 1.0
         ),
         velocity_boundary_vanish_head_weight=config["trainer"].get(
             "velocity_boundary_vanish_head_weight", 0.0
@@ -577,6 +909,15 @@ def run_test():
         velocity_boundary_vanish_one_step_use_at_sampling=config["trainer"].get(
             "velocity_boundary_vanish_one_step_use_at_sampling", False
         ),
+        velocity_boundary_time_head_weight=config["trainer"].get(
+            "velocity_boundary_time_head_weight", 0.0
+        ),
+        velocity_boundary_time_head_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_time_head_use_at_sampling", False
+        ),
+        velocity_boundary_time_hidden_dim=config["trainer"].get(
+            "velocity_boundary_time_hidden_dim", 64
+        ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
         ),
@@ -585,6 +926,54 @@ def run_test():
         ),
         training_sampling_dt_base=config["trainer"].get(
             "training_sampling_dt_base", 0.02
+        ),
+        sampling_fixed_dt_base=config["trainer"].get("sampling_fixed_dt_base"),
+        sampling_max_steps=config["trainer"].get("sampling_max_steps", 256),
+        sampling_max_events=config["trainer"].get("sampling_max_events"),
+        sampling_max_autoregressive_merges_per_boundary=config["trainer"].get(
+            "sampling_max_autoregressive_merges_per_boundary", -1
+        ),
+        sampling_disable_inner_logging=config["trainer"].get(
+            "sampling_disable_inner_logging", False
+        ),
+        sampling_only_first_hit_collapse=config["trainer"].get(
+            "sampling_only_first_hit_collapse", False
+        ),
+        sampling_actual_event_boundary_use_at_sampling=config["trainer"].get(
+            "sampling_actual_event_boundary_use_at_sampling", False
+        ),
+        sampling_actual_event_boundary_include_predicted_first_hit=config["trainer"].get(
+            "sampling_actual_event_boundary_include_predicted_first_hit", False
+        ),
+        sampling_predsim_overrun_use_at_sampling=config["trainer"].get(
+            "sampling_predsim_overrun_use_at_sampling", False
+        ),
+        sampling_random_fixed_pair_bank_use_at_sampling=config["trainer"].get(
+            "sampling_random_fixed_pair_bank_use_at_sampling", False
+        ),
+        velocity_first_hit_sampling_max_edges=config["trainer"].get(
+            "velocity_first_hit_sampling_max_edges", -1
+        ),
+        velocity_first_hit_sampling_fallback_threshold=config["trainer"].get(
+            "velocity_first_hit_sampling_fallback_threshold", -1
+        ),
+        velocity_first_hit_sampling_fallback_top_k=config["trainer"].get(
+            "velocity_first_hit_sampling_fallback_top_k", -1
+        ),
+        sampling_use_top_merge_planner=config["trainer"].get(
+            "sampling_use_top_merge_planner", False
+        ),
+        sampling_use_inference_mode=config["trainer"].get(
+            "sampling_use_inference_mode", False
+        ),
+        sampling_cache_tri_mask=config["trainer"].get(
+            "sampling_cache_tri_mask", False
+        ),
+        sampling_cache_polytomy_groups=config["trainer"].get(
+            "sampling_cache_polytomy_groups", False
+        ),
+        sampling_cache_autoregressive_state=config["trainer"].get(
+            "sampling_cache_autoregressive_state", False
         ),
         training_sampling_stop_on_zero_rf=config["trainer"].get(
             "training_sampling_stop_on_zero_rf", False
@@ -614,6 +1003,9 @@ def run_test():
         rollout_replay_max_steps=config["trainer"].get(
             "rollout_replay_max_steps", 256
         ),
+        rollout_replay_max_events=config["trainer"].get(
+            "rollout_replay_max_events"
+        ),
         rollout_replay_anchor_states=config["trainer"].get(
             "rollout_replay_anchor_states", 4
         ),
@@ -638,6 +1030,79 @@ def run_test():
         rollout_replay_dump_dir=config["trainer"].get(
             "rollout_replay_dump_dir"
         ),
+        rollout_replay_fixed_dt_base=config["trainer"].get(
+            "rollout_replay_fixed_dt_base"
+        ),
+        rollout_replay_prefix_stop_early=config["trainer"].get(
+            "rollout_replay_prefix_stop_early", False
+        ),
+        rollout_replay_cache_reuse_every_step=config["trainer"].get(
+            "rollout_replay_cache_reuse_every_step", True
+        ),
+        rollout_replay_refresh_only_if_better_rf=config["trainer"].get(
+            "rollout_replay_refresh_only_if_better_rf", False
+        ),
+        rollout_replay_legacy_loss_structure=config["trainer"].get(
+            "rollout_replay_legacy_loss_structure", False
+        ),
+        dynamic_start_bank_enabled=config["trainer"].get(
+            "dynamic_start_bank_enabled", False
+        ),
+        dynamic_start_bank_start_step=config["trainer"].get(
+            "dynamic_start_bank_start_step", 0
+        ),
+        dynamic_start_bank_max_entries=config["trainer"].get(
+            "dynamic_start_bank_max_entries", 2
+        ),
+        dynamic_start_bank_min_rf_improvement=config["trainer"].get(
+            "dynamic_start_bank_min_rf_improvement", 0.0
+        ),
+        dynamic_start_bank_max_polytomy_size=config["trainer"].get(
+            "dynamic_start_bank_max_polytomy_size", -1
+        ),
+        dynamic_start_bank_mode=config["trainer"].get(
+            "dynamic_start_bank_mode",
+            (
+                "soft_hybrid"
+                if (
+                    config["trainer"].get("analysis_soft_hybrid_best_rf_repeat")
+                    is not None
+                    or config["trainer"].get(
+                        "analysis_soft_hybrid_best_multivel_repeat"
+                    )
+                    is not None
+                )
+                else "best_start"
+            ),
+        ),
+        dynamic_start_bank_min_velocity_states=config["trainer"].get(
+            "dynamic_start_bank_min_velocity_states",
+            config["trainer"].get(
+                "analysis_dynamic_start_bank_min_velocity_states", 2
+            ),
+        ),
+        dynamic_start_bank_best_rf_repeat=config["trainer"].get(
+            "dynamic_start_bank_best_rf_repeat",
+            config["trainer"].get("analysis_soft_hybrid_best_rf_repeat", 18),
+        ),
+        dynamic_start_bank_best_multivel_repeat=config["trainer"].get(
+            "dynamic_start_bank_best_multivel_repeat",
+            config["trainer"].get(
+                "analysis_soft_hybrid_best_multivel_repeat", 9
+            ),
+        ),
+        dynamic_start_bank_trace_path=config["trainer"].get(
+            "dynamic_start_bank_trace_path"
+        ),
+        dynamic_start_bank_artifact_dir=config["trainer"].get(
+            "dynamic_start_bank_artifact_dir"
+        ),
+        dynamic_start_bank_save_improved_checkpoint=config["trainer"].get(
+            "dynamic_start_bank_save_improved_checkpoint", False
+        ),
+    )
+    model.legacy_first_hit_gather_only = bool(
+        config["trainer"].get("legacy_first_hit_gather_only", False)
     )
     # res = model(batch['tokenized_trees'], batch['batched_time'], batch['phyla_embeddings'])
     # This fails now btw non-autoregressive LOL NEED TO FIX!
@@ -761,6 +1226,7 @@ def run_overfit():
     model = TrainingModule(
         model=phyla_flow,
         lr=config["trainer"]["lr"],
+        optimizer_name=config["trainer"].get("optimizer_name", "adamw"),
         record=config["trainer"]["record"],
         epochs=config["trainer"]["epochs"],
         dataset=dataset,
@@ -856,6 +1322,9 @@ def run_overfit():
         velocity_first_hit_predictor_mode=config["trainer"].get(
             "velocity_first_hit_predictor_mode", "base"
         ),
+        velocity_refiner_mode=config["trainer"].get(
+            "velocity_refiner_mode", "base"
+        ),
         velocity_first_hit_use_geometry_features=config["trainer"].get(
             "velocity_first_hit_use_geometry_features", False
         ),
@@ -865,6 +1334,21 @@ def run_overfit():
         velocity_first_hit_edge_length_hidden_dim=config["trainer"].get(
             "velocity_first_hit_edge_length_hidden_dim", 64
         ),
+        velocity_refiner_attention_layers=config["trainer"].get(
+            "velocity_refiner_attention_layers", 1
+        ),
+        velocity_refiner_attention_heads=config["trainer"].get(
+            "velocity_refiner_attention_heads", 4
+        ),
+        velocity_refiner_bucket_count=config["trainer"].get(
+            "velocity_refiner_bucket_count", 32
+        ),
+        velocity_refiner_bucket_log_min=config["trainer"].get(
+            "velocity_refiner_bucket_log_min", -8.0
+        ),
+        velocity_refiner_bucket_log_max=config["trainer"].get(
+            "velocity_refiner_bucket_log_max", 1.0
+        ),
         velocity_boundary_vanish_head_weight=config["trainer"].get(
             "velocity_boundary_vanish_head_weight", 0.0
         ),
@@ -873,6 +1357,15 @@ def run_overfit():
         ),
         velocity_boundary_vanish_one_step_use_at_sampling=config["trainer"].get(
             "velocity_boundary_vanish_one_step_use_at_sampling", False
+        ),
+        velocity_boundary_time_head_weight=config["trainer"].get(
+            "velocity_boundary_time_head_weight", 0.0
+        ),
+        velocity_boundary_time_head_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_time_head_use_at_sampling", False
+        ),
+        velocity_boundary_time_hidden_dim=config["trainer"].get(
+            "velocity_boundary_time_hidden_dim", 64
         ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
@@ -888,6 +1381,54 @@ def run_overfit():
         ),
         training_sampling_dt_base=config["trainer"].get(
             "training_sampling_dt_base", 0.02
+        ),
+        sampling_fixed_dt_base=config["trainer"].get("sampling_fixed_dt_base"),
+        sampling_max_steps=config["trainer"].get("sampling_max_steps", 256),
+        sampling_max_events=config["trainer"].get("sampling_max_events"),
+        sampling_max_autoregressive_merges_per_boundary=config["trainer"].get(
+            "sampling_max_autoregressive_merges_per_boundary", -1
+        ),
+        sampling_disable_inner_logging=config["trainer"].get(
+            "sampling_disable_inner_logging", False
+        ),
+        sampling_only_first_hit_collapse=config["trainer"].get(
+            "sampling_only_first_hit_collapse", False
+        ),
+        sampling_actual_event_boundary_use_at_sampling=config["trainer"].get(
+            "sampling_actual_event_boundary_use_at_sampling", False
+        ),
+        sampling_actual_event_boundary_include_predicted_first_hit=config["trainer"].get(
+            "sampling_actual_event_boundary_include_predicted_first_hit", False
+        ),
+        sampling_predsim_overrun_use_at_sampling=config["trainer"].get(
+            "sampling_predsim_overrun_use_at_sampling", False
+        ),
+        sampling_random_fixed_pair_bank_use_at_sampling=config["trainer"].get(
+            "sampling_random_fixed_pair_bank_use_at_sampling", False
+        ),
+        velocity_first_hit_sampling_max_edges=config["trainer"].get(
+            "velocity_first_hit_sampling_max_edges", -1
+        ),
+        velocity_first_hit_sampling_fallback_threshold=config["trainer"].get(
+            "velocity_first_hit_sampling_fallback_threshold", -1
+        ),
+        velocity_first_hit_sampling_fallback_top_k=config["trainer"].get(
+            "velocity_first_hit_sampling_fallback_top_k", -1
+        ),
+        sampling_use_top_merge_planner=config["trainer"].get(
+            "sampling_use_top_merge_planner", False
+        ),
+        sampling_use_inference_mode=config["trainer"].get(
+            "sampling_use_inference_mode", False
+        ),
+        sampling_cache_tri_mask=config["trainer"].get(
+            "sampling_cache_tri_mask", False
+        ),
+        sampling_cache_polytomy_groups=config["trainer"].get(
+            "sampling_cache_polytomy_groups", False
+        ),
+        sampling_cache_autoregressive_state=config["trainer"].get(
+            "sampling_cache_autoregressive_state", False
         ),
         training_sampling_stop_on_zero_rf=config["trainer"].get(
             "training_sampling_stop_on_zero_rf", False
@@ -918,6 +1459,9 @@ def run_overfit():
         rollout_replay_max_steps=config["trainer"].get(
             "rollout_replay_max_steps", 256
         ),
+        rollout_replay_max_events=config["trainer"].get(
+            "rollout_replay_max_events"
+        ),
         rollout_replay_anchor_states=config["trainer"].get(
             "rollout_replay_anchor_states", 4
         ),
@@ -942,7 +1486,80 @@ def run_overfit():
         rollout_replay_dump_dir=config["trainer"].get(
             "rollout_replay_dump_dir"
         ),
+        rollout_replay_fixed_dt_base=config["trainer"].get(
+            "rollout_replay_fixed_dt_base"
+        ),
+        rollout_replay_prefix_stop_early=config["trainer"].get(
+            "rollout_replay_prefix_stop_early", False
+        ),
+        rollout_replay_cache_reuse_every_step=config["trainer"].get(
+            "rollout_replay_cache_reuse_every_step", True
+        ),
+        rollout_replay_refresh_only_if_better_rf=config["trainer"].get(
+            "rollout_replay_refresh_only_if_better_rf", False
+        ),
+        rollout_replay_legacy_loss_structure=config["trainer"].get(
+            "rollout_replay_legacy_loss_structure", False
+        ),
+        dynamic_start_bank_enabled=config["trainer"].get(
+            "dynamic_start_bank_enabled", False
+        ),
+        dynamic_start_bank_start_step=config["trainer"].get(
+            "dynamic_start_bank_start_step", 0
+        ),
+        dynamic_start_bank_max_entries=config["trainer"].get(
+            "dynamic_start_bank_max_entries", 2
+        ),
+        dynamic_start_bank_min_rf_improvement=config["trainer"].get(
+            "dynamic_start_bank_min_rf_improvement", 0.0
+        ),
+        dynamic_start_bank_max_polytomy_size=config["trainer"].get(
+            "dynamic_start_bank_max_polytomy_size", -1
+        ),
+        dynamic_start_bank_mode=config["trainer"].get(
+            "dynamic_start_bank_mode",
+            (
+                "soft_hybrid"
+                if (
+                    config["trainer"].get("analysis_soft_hybrid_best_rf_repeat")
+                    is not None
+                    or config["trainer"].get(
+                        "analysis_soft_hybrid_best_multivel_repeat"
+                    )
+                    is not None
+                )
+                else "best_start"
+            ),
+        ),
+        dynamic_start_bank_min_velocity_states=config["trainer"].get(
+            "dynamic_start_bank_min_velocity_states",
+            config["trainer"].get(
+                "analysis_dynamic_start_bank_min_velocity_states", 2
+            ),
+        ),
+        dynamic_start_bank_best_rf_repeat=config["trainer"].get(
+            "dynamic_start_bank_best_rf_repeat",
+            config["trainer"].get("analysis_soft_hybrid_best_rf_repeat", 18),
+        ),
+        dynamic_start_bank_best_multivel_repeat=config["trainer"].get(
+            "dynamic_start_bank_best_multivel_repeat",
+            config["trainer"].get(
+                "analysis_soft_hybrid_best_multivel_repeat", 9
+            ),
+        ),
+        dynamic_start_bank_trace_path=config["trainer"].get(
+            "dynamic_start_bank_trace_path"
+        ),
+        dynamic_start_bank_artifact_dir=config["trainer"].get(
+            "dynamic_start_bank_artifact_dir"
+        ),
+        dynamic_start_bank_save_improved_checkpoint=config["trainer"].get(
+            "dynamic_start_bank_save_improved_checkpoint", False
+        ),
         verbose=True,  # Enable verbose logging for overfitting
+    )
+    model.legacy_first_hit_gather_only = bool(
+        config["trainer"].get("legacy_first_hit_gather_only", False)
     )
 
     checkpoint_base = config["trainer"]["checkpoint_dir"]
@@ -1023,6 +1640,7 @@ def main():
     model = TrainingModule(
         model=phyla_flow,
         lr=config["trainer"]["lr"],
+        optimizer_name=config["trainer"].get("optimizer_name", "adamw"),
         record=config["trainer"]["record"],
         epochs=config["trainer"]["epochs"],
         dataset=dataset,
@@ -1117,6 +1735,9 @@ def main():
         velocity_first_hit_predictor_mode=config["trainer"].get(
             "velocity_first_hit_predictor_mode", "base"
         ),
+        velocity_refiner_mode=config["trainer"].get(
+            "velocity_refiner_mode", "base"
+        ),
         velocity_first_hit_use_geometry_features=config["trainer"].get(
             "velocity_first_hit_use_geometry_features", False
         ),
@@ -1126,6 +1747,21 @@ def main():
         velocity_first_hit_edge_length_hidden_dim=config["trainer"].get(
             "velocity_first_hit_edge_length_hidden_dim", 64
         ),
+        velocity_refiner_attention_layers=config["trainer"].get(
+            "velocity_refiner_attention_layers", 1
+        ),
+        velocity_refiner_attention_heads=config["trainer"].get(
+            "velocity_refiner_attention_heads", 4
+        ),
+        velocity_refiner_bucket_count=config["trainer"].get(
+            "velocity_refiner_bucket_count", 32
+        ),
+        velocity_refiner_bucket_log_min=config["trainer"].get(
+            "velocity_refiner_bucket_log_min", -8.0
+        ),
+        velocity_refiner_bucket_log_max=config["trainer"].get(
+            "velocity_refiner_bucket_log_max", 1.0
+        ),
         velocity_boundary_vanish_head_weight=config["trainer"].get(
             "velocity_boundary_vanish_head_weight", 0.0
         ),
@@ -1134,6 +1770,15 @@ def main():
         ),
         velocity_boundary_vanish_one_step_use_at_sampling=config["trainer"].get(
             "velocity_boundary_vanish_one_step_use_at_sampling", False
+        ),
+        velocity_boundary_time_head_weight=config["trainer"].get(
+            "velocity_boundary_time_head_weight", 0.0
+        ),
+        velocity_boundary_time_head_use_at_sampling=config["trainer"].get(
+            "velocity_boundary_time_head_use_at_sampling", False
+        ),
+        velocity_boundary_time_hidden_dim=config["trainer"].get(
+            "velocity_boundary_time_hidden_dim", 64
         ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
@@ -1149,6 +1794,54 @@ def main():
         ),
         training_sampling_dt_base=config["trainer"].get(
             "training_sampling_dt_base", 0.02
+        ),
+        sampling_fixed_dt_base=config["trainer"].get("sampling_fixed_dt_base"),
+        sampling_max_steps=config["trainer"].get("sampling_max_steps", 256),
+        sampling_max_events=config["trainer"].get("sampling_max_events"),
+        sampling_max_autoregressive_merges_per_boundary=config["trainer"].get(
+            "sampling_max_autoregressive_merges_per_boundary", -1
+        ),
+        sampling_disable_inner_logging=config["trainer"].get(
+            "sampling_disable_inner_logging", False
+        ),
+        sampling_only_first_hit_collapse=config["trainer"].get(
+            "sampling_only_first_hit_collapse", False
+        ),
+        sampling_actual_event_boundary_use_at_sampling=config["trainer"].get(
+            "sampling_actual_event_boundary_use_at_sampling", False
+        ),
+        sampling_actual_event_boundary_include_predicted_first_hit=config["trainer"].get(
+            "sampling_actual_event_boundary_include_predicted_first_hit", False
+        ),
+        sampling_predsim_overrun_use_at_sampling=config["trainer"].get(
+            "sampling_predsim_overrun_use_at_sampling", False
+        ),
+        sampling_random_fixed_pair_bank_use_at_sampling=config["trainer"].get(
+            "sampling_random_fixed_pair_bank_use_at_sampling", False
+        ),
+        velocity_first_hit_sampling_max_edges=config["trainer"].get(
+            "velocity_first_hit_sampling_max_edges", -1
+        ),
+        velocity_first_hit_sampling_fallback_threshold=config["trainer"].get(
+            "velocity_first_hit_sampling_fallback_threshold", -1
+        ),
+        velocity_first_hit_sampling_fallback_top_k=config["trainer"].get(
+            "velocity_first_hit_sampling_fallback_top_k", -1
+        ),
+        sampling_use_top_merge_planner=config["trainer"].get(
+            "sampling_use_top_merge_planner", False
+        ),
+        sampling_use_inference_mode=config["trainer"].get(
+            "sampling_use_inference_mode", False
+        ),
+        sampling_cache_tri_mask=config["trainer"].get(
+            "sampling_cache_tri_mask", False
+        ),
+        sampling_cache_polytomy_groups=config["trainer"].get(
+            "sampling_cache_polytomy_groups", False
+        ),
+        sampling_cache_autoregressive_state=config["trainer"].get(
+            "sampling_cache_autoregressive_state", False
         ),
         training_sampling_stop_on_zero_rf=config["trainer"].get(
             "training_sampling_stop_on_zero_rf", False
@@ -1179,6 +1872,9 @@ def main():
         rollout_replay_max_steps=config["trainer"].get(
             "rollout_replay_max_steps", 256
         ),
+        rollout_replay_max_events=config["trainer"].get(
+            "rollout_replay_max_events"
+        ),
         rollout_replay_anchor_states=config["trainer"].get(
             "rollout_replay_anchor_states", 4
         ),
@@ -1203,6 +1899,79 @@ def main():
         rollout_replay_dump_dir=config["trainer"].get(
             "rollout_replay_dump_dir"
         ),
+        rollout_replay_fixed_dt_base=config["trainer"].get(
+            "rollout_replay_fixed_dt_base"
+        ),
+        rollout_replay_prefix_stop_early=config["trainer"].get(
+            "rollout_replay_prefix_stop_early", False
+        ),
+        rollout_replay_cache_reuse_every_step=config["trainer"].get(
+            "rollout_replay_cache_reuse_every_step", True
+        ),
+        rollout_replay_refresh_only_if_better_rf=config["trainer"].get(
+            "rollout_replay_refresh_only_if_better_rf", False
+        ),
+        rollout_replay_legacy_loss_structure=config["trainer"].get(
+            "rollout_replay_legacy_loss_structure", False
+        ),
+        dynamic_start_bank_enabled=config["trainer"].get(
+            "dynamic_start_bank_enabled", False
+        ),
+        dynamic_start_bank_start_step=config["trainer"].get(
+            "dynamic_start_bank_start_step", 0
+        ),
+        dynamic_start_bank_max_entries=config["trainer"].get(
+            "dynamic_start_bank_max_entries", 2
+        ),
+        dynamic_start_bank_min_rf_improvement=config["trainer"].get(
+            "dynamic_start_bank_min_rf_improvement", 0.0
+        ),
+        dynamic_start_bank_max_polytomy_size=config["trainer"].get(
+            "dynamic_start_bank_max_polytomy_size", -1
+        ),
+        dynamic_start_bank_mode=config["trainer"].get(
+            "dynamic_start_bank_mode",
+            (
+                "soft_hybrid"
+                if (
+                    config["trainer"].get("analysis_soft_hybrid_best_rf_repeat")
+                    is not None
+                    or config["trainer"].get(
+                        "analysis_soft_hybrid_best_multivel_repeat"
+                    )
+                    is not None
+                )
+                else "best_start"
+            ),
+        ),
+        dynamic_start_bank_min_velocity_states=config["trainer"].get(
+            "dynamic_start_bank_min_velocity_states",
+            config["trainer"].get(
+                "analysis_dynamic_start_bank_min_velocity_states", 2
+            ),
+        ),
+        dynamic_start_bank_best_rf_repeat=config["trainer"].get(
+            "dynamic_start_bank_best_rf_repeat",
+            config["trainer"].get("analysis_soft_hybrid_best_rf_repeat", 18),
+        ),
+        dynamic_start_bank_best_multivel_repeat=config["trainer"].get(
+            "dynamic_start_bank_best_multivel_repeat",
+            config["trainer"].get(
+                "analysis_soft_hybrid_best_multivel_repeat", 9
+            ),
+        ),
+        dynamic_start_bank_trace_path=config["trainer"].get(
+            "dynamic_start_bank_trace_path"
+        ),
+        dynamic_start_bank_artifact_dir=config["trainer"].get(
+            "dynamic_start_bank_artifact_dir"
+        ),
+        dynamic_start_bank_save_improved_checkpoint=config["trainer"].get(
+            "dynamic_start_bank_save_improved_checkpoint", False
+        ),
+    )
+    model.legacy_first_hit_gather_only = bool(
+        config["trainer"].get("legacy_first_hit_gather_only", False)
     )
 
     checkpoint_base = config["trainer"]["checkpoint_dir"]

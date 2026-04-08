@@ -131,7 +131,6 @@ def _resolve_num_leaves(num_leaves, batch_index, edge_split_masks_b):
     if isinstance(num_leaves, (list, tuple)):
         if len(num_leaves) > batch_index:
             return int(num_leaves[batch_index])
-        return 0
     try:
         import torch
 
@@ -150,6 +149,54 @@ def _resolve_num_leaves(num_leaves, batch_index, edge_split_masks_b):
         if split_int != 0:
             max_bit = max(max_bit, split_int.bit_length())
     return max_bit
+
+
+def _positive_bhv_tree_dict(tree, eps=1e-8):
+    masks, lengths = BHVEncoder().return_BHV_encoding(tree)
+    return {
+        int(mask): float(length)
+        for mask, length in zip(masks, lengths)
+        if length is not None and float(length) > float(eps)
+    }
+
+
+def _full_bhv_tree_dict(tree):
+    masks, lengths = BHVEncoder().return_BHV_encoding(tree)
+    return {
+        int(mask): float(length)
+        for mask, length in zip(masks, lengths)
+        if length is not None
+    }
+
+
+def return_boundary_training_geodesic(newick_tree_one, newick_tree_two):
+    t1 = Tree(newick_tree_one)
+    t2 = Tree(newick_tree_two)
+    tree1 = _full_bhv_tree_dict(t1)
+    tree2 = _full_bhv_tree_dict(t2)
+    return bhv_geodesic_with_support(
+        tree1,
+        tree2,
+        n_leaves=t1.n_leaves,
+        drop_zero_length_edges=False,
+        enable_prefix_birth_groups=False,
+    )
+
+
+def _resolve_boundary_geodesic(
+    newick_tree_one,
+    newick_tree_two,
+    *,
+    legacy_training_semantics: bool = False,
+):
+    if legacy_training_semantics:
+        return return_boundary_training_geodesic(newick_tree_one, newick_tree_two)
+
+    t1 = Tree(newick_tree_one)
+    t2 = Tree(newick_tree_two)
+    tree1 = _positive_bhv_tree_dict(t1)
+    tree2 = _positive_bhv_tree_dict(t2)
+    return bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
 
 
 def _lookup_component_positions(mask_to_positions, component, bio_full):
@@ -636,6 +683,7 @@ def return_tree_boundary_merge_paths(
     newick_tree_two,
     verbose=False,
     id_to_test=None,
+    legacy_training_semantics: bool = False,
 ):
     from utils.bhv_movie import build_tree_from_splits
 
@@ -647,13 +695,11 @@ def return_tree_boundary_merge_paths(
     t1 = Tree(newick_tree_one)
     t2 = Tree(newick_tree_two)
 
-    enc = BHVEncoder()
-    t1_edge_mask, t1_edge_length = enc.return_BHV_encoding(t1)
-    t2_edge_mask, t2_edge_length = enc.return_BHV_encoding(t2)
-
-    tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
-    tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
-    geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
+    geodesic_result = _resolve_boundary_geodesic(
+        newick_tree_one,
+        newick_tree_two,
+        legacy_training_semantics=legacy_training_semantics,
+    )
     segments = geodesic_result["segments"]
 
     if id_to_test is not None:
@@ -777,6 +823,7 @@ def return_sampled_tree_boundary_decisions(
     id_to_test=None,
     require_complete_boundary=False,
     split_multi_label_events=False,
+    legacy_training_semantics: bool = False,
 ):
     _ = require_complete_boundary
     boundary_paths = return_tree_boundary_merge_paths(
@@ -784,24 +831,29 @@ def return_sampled_tree_boundary_decisions(
         newick_tree_two,
         verbose=verbose,
         id_to_test=id_to_test,
+        legacy_training_semantics=legacy_training_semantics,
     )
     training_events = _filter_training_boundary_events(boundary_paths)
     if split_multi_label_events:
         training_events = _split_multi_label_training_events(training_events)
     return training_events
 
-def return_sampled_tree_orthant_velocity(newick_tree_one, newick_tree_two, time_point, extra = False):
+def return_sampled_tree_orthant_velocity(
+    newick_tree_one,
+    newick_tree_two,
+    time_point,
+    extra = False,
+    legacy_training_semantics: bool = False,
+):
     from utils.bhv_movie import sample_tree_along_geodesic
     t1 = Tree(newick_tree_one)
     t2 = Tree(newick_tree_two)
 
-    enc = BHVEncoder()
-    t1_edge_mask, t1_edge_length = enc.return_BHV_encoding(t1)
-    t2_edge_mask, t2_edge_length = enc.return_BHV_encoding(t2)
-
-    tree1 = {m: l for m, l in zip(t1_edge_mask, t1_edge_length)}
-    tree2 = {m: l for m, l in zip(t2_edge_mask, t2_edge_length)}
-    geodesic_result = bhv_geodesic_with_support(tree1, tree2, n_leaves=t1.n_leaves)
+    geodesic_result = _resolve_boundary_geodesic(
+        newick_tree_one,
+        newick_tree_two,
+        legacy_training_semantics=legacy_training_semantics,
+    )
     G, newick, info = sample_tree_along_geodesic(
         geodesic_result,
         t1.n_leaves,

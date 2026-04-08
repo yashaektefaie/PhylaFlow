@@ -282,7 +282,7 @@ class TestEncodingConsistency(unittest.TestCase):
         flattened_events = return_sampled_tree_boundary_decisions(start_tree, target_tree)
         exact_flattened_events = []
         for path in boundary_paths:
-            for event in path["events"]:
+            for event_idx, event in enumerate(path["events"]):
                 training_labels = [
                     label for label in event["labels"] if len(label["components"]) >= 3
                 ]
@@ -291,6 +291,10 @@ class TestEncodingConsistency(unittest.TestCase):
                         {
                             "newick": event["newick"],
                             "labels": training_labels,
+                            "stop_after_merge": bool(
+                                event_idx == (len(path["events"]) - 1)
+                                and len(training_labels) == 1
+                            ),
                         }
                     )
 

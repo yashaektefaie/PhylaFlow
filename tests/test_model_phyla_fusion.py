@@ -1,0 +1,127 @@
+import unittest
+
+import torch
+
+from model.model import TreeDenoiserTokenGT, return_model
+
+
+class TestModelPhylaFusion(unittest.TestCase):
+    def test_return_model_wires_phyla_config(self):
+        config = {
+            "model": {
+                "num_node_types": 3,
+                "num_edge_types": 2,
+                "embed_dim": 32,
+                "output_dim": 1,
+                "n_layers": 2,
+                "n_heads": 4,
+                "dropout": 0.0,
+                "attention_dropout": 0.0,
+                "activation_dropout": 0.0,
+                "drop_path_rate": 0.0,
+                "use_performer": False,
+                "performer_nb_features": 64,
+                "performer_generalized_attention": False,
+                "layernorm_style": "prenorm",
+                "tokenizer_lap_dim": 4,
+                "tokenizer_lap_dropout": 0.0,
+                "tokenizer_n_layers": 1,
+                "phyla_dim": 6,
+                "phyla_use_leaf_tokens": True,
+                "phyla_use_split_tokens": False,
+                "phyla_leaf_scale": 1.5,
+                "phyla_split_scale": 0.25,
+            }
+        }
+        model = return_model(config)
+        self.assertTrue(model.phyla_use_leaf_tokens)
+        self.assertFalse(model.phyla_use_split_tokens)
+        self.assertEqual(model.phyla_leaf_scale, 1.5)
+        self.assertEqual(model.phyla_split_scale, 0.25)
+        self.assertEqual(model.phyla_proj.in_features, 6)
+
+    def test_leaf_phyla_additions_only_touch_leaf_positions(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=8,
+            n_layers=2,
+            n_heads=2,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            phyla_dim=4,
+        )
+        phyla_proj_full = torch.tensor(
+            [
+                [
+                    [1.0] * 8,
+                    [2.0] * 8,
+                    [3.0] * 8,
+                ]
+            ]
+        )
+        leaf_idx_list = [torch.tensor([0, 2, 5], dtype=torch.long)]
+        additions = model._compute_leaf_phyla_token_additions(
+            phyla_proj_full=phyla_proj_full,
+            leaf_idx_list=leaf_idx_list,
+            num_tokens=7,
+            device=phyla_proj_full.device,
+            dtype=phyla_proj_full.dtype,
+        )
+
+        self.assertEqual(tuple(additions.shape), (1, 7, 8))
+        self.assertTrue(torch.allclose(additions[0, 0], torch.ones(8)))
+        self.assertTrue(torch.allclose(additions[0, 2], torch.full((8,), 2.0)))
+        self.assertTrue(torch.allclose(additions[0, 5], torch.full((8,), 3.0)))
+        self.assertTrue(torch.allclose(additions[0, 1], torch.zeros(8)))
+        self.assertTrue(torch.allclose(additions[0, 3], torch.zeros(8)))
+
+    def test_split_phyla_additions_touch_edge_positions(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=8,
+            n_layers=2,
+            n_heads=2,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            phyla_dim=4,
+        )
+        phyla_embeddings = torch.tensor(
+            [
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ]
+            ]
+        )
+        leaf_idx_list = [torch.tensor([2, 3, 4], dtype=torch.long)]
+        edge_mask = torch.tensor([[False, True, False, False, True, False]])
+        edge_split_masks = [[0b001, 0b011]]
+
+        additions = model._compute_split_phyla_token_additions(
+            phyla_embeddings=phyla_embeddings,
+            leaf_idx_list=leaf_idx_list,
+            edge_mask=edge_mask,
+            edge_split_masks=edge_split_masks,
+            num_tokens=6,
+            device=phyla_embeddings.device,
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(tuple(additions.shape), (1, 6, 8))
+        self.assertFalse(torch.allclose(additions[0, 1], torch.zeros(8)))
+        self.assertFalse(torch.allclose(additions[0, 4], torch.zeros(8)))
+        self.assertTrue(torch.allclose(additions[0, 0], torch.zeros(8)))
+        self.assertTrue(torch.allclose(additions[0, 2], torch.zeros(8)))
+
+
+if __name__ == "__main__":
+    unittest.main()

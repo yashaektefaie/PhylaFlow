@@ -104,7 +104,6 @@ from run.TrainingModule import (
     _boundary_event_precision_margin_loss,
     _tree_to_model_split_lengths,
     _combine_autoregressive_losses,
-    _decode_structured_merge_subset,
     _edge_set_bce_loss,
     _oracle_training_topology_keys,
     _plan_autoregressive_boundary_merges,
@@ -122,6 +121,7 @@ from utils.bhv_utils import (
     _filter_training_boundary_events,
     _split_multi_label_training_events,
     get_structural_polytomy_groups_from_newick,
+    return_boundary_training_geodesic,
     return_sampled_tree_boundary_decisions,
     return_sampled_tree_orthant_velocity,
     return_tree_boundary_merge_paths,
@@ -149,7 +149,10 @@ def _make_single_velocity_batch(tokenizer, n_leaves, seed):
     start_tree = str(Tree(num_leaves=n_leaves, random=True))
     target_tree = str(Tree(num_leaves=n_leaves, random=True))
     sampled_newick, velocity = return_sampled_tree_orthant_velocity(
-        start_tree, target_tree, 0.0
+        start_tree,
+        target_tree,
+        0.0,
+        legacy_training_semantics=True,
     )
     with torch.no_grad():
         tokenized = _detach_tokenized_batch(tokenizer([sampled_newick]))
@@ -201,7 +204,10 @@ def _prune_and_renumber_tree_pair(start_newick, target_newick, keep_leaves=12):
 
 def _make_batch_from_tree_pair(tokenizer, start_tree, target_tree, time_point=0.0):
     sampled_newick, velocity = return_sampled_tree_orthant_velocity(
-        start_tree, target_tree, time_point
+        start_tree,
+        target_tree,
+        time_point,
+        legacy_training_semantics=True,
     )
     with torch.no_grad():
         tokenized = _detach_tokenized_batch(tokenizer([sampled_newick]))
@@ -224,12 +230,19 @@ def _make_batch_from_tree_pair_with_autoregressive(
     max_boundary_attempts=20,
 ):
     sampled_newick, velocity = return_sampled_tree_orthant_velocity(
-        start_tree, target_tree, time_point
+        start_tree,
+        target_tree,
+        time_point,
+        legacy_training_semantics=True,
     )
 
     boundary_labels = []
     for _ in range(max_boundary_attempts):
-        boundary_labels = return_sampled_tree_boundary_decisions(start_tree, target_tree)
+        boundary_labels = return_sampled_tree_boundary_decisions(
+            start_tree,
+            target_tree,
+            legacy_training_semantics=True,
+        )
         if boundary_labels:
             break
 
@@ -277,7 +290,11 @@ def _normalized_event_time(event_index, num_events):
 
 
 def _select_random_nonbinary_boundary_path(start_tree, target_tree, seed=777):
-    boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
+    boundary_paths = return_tree_boundary_merge_paths(
+        start_tree,
+        target_tree,
+        legacy_training_semantics=True,
+    )
     candidates = [
         path
         for path in boundary_paths
@@ -356,35 +373,46 @@ def _predict_autoregressive_event(module, tokenizer, newick, event_time):
         )
 
     predicted = {}
-    allow_all_groups = len(outputs) == 1
-    for group in outputs:
-        group_key = tuple(int(split) for split in group["splits_represented"])
-        if (not allow_all_groups) and float(group["polytomy_pred"].detach().cpu().item()) <= 0.0:
-            continue
-        if str(group.get("decoder_mode", "pairwise_threshold")) == "structured_subset":
-            decoded = _decode_structured_merge_subset(group)
-            predicted[group_key] = (
-                {frozenset(int(component) for component in decoded["subset"])}
-                if decoded is not None
-                else set()
-            )
-        else:
+    if any(
+        str(group.get("decoder_mode", "pairwise_threshold")) == "structured_subset"
+        for group in outputs
+    ):
+        current_tree = Tree(newick)
+        encoder = BHVEncoder()
+        existing_masks, existing_lengths = encoder.return_BHV_encoding(current_tree)
+        existing_splits = {
+            int(mask)
+            for mask, length in zip(existing_masks, existing_lengths)
+            if length is not None and float(length) > 1e-8
+        }
+        planned = _plan_autoregressive_boundary_merges(
+            outputs,
+            existing_splits=existing_splits,
+            threshold_logit=0.0,
+        )
+        for item in planned:
+            group_key = tuple(int(split) for split in item["splits_represented"])
+            predicted[group_key] = {
+                frozenset(int(component) for component in subset)
+                for subset, _ in item["subsets"]
+            }
+    else:
+        allow_all_groups = len(outputs) == 1
+        for group in outputs:
+            group_key = tuple(int(split) for split in group["splits_represented"])
+            if (
+                (not allow_all_groups)
+                and float(group["polytomy_pred"].detach().cpu().item()) <= 0.0
+            ):
+                continue
             predicted[group_key] = _decode_positive_merge_subsets(group)
 
     return predicted, outputs
 
 
 def _boundary_start_length_map(start_tree, target_tree, boundary_index):
-    enc = BHVEncoder()
     start_obj = Tree(start_tree)
-    target_obj = Tree(target_tree)
-    start_masks, start_lengths = enc.return_BHV_encoding(start_obj)
-    target_masks, target_lengths = enc.return_BHV_encoding(target_obj)
-    geodesic = bhv_geodesic_with_support(
-        {int(mask): float(length) for mask, length in zip(start_masks, start_lengths)},
-        {int(mask): float(length) for mask, length in zip(target_masks, target_lengths)},
-        n_leaves=start_obj.n_leaves,
-    )
+    geodesic = return_boundary_training_geodesic(start_tree, target_tree)
     boundary_lengths = {
         int(mask): float(length)
         for mask, length in geodesic["segments"][boundary_index]["end_lengths"].items()
@@ -513,16 +541,7 @@ def _sample_to_first_boundary(module, start_tree, dt_hit_true, boundary_path):
 
 
 def _boundary_prefix_time(start_tree, target_tree, boundary_index):
-    enc = BHVEncoder()
-    start_obj = Tree(start_tree)
-    target_obj = Tree(target_tree)
-    start_masks, start_lengths = enc.return_BHV_encoding(start_obj)
-    target_masks, target_lengths = enc.return_BHV_encoding(target_obj)
-    geodesic = bhv_geodesic_with_support(
-        {int(mask): float(length) for mask, length in zip(start_masks, start_lengths)},
-        {int(mask): float(length) for mask, length in zip(target_masks, target_lengths)},
-        n_leaves=start_obj.n_leaves,
-    )
+    geodesic = return_boundary_training_geodesic(start_tree, target_tree)
     segment_lengths = [float(segment["length"]) for segment in geodesic["segments"]]
     total_length = sum(segment_lengths)
     if total_length <= 0.0:
@@ -532,11 +551,13 @@ def _boundary_prefix_time(start_tree, target_tree, boundary_index):
 
 def _gather_supervised_velocity(module, batch, eps_len=1e-8):
     with torch.no_grad():
-        v_pred, edge_split_masks, _ = module.forward(
+        outputs = module.forward(
             batch["tokenized_trees"],
             batch["batched_time"],
             batch["phyla_embeddings"],
         )
+        v_pred = outputs[0]
+        edge_split_masks = outputs[1]
 
     velocity_labels = batch["batched_velocity"]
     num_leaves = batch["num_leaves"]
@@ -2077,6 +2098,7 @@ class TestTrainingSanity(unittest.TestCase):
             tokenizer_lap_dropout=0.0,
             tokenizer_n_layers=1,
             phyla_dim=16,
+            autoregressive_head_mode="structured_subset",
         ).to(device)
 
         module = TrainingModule(
@@ -2088,6 +2110,7 @@ class TestTrainingSanity(unittest.TestCase):
             deepspeed=False,
             logger=None,
         ).to(device)
+        module.autoregressive_allow_multi_subset_targets = True
 
         event_batches = [
             _make_autoregressive_event_batch(
@@ -2224,7 +2247,11 @@ class TestTrainingSanity(unittest.TestCase):
             real_tree,
             keep_leaves=12,
         )
-        boundary_path = return_tree_boundary_merge_paths(random_tree, real_tree)[0]
+        boundary_path = return_tree_boundary_merge_paths(
+            random_tree,
+            real_tree,
+            legacy_training_semantics=True,
+        )[0]
         self.assertTrue(
             boundary_path["events"],
             "The first boundary on the sanity tree pair had no merge events.",
@@ -2249,6 +2276,8 @@ class TestTrainingSanity(unittest.TestCase):
             tokenizer_lap_dropout=0.0,
             tokenizer_n_layers=2,
             phyla_dim=16,
+            autoregressive_head_mode="structured_subset",
+            autoregressive_group_refinement_layers=1,
         ).to(device)
 
         dataset_stub = MagicMock()
@@ -2270,7 +2299,12 @@ class TestTrainingSanity(unittest.TestCase):
             velocity_dt_candidate_weight=1,
             velocity_dt_hit_weight=1,
             velocity_event_weight=0.0,
+            velocity_first_hit_head_weight=1.0,
+            velocity_first_hit_head_use_at_sampling=True,
+            velocity_first_hit_predictor_mode="edge_token_attention",
         ).to(device)
+        module.legacy_first_hit_gather_only = True
+        module.autoregressive_allow_multi_subset_targets = True
 
         velocity_batch = _make_batch_from_tree_pair(
             tokenizer=model.tokenizer,
@@ -2435,7 +2469,11 @@ class TestTrainingSanity(unittest.TestCase):
         start_tree = ds.sample_random_tree(target_tree)
 
         oracle_keys = set(_oracle_training_topology_keys(start_tree, target_tree))
-        boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
+        boundary_paths = return_tree_boundary_merge_paths(
+            start_tree,
+            target_tree,
+            legacy_training_semantics=True,
+        )
 
         self.assertGreater(
             len(boundary_paths),
@@ -3367,7 +3405,11 @@ class TestTrainingSanity(unittest.TestCase):
         )
         target_tree = ds.load_posterior_trees_from_tfiles([])[0]
         start_tree = ds.sample_random_tree(target_tree)
-        boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
+        boundary_paths = return_tree_boundary_merge_paths(
+            start_tree,
+            target_tree,
+            legacy_training_semantics=True,
+        )
         self.assertGreater(
             len(boundary_paths),
             0,
@@ -3407,7 +3449,11 @@ class TestTrainingSanity(unittest.TestCase):
             random_sanity_check=True,
         )
         base_start_tree = base_ds.sample_random_tree(target_tree)
-        boundary_paths = return_tree_boundary_merge_paths(base_start_tree, target_tree)
+        boundary_paths = return_tree_boundary_merge_paths(
+            base_start_tree,
+            target_tree,
+            legacy_training_semantics=True,
+        )
         self.assertGreater(
             len(boundary_paths),
             11,
@@ -3453,7 +3499,11 @@ class TestTrainingSanity(unittest.TestCase):
             random_sanity_check=True,
         )
         base_start_tree = base_ds.sample_random_tree(target_tree)
-        boundary_paths = return_tree_boundary_merge_paths(base_start_tree, target_tree)
+        boundary_paths = return_tree_boundary_merge_paths(
+            base_start_tree,
+            target_tree,
+            legacy_training_semantics=True,
+        )
         transition = boundary_paths[11]
         self.assertGreater(
             len(transition["events"]),
@@ -3983,7 +4033,11 @@ class TestTrainingSanity(unittest.TestCase):
         real_tree = ds.load_posterior_trees_from_tfiles([])[0]
         random_tree = ds.sample_random_tree(real_tree)
 
-        boundary_paths = return_tree_boundary_merge_paths(random_tree, real_tree)
+        boundary_paths = return_tree_boundary_merge_paths(
+            random_tree,
+            real_tree,
+            legacy_training_semantics=True,
+        )
         prefix_last_boundary = 11
         self.assertGreater(
             len(boundary_paths),
@@ -4037,7 +4091,12 @@ class TestTrainingSanity(unittest.TestCase):
             velocity_dt_candidate_weight=1,
             velocity_dt_hit_weight=1,
             velocity_event_weight=0.0,
+            velocity_first_hit_head_weight=1.0,
+            velocity_first_hit_head_use_at_sampling=True,
+            velocity_first_hit_predictor_mode="edge_token_attention",
         ).to(device)
+        module.legacy_first_hit_gather_only = True
+        module.autoregressive_allow_multi_subset_targets = True
 
         velocity_times = [prefix_time * i / 8.0 for i in range(8)]
         velocity_batches = [

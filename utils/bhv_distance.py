@@ -40,6 +40,66 @@ def splits_compatible(mask_a: Bitmask, mask_b: Bitmask, full_mask: Bitmask) -> b
     return False
 
 
+def _is_internal_split(mask: Bitmask, full_mask: Bitmask) -> bool:
+    side = int(mask).bit_count()
+    other = int(full_mask ^ mask).bit_count()
+    return side > 1 and other > 1
+
+
+def _is_nested_split(mask: Bitmask, parent_mask: Bitmask, full_mask: Bitmask) -> bool:
+    mask_sides = (int(mask), int(full_mask ^ mask))
+    parent_sides = (int(parent_mask), int(full_mask ^ parent_mask))
+    for side in mask_sides:
+        for parent_side in parent_sides:
+            if side != parent_side and (side & parent_side) == side:
+                return True
+    return False
+
+
+def _compatible_prefix_birth_groups(
+    active_splits: Set[Bitmask],
+    target_only_splits: Set[Bitmask],
+    full_mask: Bitmask,
+) -> List[Set[Bitmask]]:
+    """
+    Recover local boundary births from an exact boundary-point tree.
+
+    When the start tree is a boundary tree, some target splits may already be
+    compatible with every active positive split but still represent immediate
+    local refinements inside an existing positive parent split. Those births
+    should appear as a zero-length prefix boundary event before the remaining
+    Owen–Provan support path continues.
+    """
+    if not active_splits or not target_only_splits:
+        return []
+
+    active_internal = {
+        int(split)
+        for split in active_splits
+        if _is_internal_split(int(split), full_mask)
+    }
+    if not active_internal:
+        return []
+
+    promotable = set()
+    for split in target_only_splits:
+        split = int(split)
+        if not all(
+            splits_compatible(split, int(active), full_mask)
+            for active in active_splits
+        ):
+            continue
+        if any(
+            _is_nested_split(split, int(parent), full_mask)
+            for parent in active_internal
+        ):
+            promotable.add(split)
+
+    if not promotable:
+        return []
+    return [promotable]
+
+
 ###############################################################################
 # Max-flow / Min-cut (Dinic) for min-weight vertex cover on bipartite graphs
 ###############################################################################
@@ -327,6 +387,9 @@ def bhv_geodesic_with_support(
     tree1: Dict[Bitmask, Length],
     tree2: Dict[Bitmask, Length],
     n_leaves: int,
+    *,
+    drop_zero_length_edges: bool = True,
+    enable_prefix_birth_groups: bool = True,
 ):
     """
     Compute the BHV geodesic between two bitmask-encoded trees AND
@@ -350,6 +413,22 @@ def bhv_geodesic_with_support(
         }]
       }
     """
+    if drop_zero_length_edges:
+        # Zero-length representation edges are not part of the active BHV state.
+        tree1 = {int(e): float(l) for e, l in tree1.items() if float(l) > 1e-8}
+        tree2 = {int(e): float(l) for e, l in tree2.items() if float(l) > 1e-8}
+    else:
+        tree1 = {
+            int(e): float(l)
+            for e, l in tree1.items()
+            if l is not None
+        }
+        tree2 = {
+            int(e): float(l)
+            for e, l in tree2.items()
+            if l is not None
+        }
+
     full_mask = (1 << n_leaves) - 1
 
     E1 = set(tree1.keys())
@@ -362,22 +441,42 @@ def bhv_geodesic_with_support(
     E1_only = E1 - common
     E2_only = E2 - common
 
+    prefix_birth_groups = []
+    if enable_prefix_birth_groups and len(E1_only) == 1:
+        prefix_birth_groups = _compatible_prefix_birth_groups(E1, E2_only, full_mask)
+    prefix_births = set().union(*prefix_birth_groups) if prefix_birth_groups else set()
+    if prefix_births:
+        common |= prefix_births
+        E2_only -= prefix_births
+        for split in prefix_births:
+            tree1_all[int(split)] = 0.0
+
     # Common part: Euclidean on differences
     common_sq = 0.0
     for e in common:
-        diff = tree1[e] - tree2[e]
+        diff = tree1_all.get(int(e), 0.0) - tree2_all.get(int(e), 0.0)
         common_sq += diff * diff
 
     if not E1_only and not E2_only:
         # Trees have identical split sets; pure Euclidean
         dist = math.sqrt(common_sq)
+        segments = compute_orthant_segments(
+            common,
+            [],
+            [],
+            {},
+            {},
+            tree1_all,
+            tree2_all,
+            prefix_birth_groups=prefix_birth_groups,
+        )
         return {
             "distance": dist,
             "common_sq": common_sq,
             "disjoint_sq": 0.0,
             "A_support": [],
             "B_support": [],
-            "segments": [],
+            "segments": segments,
         }
 
     lengths1 = {e: tree1[e] for e in E1_only}
@@ -407,6 +506,7 @@ def bhv_geodesic_with_support(
         lengths2,
         tree1_all,
         tree2_all,
+        prefix_birth_groups=prefix_birth_groups,
     )
 
     return {
@@ -493,6 +593,7 @@ def compute_orthant_segments(
     lengths2: Dict[Bitmask, float],
     tree1_all: Dict[Bitmask, float],
     tree2_all: Dict[Bitmask, float],
+    prefix_birth_groups: Optional[List[Set[Bitmask]]] = None,
 ):
     """
     Build a per-segment description of the BHV geodesic using Owen–Provan.
@@ -594,4 +695,46 @@ def compute_orthant_segments(
             },
         })
 
-    return segments
+    prefix_birth_groups = prefix_birth_groups or []
+    if not prefix_birth_groups:
+        return segments
+
+    prefix_lengths = lengths_at_lambda(
+        0.0,
+        common,
+        A_support,
+        B_support,
+        tree1_all,
+        tree2_all,
+        lengths1,
+        lengths2,
+        normsA,
+        normsB,
+    )
+    all_edges = set(prefix_lengths.keys())
+    prefix_segments = []
+    eps = 1e-8
+    for births in prefix_birth_groups:
+        prefix_segments.append(
+            {
+                "Ai": set(),
+                "Bi": {int(split) for split in births},
+                "start_splits": {
+                    int(edge) for edge, length in prefix_lengths.items() if float(length) > eps
+                },
+                "end_splits": {
+                    int(edge) for edge, length in prefix_lengths.items() if float(length) > eps
+                },
+                "normA": 0.0,
+                "normB": 0.0,
+                "ratio": 0.0,
+                "lambda_start": 0.0,
+                "lambda_end": 0.0,
+                "start_lengths": dict(prefix_lengths),
+                "end_lengths": dict(prefix_lengths),
+                "length": 0.0,
+                "velocity": {int(edge): 0.0 for edge in all_edges},
+            }
+        )
+
+    return prefix_segments + segments

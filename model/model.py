@@ -321,6 +321,10 @@ class TreeDenoiserTokenGT(nn.Module):
         tokenizer_lap_dim=16,  # TreeFeatureTokenizer
         tokenizer_lap_dropout=0.2,  # TreeFeatureTokenizer
         tokenizer_n_layers=6,  # TreeFeatureTokenizer
+        tokenizer_branch_length_mode="linear",
+        tokenizer_branch_length_num_buckets=64,
+        tokenizer_branch_length_log_min=-8.0,
+        tokenizer_branch_length_log_max=1.0,
         phyla_dim=256,
         phyla_use_leaf_tokens=True,
         phyla_use_split_tokens=True,
@@ -340,6 +344,10 @@ class TreeDenoiserTokenGT(nn.Module):
             n_layers=tokenizer_n_layers,
             lap_dim=tokenizer_lap_dim,
             lap_dropout=tokenizer_lap_dropout,
+            branch_length_mode=tokenizer_branch_length_mode,
+            branch_length_num_buckets=tokenizer_branch_length_num_buckets,
+            branch_length_log_min=tokenizer_branch_length_log_min,
+            branch_length_log_max=tokenizer_branch_length_log_max,
             # concat_features=True,  # Use concatenation of features
         )
         # [graph] token and [null] token
@@ -710,7 +718,7 @@ class TreeDenoiserTokenGT(nn.Module):
                 )
 
         # Prepend [graph] token
-        graph_token = self.graph_token.expand(B, 1, D)
+        graph_token = self.graph_token.to(device=x.device, dtype=x.dtype).expand(B, 1, D)
         x = torch.cat([graph_token, x], dim=1)  # [B, T_raw+1, D]
 
         if padding_mask is not None:
@@ -953,6 +961,18 @@ def return_model(config):
         tokenizer_lap_dim=config["model"]["tokenizer_lap_dim"],
         tokenizer_lap_dropout=config["model"]["tokenizer_lap_dropout"],
         tokenizer_n_layers=config["model"]["tokenizer_n_layers"],
+        tokenizer_branch_length_mode=config["model"].get(
+            "tokenizer_branch_length_mode", "linear"
+        ),
+        tokenizer_branch_length_num_buckets=config["model"].get(
+            "tokenizer_branch_length_num_buckets", 64
+        ),
+        tokenizer_branch_length_log_min=config["model"].get(
+            "tokenizer_branch_length_log_min", -8.0
+        ),
+        tokenizer_branch_length_log_max=config["model"].get(
+            "tokenizer_branch_length_log_max", 1.0
+        ),
         phyla_dim=config["model"]["phyla_dim"],
         phyla_use_leaf_tokens=config["model"].get("phyla_use_leaf_tokens", True),
         phyla_use_split_tokens=config["model"].get("phyla_use_split_tokens", True),
