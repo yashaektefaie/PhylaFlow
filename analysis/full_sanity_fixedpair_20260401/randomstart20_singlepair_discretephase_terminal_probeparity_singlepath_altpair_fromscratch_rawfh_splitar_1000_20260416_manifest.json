@@ -1,0 +1,13 @@
+{
+  "case_name": "randomstart20_singlepair_discretephase_terminal_probeparity_singlepath_altpair_fromscratch_rawfh_splitar_1000_20260416",
+  "dataset_index": 0,
+  "posterior_index": 33,
+  "start_try": 2,
+  "pair_seed": 314159,
+  "boundary_path_count": 3,
+  "num_leaves": 21,
+  "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_singlepair_discretephase_terminal_probeparity_singlepath_altpair_fromscratch_rawfh_splitar_1000_20260416_start.json",
+  "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_singlepair_discretephase_terminal_probeparity_singlepath_altpair_fromscratch_rawfh_splitar_1000_20260416_target.json",
+  "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_singlepair_discretephase_terminal_probeparity_singlepath_altpair_fromscratch_rawfh_splitar_1000_20260416_velocity_anchors.json",
+  "config_yaml": "/home/yektefai/PhylaFlow/configs/randomstart20_singlepair_discretephase_terminal_probeparity_singlepath_altpair_fromscratch_rawfh_splitar_1000_20260416.yaml"
+}

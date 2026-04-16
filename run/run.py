@@ -7,7 +7,7 @@ from run.TrainingModule import TrainingModule
 from utils.random_tree import Tree
 import random
 import wandb
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning import Trainer
 import multiprocessing
 import os
@@ -20,6 +20,61 @@ import logging
 worker_model = None
 
 
+class ThresholdStepCheckpoint(Callback):
+    """Save once a completed train batch has crossed the next due step.
+
+    Lightning's every_n_train_steps callback can miss all future checkpoints if
+    manual optimization/OOM retry logic shifts batch-end global_step off the
+    exact modulo. This callback keeps the same cadence but uses >= thresholding.
+    """
+
+    def __init__(self, dirpath, every_n_train_steps):
+        super().__init__()
+        self.dirpath = str(dirpath)
+        self.every_n_train_steps = int(every_n_train_steps)
+        self._next_step = None
+
+    def _reset_next_step(self, current_step):
+        if self.every_n_train_steps <= 0:
+            self._next_step = None
+            return
+        next_step = int(self.every_n_train_steps)
+        current_step = int(current_step)
+        if current_step >= next_step:
+            missed = ((current_step - next_step) // self.every_n_train_steps) + 1
+            next_step += missed * self.every_n_train_steps
+        self._next_step = int(next_step)
+
+    def on_train_start(self, trainer, pl_module):
+        self._reset_next_step(trainer.global_step)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.every_n_train_steps <= 0:
+            return
+        if self._next_step is None:
+            self._reset_next_step(trainer.global_step)
+
+        current_step = int(trainer.global_step)
+        if current_step < int(self._next_step):
+            return
+
+        os.makedirs(self.dirpath, exist_ok=True)
+        ckpt_path = os.path.join(
+            self.dirpath,
+            f"epoch={int(trainer.current_epoch)}-step={current_step:06d}.ckpt",
+        )
+        if getattr(trainer, "is_global_zero", True) and not os.path.exists(ckpt_path):
+            trainer.save_checkpoint(ckpt_path)
+            logging.info(
+                "Saved threshold checkpoint at global_step=%s to %s",
+                current_step,
+                ckpt_path,
+            )
+
+        while self._next_step is not None and int(self._next_step) <= current_step:
+            self._next_step += self.every_n_train_steps
+
+
 def _set_global_seed(seed):
     if seed is None:
         return
@@ -28,6 +83,41 @@ def _set_global_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _coerce_config_ids(raw_ids):
+    if raw_ids is None:
+        return []
+    if isinstance(raw_ids, str):
+        stripped = raw_ids.strip()
+        if not stripped:
+            return []
+        import re
+
+        range_match = re.fullmatch(r"DS(\d+)\s*-\s*(?:DS)?(\d+)", stripped, re.IGNORECASE)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            step = 1 if end >= start else -1
+            return [f"DS{i}" for i in range(start, end + step, step)]
+        return [part.strip() for part in stripped.split(",") if part.strip()]
+    if isinstance(raw_ids, (list, tuple, set)):
+        return [str(item).strip() for item in raw_ids if str(item).strip()]
+    return [str(raw_ids).strip()]
+
+
+def _get_dataset_ids_from_config(config):
+    data_cfg = config.get("data", {})
+    posterior_ids = _coerce_config_ids(
+        data_cfg.get("posterior_dataset_ids", data_cfg.get("short_run_dataset_ids"))
+    )
+    if not posterior_ids:
+        posterior_ids = _coerce_config_ids(
+            data_cfg.get("posterior_dataset_id", data_cfg.get("short_run_dataset_id"))
+        )
+    if posterior_ids:
+        return posterior_ids
+    return get_possible_ids(data_cfg["nexus_root"])
 
 
 def _configure_torch_runtime():
@@ -366,7 +456,7 @@ def init_worker(config_file, device_id):
     _set_global_seed(config["trainer"].get("seed"))
 
     # Initialize Dataset (needed for embeddings calculation in sample)
-    ids = get_possible_ids(config["data"]["nexus_root"])
+    ids = _get_dataset_ids_from_config(config)
     ran = random.Random(42)
     ran.shuffle(ids)
     train_ids = ids[: int(0.8 * len(ids))]
@@ -455,6 +545,15 @@ def init_worker(config_file, device_id):
             "velocity_dt_candidate_weight", 0.0
         ),
         velocity_dt_hit_weight=config["trainer"].get("velocity_dt_hit_weight", 0.0),
+        velocity_logtau_all_weight=config["trainer"].get(
+            "velocity_logtau_all_weight", 0.0
+        ),
+        velocity_logtau_first_over_weight=config["trainer"].get(
+            "velocity_logtau_first_over_weight", 0.0
+        ),
+        velocity_logtau_first_tie_weight=config["trainer"].get(
+            "velocity_logtau_first_tie_weight", 0.0
+        ),
         velocity_dt_eps=config["trainer"].get("velocity_dt_eps", 1e-6),
         velocity_event_weight=config["trainer"].get("velocity_event_weight", 0.5),
         velocity_event_temp=config["trainer"].get("velocity_event_temp", 0.5),
@@ -470,6 +569,9 @@ def init_worker(config_file, device_id):
         ),
         velocity_first_hit_head_weight=config["trainer"].get(
             "velocity_first_hit_head_weight", 0.0
+        ),
+        velocity_first_hit_loss_tol=config["trainer"].get(
+            "velocity_first_hit_loss_tol", 0.01
         ),
         velocity_first_hit_head_use_at_sampling=config["trainer"].get(
             "velocity_first_hit_head_use_at_sampling", False
@@ -543,8 +645,38 @@ def init_worker(config_file, device_id):
         velocity_boundary_time_hidden_dim=config["trainer"].get(
             "velocity_boundary_time_hidden_dim", 64
         ),
+        velocity_terminal_head_weight=config["trainer"].get(
+            "velocity_terminal_head_weight", 0.0
+        ),
+        velocity_terminal_head_use_at_sampling=config["trainer"].get(
+            "velocity_terminal_head_use_at_sampling", False
+        ),
+        velocity_terminal_head_hidden_dim=config["trainer"].get(
+            "velocity_terminal_head_hidden_dim", 64
+        ),
+        velocity_terminal_head_probe_features=config["trainer"].get(
+            "velocity_terminal_head_probe_features", False
+        ),
+        velocity_probe_direct_set_loss=config["trainer"].get(
+            "velocity_probe_direct_set_loss", False
+        ),
+        velocity_probe_direct_set_anchor_only=config["trainer"].get(
+            "velocity_probe_direct_set_anchor_only", False
+        ),
+        training_step_probe_parity_joint_update=config["trainer"].get(
+            "training_step_probe_parity_joint_update", False
+        ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
+        ),
+        sampling_discrete_phase_rollout_use_at_sampling=config["trainer"].get(
+            "sampling_discrete_phase_rollout_use_at_sampling", False
+        ),
+        sampling_discrete_phase_exact_boundary_step_use_at_sampling=config["trainer"].get(
+            "sampling_discrete_phase_exact_boundary_step_use_at_sampling", False
+        ),
+        sampling_discrete_phase_max_phases=config["trainer"].get(
+            "sampling_discrete_phase_max_phases", 8
         ),
         training_sampling_mode=config["trainer"].get(
             "training_sampling_mode", "batch_compare"
@@ -607,6 +739,7 @@ def init_worker(config_file, device_id):
             "training_sampling_stop_rf_threshold"
         ),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
+        sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -669,6 +802,9 @@ def init_worker(config_file, device_id):
         ),
         rollout_replay_legacy_loss_structure=config["trainer"].get(
             "rollout_replay_legacy_loss_structure", False
+        ),
+        rollout_replay_velocity_use_pair_oracle_orthant_labels=config["trainer"].get(
+            "rollout_replay_velocity_use_pair_oracle_orthant_labels", False
         ),
         dynamic_start_bank_enabled=config["trainer"].get(
             "dynamic_start_bank_enabled", False
@@ -753,7 +889,7 @@ def run_test():
     _configure_torch_runtime()
     _set_global_seed(config["trainer"].get("seed"))
 
-    ids = get_possible_ids(config["data"]["nexus_root"])
+    ids = _get_dataset_ids_from_config(config)
     # Random 80-20 train-test split for now
     ran = random.Random(42)
     ran.shuffle(ids)
@@ -845,6 +981,15 @@ def run_test():
             "velocity_dt_candidate_weight", 0.0
         ),
         velocity_dt_hit_weight=config["trainer"].get("velocity_dt_hit_weight", 0.0),
+        velocity_logtau_all_weight=config["trainer"].get(
+            "velocity_logtau_all_weight", 0.0
+        ),
+        velocity_logtau_first_over_weight=config["trainer"].get(
+            "velocity_logtau_first_over_weight", 0.0
+        ),
+        velocity_logtau_first_tie_weight=config["trainer"].get(
+            "velocity_logtau_first_tie_weight", 0.0
+        ),
         velocity_dt_eps=config["trainer"].get("velocity_dt_eps", 1e-6),
         velocity_event_weight=config["trainer"].get("velocity_event_weight", 0.5),
         velocity_event_temp=config["trainer"].get("velocity_event_temp", 0.5),
@@ -861,20 +1006,23 @@ def run_test():
         velocity_first_hit_head_weight=config["trainer"].get(
             "velocity_first_hit_head_weight", 0.0
         ),
+        velocity_first_hit_loss_tol=config["trainer"].get(
+            "velocity_first_hit_loss_tol", 0.01
+        ),
         velocity_first_hit_head_use_at_sampling=config["trainer"].get(
             "velocity_first_hit_head_use_at_sampling", False
         ),
         velocity_first_hit_predictor_mode=config["trainer"].get(
             "velocity_first_hit_predictor_mode", "base"
         ),
-        velocity_refiner_mode=config["trainer"].get(
-            "velocity_refiner_mode", "base"
-        ),
         velocity_first_hit_false_positive_mass_weight=config["trainer"].get(
             "velocity_first_hit_false_positive_mass_weight", 0.0
         ),
         velocity_first_hit_false_negative_mass_weight=config["trainer"].get(
             "velocity_first_hit_false_negative_mass_weight", 0.0
+        ),
+        velocity_refiner_mode=config["trainer"].get(
+            "velocity_refiner_mode", "base"
         ),
         velocity_first_hit_use_geometry_features=config["trainer"].get(
             "velocity_first_hit_use_geometry_features", False
@@ -918,8 +1066,38 @@ def run_test():
         velocity_boundary_time_hidden_dim=config["trainer"].get(
             "velocity_boundary_time_hidden_dim", 64
         ),
+        velocity_terminal_head_weight=config["trainer"].get(
+            "velocity_terminal_head_weight", 0.0
+        ),
+        velocity_terminal_head_use_at_sampling=config["trainer"].get(
+            "velocity_terminal_head_use_at_sampling", False
+        ),
+        velocity_terminal_head_hidden_dim=config["trainer"].get(
+            "velocity_terminal_head_hidden_dim", 64
+        ),
+        velocity_terminal_head_probe_features=config["trainer"].get(
+            "velocity_terminal_head_probe_features", False
+        ),
+        velocity_probe_direct_set_loss=config["trainer"].get(
+            "velocity_probe_direct_set_loss", False
+        ),
+        velocity_probe_direct_set_anchor_only=config["trainer"].get(
+            "velocity_probe_direct_set_anchor_only", False
+        ),
+        training_step_probe_parity_joint_update=config["trainer"].get(
+            "training_step_probe_parity_joint_update", False
+        ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
+        ),
+        sampling_discrete_phase_rollout_use_at_sampling=config["trainer"].get(
+            "sampling_discrete_phase_rollout_use_at_sampling", False
+        ),
+        sampling_discrete_phase_exact_boundary_step_use_at_sampling=config["trainer"].get(
+            "sampling_discrete_phase_exact_boundary_step_use_at_sampling", False
+        ),
+        sampling_discrete_phase_max_phases=config["trainer"].get(
+            "sampling_discrete_phase_max_phases", 8
         ),
         training_sampling_mode=config["trainer"].get(
             "training_sampling_mode", "batch_compare"
@@ -982,6 +1160,7 @@ def run_test():
             "training_sampling_stop_rf_threshold"
         ),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
+        sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -1044,6 +1223,9 @@ def run_test():
         ),
         rollout_replay_legacy_loss_structure=config["trainer"].get(
             "rollout_replay_legacy_loss_structure", False
+        ),
+        rollout_replay_velocity_use_pair_oracle_orthant_labels=config["trainer"].get(
+            "rollout_replay_velocity_use_pair_oracle_orthant_labels", False
         ),
         dynamic_start_bank_enabled=config["trainer"].get(
             "dynamic_start_bank_enabled", False
@@ -1196,7 +1378,7 @@ def run_overfit():
     # config["trainer"]["record"] = True # Optional: force recording
     # --- End Overrides ---
 
-    ids = get_possible_ids(config["data"]["nexus_root"])
+    ids = _get_dataset_ids_from_config(config)
 
     if not ids:
         print("No IDs found!")
@@ -1300,6 +1482,15 @@ def run_overfit():
             "velocity_dt_candidate_weight", 0.0
         ),
         velocity_dt_hit_weight=config["trainer"].get("velocity_dt_hit_weight", 0.0),
+        velocity_logtau_all_weight=config["trainer"].get(
+            "velocity_logtau_all_weight", 0.0
+        ),
+        velocity_logtau_first_over_weight=config["trainer"].get(
+            "velocity_logtau_first_over_weight", 0.0
+        ),
+        velocity_logtau_first_tie_weight=config["trainer"].get(
+            "velocity_logtau_first_tie_weight", 0.0
+        ),
         velocity_dt_eps=config["trainer"].get("velocity_dt_eps", 1e-6),
         velocity_event_weight=config["trainer"].get("velocity_event_weight", 0.5),
         velocity_event_temp=config["trainer"].get("velocity_event_temp", 0.5),
@@ -1316,11 +1507,20 @@ def run_overfit():
         velocity_first_hit_head_weight=config["trainer"].get(
             "velocity_first_hit_head_weight", 0.0
         ),
+        velocity_first_hit_loss_tol=config["trainer"].get(
+            "velocity_first_hit_loss_tol", 0.01
+        ),
         velocity_first_hit_head_use_at_sampling=config["trainer"].get(
             "velocity_first_hit_head_use_at_sampling", False
         ),
         velocity_first_hit_predictor_mode=config["trainer"].get(
             "velocity_first_hit_predictor_mode", "base"
+        ),
+        velocity_first_hit_false_positive_mass_weight=config["trainer"].get(
+            "velocity_first_hit_false_positive_mass_weight", 0.0
+        ),
+        velocity_first_hit_false_negative_mass_weight=config["trainer"].get(
+            "velocity_first_hit_false_negative_mass_weight", 0.0
         ),
         velocity_refiner_mode=config["trainer"].get(
             "velocity_refiner_mode", "base"
@@ -1367,8 +1567,38 @@ def run_overfit():
         velocity_boundary_time_hidden_dim=config["trainer"].get(
             "velocity_boundary_time_hidden_dim", 64
         ),
+        velocity_terminal_head_weight=config["trainer"].get(
+            "velocity_terminal_head_weight", 0.0
+        ),
+        velocity_terminal_head_use_at_sampling=config["trainer"].get(
+            "velocity_terminal_head_use_at_sampling", False
+        ),
+        velocity_terminal_head_hidden_dim=config["trainer"].get(
+            "velocity_terminal_head_hidden_dim", 64
+        ),
+        velocity_terminal_head_probe_features=config["trainer"].get(
+            "velocity_terminal_head_probe_features", False
+        ),
+        velocity_probe_direct_set_loss=config["trainer"].get(
+            "velocity_probe_direct_set_loss", False
+        ),
+        velocity_probe_direct_set_anchor_only=config["trainer"].get(
+            "velocity_probe_direct_set_anchor_only", False
+        ),
+        training_step_probe_parity_joint_update=config["trainer"].get(
+            "training_step_probe_parity_joint_update", False
+        ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
+        ),
+        sampling_discrete_phase_rollout_use_at_sampling=config["trainer"].get(
+            "sampling_discrete_phase_rollout_use_at_sampling", False
+        ),
+        sampling_discrete_phase_exact_boundary_step_use_at_sampling=config["trainer"].get(
+            "sampling_discrete_phase_exact_boundary_step_use_at_sampling", False
+        ),
+        sampling_discrete_phase_max_phases=config["trainer"].get(
+            "sampling_discrete_phase_max_phases", 8
         ),
         training_sampling_frequency=config["trainer"].get(
             "training_sampling_frequency", 200
@@ -1438,6 +1668,7 @@ def run_overfit():
         ),
         dt=config["trainer"].get("dt", 0.1),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
+        sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -1611,7 +1842,7 @@ def main():
     _configure_torch_runtime()
     _set_global_seed(config["trainer"].get("seed"))
 
-    ids = get_possible_ids(config["data"]["nexus_root"])
+    ids = _get_dataset_ids_from_config(config)
     # Random 80-20 train-test split for now
     ran = random.Random(42)
     ran.shuffle(ids)
@@ -1713,6 +1944,15 @@ def main():
             "velocity_dt_candidate_weight", 0.0
         ),
         velocity_dt_hit_weight=config["trainer"].get("velocity_dt_hit_weight", 0.0),
+        velocity_logtau_all_weight=config["trainer"].get(
+            "velocity_logtau_all_weight", 0.0
+        ),
+        velocity_logtau_first_over_weight=config["trainer"].get(
+            "velocity_logtau_first_over_weight", 0.0
+        ),
+        velocity_logtau_first_tie_weight=config["trainer"].get(
+            "velocity_logtau_first_tie_weight", 0.0
+        ),
         velocity_dt_eps=config["trainer"].get("velocity_dt_eps", 1e-6),
         velocity_event_weight=config["trainer"].get("velocity_event_weight", 0.5),
         velocity_event_temp=config["trainer"].get("velocity_event_temp", 0.5),
@@ -1729,11 +1969,20 @@ def main():
         velocity_first_hit_head_weight=config["trainer"].get(
             "velocity_first_hit_head_weight", 0.0
         ),
+        velocity_first_hit_loss_tol=config["trainer"].get(
+            "velocity_first_hit_loss_tol", 0.01
+        ),
         velocity_first_hit_head_use_at_sampling=config["trainer"].get(
             "velocity_first_hit_head_use_at_sampling", False
         ),
         velocity_first_hit_predictor_mode=config["trainer"].get(
             "velocity_first_hit_predictor_mode", "base"
+        ),
+        velocity_first_hit_false_positive_mass_weight=config["trainer"].get(
+            "velocity_first_hit_false_positive_mass_weight", 0.0
+        ),
+        velocity_first_hit_false_negative_mass_weight=config["trainer"].get(
+            "velocity_first_hit_false_negative_mass_weight", 0.0
         ),
         velocity_refiner_mode=config["trainer"].get(
             "velocity_refiner_mode", "base"
@@ -1780,8 +2029,38 @@ def main():
         velocity_boundary_time_hidden_dim=config["trainer"].get(
             "velocity_boundary_time_hidden_dim", 64
         ),
+        velocity_terminal_head_weight=config["trainer"].get(
+            "velocity_terminal_head_weight", 0.0
+        ),
+        velocity_terminal_head_use_at_sampling=config["trainer"].get(
+            "velocity_terminal_head_use_at_sampling", False
+        ),
+        velocity_terminal_head_hidden_dim=config["trainer"].get(
+            "velocity_terminal_head_hidden_dim", 64
+        ),
+        velocity_terminal_head_probe_features=config["trainer"].get(
+            "velocity_terminal_head_probe_features", False
+        ),
+        velocity_probe_direct_set_loss=config["trainer"].get(
+            "velocity_probe_direct_set_loss", False
+        ),
+        velocity_probe_direct_set_anchor_only=config["trainer"].get(
+            "velocity_probe_direct_set_anchor_only", False
+        ),
+        training_step_probe_parity_joint_update=config["trainer"].get(
+            "training_step_probe_parity_joint_update", False
+        ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
+        ),
+        sampling_discrete_phase_rollout_use_at_sampling=config["trainer"].get(
+            "sampling_discrete_phase_rollout_use_at_sampling", False
+        ),
+        sampling_discrete_phase_exact_boundary_step_use_at_sampling=config["trainer"].get(
+            "sampling_discrete_phase_exact_boundary_step_use_at_sampling", False
+        ),
+        sampling_discrete_phase_max_phases=config["trainer"].get(
+            "sampling_discrete_phase_max_phases", 8
         ),
         training_sampling_frequency=config["trainer"].get(
             "training_sampling_frequency", 200
@@ -1851,6 +2130,7 @@ def main():
         ),
         dt=config["trainer"].get("dt", 0.1),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
+        sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -1985,6 +2265,10 @@ def main():
         every_n_train_steps=config["trainer"]["steps_callback"],  # Save every N steps
         save_top_k=-1,  # Save all checkpoints
     )
+    threshold_save_callback = ThresholdStepCheckpoint(
+        dirpath=checkpoint_dir,
+        every_n_train_steps=config["trainer"]["steps_callback"],
+    )
 
     trainer_args = {}
     if config["trainer"]["record"]:
@@ -1993,7 +2277,10 @@ def main():
         trainer_args["logger"] = False
 
     trainer_args["max_epochs"] = config["trainer"]["epochs"]
-    trainer_args["callbacks"] = [save_callback]  # For validation callback runs
+    trainer_args["callbacks"] = [
+        save_callback,
+        threshold_save_callback,
+    ]  # For validation callback runs
     if config["trainer"]["val_callback_freq"] != 0:
         trainer_args["val_check_interval"] = config["trainer"]["val_callback_freq"]
     if config["trainer"]["limit_val_batches"] == 0:

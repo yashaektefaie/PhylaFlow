@@ -48,6 +48,8 @@ _pick_knn_pair,
 )
 from utils.metric_utils import (
 kl_divergence_topological_distributions,
+kl_divergence_tree_topology_distributions,
+topk_posterior_tree_recall,
 split_bipartition_frequency_correlation,
 compare_likelihood_distributions,
 compare_branch_length_distributions,
@@ -316,6 +318,176 @@ def _boundary_event_precision_margin_loss(
     return loss, stats
 
 
+def _group_slices_from_sizes(group_sizes, total):
+    sizes = [int(x) for x in group_sizes if int(x) > 0]
+    if not sizes or sum(sizes) != int(total):
+        return [slice(0, int(total))]
+    out = []
+    start = 0
+    for size in sizes:
+        out.append(slice(start, start + size))
+        start += size
+    return out
+
+
+def _first_hit_target_for_group_control(
+    lengths,
+    y_true,
+    *,
+    velocity_sign_eps=0.0,
+    dt_eps=1e-6,
+    first_hit_tol=0.01,
+):
+    target = torch.zeros_like(y_true, dtype=torch.bool)
+    tau_true = torch.full_like(y_true, float("inf"))
+    contract = (y_true < -float(velocity_sign_eps)) & (lengths > 1e-8)
+    if bool(contract.any().item()):
+        tau_vals = lengths[contract].clamp_min(float(dt_eps)) / (
+            -y_true[contract]
+        ).clamp_min(float(dt_eps))
+        tau_min = tau_vals.min()
+        contract_idx = torch.nonzero(contract, as_tuple=False).reshape(-1)
+        target[contract_idx[torch.abs(tau_vals - tau_min) <= float(first_hit_tol)]] = (
+            True
+        )
+        tau_true[contract] = tau_vals
+    return target, tau_true
+
+
+def _full_path_control_velocity_loss(
+    *,
+    p,
+    y,
+    lengths,
+    first_hit_logits,
+    group_sizes,
+    velocity_sign_eps=0.0,
+    dt_eps=1e-6,
+    first_hit_tol=0.01,
+    first_hit_head_weight=0.0,
+    logtau_all_weight=0.0,
+    logtau_first_over_weight=0.0,
+    logtau_first_tie_weight=0.0,
+    logtau_predset_over_weight=0.0,
+):
+    zero = p.new_tensor(0.0)
+    parts = {
+        "mse": (p - y).pow(2).mean(),
+        "firsthit_bce_raw": zero,
+        "firsthit_bce": zero,
+        "logtau_all_raw": zero,
+        "logtau_all": zero,
+        "logtau_first_over_raw": zero,
+        "logtau_first_over": zero,
+        "logtau_first_tie_raw": zero,
+        "logtau_first_tie": zero,
+        "logtau_predset_over_raw": zero,
+        "logtau_predset_over": zero,
+    }
+
+    if first_hit_logits is not None and float(first_hit_head_weight) > 0.0:
+        first_loss_raw, _stats = _first_hit_grouped_set_bce_loss(
+            lengths=lengths,
+            y_true=y,
+            first_hit_logits=first_hit_logits,
+            group_sizes=group_sizes,
+            velocity_sign_eps=velocity_sign_eps,
+            dt_eps=dt_eps,
+            first_hit_tol=first_hit_tol,
+        )
+        parts["firsthit_bce_raw"] = first_loss_raw
+        parts["firsthit_bce"] = float(first_hit_head_weight) * first_loss_raw
+
+    logtau_all_losses = []
+    logtau_first_over_losses = []
+    logtau_first_tie_losses = []
+    logtau_predset_over_losses = []
+    for sl in _group_slices_from_sizes(group_sizes, int(p.numel())):
+        pg = p[sl]
+        yg = y[sl]
+        lg = lengths[sl]
+        logits_g = None if first_hit_logits is None else first_hit_logits[sl]
+        target_first, tau_true_all = _first_hit_target_for_group_control(
+            lg,
+            yg,
+            velocity_sign_eps=velocity_sign_eps,
+            dt_eps=dt_eps,
+            first_hit_tol=first_hit_tol,
+        )
+        contract = (yg < -float(velocity_sign_eps)) & (lg > 1e-8)
+        if not bool(contract.any().item()):
+            continue
+
+        tau_pred = lg[contract].clamp_min(float(dt_eps)) / (
+            -pg[contract]
+        ).clamp_min(float(dt_eps))
+        log_tau_pred = torch.log(tau_pred.clamp_min(float(dt_eps)))
+        log_tau_true = torch.log(tau_true_all[contract].clamp_min(float(dt_eps)))
+        logtau_all_losses.append(F.smooth_l1_loss(log_tau_pred, log_tau_true))
+
+        if bool(target_first.any().item()):
+            tau_pred_first = lg[target_first].clamp_min(float(dt_eps)) / (
+                -pg[target_first]
+            ).clamp_min(float(dt_eps))
+            log_pred_first = torch.log(tau_pred_first.clamp_min(float(dt_eps)))
+            log_true_first = torch.log(
+                tau_true_all[target_first].clamp_min(float(dt_eps))
+            )
+            pred_max = log_pred_first.max()
+            true_max = log_true_first.max()
+            logtau_first_over_losses.append(F.relu(pred_max - true_max).pow(2))
+            if int(log_pred_first.numel()) > 1:
+                logtau_first_tie_losses.append(
+                    (log_pred_first - log_pred_first.mean()).pow(2).mean()
+                )
+            if logits_g is not None:
+                pred_contract = (pg < -float(velocity_sign_eps)) & (lg > 1e-8)
+                if bool(pred_contract.any().item()):
+                    tau_pred_contract = lg[pred_contract].clamp_min(float(dt_eps)) / (
+                        -pg[pred_contract]
+                    ).clamp_min(float(dt_eps))
+                    log_pred_contract = torch.log(
+                        tau_pred_contract.clamp_min(float(dt_eps))
+                    )
+                    pred_probs = torch.sigmoid(logits_g[pred_contract]).clamp_min(1e-6)
+                    predset_over = F.relu(log_pred_contract - true_max).pow(2)
+                    logtau_predset_over_losses.append(
+                        (pred_probs * predset_over).sum()
+                        / pred_probs.sum().clamp_min(1e-6)
+                    )
+
+    if logtau_all_losses and float(logtau_all_weight) > 0.0:
+        parts["logtau_all_raw"] = torch.stack(logtau_all_losses).mean()
+        parts["logtau_all"] = float(logtau_all_weight) * parts["logtau_all_raw"]
+    if logtau_first_over_losses and float(logtau_first_over_weight) > 0.0:
+        parts["logtau_first_over_raw"] = torch.stack(logtau_first_over_losses).mean()
+        parts["logtau_first_over"] = (
+            float(logtau_first_over_weight) * parts["logtau_first_over_raw"]
+        )
+    if logtau_first_tie_losses and float(logtau_first_tie_weight) > 0.0:
+        parts["logtau_first_tie_raw"] = torch.stack(logtau_first_tie_losses).mean()
+        parts["logtau_first_tie"] = (
+            float(logtau_first_tie_weight) * parts["logtau_first_tie_raw"]
+        )
+    if logtau_predset_over_losses and float(logtau_predset_over_weight) > 0.0:
+        parts["logtau_predset_over_raw"] = torch.stack(
+            logtau_predset_over_losses
+        ).mean()
+        parts["logtau_predset_over"] = (
+            float(logtau_predset_over_weight) * parts["logtau_predset_over_raw"]
+        )
+
+    total = (
+        parts["mse"]
+        + parts["firsthit_bce"]
+        + parts["logtau_all"]
+        + parts["logtau_first_over"]
+        + parts["logtau_first_tie"]
+        + parts["logtau_predset_over"]
+    )
+    return total, parts
+
+
 def _first_hit_set_bce_loss(
     lengths,
     y_true,
@@ -353,7 +525,7 @@ def _first_hit_set_bce_loss(
     neg = target.numel() - pos
     pos_weight = None
     if float(neg.item()) > 0.0:
-        pos_weight = (neg / pos).detach()
+        pos_weight = torch.clamp(neg / pos, min=1.0).detach()
     loss = F.binary_cross_entropy_with_logits(
         first_hit_logits,
         target,
@@ -382,6 +554,189 @@ def _first_hit_set_bce_loss(
         "jaccard": float((tp / union.clamp_min(1.0)).item()),
     }
     return loss, stats
+
+
+def _slice_by_group_sizes(tensor, group_sizes):
+    if tensor is None:
+        return []
+    total = int(tensor.numel())
+    if not group_sizes:
+        return [tensor]
+    sizes = [int(size) for size in group_sizes if int(size) > 0]
+    if sum(sizes) != total:
+        return [tensor]
+
+    groups = []
+    start = 0
+    for size in sizes:
+        end = start + size
+        groups.append(tensor[start:end])
+        start = end
+    return groups
+
+
+def _first_hit_grouped_target(
+    lengths,
+    y_true,
+    group_sizes=None,
+    velocity_sign_eps=0.0,
+    dt_eps=1e-6,
+    first_hit_tol=0.01,
+):
+    length_groups = _slice_by_group_sizes(lengths, group_sizes)
+    y_groups = _slice_by_group_sizes(y_true, group_sizes)
+    if not length_groups or len(length_groups) != len(y_groups):
+        return _first_hit_target(
+            lengths,
+            y_true,
+            velocity_sign_eps=velocity_sign_eps,
+            dt_eps=dt_eps,
+            first_hit_tol=first_hit_tol,
+        )
+
+    targets = [
+        _first_hit_target(
+            group_lengths,
+            group_y,
+            velocity_sign_eps=velocity_sign_eps,
+            dt_eps=dt_eps,
+            first_hit_tol=first_hit_tol,
+        )
+        for group_lengths, group_y in zip(length_groups, y_groups)
+    ]
+    if not targets:
+        return torch.zeros_like(lengths)
+    return torch.cat(targets)
+
+
+def _first_hit_grouped_set_bce_loss(
+    lengths,
+    y_true,
+    first_hit_logits,
+    group_sizes=None,
+    velocity_sign_eps=0.0,
+    dt_eps=1e-6,
+    first_hit_tol=0.01,
+):
+    zero = first_hit_logits.new_tensor(0.0)
+    stats = {
+        "n_candidates": int(first_hit_logits.numel()),
+        "target_first_size": 0,
+        "pred_first_size": 0,
+        "top1_hits_first_set": 0.0,
+        "recall": 0.0,
+        "precision": 0.0,
+        "jaccard": 0.0,
+    }
+    if first_hit_logits.numel() == 0:
+        return zero, stats
+
+    length_groups = _slice_by_group_sizes(lengths, group_sizes)
+    y_groups = _slice_by_group_sizes(y_true, group_sizes)
+    logit_groups = _slice_by_group_sizes(first_hit_logits, group_sizes)
+    if (
+        not length_groups
+        or len(length_groups) != len(y_groups)
+        or len(length_groups) != len(logit_groups)
+    ):
+        return _first_hit_set_bce_loss(
+            lengths=lengths,
+            y_true=y_true,
+            first_hit_logits=first_hit_logits,
+            velocity_sign_eps=velocity_sign_eps,
+            dt_eps=dt_eps,
+            first_hit_tol=first_hit_tol,
+        )
+
+    losses = []
+    total_candidates = 0
+    total_target = 0.0
+    total_pred = 0.0
+    total_tp = 0.0
+    total_union = 0.0
+    top1_hits = 0.0
+    valid_groups = 0
+    for group_lengths, group_y, group_logits in zip(
+        length_groups, y_groups, logit_groups
+    ):
+        total_candidates += int(group_logits.numel())
+        target = _first_hit_target(
+            group_lengths,
+            group_y,
+            velocity_sign_eps=velocity_sign_eps,
+            dt_eps=dt_eps,
+            first_hit_tol=first_hit_tol,
+        )
+        pos = target.sum()
+        if float(pos.item()) <= 0.0:
+            continue
+
+        neg = target.numel() - pos
+        pos_weight = None
+        if float(neg.item()) > 0.0:
+            pos_weight = torch.clamp(neg / pos, min=1.0).detach()
+        losses.append(
+            F.binary_cross_entropy_with_logits(
+                group_logits,
+                target,
+                pos_weight=pos_weight,
+            )
+        )
+
+        pred_probs = torch.sigmoid(group_logits)
+        pred_mask = pred_probs > 0.5
+        if int(pred_mask.sum().item()) == 0:
+            pred_mask[torch.argmax(pred_probs)] = True
+
+        top1_idx = int(torch.argmax(pred_probs).item())
+        target_bool = target.bool()
+        tp = (pred_mask & target_bool).sum().float()
+        pred_n = pred_mask.sum().float()
+        true_n = target.sum().float()
+        union = (pred_mask | target_bool).sum().float()
+
+        total_target += float(true_n.detach().item())
+        total_pred += float(pred_n.detach().item())
+        total_tp += float(tp.detach().item())
+        total_union += float(union.detach().item())
+        top1_hits += float(target[top1_idx].detach().item())
+        valid_groups += 1
+
+    if not losses:
+        stats["n_candidates"] = total_candidates
+        return zero, stats
+
+    loss = torch.stack(losses).mean()
+    stats = {
+        "n_candidates": total_candidates,
+        "target_first_size": int(total_target),
+        "pred_first_size": int(total_pred),
+        "top1_hits_first_set": top1_hits / max(valid_groups, 1),
+        "recall": total_tp / max(total_target, 1.0),
+        "precision": total_tp / max(total_pred, 1.0),
+        "jaccard": total_tp / max(total_union, 1.0),
+    }
+    return loss, stats
+
+
+def _first_hit_grouped_soft_mass_penalty(
+    lengths,
+    y_true,
+    first_hit_logits,
+    group_sizes=None,
+    velocity_sign_eps=0.0,
+    dt_eps=1e-6,
+    first_hit_tol=0.01,
+):
+    target = _first_hit_grouped_target(
+        lengths,
+        y_true,
+        group_sizes=group_sizes,
+        velocity_sign_eps=velocity_sign_eps,
+        dt_eps=dt_eps,
+        first_hit_tol=first_hit_tol,
+    )
+    return _first_hit_soft_mass_penalty(first_hit_logits, target)
 
 
 def _first_hit_target(
@@ -437,6 +792,8 @@ def _first_hit_soft_mass_penalty(
         "fp_mass": float(fp_mass.detach().item()),
         "fn_mass": float(fn_mass.detach().item()),
         "cardinality_gap": float(cardinality_gap.detach().item()),
+        "fp_mass_tensor": fp_mass,
+        "fn_mass_tensor": fn_mass,
     }
     return penalty, stats
 
@@ -474,6 +831,9 @@ def _predict_first_hit_mask_with_fallback(
     fallback_threshold=-1,
     fallback_top_k=-1,
 ):
+    # Never cap the sampled first-hit set. Training can predict a large
+    # simultaneous event, and truncating it at sampling time invalidates the
+    # learned movement program.
     raw_mask = _predict_first_hit_mask_from_logits(
         logits,
         candidate_mask,
@@ -481,29 +841,7 @@ def _predict_first_hit_mask_with_fallback(
         max_edges=-1,
     )
     raw_count = int(raw_mask.sum())
-    use_fallback = (
-        int(fallback_threshold) > 0
-        and int(fallback_top_k) > 0
-        and raw_count > int(fallback_threshold)
-    )
-    if use_fallback:
-        pred_mask = _predict_first_hit_mask_from_logits(
-            logits,
-            candidate_mask,
-            threshold=threshold,
-            max_edges=int(fallback_top_k),
-        )
-    elif int(max_edges) > 0:
-        pred_mask = _predict_first_hit_mask_from_logits(
-            logits,
-            candidate_mask,
-            threshold=threshold,
-            max_edges=int(max_edges),
-        )
-    else:
-        pred_mask = raw_mask
-
-    return pred_mask, raw_count, use_fallback
+    return raw_mask, raw_count, False
 
 
 def _oracle_first_hit_mask_for_sampling(
@@ -1332,7 +1670,12 @@ def _combine_autoregressive_losses(
     return total_loss
 
 
-def _structured_subset_loss_and_prediction(group_output, group_splits, subset):
+def _structured_subset_loss_and_prediction(
+    group_output,
+    group_splits,
+    subset,
+    include_metric_logits=True,
+):
     pair_logits = group_output["starter_pair_logits"]
     pair_indices = group_output["starter_pair_indices"]
     member_logits = group_output["member_logits"]
@@ -1415,24 +1758,29 @@ def _structured_subset_loss_and_prediction(group_output, group_splits, subset):
             predicted_size,
         )
 
-    return {
+    result = {
         "loss": pair_loss + member_loss + size_loss,
         "best_pair_id": int(best_pair_id),
         "predicted_subset": predicted_subset,
         "predicted_size": int(predicted_size),
         "target_size": int(len(subset)),
         "stop_after_merge_logit": group_output.get("stop_after_merge_logit"),
-        "target_logits": _subset_target_matrix(
+    }
+    if include_metric_logits:
+        result["target_logits"] = _subset_target_matrix(
             group_splits,
             tuple(sorted(subset)),
             pair_logits.device,
-        ),
-        "predicted_logits": _subset_prediction_logits(
+        )
+        result["predicted_logits"] = _subset_prediction_logits(
             group_splits,
             predicted_subset,
             device=pair_logits.device,
-        ),
-    }
+        )
+    else:
+        result["target_logits"] = None
+        result["predicted_logits"] = None
+    return result
 
 
 def _plan_autoregressive_boundary_merges(
@@ -1556,7 +1904,183 @@ def _move_tokenized_batch_to_device(tokenized, device):
     return tuple(moved)
 
 
+def _pooled_probe_terminal_stats(x, *, device, dtype):
+    if x is None or x.numel() == 0:
+        return torch.zeros(4, device=device, dtype=dtype)
+    flat = x.reshape(-1).to(device=device, dtype=dtype)
+    return torch.stack(
+        [
+            flat.mean(),
+            flat.min(),
+            flat.max(),
+            torch.linalg.vector_norm(flat),
+        ],
+        dim=0,
+    )
+
+
+def _build_probe_terminal_feature(
+    lengths,
+    velocities,
+    first_hit_logits,
+    boundary_vanish_logits,
+):
+    device = lengths.device
+    dtype = lengths.dtype
+    count_feat = torch.tensor(
+        [
+            float(lengths.numel()),
+            float(torch.count_nonzero(lengths > 1e-8).item()),
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    return torch.cat(
+        [
+            _pooled_probe_terminal_stats(lengths, device=device, dtype=dtype),
+            _pooled_probe_terminal_stats(velocities, device=device, dtype=dtype),
+            _pooled_probe_terminal_stats(
+                first_hit_logits, device=device, dtype=dtype
+            ),
+            _pooled_probe_terminal_stats(
+                boundary_vanish_logits, device=device, dtype=dtype
+            ),
+            count_feat,
+        ],
+        dim=0,
+    )
+
+
+def _target_splits_from_velocity_sample(sample):
+    tree_obj = Tree(sample["newick_tree"])
+    encoder = BHVEncoder()
+    masks, lengths = encoder.return_BHV_encoding(tree_obj)
+    len_map = {int(m): float(l) for m, l in zip(masks, lengths) if l is not None}
+    model_masks = [
+        int(m)
+        for m, l in zip(masks, lengths)
+        if l is not None and float(l) > 1e-8 and int(m) != 0
+    ]
+    if not model_masks:
+        return []
+    real_max_bit = max(int(m).bit_length() for m in model_masks)
+    full_mask = (1 << real_max_bit) - 1 if real_max_bit > 0 else 0
+    taus = []
+    matched = []
+    for orig_mask, vel in sample.get("velocity", {}).items():
+        vel = float(vel)
+        mask = int(orig_mask)
+        if mask.bit_length() == real_max_bit + 1:
+            mask = remove_bit(mask, int(sample["num_leaves"]) - 1)
+        elif mask.bit_length() > real_max_bit + 1:
+            continue
+        matched_mask = mask
+        if matched_mask not in model_masks:
+            comp = full_mask ^ matched_mask
+            if comp in model_masks:
+                matched_mask = comp
+            else:
+                continue
+        k_bits = int(matched_mask).bit_count()
+        if min(k_bits, real_max_bit - k_bits) == 1:
+            continue
+        length = len_map.get(int(matched_mask))
+        if length is None and full_mask:
+            length = len_map.get(full_mask ^ int(matched_mask))
+        if length is None or float(length) <= 1e-8 or vel >= -1e-3:
+            continue
+        taus.append(float(length) / max(-vel, 1e-3))
+        matched.append(int(matched_mask))
+    if not taus:
+        return []
+    tau_min = min(taus)
+    return sorted(m for m, t in zip(matched, taus) if abs(t - tau_min) <= 1e-3)
+
+
 def _build_velocity_replay_batch(module, samples):
+    if not samples:
+        return None
+
+    filtered_samples = list(samples)
+    if bool(getattr(module, "velocity_probe_direct_set_anchor_only", False)):
+        anchor_samples = [sample for sample in filtered_samples if sample.get("anchor_family")]
+        if anchor_samples:
+            filtered_samples = anchor_samples
+    samples = filtered_samples
+
+    newicks = [sample["newick_tree"] for sample in samples]
+    with torch.no_grad():
+        tokenized = _move_tokenized_batch_to_device(
+            module.model.tokenizer(newicks),
+            module.device,
+        )
+    family_canonical_targets = {}
+    if bool(getattr(module, "velocity_probe_direct_set_loss", False)):
+        try:
+            family_samples = {}
+            for sample in samples:
+                family = sample.get("anchor_family")
+                if family:
+                    family_samples.setdefault(str(family), sample)
+            start_sample = family_samples.get("O0")
+            target_tree = samples[0].get("target_tree")
+            if start_sample is not None and target_tree is not None:
+                canonical_map, _ = _build_pair_oracle_orthant_velocity_label_map(
+                    str(start_sample["newick_tree"]),
+                    str(target_tree),
+                )
+                for family, sample in family_samples.items():
+                    topo_key = tuple(_topology_key(str(sample["newick_tree"])))
+                    canonical = canonical_map.get(topo_key)
+                    if canonical is not None:
+                        canonical_sample = {
+                            **dict(canonical),
+                            "num_leaves": int(sample["num_leaves"]),
+                        }
+                        family_canonical_targets[family] = _target_splits_from_velocity_sample(
+                            canonical_sample
+                        )
+        except Exception:
+            family_canonical_targets = {}
+    probe_direct_set_targets = []
+    probe_direct_set_mask = []
+    for sample in samples:
+        use_direct = bool(
+            getattr(module, "velocity_probe_direct_set_loss", False)
+            and sample.get("anchor_family")
+        )
+        probe_direct_set_mask.append(bool(use_direct))
+        family = None if sample.get("anchor_family") is None else str(sample.get("anchor_family"))
+        probe_direct_set_targets.append(
+            family_canonical_targets.get(family, _target_splits_from_velocity_sample(sample))
+            if use_direct
+            else []
+        )
+    return {
+        "_is_replay_batch": True,
+        "_skip_training_augmentations": True,
+        "_use_full_path_control_velocity_loss": True,
+        "_use_probe_parity_direct_set_loss": bool(any(probe_direct_set_mask)),
+        "tokenized_trees": tokenized,
+        "batched_time": torch.tensor(
+            [float(sample["timepoint"]) for sample in samples],
+            dtype=torch.float32,
+            device=module.device,
+        ),
+        "phyla_embeddings": None,
+        "original_trees": newicks,
+        "target_trees": [sample["target_tree"] for sample in samples],
+        "batched_velocity": [sample["velocity"] for sample in samples],
+        "velocity_next_boundary_trees": [
+            sample.get("velocity_next_boundary_tree") for sample in samples
+        ],
+        "num_leaves": [int(sample["num_leaves"]) for sample in samples],
+        "_probe_direct_set_targets": probe_direct_set_targets,
+        "_probe_direct_set_sample_mask": probe_direct_set_mask,
+    }
+
+
+def _build_terminal_replay_batch(module, samples):
     if not samples:
         return None
 
@@ -1575,14 +2099,17 @@ def _build_velocity_replay_batch(module, samples):
             dtype=torch.float32,
             device=module.device,
         ),
+        "batched_terminal_stop": torch.tensor(
+            [
+                1.0 if sample.get("terminal_stop", False) else 0.0
+                for sample in samples
+            ],
+            dtype=torch.float32,
+            device=module.device,
+        ),
         "phyla_embeddings": None,
         "original_trees": newicks,
-        "target_trees": [sample["target_tree"] for sample in samples],
-        "batched_velocity": [sample["velocity"] for sample in samples],
-        "velocity_next_boundary_trees": [
-            sample.get("velocity_next_boundary_tree") for sample in samples
-        ],
-        "num_leaves": [int(sample["num_leaves"]) for sample in samples],
+        "target_trees": [sample.get("target_tree") for sample in samples],
     }
 
 
@@ -1618,8 +2145,6 @@ def _build_autoregressive_replay_batch(module, samples):
         ),
         "phyla_embeddings": None,
     }
-
-
 def _make_replay_anchor_state(newick_tree, timepoint, target_tree, num_leaves):
     return {
         "newick_tree": str(newick_tree),
@@ -1629,7 +2154,13 @@ def _make_replay_anchor_state(newick_tree, timepoint, target_tree, num_leaves):
     }
 
 
-def _select_rollout_replay_anchors(trace, sampled_tree, target_tree, max_anchor_states):
+def _select_rollout_replay_anchors(
+    trace,
+    sampled_tree,
+    target_tree,
+    max_anchor_states,
+    include_autoregressive=False,
+):
     if int(max_anchor_states) <= 0:
         return []
 
@@ -1647,6 +2178,21 @@ def _select_rollout_replay_anchors(trace, sampled_tree, target_tree, max_anchor_
                 sample.get("num_leaves", Tree(newick_tree).n_leaves),
             )
         )
+
+    if bool(include_autoregressive):
+        autoregressive_trace = trace.get("autoregressive", []) if trace is not None else []
+        for sample in autoregressive_trace:
+            newick_tree = sample.get("newick")
+            if not newick_tree:
+                continue
+            anchor_candidates.append(
+                _make_replay_anchor_state(
+                    newick_tree,
+                    sample.get("time", 0.0),
+                    sample.get("target_tree", target_tree),
+                    Tree(newick_tree).n_leaves,
+                )
+            )
 
     if sampled_tree:
         final_timepoint = (
@@ -1802,9 +2348,132 @@ def _build_legacy_velocity_oracle_sample(
     }
 
 
+def _velocity_replay_label_signature(sample):
+    velocity_items = tuple(
+        sorted(
+            (
+                int(split_mask),
+                round(float(value), 12),
+            )
+            for split_mask, value in sample.get("velocity", {}).items()
+        )
+    )
+    next_boundary_key = None
+    if sample.get("velocity_next_boundary_tree"):
+        try:
+            next_boundary_key = _topology_key(sample["velocity_next_boundary_tree"])
+        except Exception:
+            next_boundary_key = str(sample.get("velocity_next_boundary_tree"))
+    return velocity_items, next_boundary_key
+
+
+def _build_pair_oracle_orthant_velocity_label_map(start_tree, target_tree):
+    if not start_tree or not target_tree:
+        return {}, 0
+
+    try:
+        boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
+    except Exception:
+        return {}, 0
+    if not boundary_paths:
+        return {}, 0
+
+    velocity_trees = [str(start_tree)]
+    velocity_trees.extend(str(path["end_newick"]) for path in boundary_paths[:-1])
+    timepoints = [0.0]
+    timepoints.extend(float(path["global_time"]) for path in boundary_paths[:-1])
+    next_boundary_trees = [str(path["start_newick"]) for path in boundary_paths]
+
+    canonical_by_topology = {}
+    ambiguous_topologies = set()
+    for source_tree, next_boundary_tree, model_time in zip(
+        velocity_trees,
+        next_boundary_trees,
+        timepoints,
+    ):
+        velocity_sample = _build_legacy_velocity_oracle_sample(
+            source_tree,
+            target_tree,
+            timepoint=float(model_time),
+        )
+        if velocity_sample is None:
+            continue
+        velocity_sample = dict(velocity_sample)
+        velocity_sample["velocity_next_boundary_tree"] = str(next_boundary_tree)
+        try:
+            topology_key = _topology_key(velocity_sample["newick_tree"])
+        except Exception:
+            continue
+        existing = canonical_by_topology.get(topology_key)
+        if existing is None:
+            canonical_by_topology[topology_key] = velocity_sample
+            continue
+        if _velocity_replay_label_signature(existing) != _velocity_replay_label_signature(
+            velocity_sample
+        ):
+            ambiguous_topologies.add(topology_key)
+
+    for topology_key in ambiguous_topologies:
+        canonical_by_topology.pop(topology_key, None)
+    return canonical_by_topology, int(len(ambiguous_topologies))
+
+
+def _apply_pair_oracle_orthant_velocity_labels(velocity_samples, pair):
+    if not velocity_samples:
+        return list(velocity_samples), {
+            "matched": 0,
+            "unmatched": 0,
+            "canonical_topologies": 0,
+            "ambiguous_topologies": 0,
+        }
+
+    canonical_map, ambiguous_topologies = _build_pair_oracle_orthant_velocity_label_map(
+        pair.get("start_tree"),
+        pair.get("target_tree"),
+    )
+    if not canonical_map:
+        return list(velocity_samples), {
+            "matched": 0,
+            "unmatched": int(len(velocity_samples)),
+            "canonical_topologies": 0,
+            "ambiguous_topologies": int(ambiguous_topologies),
+        }
+
+    relabeled_samples = []
+    matched = 0
+    unmatched = 0
+    for sample in velocity_samples:
+        relabeled = dict(sample)
+        topology_key = None
+        if sample.get("newick_tree"):
+            try:
+                topology_key = _topology_key(sample["newick_tree"])
+            except Exception:
+                topology_key = None
+        canonical = canonical_map.get(topology_key)
+        if canonical is None:
+            unmatched += 1
+            relabeled_samples.append(relabeled)
+            continue
+        relabeled["velocity"] = dict(canonical["velocity"])
+        relabeled["velocity_next_boundary_tree"] = canonical.get(
+            "velocity_next_boundary_tree"
+        )
+        matched += 1
+        relabeled_samples.append(relabeled)
+
+    return relabeled_samples, {
+        "matched": int(matched),
+        "unmatched": int(unmatched),
+        "canonical_topologies": int(len(canonical_map)),
+        "ambiguous_topologies": int(ambiguous_topologies),
+    }
+
+
 def _build_legacy_autoregressive_oracle_sample(
     source_tree,
     target_tree,
+    module=None,
     *,
     time=0.0,
     split_multi_label_events=False,
@@ -1812,29 +2481,214 @@ def _build_legacy_autoregressive_oracle_sample(
     if not source_tree or not target_tree:
         return None
     try:
-        corrective_events = return_sampled_tree_boundary_decisions(
-            source_tree,
-            target_tree,
-            split_multi_label_events=split_multi_label_events,
-        )
+        current_groups = [
+            tuple(int(component) for component in group)
+            for group in get_structural_polytomy_groups_from_newick(source_tree)
+        ]
+        n_leaves = int(Tree(source_tree).n_leaves)
     except Exception:
         return None
-    if not corrective_events:
+    if not current_groups:
         return None
-    next_event = corrective_events[0]
-    if not next_event.get("labels"):
+
+    labels = []
+    seen = set()
+    for group in current_groups:
+        ready_subsets = _ready_target_merge_subsets_for_group(
+            group,
+            target_tree,
+            n_leaves,
+        )
+        for subset in ready_subsets:
+            normalized_subset = tuple(sorted(int(component) for component in subset))
+            if len(normalized_subset) < 2:
+                continue
+            try:
+                merge_indices = [int(group.index(component)) for component in normalized_subset]
+            except ValueError:
+                continue
+            result_split = 0
+            for component in normalized_subset:
+                result_split |= int(component)
+            label_key = (
+                int(result_split),
+                tuple(int(component) for component in group),
+                tuple(int(idx) for idx in merge_indices),
+            )
+            if label_key in seen:
+                continue
+            seen.add(label_key)
+            labels.append(
+                {
+                    "result_split": int(result_split),
+                    "parent_split": int(functools.reduce(operator.or_, group, 0)),
+                    "components": [int(component) for component in group],
+                    "merge_indices": [int(idx) for idx in merge_indices],
+                }
+            )
+    if not labels and module is not None:
+        fallback = _best_pairwise_merge_label_for_current_tree(
+            module,
+            source_tree,
+            target_tree,
+        )
+        if fallback is not None and fallback.get("labels"):
+            labels = list(fallback["labels"])
+    if not labels:
         return None
+    if split_multi_label_events:
+        labels = labels[:1]
     return {
-        "newick": source_tree,
+        "newick": str(source_tree),
         "target_tree": target_tree,
-        "labels": next_event["labels"],
-        "stop_after_merge": bool(next_event.get("stop_after_merge", False)),
+        "labels": labels,
+        "stop_after_merge": False,
         "time": float(time),
     }
 
 
+def _build_boundary_local_autoregressive_suffix_samples(
+    source_tree,
+    target_tree,
+    *,
+    time=0.0,
+):
+    if not source_tree or not target_tree:
+        return []
+    try:
+        boundary_paths = return_tree_boundary_merge_paths(source_tree, target_tree)
+    except Exception:
+        return []
+    if not boundary_paths:
+        return []
+
+    first_path = boundary_paths[0]
+    filtered_events = []
+    for event in first_path.get("events", []):
+        labels = [
+            label
+            for label in event.get("labels", [])
+            if len(label.get("components", [])) >= 3
+        ]
+        if labels:
+            filtered_events.append(
+                {
+                    "newick": str(event["newick"]),
+                    "labels": labels,
+                }
+            )
+    if not filtered_events:
+        return []
+
+    split_events = _split_multi_label_training_events(filtered_events)
+    suffix_samples = []
+    for event in split_events:
+        labels = list(event.get("labels", []))
+        if not labels:
+            continue
+        suffix_samples.append(
+            {
+                "newick": str(event["newick"]),
+                "target_tree": target_tree,
+                "labels": labels,
+                "stop_after_merge": bool(event.get("stop_after_merge", False)),
+                "time": float(time),
+            }
+        )
+    return suffix_samples
+
+
+def _build_full_continuation_replay_samples(
+    source_tree,
+    target_tree,
+    *,
+    anchor_time=0.0,
+    num_leaves=None,
+):
+    if not source_tree or not target_tree:
+        return [], []
+    try:
+        boundary_paths = return_tree_boundary_merge_paths(source_tree, target_tree)
+    except Exception:
+        return [], []
+
+    velocity_samples = []
+    autoregressive_samples = []
+
+    source_has_polytomy = False
+    try:
+        source_has_polytomy = bool(has_polytomy_fast(source_tree, unrooted_ok=False))
+    except Exception:
+        source_has_polytomy = False
+
+    if not source_has_polytomy:
+        velocity_sample = _build_legacy_velocity_oracle_sample(
+            source_tree,
+            target_tree,
+            timepoint=float(anchor_time),
+            num_leaves=num_leaves,
+        )
+        if velocity_sample is not None:
+            velocity_samples.append(velocity_sample)
+
+    for path_idx, boundary_path in enumerate(boundary_paths):
+        if path_idx > 0:
+            path_start_tree = boundary_paths[path_idx - 1]["end_newick"]
+            path_start_time = _rescale_replay_anchor_time(
+                anchor_time,
+                float(boundary_paths[path_idx - 1]["global_time"]),
+            )
+            velocity_sample = _build_legacy_velocity_oracle_sample(
+                path_start_tree,
+                target_tree,
+                timepoint=float(path_start_time),
+            )
+            if velocity_sample is not None:
+                velocity_samples.append(velocity_sample)
+
+        filtered_events = []
+        for event in boundary_path.get("events", []):
+            labels = [
+                label
+                for label in event.get("labels", [])
+                if len(label.get("components", [])) >= 3
+            ]
+            if labels:
+                filtered_events.append(
+                    {
+                        "newick": str(event["newick"]),
+                        "labels": labels,
+                    }
+                )
+
+        if not filtered_events:
+            continue
+
+        split_events = _split_multi_label_training_events(filtered_events)
+        boundary_time = _rescale_replay_anchor_time(
+            anchor_time,
+            float(boundary_path["global_time"]),
+        )
+        for event in split_events:
+            labels = list(event.get("labels", []))
+            if not labels:
+                continue
+            autoregressive_samples.append(
+                {
+                    "newick": str(event["newick"]),
+                    "target_tree": target_tree,
+                    "labels": labels,
+                    "stop_after_merge": bool(event.get("stop_after_merge", False)),
+                    "time": float(boundary_time),
+                }
+            )
+
+    return velocity_samples, autoregressive_samples
+
+
 def _collect_legacy_oracle_replay_samples_from_trace(
     trace,
+    module=None,
     split_multi_label_events=False,
     terminal_tree=None,
     terminal_target_tree=None,
@@ -1844,42 +2698,161 @@ def _collect_legacy_oracle_replay_samples_from_trace(
     if trace is None:
         return velocity_samples, autoregressive_samples
 
-    for sample in trace.get("velocity", []):
+    use_full_continuation_chain = bool(
+        getattr(module, "rollout_replay_full_continuation_chain", False)
+    )
+
+    def _append_full_chain_samples(
+        *,
+        current_tree,
+        target_tree,
+        timepoint,
+        num_leaves=None,
+    ):
+        if not current_tree or not target_tree:
+            return
+        velocity_chain, autoregressive_chain = _build_full_continuation_replay_samples(
+            current_tree,
+            target_tree,
+            anchor_time=timepoint,
+            num_leaves=num_leaves,
+        )
+        velocity_samples.extend(velocity_chain)
+        autoregressive_samples.extend(autoregressive_chain)
+
+    def _append_velocity_sample(
+        *,
+        current_tree,
+        target_tree,
+        timepoint,
+        num_leaves=None,
+    ):
+        if not current_tree or not target_tree:
+            return
         velocity_sample = _build_legacy_velocity_oracle_sample(
-            sample.get("newick_tree"),
-            sample.get("target_tree"),
-            timepoint=sample.get("timepoint", 0.0),
-            num_leaves=sample.get("num_leaves"),
+            current_tree,
+            target_tree,
+            timepoint=timepoint,
+            num_leaves=num_leaves,
         )
         if velocity_sample is not None:
             velocity_samples.append(velocity_sample)
 
-    for sample in trace.get("autoregressive", []):
+    def _append_autoregressive_sample(
+        *,
+        current_tree,
+        target_tree,
+        timepoint,
+    ):
+        if not current_tree or not target_tree:
+            return
+        if bool(
+            getattr(
+                module,
+                "rollout_replay_autoregressive_boundary_local_suffix",
+                False,
+            )
+        ):
+            autoregressive_samples.extend(
+                _build_boundary_local_autoregressive_suffix_samples(
+                    current_tree,
+                    target_tree,
+                    time=timepoint,
+                )
+            )
+            return
         autoregressive_sample = _build_legacy_autoregressive_oracle_sample(
-            sample.get("newick"),
-            sample.get("target_tree"),
-            time=sample.get("time", 0.0),
+            current_tree,
+            target_tree,
+            module=module,
+            time=timepoint,
             split_multi_label_events=split_multi_label_events,
         )
         if autoregressive_sample is not None:
             autoregressive_samples.append(autoregressive_sample)
 
+    for sample in trace.get("velocity", []):
+        current_tree = sample.get("newick_tree")
+        target_tree = sample.get("target_tree")
+        timepoint = float(sample.get("timepoint", 0.0))
+        num_leaves = sample.get("num_leaves")
+        if current_tree and target_tree:
+            if use_full_continuation_chain:
+                _append_full_chain_samples(
+                    current_tree=current_tree,
+                    target_tree=target_tree,
+                    timepoint=timepoint,
+                    num_leaves=num_leaves,
+                )
+                continue
+            if has_polytomy_fast(current_tree, unrooted_ok=False):
+                _append_autoregressive_sample(
+                    current_tree=current_tree,
+                    target_tree=target_tree,
+                    timepoint=timepoint,
+                )
+            else:
+                _append_velocity_sample(
+                    current_tree=current_tree,
+                    target_tree=target_tree,
+                    timepoint=timepoint,
+                    num_leaves=num_leaves,
+                )
+
+    autoregressive_trace = list(trace.get("autoregressive", []))
+    for idx, sample in enumerate(autoregressive_trace):
+        current_tree = sample.get("newick")
+        target_tree = sample.get("target_tree")
+        timepoint = float(sample.get("time", 0.0))
+        if not current_tree or not target_tree:
+            continue
+        if use_full_continuation_chain:
+            _append_full_chain_samples(
+                current_tree=current_tree,
+                target_tree=target_tree,
+                timepoint=timepoint,
+            )
+            continue
+        if has_polytomy_fast(current_tree, unrooted_ok=False):
+            _append_autoregressive_sample(
+                current_tree=current_tree,
+                target_tree=target_tree,
+                timepoint=timepoint,
+            )
+        next_time = None
+        if idx + 1 < len(autoregressive_trace):
+            next_time = float(autoregressive_trace[idx + 1].get("time", 0.0))
+        is_last_state_for_boundary = (
+            idx + 1 == len(autoregressive_trace)
+            or abs(next_time - timepoint) > 1e-8
+        )
+        if is_last_state_for_boundary:
+            _append_velocity_sample(
+                current_tree=current_tree,
+                target_tree=target_tree,
+                timepoint=timepoint,
+            )
+
     if terminal_tree and terminal_target_tree:
-        terminal_velocity_sample = _build_legacy_velocity_oracle_sample(
-            terminal_tree,
-            terminal_target_tree,
-            timepoint=1.0,
-        )
-        if terminal_velocity_sample is not None:
-            velocity_samples.append(terminal_velocity_sample)
-        terminal_autoregressive_sample = _build_legacy_autoregressive_oracle_sample(
-            terminal_tree,
-            terminal_target_tree,
-            time=1.0,
-            split_multi_label_events=split_multi_label_events,
-        )
-        if terminal_autoregressive_sample is not None:
-            autoregressive_samples.append(terminal_autoregressive_sample)
+        if use_full_continuation_chain:
+            _append_full_chain_samples(
+                current_tree=terminal_tree,
+                target_tree=terminal_target_tree,
+                timepoint=1.0,
+            )
+            return velocity_samples, autoregressive_samples
+        if has_polytomy_fast(terminal_tree, unrooted_ok=False):
+            _append_autoregressive_sample(
+                current_tree=terminal_tree,
+                target_tree=terminal_target_tree,
+                timepoint=1.0,
+            )
+        else:
+            _append_velocity_sample(
+                current_tree=terminal_tree,
+                target_tree=terminal_target_tree,
+                timepoint=1.0,
+            )
 
     return velocity_samples, autoregressive_samples
 
@@ -2760,7 +3733,11 @@ def _predsim_overrun_trace_to_sampling_trace(out, target_tree):
         elif item.get("phase") == "autoregressive":
             trace["autoregressive"].append(
                 {
-                    "newick": item.get("newick"),
+                    # Replay AR samples should use the decision-state tree the model
+                    # actually acted on, not the post-merge tree after applying the
+                    # chosen split. The generic sampler trace already records AR
+                    # states this way; keep predsim_overrun aligned with that.
+                    "newick": item.get("source_newick", item.get("newick")),
                     "time": item.get("time"),
                     "target_tree": target_tree,
                     "rf": item.get("rf"),
@@ -2785,6 +3762,7 @@ def _predsim_overrun_rollout(
     autoregressive_birth_length: float = 1e-3,
     boundary_mode: str = "pred_simultaneous",
     allow_time_overrun: bool = False,
+    blocked_edge_floor: float | None = None,
 ):
     current_newick = start_tree
     trace = []
@@ -2823,14 +3801,46 @@ def _predsim_overrun_rollout(
         )
 
         aligned_edge_features = aligned["edge_features"]
-        lengths = aligned["lengths"].detach().cpu().numpy().astype(np.float64)
-        velocities = aligned["velocities"].detach().cpu().numpy().astype(np.float64)
+        aligned_lengths = aligned["lengths"]
+        aligned_velocities = aligned["velocities"]
+        if (
+            getattr(module, "velocity_refiner_mode", "base")
+            == "edge_token_attention_delta"
+            and aligned_edge_features is not None
+        ):
+            refine_mask = aligned["supervised_mask"] & (aligned_lengths > eps_len)
+            if bool(refine_mask.any().item()):
+                refine_indices = torch.nonzero(refine_mask, as_tuple=False).reshape(-1)
+                refined_velocities = module._refine_velocity_predictions(
+                    aligned_velocities.index_select(0, refine_indices),
+                    lengths=aligned_lengths.index_select(0, refine_indices),
+                    edge_features=aligned_edge_features.index_select(0, refine_indices),
+                    group_sizes=[int(refine_indices.numel())],
+                )
+                aligned_velocities = aligned_velocities.clone()
+                aligned_velocities[refine_indices] = refined_velocities.to(
+                    aligned_velocities.device, dtype=aligned_velocities.dtype
+                )
+
+        if aligned["first_hit_logits"] is not None or aligned_edge_features is not None:
+            aligned_first_hit_logits = module._compute_first_hit_logits(
+                aligned["first_hit_logits"],
+                lengths=aligned_lengths,
+                velocities=aligned_velocities,
+                edge_features=aligned_edge_features,
+                group_sizes=[int(aligned_lengths.numel())],
+            )
+        else:
+            aligned_first_hit_logits = None
+
+        lengths = aligned_lengths.detach().cpu().numpy().astype(np.float64)
+        velocities = aligned_velocities.detach().cpu().numpy().astype(np.float64)
         supervised_mask = aligned["supervised_mask"].detach().cpu().numpy().astype(bool)
         masks = [int(x) for x in aligned["aligned_model_masks"]]
         first_logits = None
-        if aligned["first_hit_logits"] is not None:
+        if aligned_first_hit_logits is not None:
             first_logits = (
-                aligned["first_hit_logits"].detach().cpu().numpy().astype(np.float64)
+                aligned_first_hit_logits.detach().cpu().numpy().astype(np.float64)
             )
 
         candidate_mask = supervised_mask & (lengths > eps_len)
@@ -3006,7 +4016,12 @@ def _predsim_overrun_rollout(
             blocked = supervised_mask & (~collapse_mask)
             if np.any(blocked):
                 clipped_mask = blocked & (L_new <= eps_len)
-                L_new[blocked] = np.maximum(L_new[blocked], eps_len * 10.0)
+                floor = (
+                    eps_len * 10.0
+                    if blocked_edge_floor is None
+                    else max(float(blocked_edge_floor), eps_len * 10.0)
+                )
+                L_new[blocked] = np.maximum(L_new[blocked], floor)
 
         td2 = {
             int(mask): float(length)
@@ -3094,6 +4109,7 @@ def _predsim_overrun_rollout(
             top_change = False
             for planned in planned_merges:
                 for subset, new_split in planned["subsets"]:
+                    source_newick = current_newick
                     td_ar[int(new_split)] = float(autoregressive_birth_length)
                     n_events += 1
                     top_change = True
@@ -3109,6 +4125,7 @@ def _predsim_overrun_rollout(
                             "phase": "autoregressive",
                             "time": float(t),
                             "rf": float(calculate_norm_rf(current_newick, target_tree)),
+                            "source_newick": source_newick,
                             "newick": current_newick,
                             "new_split": int(new_split),
                             "subset": [int(x) for x in subset],
@@ -3132,6 +4149,325 @@ def _predsim_overrun_rollout(
         "num_ar_states": int(sum(1 for x in trace if x["phase"] == "autoregressive")),
         "trace": trace,
     }
+
+
+def _discrete_phase_rollout(
+    module,
+    start_tree,
+    target_tree,
+    phyla_embeddings,
+    *,
+    dt_base: float = 0.02,
+    eps_len: float = 1e-8,
+    autoregressive_birth_length: float = 1e-3,
+    max_events: int = 1000,
+    max_steps: int = 1000,
+    max_phases: int = 8,
+    return_trace: bool = False,
+):
+    current_newick = str(start_tree)
+    phase = 0
+    n_events = 0
+    n_steps = 0
+    trace = {
+        "velocity": [],
+        "autoregressive": [],
+        "terminal": [],
+        "stopped_for_no_valid_merge": False,
+        "stopped_for_repeated_topology": False,
+        "skipped_no_valid_boundary_revisits": 0.0,
+        "stopped_for_prefix_replay_quota": False,
+        "silent_boundary_recoveries": 0.0,
+    }
+
+    effective_max_events = (
+        1000000 if max_events is None or int(max_events) < 0 else int(max_events)
+    )
+    effective_max_steps = (
+        1000000 if max_steps is None or int(max_steps) < 0 else int(max_steps)
+    )
+    effective_max_phases = max(1, int(max_phases))
+
+    while (
+        phase < effective_max_phases
+        and n_events < effective_max_events
+        and n_steps < effective_max_steps
+    ):
+        n_steps += 1
+        td, n_leaves, mapping = _tree_to_model_split_lengths(module, current_newick)
+        tokenized = module.model.tokenizer([current_newick])
+        with torch.inference_mode():
+            (
+                velocity,
+                edge_splits,
+                _edge_split_mask,
+                first_hit_logits,
+                boundary_vanish_logits,
+                edge_features,
+            ) = module.forward(tokenized, float(phase), phyla_embeddings)
+
+        aligned = _align_model_outputs_to_tree_context(
+            module,
+            current_newick,
+            n_leaves,
+            edge_splits[0],
+            velocity[0, :, 0],
+            first_hit_logits_tree=None
+            if first_hit_logits is None
+            else first_hit_logits[0, :, 0],
+            boundary_vanish_logits_tree=None
+            if boundary_vanish_logits is None
+            else boundary_vanish_logits[0, :, 0],
+            edge_features_tree=None if edge_features is None else edge_features[0],
+            eps_len=eps_len,
+        )
+
+        aligned_edge_features = aligned["edge_features"]
+        aligned_lengths = aligned["lengths"]
+        aligned_velocities = aligned["velocities"]
+        aligned_first_hit_logits = module._compute_first_hit_logits(
+            aligned["first_hit_logits"],
+            lengths=aligned_lengths,
+            velocities=aligned_velocities,
+            edge_features=aligned_edge_features,
+            group_sizes=[int(aligned_lengths.numel())],
+        )
+
+        lengths = aligned_lengths.detach().cpu().numpy().astype(np.float64)
+        velocities = aligned_velocities.detach().cpu().numpy().astype(np.float64)
+        supervised_mask = aligned["supervised_mask"].detach().cpu().numpy().astype(bool)
+        masks = [int(x) for x in aligned["aligned_model_masks"]]
+        first_logits = (
+            aligned_first_hit_logits.detach().cpu().numpy().astype(np.float64)
+            if aligned_first_hit_logits is not None
+            else np.full_like(lengths, float("-inf"), dtype=np.float64)
+        )
+        candidate_mask = supervised_mask & (lengths > eps_len)
+        predicted_first_mask, _raw_first_count, _used_first_fallback = (
+            _predict_first_hit_mask_with_fallback(
+                first_logits,
+                candidate_mask,
+                max_edges=getattr(module, "velocity_first_hit_sampling_max_edges", -1),
+                fallback_threshold=getattr(
+                    module,
+                    "velocity_first_hit_sampling_fallback_threshold",
+                    -1,
+                ),
+                fallback_top_k=getattr(
+                    module,
+                    "velocity_first_hit_sampling_fallback_top_k",
+                    -1,
+                ),
+            )
+        )
+        pred_neg = predicted_first_mask & (velocities < 0.0) & (lengths > eps_len)
+        if not np.any(pred_neg):
+            trace["velocity"].append(
+                {
+                    "newick_tree": current_newick,
+                    "target_tree": target_tree,
+                    "timepoint": float(phase),
+                    "phase_idx": int(phase),
+                    "num_leaves": int(n_leaves),
+                    "event": "no_predicted_negative_edges",
+                }
+            )
+            break
+
+        dt_target = float(
+            np.max(lengths[pred_neg] / np.maximum(-velocities[pred_neg], eps_len))
+        )
+        if bool(
+            getattr(
+                module,
+                "sampling_discrete_phase_exact_boundary_step_use_at_sampling",
+                False,
+            )
+        ):
+            dt = float(dt_target)
+        else:
+            dt = min(float(dt_base), dt_target)
+        L_new = lengths + dt * velocities
+        collapse_mask = predicted_first_mask.copy()
+        if np.any(collapse_mask):
+            L_new[collapse_mask] = 0.0
+        blocked = supervised_mask & (~collapse_mask)
+        if np.any(blocked):
+            L_new[blocked] = np.maximum(L_new[blocked], eps_len * 10.0)
+
+        td2 = {
+            int(mask): float(length)
+            for mask, length in zip(masks, L_new)
+            if float(length) > eps_len
+        }
+        current_newick = build_tree_from_splits(
+            list(td2.keys()),
+            td2,
+            n_leaves,
+            root_leaf=n_leaves - 1,
+            mapping=mapping,
+        )[1]
+        trace["velocity"].append(
+            {
+                "newick_tree": current_newick,
+                "target_tree": target_tree,
+                "timepoint": float(phase),
+                "phase_idx": int(phase),
+                "num_leaves": int(n_leaves),
+                "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                "predicted_masks": [
+                    masks[i]
+                    for i, on in enumerate(predicted_first_mask.tolist())
+                    if on
+                ],
+                "dt_target": float(dt_target),
+            }
+        )
+
+        phase_exhausted = False
+        while (
+            has_polytomy_fast(current_newick, unrooted_ok=False)
+            and n_events < effective_max_events
+        ):
+            tokenized_trees = module.model.tokenizer([current_newick])
+            component_groups = [
+                get_structural_polytomy_groups_from_newick(current_newick)
+            ]
+            with torch.inference_mode():
+                logit_outputs = module.forward(
+                    tokenized_trees,
+                    torch.tensor(
+                        [float(phase)],
+                        dtype=torch.float32,
+                        device=module.device,
+                    ),
+                    phyla_embeddings,
+                    autoregressive=True,
+                    autoregressive_component_groups=component_groups,
+                )
+            td_ar, n_ar, m_ar = _tree_to_model_split_lengths(module, current_newick)
+            planned_merges = _plan_autoregressive_boundary_merges(
+                logit_outputs,
+                td_ar.keys(),
+                top_only=bool(getattr(module, "sampling_use_top_merge_planner", False)),
+            )
+            if planned_merges:
+                planned_merges = planned_merges[:1]
+            if not planned_merges:
+                trace["autoregressive"].append(
+                    {
+                        "newick": current_newick,
+                        "target_tree": target_tree,
+                        "time": float(phase),
+                        "phase_idx": int(phase),
+                        "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                        "planned_merge_count": 0,
+                        "selected_result_split": None,
+                    }
+                )
+                trace["stopped_for_no_valid_merge"] = True
+                phase_exhausted = True
+                break
+
+            planned = planned_merges[0]
+            _, new_split = planned["subsets"][0]
+            source_newick = current_newick
+            td_ar[int(new_split)] = float(autoregressive_birth_length)
+            n_events += 1
+            current_newick = build_tree_from_splits(
+                list(td_ar.keys()),
+                td_ar,
+                n_ar,
+                root_leaf=n_ar - 1,
+                mapping=m_ar,
+            )[1]
+            trace["autoregressive"].append(
+                {
+                    "source_newick": source_newick,
+                    "newick": current_newick,
+                    "target_tree": target_tree,
+                    "time": float(phase),
+                    "phase_idx": int(phase),
+                    "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                    "planned_merge_count": int(len(planned_merges)),
+                    "selected_result_split": int(new_split),
+                }
+            )
+
+        terminal_prob = None
+        if module.velocity_terminal_head is not None:
+            td_term, n_term, _ = _tree_to_model_split_lengths(module, current_newick)
+            tokenized_term = module.model.tokenizer([current_newick])
+            with torch.inference_mode():
+                (
+                    v_term,
+                    edge_splits_term,
+                    _edge_split_mask_term,
+                    first_hit_term,
+                    boundary_vanish_term,
+                    edge_features_term,
+                ) = module.forward(tokenized_term, float(phase), phyla_embeddings)
+            aligned_term = _align_model_outputs_to_tree_context(
+                module,
+                current_newick,
+                n_term,
+                edge_splits_term[0],
+                v_term[0, :, 0],
+                first_hit_logits_tree=None
+                if first_hit_term is None
+                else first_hit_term[0, :, 0],
+                boundary_vanish_logits_tree=None
+                if boundary_vanish_term is None
+                else boundary_vanish_term[0, :, 0],
+                edge_features_tree=None
+                if edge_features_term is None
+                else edge_features_term[0],
+                eps_len=eps_len,
+            )
+            aligned_term_first_hit_logits = module._compute_first_hit_logits(
+                aligned_term["first_hit_logits"],
+                lengths=aligned_term["lengths"],
+                velocities=aligned_term["velocities"],
+                edge_features=aligned_term["edge_features"],
+                group_sizes=[int(aligned_term["lengths"].numel())],
+            )
+            term_logit = module._predict_terminal_stop_logit(
+                aligned_term["lengths"],
+                aligned_term["velocities"],
+                time_value=float(phase),
+                first_hit_logits=aligned_term_first_hit_logits,
+                boundary_vanish_logits=aligned_term["boundary_vanish_logits"],
+                edge_features=aligned_term["edge_features"],
+            )
+            if term_logit is not None:
+                terminal_prob = float(torch.sigmoid(term_logit).detach().cpu().item())
+        trace["terminal"].append(
+            {
+                "newick": current_newick,
+                "target_tree": target_tree,
+                "timepoint": float(phase),
+                "phase_idx": int(phase),
+                "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                "pred_terminal_prob": terminal_prob,
+            }
+        )
+        if terminal_prob is not None and terminal_prob > 0.5:
+            break
+        if phase_exhausted or not has_polytomy_fast(current_newick, unrooted_ok=False):
+            phase += 1
+            continue
+        break
+
+    out = {
+        "final_tree": current_newick,
+        "final_rf": float(calculate_norm_rf(current_newick, target_tree)),
+        "num_velocity_states": int(len(trace["velocity"])),
+        "num_ar_states": int(len(trace["autoregressive"])),
+        "trace": trace,
+    }
+    if return_trace:
+        return out
+    return out
 
 
 class TrainingModule(LightningModule):
@@ -3189,6 +4525,10 @@ class TrainingModule(LightningModule):
         velocity_length_jitter_scale: float = 0.0,
         velocity_dt_candidate_weight: float = 0.0,
         velocity_dt_hit_weight: float = 0.0,
+        velocity_logtau_all_weight: float = 0.0,
+        velocity_logtau_first_over_weight: float = 0.0,
+        velocity_logtau_first_tie_weight: float = 0.0,
+        velocity_logtau_predset_over_weight: float = 0.0,
         velocity_dt_eps: float = 1e-6,
         velocity_event_weight: float = 0.5,
         velocity_event_temp: float = 0.5,
@@ -3197,6 +4537,7 @@ class TrainingModule(LightningModule):
         velocity_event_precision_weight: float = 0.0,
         velocity_event_precision_margin: float = 0.0,
         velocity_first_hit_head_weight: float = 0.0,
+        velocity_first_hit_loss_tol: float = 0.01,
         velocity_first_hit_false_positive_mass_weight: float = 0.0,
         velocity_first_hit_false_negative_mass_weight: float = 0.0,
         velocity_first_hit_head_use_at_sampling: bool = False,
@@ -3221,8 +4562,19 @@ class TrainingModule(LightningModule):
         velocity_boundary_time_head_weight: float = 0.0,
         velocity_boundary_time_head_use_at_sampling: bool = False,
         velocity_boundary_time_hidden_dim: int = 64,
+        velocity_terminal_head_weight: float = 0.0,
+        velocity_terminal_head_use_at_sampling: bool = False,
+        velocity_terminal_head_hidden_dim: int = 64,
+        velocity_terminal_head_probe_features: bool = False,
+        velocity_probe_direct_set_loss: bool = False,
+        velocity_probe_direct_set_anchor_only: bool = False,
+        training_step_probe_parity_joint_update: bool = False,
         skip_repeated_no_valid_boundary_use_at_sampling: bool = False,
+        sampling_discrete_phase_rollout_use_at_sampling: bool = False,
+        sampling_discrete_phase_exact_boundary_step_use_at_sampling: bool = False,
+        sampling_discrete_phase_max_phases: int = 8,
         sample_metrics_trace_path: str | None = None,
+        sample_metrics_num_pairs: int = 1,
         rollout_replay_velocity_weight: float = 0.0,
         rollout_replay_autoregressive_weight: float = 0.0,
         rollout_replay_start_step: int = 0,
@@ -3234,6 +4586,7 @@ class TrainingModule(LightningModule):
         rollout_replay_anchor_states: int = 4,
         rollout_replay_oracle_horizon: int = 2,
         rollout_replay_mode: str = "anchor_oracle",
+        rollout_replay_anchor_include_autoregressive: bool = False,
         rollout_replay_pairwise_max_group_size: int = 0,
         rollout_replay_bank_max_polytomy_size: int = -1,
         rollout_replay_topology_repeat_cap: int = 0,
@@ -3244,6 +4597,9 @@ class TrainingModule(LightningModule):
         rollout_replay_cache_reuse_every_step: bool = True,
         rollout_replay_refresh_only_if_better_rf: bool = False,
         rollout_replay_legacy_loss_structure: bool = False,
+        rollout_replay_autoregressive_boundary_local_suffix: bool = False,
+        rollout_replay_full_continuation_chain: bool = False,
+        rollout_replay_velocity_use_pair_oracle_orthant_labels: bool = False,
         dynamic_start_bank_enabled: bool = False,
         dynamic_start_bank_start_step: int = 0,
         dynamic_start_bank_max_entries: int = 2,
@@ -3261,6 +4617,9 @@ class TrainingModule(LightningModule):
         sampling_actual_event_boundary_use_at_sampling: bool = False,
         sampling_actual_event_boundary_include_predicted_first_hit: bool = False,
         sampling_predsim_overrun_use_at_sampling: bool = False,
+        sampling_predsim_boundary_mode: str = "pred_simultaneous",
+        sampling_predsim_allow_time_overrun: bool = True,
+        sampling_blocked_edge_floor: float | None = None,
         sampling_random_fixed_pair_bank_use_at_sampling: bool = False,
         velocity_first_hit_sampling_max_edges: int = -1,
         velocity_first_hit_sampling_fallback_threshold: int = -1,
@@ -3293,6 +4652,7 @@ class TrainingModule(LightningModule):
         self.verbose = verbose
         self.training_sampling_frequency = training_sampling_frequency
         self.training_sampling_start = training_sampling_start
+        self._next_training_sample_step = None
         self.training_sampling_mode = str(training_sampling_mode)
         self.training_sampling_dt_base = float(training_sampling_dt_base)
         self.sampling_fixed_dt_base = (
@@ -3491,6 +4851,26 @@ class TrainingModule(LightningModule):
                 "velocity_dt_hit_weight must be non-negative, "
                 f"got {velocity_dt_hit_weight}."
             )
+        if float(velocity_logtau_all_weight) < 0.0:
+            raise ValueError(
+                "velocity_logtau_all_weight must be non-negative, "
+                f"got {velocity_logtau_all_weight}."
+            )
+        if float(velocity_logtau_first_over_weight) < 0.0:
+            raise ValueError(
+                "velocity_logtau_first_over_weight must be non-negative, "
+                f"got {velocity_logtau_first_over_weight}."
+            )
+        if float(velocity_logtau_first_tie_weight) < 0.0:
+            raise ValueError(
+                "velocity_logtau_first_tie_weight must be non-negative, "
+                f"got {velocity_logtau_first_tie_weight}."
+            )
+        if float(velocity_logtau_predset_over_weight) < 0.0:
+            raise ValueError(
+                "velocity_logtau_predset_over_weight must be non-negative, "
+                f"got {velocity_logtau_predset_over_weight}."
+            )
         if float(velocity_dt_eps) <= 0.0:
             raise ValueError(
                 f"velocity_dt_eps must be > 0, got {velocity_dt_eps}."
@@ -3523,6 +4903,11 @@ class TrainingModule(LightningModule):
                 "velocity_first_hit_head_weight must be non-negative, "
                 f"got {velocity_first_hit_head_weight}."
             )
+        if float(velocity_first_hit_loss_tol) < 0.0:
+            raise ValueError(
+                "velocity_first_hit_loss_tol must be non-negative, "
+                f"got {velocity_first_hit_loss_tol}."
+            )
         if float(velocity_first_hit_false_positive_mass_weight) < 0.0:
             raise ValueError(
                 "velocity_first_hit_false_positive_mass_weight must be non-negative, "
@@ -3542,6 +4927,11 @@ class TrainingModule(LightningModule):
             raise ValueError(
                 "velocity_boundary_time_head_weight must be non-negative, "
                 f"got {velocity_boundary_time_head_weight}."
+            )
+        if float(velocity_terminal_head_weight) < 0.0:
+            raise ValueError(
+                "velocity_terminal_head_weight must be non-negative, "
+                f"got {velocity_terminal_head_weight}."
             )
         if int(velocity_first_hit_geometry_hidden_dim) < 1:
             raise ValueError(
@@ -3565,6 +4955,11 @@ class TrainingModule(LightningModule):
             raise ValueError(
                 "velocity_boundary_vanish_one_step_use_at_sampling requires "
                 "velocity_boundary_vanish_head_use_at_sampling."
+            )
+        if int(sampling_discrete_phase_max_phases) < 1:
+            raise ValueError(
+                "sampling_discrete_phase_max_phases must be >= 1, "
+                f"got {sampling_discrete_phase_max_phases}."
             )
         if float(rollout_replay_velocity_weight) < 0.0:
             raise ValueError(
@@ -3701,6 +5096,14 @@ class TrainingModule(LightningModule):
         self.velocity_length_jitter_scale = float(velocity_length_jitter_scale)
         self.velocity_dt_candidate_weight = float(velocity_dt_candidate_weight)
         self.velocity_dt_hit_weight = float(velocity_dt_hit_weight)
+        self.velocity_logtau_all_weight = float(velocity_logtau_all_weight)
+        self.velocity_logtau_first_over_weight = float(
+            velocity_logtau_first_over_weight
+        )
+        self.velocity_logtau_first_tie_weight = float(velocity_logtau_first_tie_weight)
+        self.velocity_logtau_predset_over_weight = float(
+            velocity_logtau_predset_over_weight
+        )
         self.velocity_dt_eps = float(velocity_dt_eps)
         self.velocity_event_weight = float(velocity_event_weight)
         self.velocity_event_temp = float(velocity_event_temp)
@@ -3711,6 +5114,7 @@ class TrainingModule(LightningModule):
         self.velocity_event_precision_weight = float(velocity_event_precision_weight)
         self.velocity_event_precision_margin = float(velocity_event_precision_margin)
         self.velocity_first_hit_head_weight = float(velocity_first_hit_head_weight)
+        self.velocity_first_hit_loss_tol = float(velocity_first_hit_loss_tol)
         self.velocity_first_hit_false_positive_mass_weight = float(
             velocity_first_hit_false_positive_mass_weight
         )
@@ -3731,6 +5135,27 @@ class TrainingModule(LightningModule):
         )
         self.sampling_predsim_overrun_use_at_sampling = bool(
             sampling_predsim_overrun_use_at_sampling
+        )
+        valid_predsim_boundary_modes = {
+            "pred_simultaneous",
+            "actual_hit_predset",
+            "actual_hit_union",
+            "pred_simultaneous_time_head",
+        }
+        if str(sampling_predsim_boundary_mode) not in valid_predsim_boundary_modes:
+            raise ValueError(
+                "sampling_predsim_boundary_mode must be one of "
+                f"{sorted(valid_predsim_boundary_modes)}, got "
+                f"{sampling_predsim_boundary_mode!r}."
+            )
+        self.sampling_predsim_boundary_mode = str(sampling_predsim_boundary_mode)
+        self.sampling_predsim_allow_time_overrun = bool(
+            sampling_predsim_allow_time_overrun
+        )
+        self.sampling_blocked_edge_floor = (
+            None
+            if sampling_blocked_edge_floor is None
+            else float(sampling_blocked_edge_floor)
         )
         self.velocity_first_hit_sampling_max_edges = int(
             velocity_first_hit_sampling_max_edges
@@ -3804,6 +5229,7 @@ class TrainingModule(LightningModule):
         self.velocity_first_hit_attention_layers_mod = None
         self.velocity_first_hit_attention_out = None
         self.velocity_boundary_time_head = None
+        self.velocity_terminal_head = None
         if self.velocity_first_hit_predictor_mode == "residual_geometry":
             self.velocity_first_hit_geometry_head = nn.Sequential(
                 nn.LayerNorm(5),
@@ -3909,6 +5335,25 @@ class TrainingModule(LightningModule):
                 nn.GELU(),
                 nn.Linear(int(velocity_boundary_time_hidden_dim), 1),
             )
+        if (
+            float(velocity_terminal_head_weight) > 0.0
+            or bool(velocity_terminal_head_use_at_sampling)
+            or bool(sampling_discrete_phase_rollout_use_at_sampling)
+        ):
+            terminal_input_dim = (
+                18
+                if bool(velocity_terminal_head_probe_features)
+                else int(self.model.embed_dim) + 5
+            )
+            self.velocity_terminal_head = nn.Sequential(
+                nn.LayerNorm(terminal_input_dim),
+                nn.Linear(
+                    terminal_input_dim,
+                    int(velocity_terminal_head_hidden_dim),
+                ),
+                nn.GELU(),
+                nn.Linear(int(velocity_terminal_head_hidden_dim), 1),
+            )
         self.velocity_refiner_base_proj = None
         self.velocity_refiner_length_bucket = None
         self.velocity_refiner_norm = None
@@ -3982,14 +5427,45 @@ class TrainingModule(LightningModule):
         self.velocity_boundary_time_hidden_dim = int(
             velocity_boundary_time_hidden_dim
         )
+        self.velocity_terminal_head_weight = float(
+            velocity_terminal_head_weight
+        )
+        self.velocity_terminal_head_use_at_sampling = bool(
+            velocity_terminal_head_use_at_sampling
+        )
+        self.velocity_terminal_head_hidden_dim = int(
+            velocity_terminal_head_hidden_dim
+        )
+        self.velocity_terminal_head_probe_features = bool(
+            velocity_terminal_head_probe_features
+        )
+        self.velocity_probe_direct_set_loss = bool(
+            velocity_probe_direct_set_loss
+        )
+        self.velocity_probe_direct_set_anchor_only = bool(
+            velocity_probe_direct_set_anchor_only
+        )
+        self.training_step_probe_parity_joint_update = bool(
+            training_step_probe_parity_joint_update
+        )
         self.skip_repeated_no_valid_boundary_use_at_sampling = bool(
             skip_repeated_no_valid_boundary_use_at_sampling
+        )
+        self.sampling_discrete_phase_rollout_use_at_sampling = bool(
+            sampling_discrete_phase_rollout_use_at_sampling
+        )
+        self.sampling_discrete_phase_exact_boundary_step_use_at_sampling = bool(
+            sampling_discrete_phase_exact_boundary_step_use_at_sampling
+        )
+        self.sampling_discrete_phase_max_phases = int(
+            sampling_discrete_phase_max_phases
         )
         self.sample_metrics_trace_path = (
             str(sample_metrics_trace_path).strip()
             if sample_metrics_trace_path
             else None
         )
+        self.sample_metrics_num_pairs = max(1, int(sample_metrics_num_pairs))
         self.rollout_replay_velocity_weight = float(rollout_replay_velocity_weight)
         self.rollout_replay_autoregressive_weight = float(
             rollout_replay_autoregressive_weight
@@ -4019,6 +5495,9 @@ class TrainingModule(LightningModule):
         self.rollout_replay_anchor_states = int(rollout_replay_anchor_states)
         self.rollout_replay_oracle_horizon = int(rollout_replay_oracle_horizon)
         self.rollout_replay_mode = str(rollout_replay_mode)
+        self.rollout_replay_anchor_include_autoregressive = bool(
+            rollout_replay_anchor_include_autoregressive
+        )
         self.rollout_replay_pairwise_max_group_size = int(
             rollout_replay_pairwise_max_group_size
         )
@@ -4059,6 +5538,15 @@ class TrainingModule(LightningModule):
         self.rollout_replay_legacy_loss_structure = bool(
             rollout_replay_legacy_loss_structure
         )
+        self.rollout_replay_autoregressive_boundary_local_suffix = bool(
+            rollout_replay_autoregressive_boundary_local_suffix
+        )
+        self.rollout_replay_full_continuation_chain = bool(
+            rollout_replay_full_continuation_chain
+        )
+        self.rollout_replay_velocity_use_pair_oracle_orthant_labels = bool(
+            rollout_replay_velocity_use_pair_oracle_orthant_labels
+        )
         self.dynamic_start_bank_enabled = bool(dynamic_start_bank_enabled)
         self.dynamic_start_bank_start_step = int(dynamic_start_bank_start_step)
         self.dynamic_start_bank_max_entries = int(dynamic_start_bank_max_entries)
@@ -4068,7 +5556,11 @@ class TrainingModule(LightningModule):
         self.dynamic_start_bank_max_polytomy_size = int(
             dynamic_start_bank_max_polytomy_size
         )
-        valid_dynamic_start_bank_modes = {"best_start", "soft_hybrid"}
+        valid_dynamic_start_bank_modes = {
+            "best_start",
+            "soft_hybrid",
+            "multivel_only",
+        }
         if str(dynamic_start_bank_mode) not in valid_dynamic_start_bank_modes:
             raise ValueError(
                 "dynamic_start_bank_mode must be one of "
@@ -4116,8 +5608,11 @@ class TrainingModule(LightningModule):
         self._dynamic_start_bank_base = None
         self._dynamic_start_bank_best_rf_norm = None
         self._dynamic_start_bank_best_rf_tree = None
+        self._dynamic_start_bank_best_rf_item = None
         self._dynamic_start_bank_best_multivel_rf_norm = None
         self._dynamic_start_bank_best_multivel_tree = None
+        self._dynamic_start_bank_best_multivel_item = None
+        self._harness_sampling_frozen_start_bank_base = None
         self.sampling_disable_inner_logging = bool(sampling_disable_inner_logging)
         self.sampling_use_top_merge_planner = bool(sampling_use_top_merge_planner)
         self.sampling_use_inference_mode = bool(sampling_use_inference_mode)
@@ -4145,6 +5640,39 @@ class TrainingModule(LightningModule):
                 "logs": {},
             },
         }
+
+    def on_train_start(self):
+        super().on_train_start()
+        self._reset_training_sampling_schedule()
+
+    def _reset_training_sampling_schedule(self):
+        frequency = int(self.training_sampling_frequency)
+        if frequency <= 0:
+            self._next_training_sample_step = None
+            return
+
+        next_step = int(self.training_sampling_start)
+        current_step = int(self.global_step)
+        if current_step >= next_step:
+            missed_intervals = ((current_step - next_step) // frequency) + 1
+            next_step += missed_intervals * frequency
+        self._next_training_sample_step = int(next_step)
+
+    def _training_sample_due(self):
+        frequency = int(self.training_sampling_frequency)
+        if frequency <= 0:
+            return False
+        if self._next_training_sample_step is None:
+            self._reset_training_sampling_schedule()
+        return int(self.global_step) >= int(self._next_training_sample_step)
+
+    def _advance_training_sampling_schedule(self):
+        frequency = int(self.training_sampling_frequency)
+        if frequency <= 0 or self._next_training_sample_step is None:
+            return
+        current_step = int(self.global_step)
+        while int(self._next_training_sample_step) <= current_step:
+            self._next_training_sample_step += frequency
 
     def _append_dynamic_start_bank_trace(self, payload):
         if not self.dynamic_start_bank_trace_path:
@@ -4200,25 +5728,85 @@ class TrainingModule(LightningModule):
 
     def _ensure_dynamic_start_bank_state(self, dataset_split):
         if self._dynamic_start_bank_base is None:
-            self._dynamic_start_bank_base = list(
-                getattr(dataset_split, "overfit_fixed_pair_start_tree_newick_bank", [])
+            base_items = list(
+                getattr(dataset_split, "overfit_fixed_pair_start_tree_bank_items", [])
                 or []
             )
+            if base_items:
+                self._dynamic_start_bank_base = [
+                    dict(item) if isinstance(item, dict) else item
+                    for item in base_items
+                ]
+            else:
+                self._dynamic_start_bank_base = list(
+                    getattr(
+                        dataset_split,
+                        "overfit_fixed_pair_start_tree_newick_bank",
+                        [],
+                    )
+                    or []
+                )
 
     def _refresh_dynamic_start_bank_soft_hybrid(self, dataset_split):
         self._ensure_dynamic_start_bank_state(dataset_split)
         bank = list(self._dynamic_start_bank_base or [])
-        if self._dynamic_start_bank_best_rf_tree:
+        if (
+            self.dynamic_start_bank_mode == "soft_hybrid"
+            and self._dynamic_start_bank_best_rf_item is not None
+        ):
             bank.extend(
-                [str(self._dynamic_start_bank_best_rf_tree)]
+                [self._dynamic_start_bank_best_rf_item]
                 * max(self.dynamic_start_bank_best_rf_repeat, 1)
             )
-        if self._dynamic_start_bank_best_multivel_tree:
+        if self._dynamic_start_bank_best_multivel_item is not None:
             bank.extend(
-                [str(self._dynamic_start_bank_best_multivel_tree)]
+                [self._dynamic_start_bank_best_multivel_item]
                 * max(self.dynamic_start_bank_best_multivel_repeat, 1)
             )
         return dataset_split.set_overfit_fixed_pair_start_tree_bank(bank)
+
+    def _copy_bank_items(self, items):
+        return [
+            dict(item) if isinstance(item, dict) else item
+            for item in (items or [])
+        ]
+
+    def _get_frozen_harness_start_bank_base(self, dataset_split):
+        if self._harness_sampling_frozen_start_bank_base is not None:
+            return self._copy_bank_items(self._harness_sampling_frozen_start_bank_base)
+
+        if self._dynamic_start_bank_base is not None:
+            base = self._copy_bank_items(self._dynamic_start_bank_base)
+        else:
+            base = self._copy_bank_items(
+                getattr(dataset_split, "overfit_fixed_pair_start_tree_bank_items", [])
+            )
+        self._harness_sampling_frozen_start_bank_base = self._copy_bank_items(base)
+        return base
+
+    def _sample_overfit_fixed_pair_bank_pair_for_harness(
+        self,
+        dataset_split,
+        *,
+        frozen_start_bank=False,
+    ):
+        if not hasattr(dataset_split, "sample_overfit_fixed_pair_bank_pair"):
+            return None
+        if not frozen_start_bank:
+            return dataset_split.sample_overfit_fixed_pair_bank_pair()
+
+        frozen_bank = self._get_frozen_harness_start_bank_base(dataset_split)
+        if not frozen_bank:
+            return dataset_split.sample_overfit_fixed_pair_bank_pair()
+
+        current_bank = self._copy_bank_items(
+            getattr(dataset_split, "overfit_fixed_pair_start_tree_bank_items", [])
+        )
+        try:
+            dataset_split.set_overfit_fixed_pair_start_tree_bank(frozen_bank)
+            return dataset_split.sample_overfit_fixed_pair_bank_pair()
+        finally:
+            dataset_split.set_overfit_fixed_pair_start_tree_bank(current_bank)
 
     def _maybe_update_dynamic_start_bank(
         self,
@@ -4250,6 +5838,12 @@ class TrainingModule(LightningModule):
         num_velocity_states = int(len(trace.get("velocity", [])))
         num_ar_states = int(len(trace.get("autoregressive", [])))
         max_polytomy_size = _max_polytomy_size_from_newick(sampled_tree)
+        candidate_bank_item = str(sampled_tree)
+        if pair.get("bank_group_key") is not None:
+            candidate_bank_item = {
+                "start_tree": str(sampled_tree),
+                "bank_group_key": str(pair.get("bank_group_key")),
+            }
 
         if (
             self.dynamic_start_bank_max_polytomy_size >= 0
@@ -4265,18 +5859,20 @@ class TrainingModule(LightningModule):
             )
             return logs
 
-        if self.dynamic_start_bank_mode == "soft_hybrid":
+        if self.dynamic_start_bank_mode in {"soft_hybrid", "multivel_only"}:
             self._ensure_dynamic_start_bank_state(dataset_split)
             min_improvement = float(self.dynamic_start_bank_min_rf_improvement)
             update_tags = []
 
-            current_best_rf = self._dynamic_start_bank_best_rf_norm
-            if current_best_rf is None:
-                current_best_rf = start_rf_norm
-            if candidate_rf_norm < (float(current_best_rf) - min_improvement):
-                self._dynamic_start_bank_best_rf_norm = float(candidate_rf_norm)
-                self._dynamic_start_bank_best_rf_tree = str(sampled_tree)
-                update_tags.append("best_rf")
+            if self.dynamic_start_bank_mode == "soft_hybrid":
+                current_best_rf = self._dynamic_start_bank_best_rf_norm
+                if current_best_rf is None:
+                    current_best_rf = start_rf_norm
+                if candidate_rf_norm < (float(current_best_rf) - min_improvement):
+                    self._dynamic_start_bank_best_rf_norm = float(candidate_rf_norm)
+                    self._dynamic_start_bank_best_rf_tree = str(sampled_tree)
+                    self._dynamic_start_bank_best_rf_item = candidate_bank_item
+                    update_tags.append("best_rf")
 
             if num_velocity_states >= self.dynamic_start_bank_min_velocity_states:
                 current_best_multivel = self._dynamic_start_bank_best_multivel_rf_norm
@@ -4289,6 +5885,9 @@ class TrainingModule(LightningModule):
                         candidate_rf_norm
                     )
                     self._dynamic_start_bank_best_multivel_tree = str(sampled_tree)
+                    self._dynamic_start_bank_best_multivel_item = (
+                        candidate_bank_item
+                    )
                     update_tags.append("best_multivel")
 
             if not update_tags:
@@ -4792,6 +6391,65 @@ class TrainingModule(LightningModule):
             return None
         return torch.cat(outputs, dim=0).reshape(-1)
 
+    def _predict_terminal_stop_logit(
+        self,
+        lengths,
+        velocities,
+        *,
+        time_value,
+        first_hit_logits=None,
+        boundary_vanish_logits=None,
+        edge_features=None,
+    ):
+        if self.velocity_terminal_head is None:
+            return None
+
+        if self.velocity_terminal_head_probe_features:
+            terminal_input = _build_probe_terminal_feature(
+                lengths,
+                velocities,
+                first_hit_logits,
+                boundary_vanish_logits,
+            )
+            return self.velocity_terminal_head(terminal_input).reshape(())
+
+        if edge_features is None or edge_features.numel() == 0:
+            return None
+
+        lengths_flat = lengths.reshape(-1).to(
+            edge_features.device, dtype=edge_features.dtype
+        )
+        velocities_flat = velocities.reshape(-1).to(
+            edge_features.device, dtype=edge_features.dtype
+        )
+        edge_features_flat = edge_features.reshape(
+            -1, edge_features.shape[-1]
+        ).to(edge_features.device, dtype=edge_features.dtype)
+        if edge_features_flat.numel() == 0:
+            return None
+
+        eps = float(self.velocity_dt_eps)
+        sign_eps = float(self.velocity_sign_eps)
+        safe_rate = (-velocities_flat).clamp_min(sign_eps)
+        tau_pred = lengths_flat.clamp_min(eps) / safe_rate
+        pooled_features = edge_features_flat.mean(dim=0)
+        summary = torch.stack(
+            [
+                torch.log(lengths_flat.clamp_min(eps)).mean(),
+                torch.log(tau_pred.clamp_min(eps)).mean(),
+                torch.log(tau_pred.clamp_min(eps)).min(),
+                (velocities_flat < -sign_eps).float().mean(),
+                torch.as_tensor(
+                    float(time_value),
+                    device=edge_features.device,
+                    dtype=edge_features.dtype,
+                ),
+            ],
+            dim=0,
+        )
+        terminal_input = torch.cat([pooled_features, summary], dim=0)
+        return self.velocity_terminal_head(terminal_input).reshape(())
+
         phyla_config_path = "configs/sample_eval_config.yaml"
 
         if self.phyla_checkpoint_path is not None:
@@ -5263,7 +6921,7 @@ class TrainingModule(LightningModule):
         with open(self.sample_metrics_trace_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
-    def _get_harness_sampling_pair(self, train=True):
+    def _get_harness_sampling_pair(self, train=True, frozen_start_bank=False):
         cache_key = "train" if train else "val"
 
         dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
@@ -5278,8 +6936,10 @@ class TrainingModule(LightningModule):
 
         if use_random_fixed_pair_bank:
             sampled_pair = None
-            if hasattr(dataset_split, "sample_overfit_fixed_pair_bank_pair"):
-                sampled_pair = dataset_split.sample_overfit_fixed_pair_bank_pair()
+            sampled_pair = self._sample_overfit_fixed_pair_bank_pair_for_harness(
+                dataset_split,
+                frozen_start_bank=frozen_start_bank,
+            )
             if sampled_pair is not None:
                 start_tree = sampled_pair["random_tree"]
                 target_tree = sampled_pair["effective_target_tree"]
@@ -5654,13 +7314,7 @@ class TrainingModule(LightningModule):
         sample_kwargs.update(overrides)
         return sample_kwargs
 
-    def sample_compare_harness(self, train=True):
-        if self.use_historical_sampling_impl:
-            historical_module = _load_historical_training_module_for_step()
-            return historical_module.TrainingModule.sample_compare_harness(
-                self, train=train
-            )
-        pair = self._get_harness_sampling_pair(train=train)
+    def _sample_compare_harness_once(self, pair, train=True):
         sampled_trees, _, _, _, _, trace = self.sample(
             [pair["start_tree"]],
             **self._build_harness_sample_kwargs(pair, train=train),
@@ -5682,7 +7336,93 @@ class TrainingModule(LightningModule):
         metrics["skipped_no_valid_boundary_revisits"] = float(
             trace.get("skipped_no_valid_boundary_revisits", 0.0)
         )
-        metrics.update(self._evaluate_fixed_pair_path_metrics(train=train))
+        return metrics
+
+    def _summarize_sample_compare_harness_rows(self, rows):
+        if len(rows) == 1:
+            return dict(rows[0])
+
+        def _numeric_values(key):
+            values = []
+            for row in rows:
+                value = row.get(key)
+                if isinstance(value, (int, float, np.generic)):
+                    values.append(float(value))
+            return values
+
+        metrics = {"num_pairs": int(len(rows))}
+        for key in ("rf_norm", "start_rf_norm"):
+            values = _numeric_values(key)
+            if not values:
+                continue
+            arr = np.asarray(values, dtype=np.float64)
+            metrics[key] = float(arr.mean())
+            metrics[f"{key}_mean"] = float(arr.mean())
+            metrics[f"{key}_median"] = float(np.median(arr))
+            metrics[f"{key}_best"] = float(arr.min())
+            metrics[f"{key}_worst"] = float(arr.max())
+            metrics[f"{key}_p10"] = float(np.quantile(arr, 0.10))
+            metrics[f"{key}_p90"] = float(np.quantile(arr, 0.90))
+
+        aggregate_keys = sorted(
+            {
+                key
+                for row in rows
+                for key in row.keys()
+                if key not in {"rf_norm", "start_rf_norm"}
+            }
+        )
+        for key in aggregate_keys:
+            values = _numeric_values(key)
+            if not values:
+                continue
+            arr = np.asarray(values, dtype=np.float64)
+            metrics[f"{key}_mean"] = float(arr.mean())
+            metrics[f"{key}_max"] = float(arr.max())
+        return metrics
+
+    def sample_compare_harness(self, train=True):
+        if self.use_historical_sampling_impl:
+            historical_module = _load_historical_training_module_for_step()
+            return historical_module.TrainingModule.sample_compare_harness(
+                self, train=train
+            )
+        num_pairs = max(1, int(getattr(self, "sample_metrics_num_pairs", 1)))
+        rows = []
+        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        if (
+            getattr(dataset_split, "overfit_full_path_control_mode", False)
+            and getattr(dataset_split, "_frozen_full_path_control_selections", None)
+        ):
+            max_pairs = min(
+                int(num_pairs),
+                len(getattr(dataset_split, "_frozen_full_path_control_selections", [])),
+            )
+            for pair_index in range(max_pairs):
+                sampled = dataset_split[pair_index]
+                pair = {
+                    "start_tree": sampled.get("start_tree"),
+                    "target_tree": sampled.get("target_tree"),
+                    "n_leaves": len(EteTree(sampled.get("start_tree"), format=1).get_leaves()),
+                    "max_events": int(sampled.get("fixed_pair_num_events", 1024)),
+                    "name_mapping": (
+                        dataset_split.return_nexus_number_to_name(0)
+                        if hasattr(dataset_split, "return_nexus_number_to_name")
+                        else None
+                    ),
+                }
+                rows.append(self._sample_compare_harness_once(pair, train=train))
+        else:
+            for _ in range(num_pairs):
+                pair = self._get_harness_sampling_pair(
+                    train=train,
+                    frozen_start_bank=True,
+                )
+                rows.append(self._sample_compare_harness_once(pair, train=train))
+
+        metrics = self._summarize_sample_compare_harness_rows(rows)
+        if num_pairs == 1:
+            metrics.update(self._evaluate_fixed_pair_path_metrics(train=train))
         return metrics
 
     def _should_collect_rollout_replay(self):
@@ -5910,6 +7650,7 @@ class TrainingModule(LightningModule):
                 sampled_trees[0],
                 pair["target_tree"],
                 self.rollout_replay_anchor_states,
+                include_autoregressive=self.rollout_replay_anchor_include_autoregressive,
             )
             velocity_samples, autoregressive_samples = (
                 _collect_oracle_replay_samples_from_anchors(
@@ -5923,6 +7664,7 @@ class TrainingModule(LightningModule):
             velocity_samples, autoregressive_samples = (
                 _collect_legacy_oracle_replay_samples_from_trace(
                     trace,
+                    module=self,
                     split_multi_label_events=split_multi_label_events,
                 )
             )
@@ -5941,6 +7683,7 @@ class TrainingModule(LightningModule):
             velocity_samples, autoregressive_samples = (
                 _collect_legacy_oracle_replay_samples_from_trace(
                     preselected_trace,
+                    module=self,
                     split_multi_label_events=split_multi_label_events,
                 )
             )
@@ -5948,6 +7691,7 @@ class TrainingModule(LightningModule):
             velocity_samples, autoregressive_samples = (
                 _collect_legacy_oracle_replay_samples_from_trace(
                     trace,
+                    module=self,
                     split_multi_label_events=split_multi_label_events,
                     terminal_tree=sampled_trees[0],
                     terminal_target_tree=pair["target_tree"],
@@ -5961,6 +7705,21 @@ class TrainingModule(LightningModule):
                 round(float(sample["timepoint"]), 8),
             ),
         )
+        velocity_samples = [
+            sample
+            for sample in velocity_samples
+            if float(sample.get("timepoint", 0.0)) <= 1.0
+        ]
+        velocity_oracle_orthant_relabel_stats = {
+            "matched": 0,
+            "unmatched": 0,
+            "canonical_topologies": 0,
+            "ambiguous_topologies": 0,
+        }
+        if self.rollout_replay_velocity_use_pair_oracle_orthant_labels:
+            velocity_samples, velocity_oracle_orthant_relabel_stats = (
+                _apply_pair_oracle_orthant_velocity_labels(velocity_samples, pair)
+            )
         autoregressive_samples = _dedupe_samples(
             autoregressive_samples,
             key_fn=lambda sample: (
@@ -6096,6 +7855,26 @@ class TrainingModule(LightningModule):
             ),
             "replay/num_anchor_states": torch.tensor(
                 float(len(anchor_states)),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "replay/oracle_orthant_velocity_label_matches": torch.tensor(
+                float(velocity_oracle_orthant_relabel_stats["matched"]),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "replay/oracle_orthant_velocity_label_unmatched": torch.tensor(
+                float(velocity_oracle_orthant_relabel_stats["unmatched"]),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "replay/oracle_orthant_velocity_label_topologies": torch.tensor(
+                float(velocity_oracle_orthant_relabel_stats["canonical_topologies"]),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "replay/oracle_orthant_velocity_label_ambiguous_topologies": torch.tensor(
+                float(velocity_oracle_orthant_relabel_stats["ambiguous_topologies"]),
                 dtype=torch.float32,
                 device=self.device,
             ),
@@ -6498,6 +8277,9 @@ class TrainingModule(LightningModule):
                 }
                 or self.velocity_boundary_time_head_weight > 0.0
                 or self.velocity_boundary_time_head_use_at_sampling
+                or self.velocity_terminal_head_weight > 0.0
+                or self.velocity_terminal_head_use_at_sampling
+                or self.sampling_discrete_phase_rollout_use_at_sampling
                 or self.velocity_refiner_mode == "edge_token_attention_delta"
             )
             edge_outputs = self.model(
@@ -6578,6 +8360,116 @@ class TrainingModule(LightningModule):
                 **model_kwargs,
             )
             return all_group_logits
+
+    def step_terminal(self, batch, eval=False):
+        if batch is None:
+            loss = torch.tensor(0.0, device=self.device, requires_grad=not eval)
+            return {
+                "loss": loss,
+                "velocity/terminal_head_accuracy": torch.tensor(
+                    0.0, dtype=torch.float32, device=self.device
+                ),
+                "velocity/terminal_head_target_rate": torch.tensor(
+                    0.0, dtype=torch.float32, device=self.device
+                ),
+                "velocity/terminal_head_pred_rate": torch.tensor(
+                    0.0, dtype=torch.float32, device=self.device
+                ),
+            }
+
+        (
+            v_pred,
+            edge_split_masks,
+            _edge_mask,
+            first_hit_logits,
+            boundary_vanish_logits,
+            edge_features,
+        ) = self.forward(
+            batch["tokenized_trees"],
+            batch["batched_time"],
+            batch["phyla_embeddings"],
+        )
+
+        logits = []
+        targets = []
+        original_trees = batch.get("original_trees", [])
+        batched_time = batch.get("batched_time")
+        batched_targets = batch.get("batched_terminal_stop")
+        for num, current_newick in enumerate(original_trees):
+            if current_newick is None:
+                continue
+            try:
+                n_leaves = int(Tree(current_newick).n_leaves)
+            except Exception:
+                continue
+            aligned = _align_model_outputs_to_tree_context(
+                self,
+                current_newick,
+                n_leaves,
+                edge_split_masks[num],
+                v_pred[num, :, 0],
+                first_hit_logits_tree=None
+                if first_hit_logits is None
+                else first_hit_logits[num, :, 0],
+                boundary_vanish_logits_tree=None
+                if boundary_vanish_logits is None
+                else boundary_vanish_logits[num, :, 0],
+                edge_features_tree=None if edge_features is None else edge_features[num],
+                eps_len=1e-8,
+            )
+            aligned_first_hit_logits = self._compute_first_hit_logits(
+                aligned["first_hit_logits"],
+                lengths=aligned["lengths"],
+                velocities=aligned["velocities"],
+                edge_features=aligned["edge_features"],
+                group_sizes=[int(aligned["lengths"].numel())],
+            )
+            term_logit = self._predict_terminal_stop_logit(
+                aligned["lengths"],
+                aligned["velocities"],
+                time_value=float(batched_time[num].item()),
+                first_hit_logits=aligned_first_hit_logits,
+                boundary_vanish_logits=aligned["boundary_vanish_logits"],
+                edge_features=aligned["edge_features"],
+            )
+            if term_logit is None:
+                continue
+            logits.append(term_logit)
+            targets.append(batched_targets[num])
+
+        if not logits:
+            loss = torch.tensor(0.0, device=self.device, requires_grad=not eval)
+            return {
+                "loss": loss,
+                "velocity/terminal_head_accuracy": torch.tensor(
+                    0.0, dtype=torch.float32, device=self.device
+                ),
+                "velocity/terminal_head_target_rate": torch.tensor(
+                    0.0, dtype=torch.float32, device=self.device
+                ),
+                "velocity/terminal_head_pred_rate": torch.tensor(
+                    0.0, dtype=torch.float32, device=self.device
+                ),
+            }
+
+        logits_tensor = torch.stack(logits).reshape(-1)
+        target_tensor = torch.stack(targets).to(
+            logits_tensor.device, dtype=logits_tensor.dtype
+        )
+        loss = F.binary_cross_entropy_with_logits(logits_tensor, target_tensor)
+        with torch.no_grad():
+            probs = torch.sigmoid(logits_tensor)
+            preds = probs > 0.5
+            target_bool = target_tensor > 0.5
+            acc = (preds == target_bool).float().mean()
+            target_rate = target_bool.float().mean()
+            pred_rate = preds.float().mean()
+        return {
+            "loss": loss,
+            "velocity/terminal_head_accuracy": acc.detach(),
+            "velocity/terminal_head_target_rate": target_rate.detach(),
+            "velocity/terminal_head_pred_rate": pred_rate.detach(),
+        }
 
     def step(self, batch, eval=False, autoregressive=False):
         if self.use_historical_step_impl:
@@ -6666,6 +8558,130 @@ class TrainingModule(LightningModule):
             #     elif not torch.equal(batch["tokenized_trees"][0], self.train_tokenized_trees[0]):
             #         import pdb; pdb.set_trace()
             #         raise Exception("Training tokenized trees changed during training!")
+
+            if bool(batch.get("_use_probe_parity_direct_set_loss", False)):
+                direct_losses = []
+                exact_flags = []
+                jaccards = []
+                sample_mask = list(
+                    batch.get(
+                        "_probe_direct_set_sample_mask",
+                        [True for _ in batch.get("original_trees", [])],
+                    )
+                )
+                target_sets = list(
+                    batch.get(
+                        "_probe_direct_set_targets",
+                        [[] for _ in batch.get("original_trees", [])],
+                    )
+                )
+                for num, current_newick in enumerate(batch.get("original_trees", [])):
+                    if num >= len(sample_mask) or not bool(sample_mask[num]):
+                        continue
+                    if current_newick is None:
+                        continue
+                    if first_hit_logits is None:
+                        continue
+                    try:
+                        tree_obj = Tree(current_newick)
+                        n_leaves = int(tree_obj.n_leaves)
+                    except Exception:
+                        continue
+                    split_masks_num = [int(m) for m in edge_split_masks[num]]
+                    split_masks_nonzero = [m for m in split_masks_num if m != 0]
+                    if not split_masks_nonzero:
+                        continue
+                    real_max_bit = max(m.bit_length() for m in split_masks_nonzero)
+                    full_mask = (1 << real_max_bit) - 1 if real_max_bit > 0 else 0
+                    try:
+                        encoder = BHVEncoder()
+                        bhv_masks, bhv_lengths = encoder.return_BHV_encoding(tree_obj)
+                        bhv_len_map = {
+                            int(m): float(l)
+                            for m, l in zip(bhv_masks, bhv_lengths)
+                            if l is not None
+                        }
+                    except Exception:
+                        continue
+                    target_set = {int(x) for x in target_sets[num]}
+                    logits = []
+                    targets = []
+                    matched_masks = []
+                    for edge_idx, mask in enumerate(split_masks_num):
+                        if mask == 0:
+                            continue
+                        k_bits = int(mask).bit_count()
+                        if min(k_bits, real_max_bit - k_bits) == 1:
+                            continue
+                        edge_length = bhv_len_map.get(int(mask))
+                        if edge_length is None and full_mask:
+                            edge_length = bhv_len_map.get(full_mask ^ int(mask))
+                        if edge_length is None or float(edge_length) <= 1e-8:
+                            continue
+                        logits.append(first_hit_logits[num, edge_idx, 0])
+                        matched_masks.append(int(mask))
+                        targets.append(1.0 if int(mask) in target_set else 0.0)
+                    if not logits:
+                        continue
+                    logits_tensor = torch.stack(logits).reshape(-1)
+                    target_tensor = torch.tensor(
+                        targets,
+                        device=logits_tensor.device,
+                        dtype=logits_tensor.dtype,
+                    )
+                    sample_loss = F.binary_cross_entropy_with_logits(
+                        logits_tensor,
+                        target_tensor,
+                    )
+                    direct_losses.append(sample_loss)
+                    with torch.no_grad():
+                        pred_mask = torch.sigmoid(logits_tensor) > 0.5
+                        pred_set = {
+                            matched_masks[i]
+                            for i in range(len(matched_masks))
+                            if bool(pred_mask[i].item())
+                        }
+                        exact_flags.append(float(pred_set == target_set))
+                        union = len(pred_set | target_set)
+                        inter = len(pred_set & target_set)
+                        jaccards.append(
+                            float(inter / union) if union > 0 else 1.0
+                        )
+
+                if direct_losses:
+                    loss = torch.stack(direct_losses).mean()
+                else:
+                    loss = torch.tensor(
+                        0.0,
+                        device=self.device,
+                        requires_grad=not eval,
+                    )
+                zero = torch.zeros((), device=loss.device, dtype=loss.dtype)
+                logs = {
+                    "loss": loss,
+                    "loss_regression": loss,
+                    "loss_auxiliary": zero,
+                    "velocity/probe_direct_set_exact_rate": torch.tensor(
+                        float(sum(exact_flags) / len(exact_flags))
+                        if exact_flags
+                        else 0.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ),
+                    "velocity/probe_direct_set_mean_jaccard": torch.tensor(
+                        float(sum(jaccards) / len(jaccards)) if jaccards else 0.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ),
+                    "velocity/full_path_control_mode": torch.tensor(
+                        1.0
+                        if batch.get("_use_full_path_control_velocity_loss", False)
+                        else 0.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ),
+                }
+                return logs
 
             velocity_labels = batch["batched_velocity"]
             num_leaves = batch["num_leaves"]
@@ -6827,7 +8843,6 @@ class TrainingModule(LightningModule):
                 gathered_velocity_lengths_flat = torch.cat(gathered_velocity_lengths).to(
                     v_pred_gathered.device
                 )
-
                 y = gathered_velocity_labels_flat
                 p = v_pred_gathered
                 lengths = gathered_velocity_lengths_flat
@@ -7072,6 +9087,14 @@ class TrainingModule(LightningModule):
                 # )
 
                 first_hit_velocity_loss = p.new_tensor(0.0)
+                logtau_all_loss_raw = p.new_tensor(0.0)
+                logtau_all_loss = p.new_tensor(0.0)
+                logtau_first_over_loss_raw = p.new_tensor(0.0)
+                logtau_first_over_loss = p.new_tensor(0.0)
+                logtau_first_tie_loss_raw = p.new_tensor(0.0)
+                logtau_first_tie_loss = p.new_tensor(0.0)
+                logtau_predset_over_loss_raw = p.new_tensor(0.0)
+                logtau_predset_over_loss = p.new_tensor(0.0)
                 event_loss_raw = p.new_tensor(0.0)
                 event_loss = p.new_tensor(0.0)
                 event_precision_loss_raw = p.new_tensor(0.0)
@@ -7119,14 +9142,154 @@ class TrainingModule(LightningModule):
                     "dt_true_mean": 0.0,
                     "dt_rel_err_mean": 0.0,
                 }
+                first_hit_extra_penalty_raw = p.new_tensor(0.0)
+                first_hit_fp_mass = p.new_tensor(0.0)
+                first_hit_fn_mass = p.new_tensor(0.0)
+                use_full_path_control_velocity_loss = bool(
+                    batch.get("_use_full_path_control_velocity_loss", False)
+                )
+                if use_full_path_control_velocity_loss:
+                    control_loss, control_parts = _full_path_control_velocity_loss(
+                        p=p,
+                        y=y,
+                        lengths=lengths,
+                        first_hit_logits=first_hit_logits_gathered,
+                        group_sizes=velocity_group_sizes,
+                        velocity_sign_eps=self.velocity_sign_eps,
+                        dt_eps=self.velocity_dt_eps,
+                        first_hit_tol=self.velocity_first_hit_loss_tol,
+                        first_hit_head_weight=self.velocity_first_hit_head_weight,
+                        logtau_all_weight=self.velocity_logtau_all_weight,
+                        logtau_first_over_weight=self.velocity_logtau_first_over_weight,
+                        logtau_first_tie_weight=self.velocity_logtau_first_tie_weight,
+                        logtau_predset_over_weight=self.velocity_logtau_predset_over_weight,
+                    )
+                    loss = control_loss
+                    regression_loss = control_parts["mse"]
+                    auxiliary_loss = loss - regression_loss
+                    logtau_all_loss_raw = control_parts["logtau_all_raw"]
+                    logtau_all_loss = control_parts["logtau_all"]
+                    logtau_first_over_loss_raw = control_parts["logtau_first_over_raw"]
+                    logtau_first_over_loss = control_parts["logtau_first_over"]
+                    logtau_first_tie_loss_raw = control_parts["logtau_first_tie_raw"]
+                    logtau_first_tie_loss = control_parts["logtau_first_tie"]
+                    logtau_predset_over_loss_raw = control_parts[
+                        "logtau_predset_over_raw"
+                    ]
+                    logtau_predset_over_loss = control_parts["logtau_predset_over"]
+                    first_hit_head_loss_raw = control_parts["firsthit_bce_raw"]
+                    first_hit_head_loss = control_parts["firsthit_bce"]
+                    logs["velocity/full_path_control_mode"] = torch.tensor(
+                        1.0, dtype=torch.float32, device=v_pred.device
+                    )
                 contract_mask = (y < -self.velocity_sign_eps) & (lengths > 1e-8)
-                if self.velocity_dt_hit_weight > 0.0 and int(contract_mask.sum()) > 0:
+                if (
+                    not use_full_path_control_velocity_loss
+                    and (
+                    self.velocity_logtau_all_weight > 0.0
+                    and int(contract_mask.sum()) > 0
+                    )
+                ):
+                    dt_eps = float(self.velocity_dt_eps)
+                    Lc = lengths[contract_mask].clamp_min(dt_eps)
+                    yc = y[contract_mask]
+                    pc = p[contract_mask]
+                    tau_true = Lc / (-yc).clamp_min(dt_eps)
+                    tau_pred = Lc / (-pc).clamp_min(dt_eps)
+                    logtau_all_loss_raw = F.smooth_l1_loss(
+                        torch.log(tau_pred.clamp_min(dt_eps)),
+                        torch.log(tau_true.clamp_min(dt_eps)),
+                    )
+                    logtau_all_loss = (
+                        self.velocity_logtau_all_weight * logtau_all_loss_raw
+                    )
+                    loss = loss + logtau_all_loss
+                    auxiliary_loss = auxiliary_loss + logtau_all_loss
+                if (
+                    not use_full_path_control_velocity_loss
+                    and (
+                    (
+                        self.velocity_logtau_first_over_weight > 0.0
+                        or self.velocity_logtau_first_tie_weight > 0.0
+                    )
+                    and int(contract_mask.sum()) > 0
+                    and velocity_group_sizes
+                    )
+                ):
+                    dt_eps = float(self.velocity_dt_eps)
+                    over_losses = []
+                    tie_losses = []
+                    start_idx = 0
+                    for group_size in velocity_group_sizes:
+                        end_idx = start_idx + int(group_size)
+                        Lg = lengths[start_idx:end_idx]
+                        yg = y[start_idx:end_idx]
+                        pg = p[start_idx:end_idx]
+                        start_idx = end_idx
+                        group_contract = (yg < -self.velocity_sign_eps) & (Lg > 1e-8)
+                        if not bool(group_contract.any().item()):
+                            continue
+                        tau_true = Lg[group_contract].clamp_min(dt_eps) / (
+                            -yg[group_contract]
+                        ).clamp_min(dt_eps)
+                        tau_min = tau_true.min()
+                        group_contract_idx = torch.nonzero(
+                            group_contract, as_tuple=False
+                        ).reshape(-1)
+                        first_idx = group_contract_idx[
+                            torch.abs(tau_true - tau_min)
+                            <= float(self.velocity_first_hit_loss_tol)
+                        ]
+                        if int(first_idx.numel()) == 0:
+                            continue
+                        tau_true_first = Lg[first_idx].clamp_min(dt_eps) / (
+                            -yg[first_idx]
+                        ).clamp_min(dt_eps)
+                        tau_pred_first = Lg[first_idx].clamp_min(dt_eps) / (
+                            -pg[first_idx]
+                        ).clamp_min(dt_eps)
+                        pred_max = torch.log(tau_pred_first.clamp_min(dt_eps)).max()
+                        true_max = torch.log(tau_true_first.clamp_min(dt_eps)).max()
+                        over_losses.append(F.relu(pred_max - true_max).pow(2))
+                        if int(tau_pred_first.numel()) > 1:
+                            log_pred_first = torch.log(
+                                tau_pred_first.clamp_min(dt_eps)
+                            )
+                            tie_losses.append(
+                                (
+                                    log_pred_first - log_pred_first.mean()
+                                ).pow(2).mean()
+                            )
+                    if over_losses and self.velocity_logtau_first_over_weight > 0.0:
+                        logtau_first_over_loss_raw = torch.stack(over_losses).mean()
+                        logtau_first_over_loss = (
+                            self.velocity_logtau_first_over_weight
+                            * logtau_first_over_loss_raw
+                        )
+                        loss = loss + logtau_first_over_loss
+                        auxiliary_loss = auxiliary_loss + logtau_first_over_loss
+                    if tie_losses and self.velocity_logtau_first_tie_weight > 0.0:
+                        logtau_first_tie_loss_raw = torch.stack(tie_losses).mean()
+                        logtau_first_tie_loss = (
+                            self.velocity_logtau_first_tie_weight
+                            * logtau_first_tie_loss_raw
+                        )
+                        loss = loss + logtau_first_tie_loss
+                        auxiliary_loss = auxiliary_loss + logtau_first_tie_loss
+                if (
+                    not use_full_path_control_velocity_loss
+                    and self.velocity_dt_hit_weight > 0.0
+                    and int(contract_mask.sum()) > 0
+                ):
                     Lc = lengths[contract_mask].clamp_min(eps)
                     yc = y[contract_mask]
                     pc = p[contract_mask]
                     tau_true = Lc / (-yc).clamp_min(eps)
                     tau_true_min = tau_true.min()
-                    first_mask = torch.abs(tau_true - tau_true_min) <= 0.01
+                    first_mask = (
+                        torch.abs(tau_true - tau_true_min)
+                        <= float(self.velocity_first_hit_loss_tol)
+                    )
                     if int(first_mask.sum()) > 0:
                         first_hit_velocity_loss = F.smooth_l1_loss(
                             pc[first_mask], yc[first_mask]
@@ -7152,9 +9315,13 @@ class TrainingModule(LightningModule):
                 first_hit_velocity_aux = (
                     self.velocity_dt_hit_weight * first_hit_velocity_loss
                 )
-                loss = loss + first_hit_velocity_aux
-                auxiliary_loss = auxiliary_loss + first_hit_velocity_aux
-                if self.velocity_event_weight > 0.0:
+                if not use_full_path_control_velocity_loss:
+                    loss = loss + first_hit_velocity_aux
+                    auxiliary_loss = auxiliary_loss + first_hit_velocity_aux
+                if (
+                    not use_full_path_control_velocity_loss
+                    and self.velocity_event_weight > 0.0
+                ):
                     event_loss_raw, event_stats = _boundary_event_distribution_loss(
                         lengths=lengths,
                         y_true=y,
@@ -7168,7 +9335,10 @@ class TrainingModule(LightningModule):
                     event_loss = self.velocity_event_weight * event_loss_raw
                     loss = loss + event_loss
                     auxiliary_loss = auxiliary_loss + event_loss
-                if self.velocity_event_precision_weight > 0.0:
+                if (
+                    not use_full_path_control_velocity_loss
+                    and self.velocity_event_precision_weight > 0.0
+                ):
                     (
                         event_precision_loss_raw,
                         event_precision_stats,
@@ -7189,24 +9359,23 @@ class TrainingModule(LightningModule):
                     loss = loss + event_precision_loss
                     auxiliary_loss = auxiliary_loss + event_precision_loss
                 if (
+                    not use_full_path_control_velocity_loss
+                    and (
                     self.velocity_first_hit_head_weight > 0.0
                     and first_hit_logits_gathered is not None
-                ):
-                    first_hit_target = _first_hit_target(
-                        lengths,
-                        y,
-                        velocity_sign_eps=self.velocity_sign_eps,
-                        dt_eps=self.velocity_dt_eps,
                     )
+                ):
                     (
                         first_hit_head_loss_raw,
                         first_hit_head_stats,
-                    ) = _first_hit_set_bce_loss(
+                    ) = _first_hit_grouped_set_bce_loss(
                         lengths=lengths,
                         y_true=y,
                         first_hit_logits=first_hit_logits_gathered,
+                        group_sizes=velocity_group_sizes,
                         velocity_sign_eps=self.velocity_sign_eps,
                         dt_eps=self.velocity_dt_eps,
+                        first_hit_tol=self.velocity_first_hit_loss_tol,
                     )
                     first_hit_extra_penalty_raw = p.new_tensor(0.0)
                     first_hit_fp_mass = p.new_tensor(0.0)
@@ -7216,16 +9385,21 @@ class TrainingModule(LightningModule):
                         or self.velocity_first_hit_false_negative_mass_weight > 0.0
                     ):
                         first_hit_mass_penalty_raw, first_hit_mass_stats = (
-                            _first_hit_soft_mass_penalty(
-                                first_hit_logits_gathered,
-                                first_hit_target,
+                            _first_hit_grouped_soft_mass_penalty(
+                                lengths=lengths,
+                                y_true=y,
+                                first_hit_logits=first_hit_logits_gathered,
+                                group_sizes=velocity_group_sizes,
+                                velocity_sign_eps=self.velocity_sign_eps,
+                                dt_eps=self.velocity_dt_eps,
+                                first_hit_tol=self.velocity_first_hit_loss_tol,
                             )
                         )
-                        first_hit_fp_mass = p.new_tensor(
-                            first_hit_mass_stats["fp_mass"]
+                        first_hit_fp_mass = first_hit_mass_stats.get(
+                            "fp_mass_tensor", p.new_tensor(0.0)
                         )
-                        first_hit_fn_mass = p.new_tensor(
-                            first_hit_mass_stats["fn_mass"]
+                        first_hit_fn_mass = first_hit_mass_stats.get(
+                            "fn_mass_tensor", p.new_tensor(0.0)
                         )
                         first_hit_extra_penalty_raw = (
                             self.velocity_first_hit_false_positive_mass_weight
@@ -7245,9 +9419,12 @@ class TrainingModule(LightningModule):
                         first_hit_extra_penalty_raw
                     )
                 if (
+                    not use_full_path_control_velocity_loss
+                    and (
                     self.velocity_boundary_time_head_weight > 0.0
                     and edge_features_gathered is not None
                     and velocity_group_sizes
+                    )
                 ):
                     boundary_time_pred_log = self._predict_boundary_time_log(
                         lengths=lengths,
@@ -7311,9 +9488,12 @@ class TrainingModule(LightningModule):
                                 "dt_rel_err_mean": float(rel_err.mean().item()),
                             }
                 if (
+                    not use_full_path_control_velocity_loss
+                    and (
                     self.velocity_boundary_vanish_head_weight > 0.0
                     and boundary_vanish_logits_gathered is not None
                     and boundary_vanish_targets_flat is not None
+                    )
                 ):
                     (
                         boundary_vanish_head_loss_raw,
@@ -7346,6 +9526,14 @@ class TrainingModule(LightningModule):
                 plain_mse = loss.detach() * 0.0
                 weighted_mse = loss.detach() * 0.0
                 first_hit_velocity_loss = loss.detach() * 0.0
+                logtau_all_loss_raw = loss.detach() * 0.0
+                logtau_all_loss = loss.detach() * 0.0
+                logtau_first_over_loss_raw = loss.detach() * 0.0
+                logtau_first_over_loss = loss.detach() * 0.0
+                logtau_first_tie_loss_raw = loss.detach() * 0.0
+                logtau_first_tie_loss = loss.detach() * 0.0
+                logtau_predset_over_loss_raw = loss.detach() * 0.0
+                logtau_predset_over_loss = loss.detach() * 0.0
                 event_loss_raw = loss.detach() * 0.0
                 event_loss = loss.detach() * 0.0
                 event_precision_loss_raw = loss.detach() * 0.0
@@ -7402,6 +9590,14 @@ class TrainingModule(LightningModule):
                     "velocity/loss_regression_unscaled": regression_loss.detach(),
                     "velocity/loss_auxiliary_unscaled": auxiliary_loss.detach(),
                     "velocity/first_hit_velocity_loss": first_hit_velocity_loss.detach(),
+                    "velocity/logtau_all_loss_raw": logtau_all_loss_raw.detach(),
+                    "velocity/logtau_all_loss": logtau_all_loss.detach(),
+                    "velocity/logtau_first_over_loss_raw": logtau_first_over_loss_raw.detach(),
+                    "velocity/logtau_first_over_loss": logtau_first_over_loss.detach(),
+                    "velocity/logtau_first_tie_loss_raw": logtau_first_tie_loss_raw.detach(),
+                    "velocity/logtau_first_tie_loss": logtau_first_tie_loss.detach(),
+                    "velocity/logtau_predset_over_loss_raw": logtau_predset_over_loss_raw.detach(),
+                    "velocity/logtau_predset_over_loss": logtau_predset_over_loss.detach(),
                     "velocity/event_loss_raw": event_loss_raw.detach(),
                     "velocity/event_loss": event_loss.detach(),
                     "velocity/event_precision_loss_raw": event_precision_loss_raw.detach(),
@@ -7491,6 +9687,14 @@ class TrainingModule(LightningModule):
                         "velocity/event_precision_n_pos": float(event_precision_stats["n_pos"]),
                         "velocity/event_precision_n_neg": float(event_precision_stats["n_neg"]),
                         "velocity/event_precision_violated": float(event_precision_stats["violated"]),
+                        "velocity/logtau_all_loss_raw": float(logtau_all_loss_raw.detach().item()),
+                        "velocity/logtau_all_loss": float(logtau_all_loss.detach().item()),
+                        "velocity/logtau_first_over_loss_raw": float(logtau_first_over_loss_raw.detach().item()),
+                        "velocity/logtau_first_over_loss": float(logtau_first_over_loss.detach().item()),
+                        "velocity/logtau_first_tie_loss_raw": float(logtau_first_tie_loss_raw.detach().item()),
+                        "velocity/logtau_first_tie_loss": float(logtau_first_tie_loss.detach().item()),
+                        "velocity/logtau_predset_over_loss_raw": float(logtau_predset_over_loss_raw.detach().item()),
+                        "velocity/logtau_predset_over_loss": float(logtau_predset_over_loss.detach().item()),
                         "velocity/first_hit_head_loss_raw": float(first_hit_head_loss_raw.detach().item()),
                         "velocity/first_hit_head_loss": float(first_hit_head_loss.detach().item()),
                         "velocity/first_hit_head_target_size": float(first_hit_head_stats["target_first_size"]),
@@ -7519,7 +9723,15 @@ class TrainingModule(LightningModule):
             # pdb.set_trace()
         else:
             batch, ar_prep_stats = self._prepare_autoregressive_training_batch(batch)
-            if "newick_autoregressive_trees" in batch:
+            skip_autoregressive_merge_metrics = bool(
+                batch.get("_skip_autoregressive_merge_metrics", False)
+            )
+            cached_component_groups = batch.get(
+                "_cached_autoregressive_component_groups"
+            )
+            if cached_component_groups is not None:
+                autoregressive_component_groups = cached_component_groups
+            elif "newick_autoregressive_trees" in batch:
                 autoregressive_component_groups = [
                     get_structural_polytomy_groups_from_newick(newick_tree)
                     for newick_tree in batch["newick_autoregressive_trees"]
@@ -7660,6 +9872,9 @@ class TrainingModule(LightningModule):
                                 group,
                                 splits_in_polytomy,
                                 subset,
+                                include_metric_logits=(
+                                    not skip_autoregressive_merge_metrics
+                                ),
                             )
                             if structured is None:
                                 continue
@@ -7737,12 +9952,13 @@ class TrainingModule(LightningModule):
                                 else 0.0
                             )
 
-                        metrics = compute_merge_metrics(
-                            best_pred_logits,
-                            best_target,
-                            threshold_logit=0.0,
-                        )
-                        total_metrics.append(metrics)
+                        if best_pred_logits is not None and best_target is not None:
+                            metrics = compute_merge_metrics(
+                                best_pred_logits,
+                                best_target,
+                                threshold_logit=0.0,
+                            )
+                            total_metrics.append(metrics)
 
                         losses.append(loss)
                 elif size_info is not None:
@@ -8019,6 +10235,37 @@ class TrainingModule(LightningModule):
                 oracle_boundary_vanish_use_at_sampling=oracle_boundary_vanish_use_at_sampling,
             )
         if (
+            self.sampling_discrete_phase_rollout_use_at_sampling
+            and len(newick_starting_trees) == 1
+            and target_trees is not None
+            and len(target_trees) == 1
+        ):
+            out = _discrete_phase_rollout(
+                self,
+                newick_starting_trees[0],
+                target_trees[0],
+                phyla_embeddings,
+                dt_base=float(dt_base),
+                eps_len=float(eps_len),
+                autoregressive_birth_length=float(autoregressive_birth_length),
+                max_events=max_events,
+                max_steps=max_steps,
+                max_phases=int(
+                    getattr(self, "sampling_discrete_phase_max_phases", 8)
+                ),
+                return_trace=return_trace,
+            )
+            result = (
+                [out["final_tree"]],
+                int(out["num_ar_states"]),
+                0.0,
+                0.0,
+                int(out["num_ar_states"]),
+            )
+            if return_trace:
+                return result + (out["trace"],)
+            return result
+        if (
             self.sampling_predsim_overrun_use_at_sampling
             and len(newick_starting_trees) == 1
             and target_trees is not None
@@ -8050,9 +10297,18 @@ class TrainingModule(LightningModule):
                 boundary_mode=(
                     "pred_simultaneous_time_head"
                     if getattr(self, "velocity_boundary_time_head_use_at_sampling", False)
-                    else "pred_simultaneous"
+                    else getattr(
+                        self,
+                        "sampling_predsim_boundary_mode",
+                        "pred_simultaneous",
+                    )
                 ),
-                allow_time_overrun=True,
+                allow_time_overrun=bool(
+                    getattr(self, "sampling_predsim_allow_time_overrun", True)
+                ),
+                blocked_edge_floor=getattr(
+                    self, "sampling_blocked_edge_floor", None
+                ),
             )
             result = (
                 [out["final_tree"]],
@@ -9293,6 +11549,7 @@ class TrainingModule(LightningModule):
                                         and _build_legacy_autoregressive_oracle_sample(
                                             td2_newick,
                                             target_tree_for_trace,
+                                            module=self,
                                             time=autoregressive_time_value,
                                             split_multi_label_events=prefix_replay_split_multi_label_events,
                                         )
@@ -9616,8 +11873,17 @@ class TrainingModule(LightningModule):
                     real_trees[0]
                 )
 
-            # Random trees are offset only in the default non-sanity path.
-            random_tree_offset = 1 if (not sanity_check and not random_sanity_check) else 0
+            starting_leaf_names = {
+                leaf.name for leaf in EteTree(starting_tree, format=1).get_leaves()
+            }
+            already_batch_indexed = starting_leaf_names.issubset(
+                {str(value) for value in seq_ordering_map.values()}
+            )
+            random_tree_offset = (
+                0
+                if already_batch_indexed
+                else 1 if (not sanity_check and not random_sanity_check) else 0
+            )
             starting_tree = _remap_tree_to_batch_indexing(
                 starting_tree, offset=random_tree_offset, tree_kind="random tree"
             )
@@ -9679,6 +11945,16 @@ class TrainingModule(LightningModule):
         metrics.update(
             kl_divergence_topological_distributions(
                 posterior_trees, sampled, num_leaves=num_leaves
+            )
+        )
+        metrics.update(
+            kl_divergence_tree_topology_distributions(
+                posterior_trees, sampled
+            )
+        )
+        metrics.update(
+            topk_posterior_tree_recall(
+                posterior_trees, sampled
             )
         )
         metrics.update(
@@ -9982,10 +12258,50 @@ class TrainingModule(LightningModule):
                             replay_autoregressive_batch,
                             replay_metric_logs,
                         ) = self._collect_rollout_replay_batches(train=True)
+                    velocity_training_batch = batch
+                    autoregressive_training_batch = batch
+                    terminal_training_batch = None
+                    control_mode = bool(batch.get("_full_path_control_mode", False))
+                    probe_parity_joint = bool(
+                        control_mode and self.training_step_probe_parity_joint_update
+                    )
+                    if control_mode:
+                        full_path_velocity_samples = (
+                            batch.get("full_path_velocity_samples") or []
+                        )
+                        full_path_autoregressive_samples = (
+                            batch.get("full_path_autoregressive_samples") or []
+                        )
+                        full_path_terminal_samples = (
+                            batch.get("full_path_terminal_samples") or []
+                        )
+                        if full_path_velocity_samples:
+                            velocity_training_batch = _build_velocity_replay_batch(
+                                self,
+                                full_path_velocity_samples,
+                            )
+                            velocity_training_batch[
+                                "_use_full_path_control_velocity_loss"
+                            ] = True
+                        if full_path_autoregressive_samples:
+                            autoregressive_training_batch = (
+                                _build_autoregressive_replay_batch(
+                                    self,
+                                    full_path_autoregressive_samples,
+                                )
+                            )
+                        if full_path_terminal_samples:
+                            terminal_training_batch = _build_terminal_replay_batch(
+                                self,
+                                full_path_terminal_samples,
+                            )
 
                     # --- HEAD 1: VELOCITY ---
                     logging.info("DEBUG: Starting Velocity Head Training")
-                    logs_vel = self.step(batch, autoregressive=False)
+                    logs_vel = self.step(
+                        velocity_training_batch,
+                        autoregressive=False,
+                    )
                     velocity_metric_logs = {
                         k: v for k, v in logs_vel.items() if k.startswith("velocity/")
                     }
@@ -10069,6 +12385,35 @@ class TrainingModule(LightningModule):
                         replay_metric_logs["replay/velocity_loss_scaled"] = (
                             replay_velocity_loss.detach()
                         )
+                    terminal_loss_unscaled = None
+                    terminal_loss = None
+                    if (
+                        terminal_training_batch is not None
+                        and self.velocity_terminal_head_weight > 0.0
+                    ):
+                        terminal_logs = self.step_terminal(
+                            terminal_training_batch,
+                            eval=control_mode,
+                        )
+                        terminal_loss_unscaled = terminal_logs["loss"]
+                        terminal_loss = (
+                            terminal_loss_unscaled
+                            * self.velocity_terminal_head_weight
+                        )
+                        loss_vel = loss_vel + terminal_loss
+                        replay_metric_logs["train/terminal_loss_unscaled"] = (
+                            terminal_loss_unscaled.detach()
+                        )
+                        replay_metric_logs["train/terminal_loss_scaled"] = (
+                            terminal_loss.detach()
+                        )
+                        replay_metric_logs.update(
+                            {
+                                k: v
+                                for k, v in terminal_logs.items()
+                                if k != "loss"
+                            }
+                        )
                     loss_vel_unscaled_detached = loss_vel_unscaled.detach()
                     loss_vel_regression_unscaled_detached = (
                         loss_vel_regression_unscaled.detach()
@@ -10085,39 +12430,45 @@ class TrainingModule(LightningModule):
                         float(loss_vel_scaled_detached.item()),
                         float(self.training_step_velocity_weight),
                     )
-                    self.manual_backward(loss_vel)
                     pre_ar_grads = None
                     velocity_grad_norm = None
-                    if self.training_step_separate_optimizer_steps:
-                        if self.training_step_gradient_clip_val > 0.0:
-                            self.clip_gradients(
-                                opt,
-                                gradient_clip_val=self.training_step_gradient_clip_val,
-                                gradient_clip_algorithm="norm",
-                            )
-                        opt.step()
-                        opt.zero_grad()
-                    elif self.training_step_autoregressive_grad_ratio is not None:
-                        pre_ar_grads = {}
-                        vel_sq = 0.0
-                        for p in self.model.parameters():
-                            if p.grad is None:
-                                continue
-                            g_prev = p.grad.detach().clone()
-                            pre_ar_grads[p] = g_prev
-                            vel_sq += float(torch.sum(g_prev * g_prev))
-                        velocity_grad_norm = vel_sq ** 0.5
+                    if not probe_parity_joint:
+                        self.manual_backward(loss_vel)
+                        if self.training_step_separate_optimizer_steps:
+                            if self.training_step_gradient_clip_val > 0.0:
+                                self.clip_gradients(
+                                    opt,
+                                    gradient_clip_val=self.training_step_gradient_clip_val,
+                                    gradient_clip_algorithm="norm",
+                                )
+                            opt.step()
+                            opt.zero_grad()
+                        elif self.training_step_autoregressive_grad_ratio is not None:
+                            pre_ar_grads = {}
+                            vel_sq = 0.0
+                            for p in self.model.parameters():
+                                if p.grad is None:
+                                    continue
+                                g_prev = p.grad.detach().clone()
+                                pre_ar_grads[p] = g_prev
+                                vel_sq += float(torch.sum(g_prev * g_prev))
+                            velocity_grad_norm = vel_sq ** 0.5
                     logging.info("DEBUG: Finished Velocity Head Training")
 
                     del logs_vel
-                    del loss_vel_unscaled
-                    del loss_vel
-                    if hasattr(torch.cuda, "empty_cache"):
-                        torch.cuda.empty_cache()
+                    if not probe_parity_joint:
+                        del loss_vel_unscaled
+                        del loss_vel
+                        if hasattr(torch.cuda, "empty_cache"):
+                            torch.cuda.empty_cache()
 
                     # --- HEAD 2: AUTOREGRESSIVE ---
                     logging.info("DEBUG: Starting Autoregressive Head Training")
-                    logs = self.step(batch, autoregressive=True)
+                    logs = self.step(
+                        autoregressive_training_batch,
+                        eval=control_mode,
+                        autoregressive=True,
+                    )
                     if "loss" not in logs:
                         import pickle
 
@@ -10193,7 +12544,6 @@ class TrainingModule(LightningModule):
                     )
                     logs.update(velocity_metric_logs)
                     logs.update(replay_metric_logs)
-                    logs["loss"] = loss
                     logging.info(
                         "Autoregressive head loss: raw=%.6f scaled=%.6f weight=%.4f",
                         float(loss_unscaled.detach().item()),
@@ -10208,59 +12558,68 @@ class TrainingModule(LightningModule):
                         f"Memory reserved before backward: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
                     )
 
-                    self.manual_backward(loss)
-                    if (
-                        not self.training_step_separate_optimizer_steps
-                        and self.training_step_autoregressive_grad_ratio is not None
-                        and pre_ar_grads is not None
-                        and velocity_grad_norm is not None
-                    ):
-                        ar_sq = 0.0
-                        for p in self.model.parameters():
-                            if p.grad is None:
-                                continue
-                            g_prev = pre_ar_grads.get(p)
-                            if g_prev is None:
-                                ar_delta = p.grad.detach()
-                            else:
-                                ar_delta = p.grad.detach() - g_prev
-                            ar_sq += float(torch.sum(ar_delta * ar_delta))
-                        autoregressive_grad_norm = ar_sq ** 0.5
-                        grad_scale = 1.0
+                    if probe_parity_joint:
+                        joint_loss = loss_vel + loss
+                        logs["train/probe_parity_joint_loss_scaled"] = (
+                            joint_loss.detach()
+                        )
+                        logs["loss"] = joint_loss
+                        self.manual_backward(joint_loss)
+                    else:
+                        logs["loss"] = loss
+                        self.manual_backward(loss)
                         if (
-                            autoregressive_grad_norm > 1e-12
-                            and velocity_grad_norm > 1e-12
+                            not self.training_step_separate_optimizer_steps
+                            and self.training_step_autoregressive_grad_ratio is not None
+                            and pre_ar_grads is not None
+                            and velocity_grad_norm is not None
                         ):
-                            target_norm = (
-                                velocity_grad_norm
-                                * self.training_step_autoregressive_grad_ratio
-                            )
-                            if autoregressive_grad_norm > target_norm:
-                                grad_scale = target_norm / (
-                                    autoregressive_grad_norm + 1e-12
+                            ar_sq = 0.0
+                            for p in self.model.parameters():
+                                if p.grad is None:
+                                    continue
+                                g_prev = pre_ar_grads.get(p)
+                                if g_prev is None:
+                                    ar_delta = p.grad.detach()
+                                else:
+                                    ar_delta = p.grad.detach() - g_prev
+                                ar_sq += float(torch.sum(ar_delta * ar_delta))
+                            autoregressive_grad_norm = ar_sq ** 0.5
+                            grad_scale = 1.0
+                            if (
+                                autoregressive_grad_norm > 1e-12
+                                and velocity_grad_norm > 1e-12
+                            ):
+                                target_norm = (
+                                    velocity_grad_norm
+                                    * self.training_step_autoregressive_grad_ratio
                                 )
-                                for p in self.model.parameters():
-                                    g_prev = pre_ar_grads.get(p)
-                                    if p.grad is None:
-                                        if g_prev is not None:
-                                            p.grad = g_prev.clone()
-                                        continue
-                                    if g_prev is None:
-                                        p.grad.mul_(grad_scale)
-                                    else:
-                                        p.grad.copy_(
-                                            g_prev + (p.grad - g_prev) * grad_scale
-                                        )
-                        device_for_logs = loss.device
-                        logs["train/velocity_grad_norm"] = torch.tensor(
-                            velocity_grad_norm, device=device_for_logs
-                        )
-                        logs["train/autoregressive_grad_norm"] = torch.tensor(
-                            autoregressive_grad_norm, device=device_for_logs
-                        )
-                        logs["train/autoregressive_grad_scale"] = torch.tensor(
-                            grad_scale, device=device_for_logs
-                        )
+                                if autoregressive_grad_norm > target_norm:
+                                    grad_scale = target_norm / (
+                                        autoregressive_grad_norm + 1e-12
+                                    )
+                                    for p in self.model.parameters():
+                                        g_prev = pre_ar_grads.get(p)
+                                        if p.grad is None:
+                                            if g_prev is not None:
+                                                p.grad = g_prev.clone()
+                                            continue
+                                        if g_prev is None:
+                                            p.grad.mul_(grad_scale)
+                                        else:
+                                            p.grad.copy_(
+                                                g_prev + (p.grad - g_prev) * grad_scale
+                                            )
+                            device_for_logs = loss.device
+                            logs["train/velocity_grad_norm"] = torch.tensor(
+                                velocity_grad_norm, device=device_for_logs
+                            )
+                            logs["train/autoregressive_grad_norm"] = torch.tensor(
+                                autoregressive_grad_norm, device=device_for_logs
+                            )
+                            logs["train/autoregressive_grad_scale"] = torch.tensor(
+                                grad_scale, device=device_for_logs
+                            )
                     if self.training_step_gradient_clip_val > 0.0:
                         self.clip_gradients(
                             opt,
@@ -10279,6 +12638,9 @@ class TrainingModule(LightningModule):
                     logging.info(
                         f"Memory reserved after backward: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
                     )
+                    if probe_parity_joint:
+                        del loss_vel_unscaled
+                        del loss_vel
 
                 except RuntimeError as e:
                     if "out of memory" in str(e):
@@ -10368,7 +12730,7 @@ class TrainingModule(LightningModule):
 
             # ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
 
-            if self.global_step >= self.training_sampling_start and (self.global_step - self.training_sampling_start) % self.training_sampling_frequency == 0:
+            if self._training_sample_due():
                 if self.training_sampling_mode == "harness_sanity":
                     metrics = self.sample_compare_harness(train=True)
                 else:
@@ -10377,6 +12739,7 @@ class TrainingModule(LightningModule):
                 for k, v in metrics.items():
                     self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
                 self._append_sample_metrics_trace(metrics)
+                self._advance_training_sampling_schedule()
                 if self.record:
                     wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.stepper)
                 print(metrics)
