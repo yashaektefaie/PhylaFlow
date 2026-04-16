@@ -334,6 +334,8 @@ class TreeDenoiserTokenGT(nn.Module):
         autoregressive_head_mode="pairwise_threshold",
         autoregressive_group_refinement_layers=0,
         autoregressive_max_subset_size=64,
+        first_hit_head_use_phase_input=False,
+        first_hit_head_phase_hidden_dim=None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -413,9 +415,24 @@ class TreeDenoiserTokenGT(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(embed_dim, output_dim), # Final layer is LINEAR
         )
+        self.first_hit_head_use_phase_input = bool(first_hit_head_use_phase_input)
+        self.first_hit_head_phase_hidden_dim = int(
+            embed_dim
+            if first_hit_head_phase_hidden_dim is None
+            else first_hit_head_phase_hidden_dim
+        )
+        self.first_hit_phase_proj = None
+        first_hit_head_input_dim = embed_dim
+        if self.first_hit_head_use_phase_input:
+            self.first_hit_phase_proj = nn.Sequential(
+                nn.Linear(1, self.first_hit_head_phase_hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.first_hit_head_phase_hidden_dim, embed_dim),
+            )
+            first_hit_head_input_dim = 2 * embed_dim
         self.first_hit_edge_head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(first_hit_head_input_dim),
+            nn.Linear(first_hit_head_input_dim, embed_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(embed_dim, 1),
@@ -758,6 +775,49 @@ class TreeDenoiserTokenGT(nn.Module):
             x, _ = layer(x, padding_mask=padding_mask)
         return final_layer_norm(x)
 
+    def _coerce_time_batch(self, t, batch_size, device, dtype):
+        if t is None:
+            return None
+        if torch.is_tensor(t):
+            t_tensor = t.to(device=device, dtype=dtype).reshape(-1)
+        elif isinstance(t, (list, tuple)):
+            t_tensor = torch.tensor(
+                [float(v) for v in t],
+                device=device,
+                dtype=dtype,
+            ).reshape(-1)
+        else:
+            t_tensor = torch.tensor(
+                [float(t)],
+                device=device,
+                dtype=dtype,
+            )
+        if t_tensor.numel() == 1 and int(batch_size) > 1:
+            t_tensor = t_tensor.expand(int(batch_size))
+        elif t_tensor.numel() != int(batch_size) and int(batch_size) > 0:
+            t_tensor = t_tensor[:1].expand(int(batch_size))
+        return t_tensor
+
+    def _build_first_hit_head_input(self, padded_edges, *, t=None):
+        if not self.first_hit_head_use_phase_input or self.first_hit_phase_proj is None:
+            return padded_edges
+        batch_size, max_edges, _ = padded_edges.shape
+        if batch_size == 0 or max_edges == 0:
+            return padded_edges
+        phase_values = self._coerce_time_batch(
+            t,
+            batch_size=batch_size,
+            device=padded_edges.device,
+            dtype=padded_edges.dtype,
+        )
+        if phase_values is None:
+            return padded_edges
+        phase_features = self.first_hit_phase_proj(
+            phase_values.unsqueeze(-1)
+        ).unsqueeze(1)
+        phase_features = phase_features.expand(batch_size, max_edges, self.embed_dim)
+        return torch.cat([padded_edges, phase_features], dim=-1)
+
     def _decode_outputs(
         self,
         x,
@@ -765,6 +825,7 @@ class TreeDenoiserTokenGT(nn.Module):
         leaf_idx,
         edge_mask,
         edge_split_masks,
+        t=None,
         return_all_tokens=True,
         return_leafs_only=False,
         return_edges_only=False,
@@ -906,7 +967,13 @@ class TreeDenoiserTokenGT(nn.Module):
                 first_hit_logits = None
                 boundary_vanish_logits = None
                 if return_first_hit_logits:
-                    first_hit_logits = self.first_hit_edge_head(padded_edges)
+                    first_hit_head_input = self._build_first_hit_head_input(
+                        padded_edges,
+                        t=t,
+                    )
+                    first_hit_logits = self.first_hit_edge_head(
+                        first_hit_head_input
+                    )
                 if return_boundary_vanish_logits:
                     boundary_vanish_logits = self.boundary_vanish_edge_head(
                         padded_edges
@@ -975,6 +1042,7 @@ class TreeDenoiserTokenGT(nn.Module):
             leaf_idx=leaf_idx,
             edge_mask=edge_mask,
             edge_split_masks=edge_split_masks,
+            t=t,
             return_all_tokens=return_all_tokens,
             return_leafs_only=return_leafs_only,
             return_edges_only=return_edges_only,
@@ -1102,6 +1170,7 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
             leaf_idx=leaf_idx,
             edge_mask=edge_mask,
             edge_split_masks=edge_split_masks,
+            t=t,
             return_all_tokens=return_all_tokens,
             return_leafs_only=return_leafs_only,
             return_edges_only=return_edges_only,
@@ -1256,6 +1325,7 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
             leaf_idx=leaf_idx,
             edge_mask=edge_mask,
             edge_split_masks=edge_split_masks,
+            t=t,
             return_all_tokens=return_all_tokens,
             return_leafs_only=return_leafs_only,
             return_edges_only=return_edges_only,
@@ -1313,6 +1383,12 @@ def return_model(config):
         ),
         autoregressive_max_subset_size=config["model"].get(
             "autoregressive_max_subset_size", 64
+        ),
+        first_hit_head_use_phase_input=config["model"].get(
+            "first_hit_head_use_phase_input", False
+        ),
+        first_hit_head_phase_hidden_dim=config["model"].get(
+            "first_hit_head_phase_hidden_dim"
         ),
     )
     model_variant = str(config["model"].get("model_variant", "base"))

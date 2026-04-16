@@ -1,0 +1,99 @@
+{
+  "bank_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416",
+  "num_cases": 8,
+  "dataset_index": 0,
+  "pair_seed": 271828,
+  "combined_anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_velocity_anchors.json",
+  "config_yaml": "/home/yektefai/PhylaFlow/configs/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416.yaml",
+  "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_metrics.jsonl",
+  "cases": [
+    {
+      "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case00",
+      "dataset_index": 0,
+      "posterior_index": 0,
+      "start_try": 2,
+      "boundary_path_count": 3,
+      "num_leaves": 21,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case00_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case00_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case00_velocity_anchors.json"
+    },
+    {
+      "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case01",
+      "dataset_index": 0,
+      "posterior_index": 110,
+      "start_try": 0,
+      "boundary_path_count": 3,
+      "num_leaves": 21,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case01_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case01_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case01_velocity_anchors.json"
+    },
+    {
+      "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case02",
+      "dataset_index": 0,
+      "posterior_index": 222,
+      "start_try": 2,
+      "boundary_path_count": 3,
+      "num_leaves": 21,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case02_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case02_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case02_velocity_anchors.json"
+    },
+    {
+      "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case03",
+      "dataset_index": 0,
+      "posterior_index": 105,
+      "start_try": 2,
+      "boundary_path_count": 3,
+      "num_leaves": 21,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case03_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case03_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case03_velocity_anchors.json"
+    },
+    {
+      "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case04",
+      "dataset_index": 0,
+      "posterior_index": 168,
+      "start_try": 2,
+      "boundary_path_count": 3,
+      "num_leaves": 21,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case04_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case04_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case04_velocity_anchors.json"
+    },
+    {
+      "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case05",
+      "dataset_index": 0,
+      "posterior_index": 150,
+      "start_try": 3,
+      "boundary_path_count": 3,
+      "num_leaves": 21,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case05_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case05_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case05_velocity_anchors.json"
+    },
+    {
+      "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case06",
+      "dataset_index": 0,
+      "posterior_index": 32,
+      "start_try": 0,
+      "boundary_path_count": 4,
+      "num_leaves": 21,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case06_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case06_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case06_velocity_anchors.json"
+    },
+    {
+      "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case07",
+      "dataset_index": 0,
+      "posterior_index": 137,
+      "start_try": 4,
+      "boundary_path_count": 4,
+      "num_leaves": 21,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case07_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case07_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case07_velocity_anchors.json"
+    }
+  ]
+}

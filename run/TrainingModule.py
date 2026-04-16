@@ -4568,6 +4568,8 @@ class TrainingModule(LightningModule):
         velocity_terminal_head_probe_features: bool = False,
         velocity_probe_direct_set_loss: bool = False,
         velocity_probe_direct_set_anchor_only: bool = False,
+        velocity_probe_direct_set_target_negative_weight: float = 1.0,
+        velocity_probe_direct_set_nontarget_nonnegative_weight: float = 0.0,
         training_step_probe_parity_joint_update: bool = False,
         skip_repeated_no_valid_boundary_use_at_sampling: bool = False,
         sampling_discrete_phase_rollout_use_at_sampling: bool = False,
@@ -5444,6 +5446,12 @@ class TrainingModule(LightningModule):
         )
         self.velocity_probe_direct_set_anchor_only = bool(
             velocity_probe_direct_set_anchor_only
+        )
+        self.velocity_probe_direct_set_target_negative_weight = float(
+            velocity_probe_direct_set_target_negative_weight
+        )
+        self.velocity_probe_direct_set_nontarget_nonnegative_weight = float(
+            velocity_probe_direct_set_nontarget_nonnegative_weight
         )
         self.training_step_probe_parity_joint_update = bool(
             training_step_probe_parity_joint_update
@@ -7340,7 +7348,21 @@ class TrainingModule(LightningModule):
 
     def _summarize_sample_compare_harness_rows(self, rows):
         if len(rows) == 1:
-            return dict(rows[0])
+            row = dict(rows[0])
+            metrics = {"num_pairs": 1}
+            for key in ("rf_norm", "start_rf_norm"):
+                value = row.get(key)
+                if isinstance(value, (int, float, np.generic)):
+                    scalar = float(value)
+                    metrics[key] = scalar
+                    metrics[f"{key}_mean"] = scalar
+                    metrics[f"{key}_median"] = scalar
+                    metrics[f"{key}_best"] = scalar
+                    metrics[f"{key}_worst"] = scalar
+                    metrics[f"{key}_p10"] = scalar
+                    metrics[f"{key}_p90"] = scalar
+            metrics.update(row)
+            return metrics
 
         def _numeric_values(key):
             values = []
@@ -8563,6 +8585,9 @@ class TrainingModule(LightningModule):
                 direct_losses = []
                 exact_flags = []
                 jaccards = []
+                target_negative_rates = []
+                target_negative_losses = []
+                nontarget_nonnegative_losses = []
                 sample_mask = list(
                     batch.get(
                         "_probe_direct_set_sample_mask",
@@ -8606,6 +8631,7 @@ class TrainingModule(LightningModule):
                     target_set = {int(x) for x in target_sets[num]}
                     logits = []
                     targets = []
+                    velocity_preds = []
                     matched_masks = []
                     for edge_idx, mask in enumerate(split_masks_num):
                         if mask == 0:
@@ -8619,11 +8645,13 @@ class TrainingModule(LightningModule):
                         if edge_length is None or float(edge_length) <= 1e-8:
                             continue
                         logits.append(first_hit_logits[num, edge_idx, 0])
+                        velocity_preds.append(v_pred[num, edge_idx, 0])
                         matched_masks.append(int(mask))
                         targets.append(1.0 if int(mask) in target_set else 0.0)
                     if not logits:
                         continue
                     logits_tensor = torch.stack(logits).reshape(-1)
+                    velocity_tensor = torch.stack(velocity_preds).reshape(-1)
                     target_tensor = torch.tensor(
                         targets,
                         device=logits_tensor.device,
@@ -8633,6 +8661,48 @@ class TrainingModule(LightningModule):
                         logits_tensor,
                         target_tensor,
                     )
+                    target_mask = target_tensor > 0.5
+                    target_negative_weight = float(
+                        getattr(
+                            self,
+                            "velocity_probe_direct_set_target_negative_weight",
+                            1.0,
+                        )
+                    )
+                    if bool(target_mask.any().item()) and target_negative_weight > 0.0:
+                        target_negative_loss = F.softplus(
+                            velocity_tensor[target_mask]
+                        ).mean()
+                        sample_loss = sample_loss + (
+                            target_negative_weight * target_negative_loss
+                        )
+                        target_negative_losses.append(target_negative_loss.detach())
+                        with torch.no_grad():
+                            target_negative_rates.append(
+                                float((velocity_tensor[target_mask] < 0.0).float().mean().item())
+                            )
+                    nontarget_mask = ~target_mask
+                    nontarget_nonnegative_weight = float(
+                        getattr(
+                            self,
+                            "velocity_probe_direct_set_nontarget_nonnegative_weight",
+                            0.0,
+                        )
+                    )
+                    if (
+                        bool(nontarget_mask.any().item())
+                        and nontarget_nonnegative_weight > 0.0
+                    ):
+                        nontarget_nonnegative_loss = F.softplus(
+                            -velocity_tensor[nontarget_mask]
+                        ).mean()
+                        sample_loss = sample_loss + (
+                            nontarget_nonnegative_weight
+                            * nontarget_nonnegative_loss
+                        )
+                        nontarget_nonnegative_losses.append(
+                            nontarget_nonnegative_loss.detach()
+                        )
                     direct_losses.append(sample_loss)
                     with torch.no_grad():
                         pred_mask = torch.sigmoid(logits_tensor) > 0.5
@@ -8670,6 +8740,31 @@ class TrainingModule(LightningModule):
                     ),
                     "velocity/probe_direct_set_mean_jaccard": torch.tensor(
                         float(sum(jaccards) / len(jaccards)) if jaccards else 0.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ),
+                    "velocity/probe_direct_set_target_negative_rate": torch.tensor(
+                        float(sum(target_negative_rates) / len(target_negative_rates))
+                        if target_negative_rates
+                        else 0.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ),
+                    "velocity/probe_direct_set_target_negative_loss": torch.tensor(
+                        float(
+                            torch.stack(target_negative_losses).mean().item()
+                        )
+                        if target_negative_losses
+                        else 0.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ),
+                    "velocity/probe_direct_set_nontarget_nonnegative_loss": torch.tensor(
+                        float(
+                            torch.stack(nontarget_nonnegative_losses).mean().item()
+                        )
+                        if nontarget_nonnegative_losses
+                        else 0.0,
                         device=loss.device,
                         dtype=torch.float32,
                     ),

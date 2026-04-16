@@ -1,0 +1,11 @@
+{
+  "case_name": "randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case01",
+  "dataset_index": 0,
+  "posterior_index": 110,
+  "start_try": 0,
+  "boundary_path_count": 3,
+  "num_leaves": 21,
+  "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case01_start.json",
+  "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case01_target.json",
+  "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/randomstart20_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_1000_20260416_case01_velocity_anchors.json"
+}

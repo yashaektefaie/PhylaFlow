@@ -97,6 +97,11 @@ def _load_full_path_control_extra_velocity_samples(json_path: Optional[str]) -> 
                     if item.get("source_checkpoint") in {None, ""}
                     else str(item.get("source_checkpoint"))
                 ),
+                "bank_group_key": (
+                    None
+                    if item.get("bank_group_key") in {None, ""}
+                    else str(item.get("bank_group_key"))
+                ),
             }
         )
     return samples
@@ -392,21 +397,26 @@ class TreeDataset(Dataset):
             override_start_tree = str(
                 override_payload.get("final_tree")
                 or override_payload.get("start_tree")
+                or override_payload.get("tree")
             )
             override_start_tree_bank.append(dict(override_payload))
         if overfit_fixed_pair_start_tree_json_paths:
             for raw_path in overfit_fixed_pair_start_tree_json_paths:
                 override_payload = json.loads(Path(raw_path).read_text())
-                override_tree = override_payload.get("final_tree") or override_payload.get(
-                    "start_tree"
+                override_tree = (
+                    override_payload.get("final_tree")
+                    or override_payload.get("start_tree")
+                    or override_payload.get("tree")
                 )
                 if override_tree:
                     override_start_tree_bank.append(dict(override_payload))
         if overfit_fixed_pair_start_tree_json_dir:
             for raw_path in sorted(Path(overfit_fixed_pair_start_tree_json_dir).glob("*.json")):
                 override_payload = json.loads(raw_path.read_text())
-                override_tree = override_payload.get("final_tree") or override_payload.get(
-                    "start_tree"
+                override_tree = (
+                    override_payload.get("final_tree")
+                    or override_payload.get("start_tree")
+                    or override_payload.get("tree")
                 )
                 if override_tree:
                     override_start_tree_bank.append(dict(override_payload))
@@ -424,6 +434,7 @@ class TreeDataset(Dataset):
                 override_payload.get("target_tree")
                 or override_payload.get("final_tree")
                 or override_payload.get("start_tree")
+                or override_payload.get("tree")
             )
             override_target_tree_bank.append(dict(override_payload))
         if overfit_fixed_pair_target_tree_json_paths:
@@ -433,6 +444,7 @@ class TreeDataset(Dataset):
                     override_payload.get("target_tree")
                     or override_payload.get("final_tree")
                     or override_payload.get("start_tree")
+                    or override_payload.get("tree")
                 )
                 if override_tree:
                     override_target_tree_bank.append(dict(override_payload))
@@ -443,6 +455,7 @@ class TreeDataset(Dataset):
                     override_payload.get("target_tree")
                     or override_payload.get("final_tree")
                     or override_payload.get("start_tree")
+                    or override_payload.get("tree")
                 )
                 if override_tree:
                     override_target_tree_bank.append(dict(override_payload))
@@ -955,6 +968,12 @@ class TreeDataset(Dataset):
             prev_time = boundary_time
 
         for extra_sample in self.overfit_full_path_control_extra_velocity_samples:
+            sample_group_key = extra_sample.get("bank_group_key")
+            pair_group_key = pair.get("bank_group_key")
+            if sample_group_key is not None and str(sample_group_key) != str(
+                pair_group_key
+            ):
+                continue
             relabeled_sample = dict(extra_sample)
             relabeled_sample["target_tree"] = target_tree
             relabeled_sample["path_index"] = int(

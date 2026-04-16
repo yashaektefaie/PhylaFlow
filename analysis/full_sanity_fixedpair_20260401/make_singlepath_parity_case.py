@@ -93,6 +93,7 @@ def _sample_phase_family_anchors(
     phase_source_tree: str,
     target_tree: str,
     *,
+    bank_group_key: str,
     anchor_family: str,
     phase_idx: int,
     num_leaves: int,
@@ -136,12 +137,21 @@ def _sample_phase_family_anchors(
                 "velocity_next_boundary_tree": next_boundary_tree,
                 "local_anchor_time": float(u),
                 "local_next_boundary_time": float(local_time),
+                "bank_group_key": str(bank_group_key),
             }
         )
     return anchors
 
 
-def _build_anchor_payloads(start_tree: str, target_tree: str, *, a1_count: int):
+def _build_anchor_payloads(
+    start_tree: str,
+    target_tree: str,
+    *,
+    bank_group_key: str,
+    o0_count: int,
+    a1_count: int,
+    o2_count: int,
+):
     boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
     if len(boundary_paths) < 3:
         raise RuntimeError(
@@ -158,11 +168,30 @@ def _build_anchor_payloads(start_tree: str, target_tree: str, *, a1_count: int):
     o0["anchor_family"] = "O0"
     o0["path_index"] = 0
     o0["source_checkpoint"] = None
+    o0["bank_group_key"] = str(bank_group_key)
+    o0_anchors = _sample_phase_family_anchors(
+        start_tree,
+        target_tree,
+        bank_group_key=str(bank_group_key),
+        anchor_family="O0",
+        phase_idx=0,
+        num_leaves=num_leaves,
+        count=int(o0_count),
+    )
+    if o0_anchors:
+        o0_anchors[0].update(
+            {
+                "velocity": dict(o0.get("velocity", {})),
+                "velocity_next_boundary_tree": o0.get("velocity_next_boundary_tree"),
+                "source_checkpoint": None,
+            }
+        )
 
     phase1_source = str(boundary_paths[0]["end_newick"])
     a1_anchors = _sample_phase_family_anchors(
         phase1_source,
         target_tree,
+        bank_group_key=str(bank_group_key),
         anchor_family="A1",
         phase_idx=1,
         num_leaves=num_leaves,
@@ -179,11 +208,29 @@ def _build_anchor_payloads(start_tree: str, target_tree: str, *, a1_count: int):
     o2["anchor_family"] = "O2"
     o2["path_index"] = 2
     o2["source_checkpoint"] = None
+    o2["bank_group_key"] = str(bank_group_key)
+    o2_anchors = _sample_phase_family_anchors(
+        phase2_source,
+        target_tree,
+        bank_group_key=str(bank_group_key),
+        anchor_family="O2",
+        phase_idx=2,
+        num_leaves=num_leaves,
+        count=int(o2_count),
+    )
+    if o2_anchors:
+        o2_anchors[0].update(
+            {
+                "velocity": dict(o2.get("velocity", {})),
+                "velocity_next_boundary_tree": o2.get("velocity_next_boundary_tree"),
+                "source_checkpoint": None,
+            }
+        )
 
     return {
         "num_leaves": int(num_leaves),
         "boundary_path_count": int(len(boundary_paths)),
-        "anchors": [o0, *a1_anchors, o2],
+        "anchors": [*o0_anchors, *a1_anchors, *o2_anchors],
     }
 
 
@@ -213,7 +260,9 @@ def main():
     parser.add_argument("--dataset-index", type=int, default=0)
     parser.add_argument("--posterior-index", type=int, default=None)
     parser.add_argument("--pair-seed", type=int, default=314159)
+    parser.add_argument("--o0-count", type=int, default=4)
     parser.add_argument("--a1-count", type=int, default=4)
+    parser.add_argument("--o2-count", type=int, default=4)
     parser.add_argument("--min-boundary-paths", type=int, default=3)
     parser.add_argument("--max-start-tries-per-target", type=int, default=200)
     args = parser.parse_args()
@@ -236,7 +285,10 @@ def main():
     anchor_payload = _build_anchor_payloads(
         pair["start_tree"],
         pair["target_tree"],
+        bank_group_key=str(args.case_name),
+        o0_count=int(args.o0_count),
         a1_count=int(args.a1_count),
+        o2_count=int(args.o2_count),
     )
 
     out_dir = ROOT / "analysis/full_sanity_fixedpair_20260401"
@@ -246,8 +298,24 @@ def main():
     config_yaml = ROOT / "configs" / f"{args.case_name}.yaml"
     manifest_json = out_dir / f"{args.case_name}_manifest.json"
 
-    start_json.write_text(json.dumps({"tree": pair["start_tree"]}, indent=2))
-    target_json.write_text(json.dumps({"tree": pair["target_tree"]}, indent=2))
+    start_json.write_text(
+        json.dumps(
+            {
+                "tree": pair["start_tree"],
+                "group_key": str(args.case_name),
+            },
+            indent=2,
+        )
+    )
+    target_json.write_text(
+        json.dumps(
+            {
+                "tree": pair["target_tree"],
+                "group_key": str(args.case_name),
+            },
+            indent=2,
+        )
+    )
     anchors_json.write_text(json.dumps(anchor_payload["anchors"], indent=2))
 
     case_config = _update_config_paths(
