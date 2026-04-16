@@ -122,6 +122,30 @@ class TestModelPhylaFusion(unittest.TestCase):
         self.assertTrue(torch.allclose(additions[0, 0], torch.zeros(8)))
         self.assertTrue(torch.allclose(additions[0, 2], torch.zeros(8)))
 
+    def test_split_identity_cache_survives_inference_then_training(self):
+        model = TreeDenoiserTokenGT(
+            num_node_types=3,
+            num_edge_types=2,
+            embed_dim=8,
+            n_layers=2,
+            n_heads=2,
+            dropout=0.0,
+            attention_dropout=0.0,
+            activation_dropout=0.0,
+            drop_path_rate=0.0,
+            use_performer=False,
+            phyla_dim=4,
+        )
+
+        with torch.inference_mode():
+            inference_out = model.create_split_identity_embedding([1, 3, 7], "cpu")
+        self.assertEqual(tuple(inference_out.shape), (3, 8))
+
+        training_out = model.create_split_identity_embedding([1, 3, 7], "cpu")
+        self.assertTrue(training_out.requires_grad)
+        training_out.sum().backward()
+        self.assertIsNotNone(model.split_mask_proj[0].weight.grad)
+
 
 if __name__ == "__main__":
     unittest.main()

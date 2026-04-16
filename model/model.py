@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 from math import log, sqrt
 
 import torch
@@ -442,6 +443,8 @@ class TreeDenoiserTokenGT(nn.Module):
         # )
         self.split_identity_scale = 0.75
         self.split_output_scale = 0.5
+        self._split_identity_binary_cache = OrderedDict()
+        self._split_identity_binary_cache_max = 4096
         self.dropout = nn.Dropout(dropout)
         self.autoregressive_head_mode = str(autoregressive_head_mode)
         self.autoregressive_group_refinement_layers = int(
@@ -516,20 +519,39 @@ class TreeDenoiserTokenGT(nn.Module):
         if not split_masks:
             return torch.zeros(0, self.embed_dim, device=device)
 
-        binary_masks = torch.zeros(
-            len(split_masks),
-            self.max_split_bits,
-            device=device,
-            dtype=self.graph_token.dtype,
+        split_masks_tuple = tuple(int(mask) for mask in split_masks)
+        cache_key = (
+            split_masks_tuple,
+            str(device),
+            str(self.graph_token.dtype),
         )
-        for row_idx, mask in enumerate(split_masks):
-            mask_int = int(mask)
-            bit_idx = 0
-            while mask_int and bit_idx < self.max_split_bits:
-                if mask_int & 1:
-                    binary_masks[row_idx, bit_idx] = 1.0
-                mask_int >>= 1
-                bit_idx += 1
+        binary_masks = self._split_identity_binary_cache.get(cache_key)
+        cache_writable = not torch.is_inference_mode_enabled()
+        if binary_masks is None or (
+            not torch.is_inference_mode_enabled() and binary_masks.is_inference()
+        ):
+            binary_masks = torch.zeros(
+                len(split_masks_tuple),
+                self.max_split_bits,
+                device=device,
+                dtype=self.graph_token.dtype,
+            )
+            for row_idx, mask_int in enumerate(split_masks_tuple):
+                bit_idx = 0
+                while mask_int and bit_idx < self.max_split_bits:
+                    if mask_int & 1:
+                        binary_masks[row_idx, bit_idx] = 1.0
+                    mask_int >>= 1
+                    bit_idx += 1
+            if cache_writable:
+                self._split_identity_binary_cache[cache_key] = binary_masks
+                if (
+                    len(self._split_identity_binary_cache)
+                    > self._split_identity_binary_cache_max
+                ):
+                    self._split_identity_binary_cache.popitem(last=False)
+        else:
+            self._split_identity_binary_cache.move_to_end(cache_key)
 
         return self.split_mask_proj(binary_masks)
 
@@ -649,26 +671,12 @@ class TreeDenoiserTokenGT(nn.Module):
                 ).to(dtype)
         return additions
 
-    def forward(
+    def _prepare_encoder_inputs(
         self,
         tokenized_tree_batch,
         t=None,
         phyla_embeddings=None,
-        return_all_tokens=True,
-        return_leafs_only=False,
-        return_edges_only=False,
-        return_edge_features=False,
-        return_first_hit_logits=False,
-        return_boundary_vanish_logits=False,
-        autoregressive=False,
-        autoregressive_component_groups=None,
     ):
-        # Tree is this format now: (children, root_idx[, branch_lengths][, edge_types])
-        # Handle both single tree and batch of trees
-        # is_single_tree = not isinstance(tree, list)
-        # if is_single_tree:
-        #     tree = [tree]
-
         (
             padded_feature,
             padding_mask,
@@ -678,13 +686,6 @@ class TreeDenoiserTokenGT(nn.Module):
             edge_mask,
             edge_split_masks,
         ) = tokenized_tree_batch
-
-        # for i in edge_split_masks[0]:
-        #     print(
-        #                 [j for j in range(int(i).bit_length()) if (int(i) >> j) & 1],
-        #             )
-
-        # import pdb; pdb.set_trace()
 
         x = padded_feature
         B, T_raw, D = x.shape
@@ -717,9 +718,8 @@ class TreeDenoiserTokenGT(nn.Module):
                     )
                 )
 
-        # Prepend [graph] token
         graph_token = self.graph_token.to(device=x.device, dtype=x.dtype).expand(B, 1, D)
-        x = torch.cat([graph_token, x], dim=1)  # [B, T_raw+1, D]
+        x = torch.cat([graph_token, x], dim=1)
 
         if padding_mask is not None:
             special_tokens_mask = torch.zeros(
@@ -728,15 +728,14 @@ class TreeDenoiserTokenGT(nn.Module):
             padding_mask = torch.cat(
                 [special_tokens_mask, padding_mask],
                 dim=1,
-            )  # [B, T_raw+1]
+            )
 
-            # Update leaf_mask for batch format
-            if leaf_mask.dim() == 2:  # Already batched
+            if leaf_mask.dim() == 2:
                 leaf_mask_special = torch.zeros(
                     B, 1, dtype=leaf_mask.dtype, device=leaf_mask.device
                 )
                 leaf_mask = torch.cat([leaf_mask_special, leaf_mask], dim=1)
-            else:  # Single tree case, need to expand
+            else:
                 leaf_mask_expanded = torch.zeros(
                     B, T_raw, dtype=leaf_mask.dtype, device=leaf_mask.device
                 )
@@ -746,103 +745,112 @@ class TreeDenoiserTokenGT(nn.Module):
                 )
                 leaf_mask = torch.cat([leaf_mask_special, leaf_mask_expanded], dim=1)
 
-        # Timestep conditioning via addition
         if t is not None:
-            time_sin_emb = self.create_sinusoidal_embedding(t, self.embed_dim)  # [B, D]
-            time_emb = self.time_embed(time_sin_emb)  # [B, D]
+            time_sin_emb = self.create_sinusoidal_embedding(t, self.embed_dim)
+            time_emb = self.time_embed(time_sin_emb)
             x = x + time_emb.unsqueeze(1)
         x = self.dropout(x)
 
-        # Transformer encoder
-        for layer in self.layers:
+        return x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks
+
+    def _encode_with_layers(self, x, padding_mask, layers, final_layer_norm):
+        for layer in layers:
             x, _ = layer(x, padding_mask=padding_mask)
-        x = self.final_layer_norm(x)
+        return final_layer_norm(x)
+
+    def _decode_outputs(
+        self,
+        x,
+        leaf_mask,
+        leaf_idx,
+        edge_mask,
+        edge_split_masks,
+        return_all_tokens=True,
+        return_leafs_only=False,
+        return_edges_only=False,
+        return_edge_features=False,
+        return_first_hit_logits=False,
+        return_boundary_vanish_logits=False,
+        autoregressive=False,
+        autoregressive_component_groups=None,
+    ):
+        B, _T, D = x.shape
+        leaf_idx_list = list(leaf_idx) if isinstance(leaf_idx, (list, tuple)) else [leaf_idx]
+        is_single_tree = B == 1 and not isinstance(leaf_idx, (list, tuple))
 
         if return_leafs_only:
-            # Handle batch of leaf indices
             if is_single_tree and B == 1:
-                # Return single tree format for backward compatibility
                 if len(leaf_idx_list[0]) > 0:
                     adjusted_indices = leaf_idx_list[0] + 1
                     valid_mask = adjusted_indices < x.size(1)
                     valid_indices = adjusted_indices[valid_mask]
                     if valid_indices.numel() > 0:
                         return x[0, valid_indices].unsqueeze(0)
-                    else:
-                        return torch.zeros(1, 0, D, device=x.device)
-                else:
                     return torch.zeros(1, 0, D, device=x.device)
-            else:
-                # Batch format
-                batch_leaf_outputs = []
-                for b in range(B):
-                    if len(leaf_idx_list[b]) > 0:
-                        # Add 1 to account for [graph] token
-                        adjusted_indices = leaf_idx_list[b] + 1
-                        valid_mask = adjusted_indices < x.size(1)
-                        valid_indices = adjusted_indices[valid_mask]
-                        if valid_indices.numel() > 0:
-                            batch_leaf_outputs.append(x[b, valid_indices])
-                        else:
-                            batch_leaf_outputs.append(
-                                torch.zeros(0, D, device=x.device)
-                            )
+                return torch.zeros(1, 0, D, device=x.device)
+
+            batch_leaf_outputs = []
+            for b in range(B):
+                if len(leaf_idx_list[b]) > 0:
+                    adjusted_indices = leaf_idx_list[b] + 1
+                    valid_mask = adjusted_indices < x.size(1)
+                    valid_indices = adjusted_indices[valid_mask]
+                    if valid_indices.numel() > 0:
+                        batch_leaf_outputs.append(x[b, valid_indices])
                     else:
                         batch_leaf_outputs.append(torch.zeros(0, D, device=x.device))
-
-                # Pad to same length for batch processing
-                if batch_leaf_outputs:
-                    max_leaf_len = max(out.size(0) for out in batch_leaf_outputs)
-                    if max_leaf_len > 0:
-                        padded_leaf_outputs = torch.zeros(
-                            B, max_leaf_len, D, device=x.device
-                        )
-                        for b, out in enumerate(batch_leaf_outputs):
-                            if out.size(0) > 0:
-                                padded_leaf_outputs[b, : out.size(0)] = out
-                        return padded_leaf_outputs
-                    else:
-                        return torch.zeros(B, 0, D, device=x.device)
                 else:
-                    return torch.zeros(B, 0, D, device=x.device)
-        elif autoregressive:
-            # Remove graph token; edge_mask assumed shape [B, T_raw]
+                    batch_leaf_outputs.append(torch.zeros(0, D, device=x.device))
+
+            if batch_leaf_outputs:
+                max_leaf_len = max(out.size(0) for out in batch_leaf_outputs)
+                if max_leaf_len > 0:
+                    padded_leaf_outputs = torch.zeros(
+                        B, max_leaf_len, D, device=x.device
+                    )
+                    for b, out in enumerate(batch_leaf_outputs):
+                        if out.size(0) > 0:
+                            padded_leaf_outputs[b, : out.size(0)] = out
+                    return padded_leaf_outputs
+            return torch.zeros(B, 0, D, device=x.device)
+
+        if autoregressive:
             x_no_graph = x[:, 1:, :]
-
             all_group_logits = []
-
-            # Tokenizer leaf tokens exclude the distinguished root/outgroup leaf
-            # that the BHV structural code keeps in its split space.
-            num_leaves = [
-                int(leaf_mask[b].sum().item()) + 1
-                for b in range(B)
-            ]
+            num_leaves = [int(leaf_mask[b].sum().item()) + 1 for b in range(B)]
 
             if autoregressive_component_groups is None:
-                batch_polytomy_index, batch_polytomy_splits = get_batch_structural_polytomy_indices(
-                    edge_split_masks,
-                    edge_mask,
-                    min_children=3,
-                    num_leaves=num_leaves,
+                batch_polytomy_index, batch_polytomy_splits = (
+                    get_batch_structural_polytomy_indices(
+                        edge_split_masks,
+                        edge_mask,
+                        min_children=3,
+                        num_leaves=num_leaves,
+                    )
                 )
             else:
-                batch_polytomy_index, batch_polytomy_splits = get_batch_explicit_structural_group_indices(
-                    edge_split_masks,
-                    edge_mask,
-                    autoregressive_component_groups,
-                    num_leaves=num_leaves,
+                batch_polytomy_index, batch_polytomy_splits = (
+                    get_batch_explicit_structural_group_indices(
+                        edge_split_masks,
+                        edge_mask,
+                        autoregressive_component_groups,
+                        num_leaves=num_leaves,
+                    )
                 )
-                                                                                    
+
             for b, groups in enumerate(batch_polytomy_index):
                 for num, group in enumerate(groups):
                     if group.size(0) <= 1:
                         continue
-                    # Get the embeddings for this group
-                    group_embeddings = x_no_graph[b, group, :]  # [G, D]
+                    group_embeddings = x_no_graph[b, group, :]
                     group_splits = batch_polytomy_splits[b][num]
-                    group_identity = self.create_split_identity_embedding(group_splits, x.device)
+                    group_identity = self.create_split_identity_embedding(
+                        group_splits, x.device
+                    )
 
-                    group_embeddings = group_embeddings + (self.split_identity_scale * group_identity)
+                    group_embeddings = group_embeddings + (
+                        self.split_identity_scale * group_identity
+                    )
                     for refinement_block in self.autoregressive_group_refinement:
                         group_embeddings = refinement_block(group_embeddings)
                     if self.autoregressive_head_mode == "structured_subset":
@@ -850,13 +858,14 @@ class TreeDenoiserTokenGT(nn.Module):
                         logits = head_outputs["logits"]
                     else:
                         head_outputs = {}
-                        logits = self.pairwise_head(group_embeddings)  # [G, G]
-                    
+                        logits = self.pairwise_head(group_embeddings)
+
                     group_output = {
                         "batch_index": b,
                         "group_indices": group,
-                        # Pass through the norm for the group head as well
-                        "polytomy_pred": self.group_head(self.final_layer_norm(group_embeddings).mean(dim=0)),
+                        "polytomy_pred": self.group_head(
+                            self.final_layer_norm(group_embeddings).mean(dim=0)
+                        ),
                         "logits": logits,
                         "splits_represented": group_splits,
                         "group_embeddings": group_embeddings,
@@ -864,40 +873,35 @@ class TreeDenoiserTokenGT(nn.Module):
                     }
                     group_output.update(head_outputs)
                     all_group_logits.append(group_output)
-            # if not all_group_logits:
-            #     raise ValueError("No polytomies found for autoregressive processing.")
-            # import pdb; pdb.set_trace()
             return all_group_logits
 
-        elif return_edges_only:
+        if return_edges_only:
             x_no_graph = x[:, 1:, :]
             edge_mask_bool = edge_mask.bool()
             edge_lists = [x_no_graph[b][edge_mask_bool[b]] for b in range(B)]
             max_edges = max((e.size(0) for e in edge_lists), default=0)
 
             if max_edges == 0:
-                return torch.zeros(B, 0, D, ...), torch.ones(B, 0, ...)
+                return torch.zeros(B, 0, D, device=x.device), torch.ones(
+                    B, 0, device=x.device, dtype=torch.bool
+                )
 
             padded_edges = torch.zeros(B, max_edges, D, device=x.device, dtype=x.dtype)
             edge_pad_mask = torch.ones(B, max_edges, device=x.device, dtype=torch.bool)
 
             for b, edges_b in enumerate(edge_lists):
                 n_b = edges_b.size(0)
-                if n_b == 0: continue
-                
-                # 1. Get the positional embedding for the splits
+                if n_b == 0:
+                    continue
                 split_identity = self.create_split_identity_embedding(
                     edge_split_masks[b][:n_b], x.device
                 )
-                
-                # 2. Combine Node Context + Split Identity ONCE
-                # We use a residual-style addition to keep the Transformer signal alive
-                padded_edges[b, :n_b] = edges_b + (self.split_identity_scale * split_identity)
+                padded_edges[b, :n_b] = edges_b + (
+                    self.split_identity_scale * split_identity
+                )
                 edge_pad_mask[b, :n_b] = False
 
-            # 3. Pass through the head. 
-            # No tanh on the outside. The LayerNorm inside the MLP provides the stability.
-            edge_outputs = self.edge_output_layer(padded_edges) 
+            edge_outputs = self.edge_output_layer(padded_edges)
             if return_first_hit_logits or return_boundary_vanish_logits:
                 first_hit_logits = None
                 boundary_vanish_logits = None
@@ -933,15 +937,338 @@ class TreeDenoiserTokenGT(nn.Module):
             if return_edge_features:
                 return edge_outputs, edge_pad_mask, padded_edges
             return edge_outputs, edge_pad_mask
-        elif return_all_tokens:
-            return x  # [B, T, D]
+
+        if return_all_tokens:
+            return x
+        return self.output_layer(x[:, 0])
+
+    def forward(
+        self,
+        tokenized_tree_batch,
+        t=None,
+        phyla_embeddings=None,
+        return_all_tokens=True,
+        return_leafs_only=False,
+        return_edges_only=False,
+        return_edge_features=False,
+        return_first_hit_logits=False,
+        return_boundary_vanish_logits=False,
+        autoregressive=False,
+        autoregressive_component_groups=None,
+    ):
+        x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
+            self._prepare_encoder_inputs(
+                tokenized_tree_batch,
+                t=t,
+                phyla_embeddings=phyla_embeddings,
+            )
+        )
+        x = self._encode_with_layers(
+            x,
+            padding_mask=padding_mask,
+            layers=self.layers,
+            final_layer_norm=self.final_layer_norm,
+        )
+        return self._decode_outputs(
+            x,
+            leaf_mask=leaf_mask,
+            leaf_idx=leaf_idx,
+            edge_mask=edge_mask,
+            edge_split_masks=edge_split_masks,
+            return_all_tokens=return_all_tokens,
+            return_leafs_only=return_leafs_only,
+            return_edges_only=return_edges_only,
+            return_edge_features=return_edge_features,
+            return_first_hit_logits=return_first_hit_logits,
+            return_boundary_vanish_logits=return_boundary_vanish_logits,
+            autoregressive=autoregressive,
+            autoregressive_component_groups=autoregressive_component_groups,
+        )
+
+
+class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
+    def __init__(
+        self,
+        *args,
+        block2_n_layers=None,
+        block2_input_mode="direct",
+        block2_drop_path_rate=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.block2_n_layers = int(
+            self.n_layers if block2_n_layers is None else block2_n_layers
+        )
+        self.block2_input_mode = str(block2_input_mode)
+        block2_drop_path_rate = (
+            self.block2_n_layers > 1 and kwargs.get("drop_path_rate", 0.0)
+            if block2_drop_path_rate is None
+            else float(block2_drop_path_rate)
+        )
+        dprates = [
+            block2_drop_path_rate * i / (self.block2_n_layers - 1)
+            if self.block2_n_layers > 1
+            else 0.0
+            for i in range(self.block2_n_layers)
+        ]
+        self.block2_layers = nn.ModuleList(
+            [
+                TreeGraphEncoderLayer(
+                    embed_dim=self.embed_dim,
+                    ffn_dim=self.embed_dim * 4,
+                    n_heads=kwargs["n_heads"],
+                    dropout=kwargs["dropout"],
+                    attention_dropout=kwargs["attention_dropout"],
+                    activation_dropout=kwargs["activation_dropout"],
+                    drop_path=dprates[i],
+                    use_performer=kwargs["use_performer"],
+                    performer_nb_features=kwargs["performer_nb_features"],
+                    performer_generalized_attention=kwargs[
+                        "performer_generalized_attention"
+                    ],
+                    layernorm_style=kwargs["layernorm_style"],
+                    n_layers=self.block2_n_layers,
+                )
+                for i in range(self.block2_n_layers)
+            ]
+        )
+        self.block2_final_layer_norm = nn.LayerNorm(self.embed_dim)
+        if self.block2_input_mode == "direct":
+            self.block2_bridge = nn.Identity()
+        elif self.block2_input_mode == "residual_mlp":
+            self.block2_bridge = nn.Sequential(
+                nn.LayerNorm(self.embed_dim),
+                nn.Linear(self.embed_dim, self.embed_dim),
+                nn.GELU(),
+                nn.Dropout(kwargs["dropout"]),
+            )
+        elif self.block2_input_mode == "concat_raw_mlp":
+            self.block2_bridge = nn.Sequential(
+                nn.LayerNorm(2 * self.embed_dim),
+                nn.Linear(2 * self.embed_dim, self.embed_dim),
+                nn.GELU(),
+                nn.Dropout(kwargs["dropout"]),
+            )
         else:
-            out = self.output_layer(x[:, 0])
-            return out
+            raise ValueError(
+                f"Unknown block2_input_mode={self.block2_input_mode!r}"
+            )
+        self.apply(lambda m: init_params(m, self.n_layers + self.block2_n_layers))
+
+    def _build_block2_input(self, stage1_x, encoder_input_x):
+        if self.block2_input_mode == "direct":
+            return stage1_x
+        if self.block2_input_mode == "residual_mlp":
+            return stage1_x + self.block2_bridge(stage1_x)
+        return self.block2_bridge(torch.cat([stage1_x, encoder_input_x], dim=-1))
+
+    def forward(
+        self,
+        tokenized_tree_batch,
+        t=None,
+        phyla_embeddings=None,
+        return_all_tokens=True,
+        return_leafs_only=False,
+        return_edges_only=False,
+        return_edge_features=False,
+        return_first_hit_logits=False,
+        return_boundary_vanish_logits=False,
+        autoregressive=False,
+        autoregressive_component_groups=None,
+    ):
+        x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
+            self._prepare_encoder_inputs(
+                tokenized_tree_batch,
+                t=t,
+                phyla_embeddings=phyla_embeddings,
+            )
+        )
+        stage1_x = self._encode_with_layers(
+            x,
+            padding_mask=padding_mask,
+            layers=self.layers,
+            final_layer_norm=self.final_layer_norm,
+        )
+        block2_x = self._build_block2_input(stage1_x, x)
+        x = self._encode_with_layers(
+            block2_x,
+            padding_mask=padding_mask,
+            layers=self.block2_layers,
+            final_layer_norm=self.block2_final_layer_norm,
+        )
+        return self._decode_outputs(
+            x,
+            leaf_mask=leaf_mask,
+            leaf_idx=leaf_idx,
+            edge_mask=edge_mask,
+            edge_split_masks=edge_split_masks,
+            return_all_tokens=return_all_tokens,
+            return_leafs_only=return_leafs_only,
+            return_edges_only=return_edges_only,
+            return_edge_features=return_edge_features,
+            return_first_hit_logits=return_first_hit_logits,
+            return_boundary_vanish_logits=return_boundary_vanish_logits,
+            autoregressive=autoregressive,
+            autoregressive_component_groups=autoregressive_component_groups,
+        )
+
+
+class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
+    def __init__(
+        self,
+        *args,
+        num_model_blocks=3,
+        refine_block_n_layers=None,
+        refine_block_input_mode="direct",
+        refine_block_drop_path_rate=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.num_model_blocks = int(num_model_blocks)
+        if self.num_model_blocks < 2:
+            raise ValueError("num_model_blocks must be at least 2.")
+        self.refine_block_n_layers = int(
+            self.n_layers if refine_block_n_layers is None else refine_block_n_layers
+        )
+        self.refine_block_input_mode = str(refine_block_input_mode)
+        refine_block_drop_path_rate = (
+            kwargs.get("drop_path_rate", 0.0)
+            if refine_block_drop_path_rate is None
+            else float(refine_block_drop_path_rate)
+        )
+        self.refine_blocks = nn.ModuleList()
+        for _ in range(self.num_model_blocks - 1):
+            dprates = [
+                refine_block_drop_path_rate * i / (self.refine_block_n_layers - 1)
+                if self.refine_block_n_layers > 1
+                else 0.0
+                for i in range(self.refine_block_n_layers)
+            ]
+            layers = nn.ModuleList(
+                [
+                    TreeGraphEncoderLayer(
+                        embed_dim=self.embed_dim,
+                        ffn_dim=self.embed_dim * 4,
+                        n_heads=kwargs["n_heads"],
+                        dropout=kwargs["dropout"],
+                        attention_dropout=kwargs["attention_dropout"],
+                        activation_dropout=kwargs["activation_dropout"],
+                        drop_path=dprates[i],
+                        use_performer=kwargs["use_performer"],
+                        performer_nb_features=kwargs["performer_nb_features"],
+                        performer_generalized_attention=kwargs[
+                            "performer_generalized_attention"
+                        ],
+                        layernorm_style=kwargs["layernorm_style"],
+                        n_layers=self.refine_block_n_layers,
+                    )
+                    for i in range(self.refine_block_n_layers)
+                ]
+            )
+            final_norm = nn.LayerNorm(self.embed_dim)
+            if self.refine_block_input_mode == "direct":
+                bridge = nn.Identity()
+            elif self.refine_block_input_mode == "residual_mlp":
+                bridge = nn.Sequential(
+                    nn.LayerNorm(self.embed_dim),
+                    nn.Linear(self.embed_dim, self.embed_dim),
+                    nn.GELU(),
+                    nn.Dropout(kwargs["dropout"]),
+                )
+            elif self.refine_block_input_mode == "concat_raw_mlp":
+                bridge = nn.Sequential(
+                    nn.LayerNorm(2 * self.embed_dim),
+                    nn.Linear(2 * self.embed_dim, self.embed_dim),
+                    nn.GELU(),
+                    nn.Dropout(kwargs["dropout"]),
+                )
+            else:
+                raise ValueError(
+                    f"Unknown refine_block_input_mode={self.refine_block_input_mode!r}"
+                )
+            self.refine_blocks.append(
+                nn.ModuleDict(
+                    {
+                        "layers": layers,
+                        "final_norm": final_norm,
+                        "bridge": bridge,
+                    }
+                )
+            )
+        self.apply(
+            lambda m: init_params(
+                m,
+                self.n_layers
+                + ((self.num_model_blocks - 1) * self.refine_block_n_layers),
+            )
+        )
+
+    def _build_refine_block_input(self, prev_x, encoder_input_x, bridge):
+        if self.refine_block_input_mode == "direct":
+            return prev_x
+        if self.refine_block_input_mode == "residual_mlp":
+            return prev_x + bridge(prev_x)
+        return bridge(torch.cat([prev_x, encoder_input_x], dim=-1))
+
+    def forward(
+        self,
+        tokenized_tree_batch,
+        t=None,
+        phyla_embeddings=None,
+        return_all_tokens=True,
+        return_leafs_only=False,
+        return_edges_only=False,
+        return_edge_features=False,
+        return_first_hit_logits=False,
+        return_boundary_vanish_logits=False,
+        autoregressive=False,
+        autoregressive_component_groups=None,
+    ):
+        x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
+            self._prepare_encoder_inputs(
+                tokenized_tree_batch,
+                t=t,
+                phyla_embeddings=phyla_embeddings,
+            )
+        )
+        encoder_input_x = x
+        x = self._encode_with_layers(
+            x,
+            padding_mask=padding_mask,
+            layers=self.layers,
+            final_layer_norm=self.final_layer_norm,
+        )
+        for block in self.refine_blocks:
+            block_input_x = self._build_refine_block_input(
+                x,
+                encoder_input_x,
+                block["bridge"],
+            )
+            x = self._encode_with_layers(
+                block_input_x,
+                padding_mask=padding_mask,
+                layers=block["layers"],
+                final_layer_norm=block["final_norm"],
+            )
+        return self._decode_outputs(
+            x,
+            leaf_mask=leaf_mask,
+            leaf_idx=leaf_idx,
+            edge_mask=edge_mask,
+            edge_split_masks=edge_split_masks,
+            return_all_tokens=return_all_tokens,
+            return_leafs_only=return_leafs_only,
+            return_edges_only=return_edges_only,
+            return_edge_features=return_edge_features,
+            return_first_hit_logits=return_first_hit_logits,
+            return_boundary_vanish_logits=return_boundary_vanish_logits,
+            autoregressive=autoregressive,
+            autoregressive_component_groups=autoregressive_component_groups,
+        )
 
 
 def return_model(config):
-    model = TreeDenoiserTokenGT(
+    model_kwargs = dict(
         num_node_types=config["model"]["num_node_types"],
         num_edge_types=config["model"]["num_edge_types"],
         embed_dim=config["model"]["embed_dim"],
@@ -988,5 +1315,27 @@ def return_model(config):
             "autoregressive_max_subset_size", 64
         ),
     )
+    model_variant = str(config["model"].get("model_variant", "base"))
+    if model_variant == "two_block_refine":
+        model = TreeDenoiserTokenGTTwoBlock(
+            **model_kwargs,
+            block2_n_layers=config["model"].get("block2_n_layers"),
+            block2_input_mode=config["model"].get("block2_input_mode", "direct"),
+            block2_drop_path_rate=config["model"].get("block2_drop_path_rate"),
+        )
+    elif model_variant == "multi_block_refine":
+        model = TreeDenoiserTokenGTMultiBlock(
+            **model_kwargs,
+            num_model_blocks=config["model"].get("num_model_blocks", 3),
+            refine_block_n_layers=config["model"].get("refine_block_n_layers"),
+            refine_block_input_mode=config["model"].get(
+                "refine_block_input_mode", "direct"
+            ),
+            refine_block_drop_path_rate=config["model"].get(
+                "refine_block_drop_path_rate"
+            ),
+        )
+    else:
+        model = TreeDenoiserTokenGT(**model_kwargs)
 
     return model
