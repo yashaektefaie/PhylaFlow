@@ -1,0 +1,24 @@
+{
+  "comparison_summary": {
+    "tree20_actual_leaves": 20,
+    "ds1_actual_leaves": 27,
+    "tree20_mean_start_rf": 0.5857405462184874,
+    "ds1_mean_start_rf": 0.7552083333333334,
+    "tree20_anchor_target_size_means": {
+      "O0": 2.25,
+      "A1": 11.125,
+      "O2": 3.125
+    },
+    "ds1_anchor_target_size_means": {
+      "O0": 5.125,
+      "A1": 15.625,
+      "O2": 6.0
+    },
+    "tree20_mean_ar_samples_per_case": 17.75,
+    "ds1_mean_ar_samples_per_case": 23.875,
+    "tree20_ar_components_per_event_mean": 9.23943661971831,
+    "ds1_ar_components_per_event_mean": 12.93193717277487,
+    "tree20_ar_merge_arity_mean": 2.1056338028169015,
+    "ds1_ar_merge_arity_mean": 2.0157068062827226
+  }
+}

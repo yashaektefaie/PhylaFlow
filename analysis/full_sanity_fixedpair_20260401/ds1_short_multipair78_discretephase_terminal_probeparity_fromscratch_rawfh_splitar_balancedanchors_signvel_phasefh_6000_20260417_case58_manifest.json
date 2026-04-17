@@ -1,0 +1,11 @@
+{
+  "case_name": "ds1_short_multipair78_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_6000_20260417_case58",
+  "dataset_index": 0,
+  "posterior_index": 956,
+  "start_try": 2,
+  "boundary_path_count": 3,
+  "num_leaves": 28,
+  "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair78_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_6000_20260417_case58_start.json",
+  "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair78_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_6000_20260417_case58_target.json",
+  "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair78_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_6000_20260417_case58_velocity_anchors.json"
+}

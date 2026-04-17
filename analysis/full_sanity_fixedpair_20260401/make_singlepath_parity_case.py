@@ -245,6 +245,9 @@ def _update_config_paths(config, *, case_name: str, start_json: Path, target_jso
     cfg["data"]["overfit_full_path_control_extra_velocity_samples_json_path"] = str(
         anchors_json
     )
+    cfg["data"]["overfit_full_path_control_mode"] = True
+    cfg["data"]["overfit_full_path_control_use_discrete_phase_time"] = True
+    cfg["data"]["overfit_fixed_pair"] = True
     cfg["data"]["overfit_fixed_pair_start_tree_json_path"] = str(start_json)
     cfg["data"]["overfit_fixed_pair_target_tree_json_path"] = str(target_json)
     cfg["data"]["overfit_fixed_pair_start_tree_json_paths"] = None

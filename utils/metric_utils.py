@@ -33,6 +33,124 @@ def calculate_norm_rf(t1_nw: str, t2_nw: str) -> float:
 		return float("nan")
 
 
+def _topology_leaf_sort_key(name: str) -> Tuple[int, str]:
+    try:
+        return (0, f"{int(name):020d}")
+    except Exception:
+        return (1, str(name))
+
+
+def canonicalize_topology_newick(newick: str) -> str:
+    """Return a branch-length-free canonical key for an unrooted topology."""
+    tree = EteTree(newick, format=1, quoted_node_names=True)
+    leaves = list(tree.iter_leaves())
+    if not leaves:
+        return ";"
+
+    outgroup = min(leaves, key=lambda leaf: _topology_leaf_sort_key(leaf.name))
+    tree.set_outgroup(outgroup)
+
+    def emit(node) -> str:
+        if node.is_leaf():
+            return str(node.name)
+        child_strings = sorted(emit(child) for child in node.children)
+        return "(" + ",".join(child_strings) + ")"
+
+    return emit(tree) + ";"
+
+
+def _empirical_tree_topology_counts(trees: List[str]) -> Counter:
+    counts = Counter()
+    for tree in trees:
+        try:
+            counts[canonicalize_topology_newick(tree)] += 1
+        except Exception as e:
+            logger.warning("Skipping tree in topology counting: %s", e)
+    return counts
+
+
+def kl_divergence_tree_topology_distributions(
+    posterior_trees: List[str],
+    sampled_trees: List[str],
+    alpha: float = 1e-6,
+) -> Dict[str, float]:
+    """KL D(posterior || sampled) over exact whole-tree topology frequencies."""
+    posterior_counts = _empirical_tree_topology_counts(posterior_trees)
+    sampled_counts = _empirical_tree_topology_counts(sampled_trees)
+
+    support = set(posterior_counts.keys()).union(sampled_counts.keys())
+    if not support:
+        return {
+            "kl_divergence_tree_topology": 0.0,
+            "n_unique_posterior_topologies": 0.0,
+            "n_unique_sampled_topologies": 0.0,
+            "n_shared_topologies": 0.0,
+            "posterior_topology_support_recall": 1.0,
+        }
+
+    posterior_total = float(sum(posterior_counts.values()))
+    sampled_total = float(sum(sampled_counts.values()))
+    zp = posterior_total + alpha * len(support)
+    zq = sampled_total + alpha * len(support)
+
+    kl = 0.0
+    for key in support:
+        p = (float(posterior_counts.get(key, 0.0)) + alpha) / zp
+        q = (float(sampled_counts.get(key, 0.0)) + alpha) / zq
+        kl += p * math.log(p / q)
+
+    shared = len(set(posterior_counts.keys()).intersection(sampled_counts.keys()))
+    unique_posterior = len(posterior_counts)
+    return {
+        "kl_divergence_tree_topology": float(kl),
+        "n_unique_posterior_topologies": float(unique_posterior),
+        "n_unique_sampled_topologies": float(len(sampled_counts)),
+        "n_shared_topologies": float(shared),
+        "posterior_topology_support_recall": (
+            float(shared) / float(unique_posterior) if unique_posterior else 1.0
+        ),
+    }
+
+
+def topk_posterior_tree_recall(
+    posterior_trees: List[str],
+    sampled_trees: List[str],
+    top_ks: Tuple[int, ...] = (1, 5, 10, 20, 50),
+) -> Dict[str, float]:
+    """Recall of the top-k posterior topologies under sampled support."""
+    posterior_counts = _empirical_tree_topology_counts(posterior_trees)
+    sampled_support = set(_empirical_tree_topology_counts(sampled_trees).keys())
+    if not posterior_counts:
+        return {}
+
+    ranked = sorted(
+        posterior_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    posterior_total = float(sum(posterior_counts.values()))
+    metrics = {}
+    for raw_k in top_ks:
+        k = max(1, int(raw_k))
+        top_items = ranked[: min(k, len(ranked))]
+        if not top_items:
+            metrics[f"posterior_topology_recall_at_{k}"] = 1.0
+            metrics[f"posterior_topology_mass_recall_at_{k}"] = 1.0
+            continue
+        hits = [key for key, _ in top_items if key in sampled_support]
+        top_mass = sum(count for _, count in top_items)
+        hit_mass = sum(posterior_counts[key] for key in hits)
+        metrics[f"posterior_topology_recall_at_{k}"] = float(len(hits)) / float(
+            len(top_items)
+        )
+        metrics[f"posterior_topology_mass_recall_at_{k}"] = (
+            float(hit_mass) / float(top_mass) if top_mass > 0 else 1.0
+        )
+    metrics["posterior_topology_sample_support_size"] = float(len(sampled_support))
+    metrics["posterior_topology_posterior_support_size"] = float(len(posterior_counts))
+    metrics["posterior_topology_total_mass"] = float(posterior_total)
+    return metrics
+
+
 def kl_divergence_topological_distributions(
 	posterior_trees: List[str],
 	sampled_trees: List[str],

@@ -1,0 +1,99 @@
+{
+  "bank_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417",
+  "num_cases": 8,
+  "dataset_index": 0,
+  "pair_seed": 271828,
+  "combined_anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_velocity_anchors.json",
+  "config_yaml": "/home/yektefai/PhylaFlow/configs/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417.yaml",
+  "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_metrics.jsonl",
+  "cases": [
+    {
+      "case_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case00",
+      "dataset_index": 0,
+      "posterior_index": 2387,
+      "start_try": 2,
+      "boundary_path_count": 3,
+      "num_leaves": 28,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case00_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case00_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case00_velocity_anchors.json"
+    },
+    {
+      "case_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case01",
+      "dataset_index": 0,
+      "posterior_index": 7821,
+      "start_try": 1,
+      "boundary_path_count": 3,
+      "num_leaves": 28,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case01_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case01_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case01_velocity_anchors.json"
+    },
+    {
+      "case_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case02",
+      "dataset_index": 0,
+      "posterior_index": 3280,
+      "start_try": 9,
+      "boundary_path_count": 3,
+      "num_leaves": 28,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case02_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case02_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case02_velocity_anchors.json"
+    },
+    {
+      "case_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case03",
+      "dataset_index": 0,
+      "posterior_index": 2720,
+      "start_try": 22,
+      "boundary_path_count": 3,
+      "num_leaves": 28,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case03_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case03_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case03_velocity_anchors.json"
+    },
+    {
+      "case_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case04",
+      "dataset_index": 0,
+      "posterior_index": 8994,
+      "start_try": 7,
+      "boundary_path_count": 3,
+      "num_leaves": 28,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case04_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case04_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case04_velocity_anchors.json"
+    },
+    {
+      "case_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case05",
+      "dataset_index": 0,
+      "posterior_index": 4500,
+      "start_try": 4,
+      "boundary_path_count": 3,
+      "num_leaves": 28,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case05_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case05_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case05_velocity_anchors.json"
+    },
+    {
+      "case_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case06",
+      "dataset_index": 0,
+      "posterior_index": 5902,
+      "start_try": 0,
+      "boundary_path_count": 3,
+      "num_leaves": 28,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case06_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case06_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case06_velocity_anchors.json"
+    },
+    {
+      "case_name": "ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case07",
+      "dataset_index": 0,
+      "posterior_index": 5775,
+      "start_try": 7,
+      "boundary_path_count": 4,
+      "num_leaves": 28,
+      "start_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case07_start.json",
+      "target_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case07_target.json",
+      "anchors_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair8_discretephase_terminal_probeparity_fromscratch_rawfh_splitar_balancedanchors_signvel_phasefh_200_20260417_case07_velocity_anchors.json"
+    }
+  ]
+}

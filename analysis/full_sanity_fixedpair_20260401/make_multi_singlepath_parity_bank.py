@@ -21,6 +21,7 @@ from analysis.full_sanity_fixedpair_20260401.probe_current_mainline_ckpt import 
     build_dataset,
     set_seed,
 )
+from utils.metric_utils import canonicalize_topology_newick
 
 
 def _case_file_paths(case_name: str):
@@ -70,6 +71,11 @@ def main():
     parser.add_argument("--o2-count", type=int, default=4)
     parser.add_argument("--min-boundary-paths", type=int, default=3)
     parser.add_argument("--max-start-tries-per-target", type=int, default=200)
+    parser.add_argument(
+        "--require-unique-target-topologies",
+        action="store_true",
+        help="Use at most one representative target tree per unique posterior topology.",
+    )
     args = parser.parse_args()
 
     template_config = yaml.safe_load(args.template_config.read_text())
@@ -87,15 +93,41 @@ def main():
     start_paths = []
     target_paths = []
     pair_attempt = 0
+    target_index_schedule = None
+    if bool(args.require_unique_target_topologies):
+        posterior_trees = list(dataset.dataset_train.return_posterior_trees(int(args.dataset_index)))
+        topology_to_indices = {}
+        for idx, tree in enumerate(posterior_trees):
+            key = canonicalize_topology_newick(str(tree).strip())
+            topology_to_indices.setdefault(key, []).append(int(idx))
+        target_index_schedule = [
+            indices[0] for _, indices in sorted(topology_to_indices.items(), key=lambda item: item[1][0])
+        ]
+        rng.shuffle(target_index_schedule)
+        if exclude_target is not None:
+            exclude_key = canonicalize_topology_newick(str(exclude_target).strip())
+            target_index_schedule = [
+                idx
+                for idx in target_index_schedule
+                if canonicalize_topology_newick(str(posterior_trees[idx]).strip()) != exclude_key
+            ]
+        if int(args.num_cases) > len(target_index_schedule):
+            raise RuntimeError(
+                f"Requested {args.num_cases} cases but only {len(target_index_schedule)} unique target topologies exist."
+            )
+
     while len(manifests) < int(args.num_cases):
         case_idx = len(manifests)
         case_name = f"{args.bank_name}_case{case_idx:02d}"
+        posterior_index = None
+        if target_index_schedule is not None:
+            posterior_index = int(target_index_schedule[case_idx])
         pair = _pick_pair(
             dataset,
             dataset_index=int(args.dataset_index),
             rng=random.Random(int(args.pair_seed) + pair_attempt),
             exclude_target=None,
-            posterior_index=None,
+            posterior_index=posterior_index,
             min_boundary_paths=int(args.min_boundary_paths),
             max_start_tries_per_target=int(args.max_start_tries_per_target),
         )
@@ -139,6 +171,9 @@ def main():
     data_cfg["overfit_full_path_control_extra_velocity_samples_json_path"] = str(
         combined_anchors_path
     )
+    data_cfg["overfit_full_path_control_mode"] = True
+    data_cfg["overfit_full_path_control_use_discrete_phase_time"] = True
+    data_cfg["overfit_fixed_pair"] = True
     data_cfg["overfit_fixed_pair_start_tree_json_path"] = None
     data_cfg["overfit_fixed_pair_target_tree_json_path"] = None
     data_cfg["overfit_fixed_pair_start_tree_json_paths"] = start_paths

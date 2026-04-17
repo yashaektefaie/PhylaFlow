@@ -2,6 +2,8 @@ import unittest
 
 from utils.metric_utils import (
     kl_divergence_topological_distributions,
+    kl_divergence_tree_topology_distributions,
+    topk_posterior_tree_recall,
     split_bipartition_frequency_correlation,
     raxmlng_loglh_batch,
     compare_likelihood_distributions,
@@ -34,6 +36,44 @@ class TestMetricUtils(unittest.TestCase):
 
         self.assertLess(kl_same, 1e-8)
         self.assertGreater(kl_diff, 1e-4)
+
+    def test_tree_topology_kl_matches_identity(self):
+        posterior = [self.tree_a, self.tree_a, self.tree_b]
+        sampled_same = list(posterior)
+        sampled_diff = [self.tree_c, self.tree_c, self.tree_c]
+
+        kl_same = kl_divergence_tree_topology_distributions(
+            posterior, sampled_same
+        )["kl_divergence_tree_topology"]
+        kl_diff = kl_divergence_tree_topology_distributions(
+            posterior, sampled_diff
+        )["kl_divergence_tree_topology"]
+
+        self.assertLess(kl_same, 1e-8)
+        self.assertGreater(kl_diff, 1e-4)
+
+    def test_topk_posterior_tree_recall(self):
+        posterior = [
+            self.tree_a,
+            self.tree_a,
+            self.tree_a,
+            self.tree_b,
+            self.tree_b,
+            self.tree_c,
+        ]
+        sampled = [self.tree_a, self.tree_b, str(Tree(num_leaves=50, random=True))]
+
+        metrics = topk_posterior_tree_recall(posterior, sampled, top_ks=(1, 2, 3))
+
+        self.assertEqual(metrics["posterior_topology_recall_at_1"], 1.0)
+        self.assertEqual(metrics["posterior_topology_recall_at_2"], 1.0)
+        self.assertAlmostEqual(metrics["posterior_topology_recall_at_3"], 2.0 / 3.0)
+        self.assertEqual(metrics["posterior_topology_mass_recall_at_1"], 1.0)
+        self.assertEqual(metrics["posterior_topology_mass_recall_at_2"], 1.0)
+        self.assertAlmostEqual(
+            metrics["posterior_topology_mass_recall_at_3"],
+            5.0 / 6.0,
+        )
 
     def test_bipartition_frequency_correlation(self):
         posterior = [str(Tree(num_leaves=self.num_leaves, random=True)) for _ in range(5)]
