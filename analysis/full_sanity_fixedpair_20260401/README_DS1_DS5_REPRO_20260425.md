@@ -88,12 +88,17 @@ generated artifacts:
     `analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXX_target.json`
 
 - DS5 current-recipe training bank: 1051 files, 51.93 MB total.
-  - One velocity-anchor JSON:
-    `analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_velocity_anchors.json`
+  - One full-path velocity-anchor JSON:
+    `analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_fullpathanchors4_20260425_velocity_anchors.json`
   - 525 start JSON files:
     `analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXXX_start.json`
   - 525 target JSON files:
     `analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXXX_target.json`
+
+The DS2-DS8 aggregate anchor files were rebuilt with
+`rebuild_bank_full_path_anchors.py --full-path-anchor-count 4` on
+2026-04-25 so they cover every boundary phase (`O0`, `A1`, `O2`, and later
+`P*` phases), matching the DS1 full-path-anchor recipe.
 
 MrBayes analysis also expects:
 
