@@ -39,6 +39,7 @@ Analysis scripts:
 - `analysis/full_sanity_fixedpair_20260401/make_sampled_start_bank_from_ckpt.py`
 - `analysis/full_sanity_fixedpair_20260401/remap_posterior_to_harness_lexindex.py`
 - `analysis/full_sanity_fixedpair_20260401/build_weighted_fullsupport_ds_banks.py`
+- `analysis/full_sanity_fixedpair_20260401/rebuild_bank_full_path_anchors.py`
 - `analysis/full_sanity_fixedpair_20260401/build_ds1_usher_matopt_start.py`
 - `analysis/full_sanity_fixedpair_20260401/build_ds1_usher_matopt_multistart.py`
 
@@ -51,6 +52,27 @@ training banks, checkpoints, exact MrBayes start/result artifacts, optional
 ML/parsimony starts, and sampled-analysis JSONs. The configs currently use
 absolute local paths under `/home/yektefai/PhylaFlow`; if the repo is checked out
 elsewhere, rewrite those paths or restore artifacts to the same path.
+
+## Regenerating Training Banks
+
+The DS1-DS8 weighted full-support bank generator is:
+
+```bash
+python analysis/full_sanity_fixedpair_20260401/build_weighted_fullsupport_ds_banks.py
+```
+
+It calls `make_multi_singlepath_parity_bank.py` to write the per-case start,
+target, manifest, and velocity-anchor JSONs. The DS1 `fullpathanchors4`
+aggregate anchor file used by the current case-adapted recipe can be rebuilt
+from an existing bank manifest with:
+
+```bash
+python analysis/full_sanity_fixedpair_20260401/rebuild_bank_full_path_anchors.py \
+  --source-manifest analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json \
+  --source-config configs/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml \
+  --output-name ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_20260418 \
+  --full-path-anchor-count 4
+```
 
 ## External Artifacts To Put On GCP
 
