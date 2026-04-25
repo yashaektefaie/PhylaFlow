@@ -1,7 +1,8 @@
-# DS1/DS5 Repro Package, 2026-04-25
+# DS1-DS8 Repro Package, 2026-04-25
 
-This package records the current reproducible path for the good DS1 result and
-the current DS5 run. It is meant to be used from the repository root:
+This package records the current reproducible path for the good DS1 result, the
+current DS5 run, and the DS1-DS8 launch-ready configs using the same
+full-path-anchor recipe. It is meant to be used from the repository root:
 
 ```bash
 cd /home/yektefai/PhylaFlow
@@ -12,6 +13,50 @@ The training entry point is positional. Do not launch these configs with
 
 ```bash
 python -m run.run /home/yektefai/PhylaFlow/configs/<config>.yaml
+```
+
+## External Artifact Restore
+
+The DS launch configs do not commit the start/target/anchor JSON banks. Restore
+the GCP artifact folder before launching:
+
+```bash
+mkdir -p /home/yektefai/30272299
+gcloud storage cp -r gs://phyla/<GCP_ARTIFACT_PREFIX>/phylaflow_fixed_path_artifacts \
+  /home/yektefai/30272299/
+```
+
+After the copy, the required local layout is:
+
+```text
+/home/yektefai/30272299/phylaflow_fixed_path_artifacts/
+  DS1/
+  DS2/
+  DS3/
+  DS4/
+  DS5/
+  DS6/
+  DS7/
+  DS8/
+```
+
+Each `DS*` folder must contain that dataset's start JSONs, target JSONs, and one
+active `*_velocity_anchors.json` file. These are the all-orthant/full-path
+anchors; the old early-only anchor files should not be used for the current
+recipe.
+
+The committed `currentrecipe_20260425` configs point at this local artifact
+root. If the artifact folder is restored somewhere else, rewrite these config
+fields to the new local path before launching:
+
+- `data.overfit_full_path_control_extra_velocity_samples_json_path`
+- `data.overfit_fixed_pair_start_tree_json_paths`
+- `data.overfit_fixed_pair_target_tree_json_paths`
+
+The helper launch list is:
+
+```text
+analysis/full_sanity_fixedpair_20260401/ds1_ds8_currentrecipe_20260425_launch_commands.txt
 ```
 
 ## Committed Files
@@ -29,6 +74,14 @@ Training configs:
 
 - `configs/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421.yaml`
 - `configs/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260424.yaml`
+- `configs/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_currentrecipe_20260425.yaml`
+- `configs/ds2_short_multipair42_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425.yaml`
+- `configs/ds3_short_multipair243_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425.yaml`
+- `configs/ds4_short_multipair573_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425.yaml`
+- `configs/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425.yaml`
+- `configs/ds6_short_multipair219_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425.yaml`
+- `configs/ds7_short_multipair1344_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425.yaml`
+- `configs/ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425.yaml`
 
 Analysis scripts:
 
@@ -46,12 +99,14 @@ Analysis scripts:
 Artifact manifest:
 
 - `analysis/full_sanity_fixedpair_20260401/ds1_ds5_repro_artifacts_20260425.json`
+- `analysis/full_sanity_fixedpair_20260401/ds1_ds8_currentrecipe_20260425_launch_commands.txt`
 
 The manifest summarizes the external artifact groups that should live on GCP:
 training banks, checkpoints, exact MrBayes start/result artifacts, optional
-ML/parsimony starts, and sampled-analysis JSONs. The configs currently use
-absolute local paths under `/home/yektefai/PhylaFlow`; if the repo is checked out
-elsewhere, rewrite those paths or restore artifacts to the same path.
+ML/parsimony starts, and sampled-analysis JSONs. The `currentrecipe_20260425`
+configs use absolute local paths under
+`/home/yektefai/30272299/phylaflow_fixed_path_artifacts`; if the artifacts are
+restored elsewhere, rewrite the config paths listed above.
 
 ## Regenerating Training Banks
 
@@ -81,19 +136,33 @@ generated artifacts:
 
 - DS1 caseadaptboth training bank: 469 files, 12.79 MB total.
   - One velocity-anchor JSON:
-    `analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_20260418_velocity_anchors.json`
+    `/home/yektefai/30272299/phylaflow_fixed_path_artifacts/DS1/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_20260418_velocity_anchors.json`
   - 234 start JSON files:
-    `analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXX_start.json`
+    `/home/yektefai/30272299/phylaflow_fixed_path_artifacts/DS1/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXX_start.json`
   - 234 target JSON files:
-    `analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXX_target.json`
+    `/home/yektefai/30272299/phylaflow_fixed_path_artifacts/DS1/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXX_target.json`
 
 - DS5 current-recipe training bank: 1051 files, 51.93 MB total.
   - One full-path velocity-anchor JSON:
-    `analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_fullpathanchors4_20260425_velocity_anchors.json`
+    `/home/yektefai/30272299/phylaflow_fixed_path_artifacts/DS5/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_fullpathanchors4_20260425_velocity_anchors.json`
   - 525 start JSON files:
-    `analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXXX_start.json`
+    `/home/yektefai/30272299/phylaflow_fixed_path_artifacts/DS5/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXXX_start.json`
   - 525 target JSON files:
-    `analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXXX_target.json`
+    `/home/yektefai/30272299/phylaflow_fixed_path_artifacts/DS5/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_caseXXX_target.json`
+
+The full DS1-DS8 fixed-path artifact folder is about 940 MB locally and should
+be kept on GCP as one directory. Counts by dataset:
+
+| dataset | cases | required files |
+| --- | ---: | ---: |
+| DS1 | 234 | 234 starts, 234 targets, 1 full-path anchor |
+| DS2 | 42 | 42 starts, 42 targets, 1 full-path anchor |
+| DS3 | 243 | 243 starts, 243 targets, 1 full-path anchor |
+| DS4 | 573 | 573 starts, 573 targets, 1 full-path anchor |
+| DS5 | 525 | 525 starts, 525 targets, 1 full-path anchor |
+| DS6 | 219 | 219 starts, 219 targets, 1 full-path anchor |
+| DS7 | 1344 | 1344 starts, 1344 targets, 1 full-path anchor |
+| DS8 | 1122 | 1122 starts, 1122 targets, 1 full-path anchor |
 
 The DS2-DS8 aggregate anchor files were rebuilt with
 `rebuild_bank_full_path_anchors.py --full-path-anchor-count 4` on
