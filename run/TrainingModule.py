@@ -3,6 +3,8 @@ import time
 import inspect
 import math
 import json
+import numbers
+from collections import Counter
 import importlib.util
 import functools
 import operator
@@ -54,8 +56,9 @@ split_bipartition_frequency_correlation,
 compare_likelihood_distributions,
 compare_branch_length_distributions,
 calculate_norm_rf,
+canonicalize_topology_newick,
 )
-from data.dataset import PhylaDataModule
+from data.dataset import PhylaDataModule, TreeDataset
 from model.model import TreeDenoiserTokenGT
 import numpy as np
 import logging
@@ -83,6 +86,7 @@ def _load_phyla_runtime():
 
 
 _HISTORICAL_STEP_MODULE = None
+_HISTORICAL_METHOD_SIGNATURES = {}
 
 
 def _load_historical_training_module_for_step():
@@ -100,6 +104,29 @@ def _load_historical_training_module_for_step():
     spec.loader.exec_module(module)
     _HISTORICAL_STEP_MODULE = module
     return module
+
+
+def _call_historical_trainingmodule_method(method_name, self_obj, /, *args, **kwargs):
+    historical_module = _load_historical_training_module_for_step()
+    method = getattr(historical_module.TrainingModule, method_name)
+    signature = _HISTORICAL_METHOD_SIGNATURES.get(method_name)
+    if signature is None:
+        signature = inspect.signature(method)
+        _HISTORICAL_METHOD_SIGNATURES[method_name] = signature
+
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_var_kwargs:
+        filtered_kwargs = dict(kwargs)
+    else:
+        filtered_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature.parameters
+        }
+    return method(self_obj, *args, **filtered_kwargs)
 
 
 def _decode_positive_merge_subsets(group_output, threshold_logit=0.0):
@@ -844,6 +871,33 @@ def _predict_first_hit_mask_with_fallback(
     return raw_mask, raw_count, False
 
 
+def _sampling_supervised_candidate_mask(masks, lengths, n_leaves):
+    candidate_mask = np.zeros(len(masks), dtype=bool)
+    biological_bits = max(int(n_leaves) - 1, 0)
+    for idx, (mask, length) in enumerate(zip(masks, lengths)):
+        if float(length) <= 1e-8:
+            continue
+        k_bits = int(mask).bit_count()
+        is_pendant = biological_bits > 0 and min(
+            k_bits, biological_bits - k_bits
+        ) == 1
+        if not is_pendant:
+            candidate_mask[idx] = True
+    return candidate_mask
+
+
+def _mask_precision_recall(pred_mask, true_mask):
+    pred_mask = np.asarray(pred_mask, dtype=bool)
+    true_mask = np.asarray(true_mask, dtype=bool)
+    tp = float(np.logical_and(pred_mask, true_mask).sum())
+    pred_n = float(pred_mask.sum())
+    true_n = float(true_mask.sum())
+    return {
+        "precision": tp / max(pred_n, 1.0),
+        "recall": tp / max(true_n, 1.0),
+    }
+
+
 def _oracle_first_hit_mask_for_sampling(
     current_newick,
     target_tree,
@@ -1131,6 +1185,28 @@ def _summarize_fixed_pair_eval_rows(velocity_rows, ar_rows):
         ),
         -1,
     )
+    first_wrong_first_hit_index = next(
+        (
+            int(row.get("index", idx))
+            for idx, row in enumerate(velocity_rows)
+            if not (
+                float(row.get("first_hit_precision", 0.0)) == 1.0
+                and float(row.get("first_hit_recall", 0.0)) == 1.0
+            )
+        ),
+        -1,
+    )
+    first_wrong_vanish_index = next(
+        (
+            int(row.get("index", idx))
+            for idx, row in enumerate(velocity_rows)
+            if not (
+                float(row.get("vanish_precision", 0.0)) == 1.0
+                and float(row.get("vanish_recall", 0.0)) == 1.0
+            )
+        ),
+        -1,
+    )
     first_wrong_ar_index = next(
         (
             int(row.get("event_index", idx))
@@ -1155,6 +1231,8 @@ def _summarize_fixed_pair_eval_rows(velocity_rows, ar_rows):
         ),
         "fixed_path_autoregressive_exact_frac": _frac(ar_exact, n_ar),
         "fixed_path_first_wrong_velocity_index": float(first_wrong_velocity_index),
+        "fixed_path_first_wrong_first_hit_index": float(first_wrong_first_hit_index),
+        "fixed_path_first_wrong_vanish_index": float(first_wrong_vanish_index),
         "fixed_path_first_wrong_autoregressive_index": float(first_wrong_ar_index),
     }
 
@@ -1904,6 +1982,116 @@ def _move_tokenized_batch_to_device(tokenized, device):
     return tuple(moved)
 
 
+def _tokenizer_structural_cache(module):
+    cache = getattr(module, "_tree_tokenizer_structural_cache", None)
+    if cache is None:
+        cache = {}
+        module._tree_tokenizer_structural_cache = cache
+    return cache
+
+
+def _structuralize_trees_with_cache(module, trees):
+    tokenizer = module.model.tokenizer
+    cache = _tokenizer_structural_cache(module)
+    structural_trees = []
+    for tree in trees:
+        key = str(tree)
+        structural = cache.get(key)
+        if structural is None:
+            structural = tokenizer._newick_to_structural(key)
+            cache[key] = structural
+        structural_trees.append(structural)
+    return structural_trees
+
+
+def _build_start_topology_feature_tensor(module, start_trees, *, device=None, dtype=None):
+    if not start_trees:
+        return None
+    if device is None:
+        device = module.device
+    if dtype is None:
+        dtype = next(module.model.parameters()).dtype
+    embed_dim = int(module.model.embed_dim)
+    zero = torch.zeros(3 * embed_dim, device=device, dtype=dtype)
+    features = []
+    for start_tree in start_trees:
+        if start_tree is None:
+            features.append(zero.clone())
+            continue
+        try:
+            tokenized = module.model.tokenizer([str(start_tree)])
+            raw_masks = tokenized[-1][0]
+            masks = [int(mask) for mask in raw_masks if int(mask) != 0]
+            if not masks:
+                features.append(zero.clone())
+                continue
+            split_identity = module.model.create_split_identity_embedding(
+                masks,
+                device=device,
+            ).to(device=device, dtype=dtype)
+            if split_identity.numel() == 0:
+                features.append(zero.clone())
+                continue
+            start_sum = split_identity.sum(dim=0)
+            start_mean = split_identity.mean(dim=0)
+            start_max = split_identity.max(dim=0).values
+            features.append(torch.cat([start_sum, start_mean, start_max], dim=0))
+        except Exception:
+            features.append(zero.clone())
+    return torch.stack(features, dim=0)
+
+
+def _build_start_topology_identity_batch(module, start_trees, *, device=None, dtype=None):
+    if not start_trees:
+        return None, None
+    if device is None:
+        device = module.device
+    if dtype is None:
+        dtype = next(module.model.parameters()).dtype
+    embed_dim = int(module.model.embed_dim)
+    identity_rows = []
+    max_len = 0
+    for start_tree in start_trees:
+        identity = None
+        if start_tree is not None:
+            try:
+                tokenized = module.model.tokenizer([str(start_tree)])
+                raw_masks = tokenized[-1][0]
+                masks = [int(mask) for mask in raw_masks if int(mask) != 0]
+                if masks:
+                    identity = module.model.create_split_identity_embedding(
+                        masks,
+                        device=device,
+                    ).to(device=device, dtype=dtype)
+            except Exception:
+                identity = None
+        if identity is None or identity.numel() == 0:
+            identity = torch.zeros(0, embed_dim, device=device, dtype=dtype)
+        identity_rows.append(identity)
+        max_len = max(max_len, int(identity.shape[0]))
+    max_len = max(max_len, 1)
+    padded = torch.zeros(
+        len(identity_rows),
+        max_len,
+        embed_dim,
+        device=device,
+        dtype=dtype,
+    )
+    pad_mask = torch.ones(
+        len(identity_rows),
+        max_len,
+        device=device,
+        dtype=torch.bool,
+    )
+    for row_idx, identity in enumerate(identity_rows):
+        n = int(identity.shape[0])
+        if n <= 0:
+            continue
+        padded[row_idx, :n] = identity
+        pad_mask[row_idx, :n] = False
+    return padded, pad_mask
+
+
 def _pooled_probe_terminal_stats(x, *, device, dtype):
     if x is None or x.numel() == 0:
         return torch.zeros(4, device=device, dtype=dtype)
@@ -1949,6 +2137,113 @@ def _build_probe_terminal_feature(
         ],
         dim=0,
     )
+
+
+def _build_topology_terminal_feature(
+    module,
+    aligned_model_masks,
+    *,
+    supervised_mask=None,
+    device,
+    dtype,
+):
+    if aligned_model_masks is None:
+        return torch.zeros(int(module.model.embed_dim), device=device, dtype=dtype)
+
+    masks = [int(mask) for mask in aligned_model_masks]
+    if supervised_mask is not None:
+        keep = (
+            supervised_mask.reshape(-1)
+            .detach()
+            .to(device="cpu", dtype=torch.bool)
+            .tolist()
+        )
+        masks = [mask for mask, include in zip(masks, keep) if include]
+
+    if not masks:
+        return torch.zeros(int(module.model.embed_dim), device=device, dtype=dtype)
+
+    split_identity = module.model.create_split_identity_embedding(masks, device=device)
+    if split_identity.numel() == 0:
+        return torch.zeros(int(module.model.embed_dim), device=device, dtype=dtype)
+    split_identity = split_identity.to(device=device, dtype=dtype)
+    topology_pool = str(
+        getattr(module, "velocity_terminal_head_topology_pool", "mean")
+    ).lower()
+    if topology_pool == "sum":
+        return split_identity.sum(dim=0)
+    return split_identity.mean(dim=0)
+
+
+def _build_edge_terminal_feature(
+    edge_features,
+    *,
+    supervised_mask=None,
+    device,
+    dtype,
+):
+    if edge_features is None or edge_features.numel() == 0:
+        return None
+
+    edge_features_flat = edge_features.reshape(-1, edge_features.shape[-1]).to(
+        device=device, dtype=dtype
+    )
+    if supervised_mask is not None:
+        keep = supervised_mask.reshape(-1).to(device=device, dtype=torch.bool)
+        if keep.numel() == edge_features_flat.shape[0]:
+            filtered = edge_features_flat[keep]
+            if filtered.numel() > 0:
+                edge_features_flat = filtered
+
+    if edge_features_flat.numel() == 0:
+        return None
+    return edge_features_flat.mean(dim=0)
+
+
+def _build_edge_topology_terminal_feature(
+    module,
+    edge_features,
+    aligned_model_masks,
+    *,
+    supervised_mask=None,
+    device,
+    dtype,
+):
+    if edge_features is None or edge_features.numel() == 0 or aligned_model_masks is None:
+        return None
+
+    edge_features_flat = edge_features.reshape(-1, edge_features.shape[-1]).to(
+        device=device, dtype=dtype
+    )
+    masks = [int(mask) for mask in aligned_model_masks]
+    if supervised_mask is not None:
+        keep = supervised_mask.reshape(-1).to(device=device, dtype=torch.bool)
+        if keep.numel() == edge_features_flat.shape[0]:
+            filtered = edge_features_flat[keep]
+            if filtered.numel() > 0:
+                edge_features_flat = filtered
+            masks = [mask for mask, include in zip(masks, keep.tolist()) if include]
+
+    if edge_features_flat.numel() == 0 or not masks:
+        return None
+
+    split_identity = module.model.create_split_identity_embedding(masks, device=device)
+    if split_identity.numel() == 0:
+        return None
+    split_identity = split_identity.to(device=device, dtype=dtype)
+
+    if split_identity.shape[0] != edge_features_flat.shape[0]:
+        n = min(split_identity.shape[0], edge_features_flat.shape[0])
+        if n <= 0:
+            return None
+        split_identity = split_identity[:n]
+        edge_features_flat = edge_features_flat[:n]
+
+    fused = torch.cat([edge_features_flat, split_identity], dim=-1)
+    fused = module.velocity_terminal_head_edge_topology_fusion(fused)
+    if fused.numel() == 0:
+        return None
+    return fused.mean(dim=0)
 
 
 def _target_splits_from_velocity_sample(sample):
@@ -1997,11 +2292,48 @@ def _target_splits_from_velocity_sample(sample):
     return sorted(m for m, t in zip(matched, taus) if abs(t - tau_min) <= 1e-3)
 
 
+def _extract_case_index_from_group_key(group_key):
+    if group_key is None:
+        return None
+    group_key = str(group_key)
+    marker_idx = group_key.rfind("case")
+    if marker_idx < 0:
+        return None
+    suffix = group_key[marker_idx + len("case") :]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _build_case_index_tensor_from_group_keys(
+    group_keys,
+    *,
+    device,
+    require_all_or_none=True,
+):
+    if group_keys is None:
+        return None
+    indices = []
+    any_case_index = False
+    for group_key in group_keys:
+        case_index = _extract_case_index_from_group_key(group_key)
+        indices.append(-1 if case_index is None else int(case_index))
+        any_case_index = any_case_index or (case_index is not None)
+    if not any_case_index:
+        return None
+    if require_all_or_none and any(int(idx) < 0 for idx in indices):
+        raise ValueError(
+            "Mixed missing/valid bank_group_key values are not supported for case indexing."
+        )
+    return torch.tensor(indices, dtype=torch.long, device=device)
+
+
 def _build_velocity_replay_batch(module, samples):
     if not samples:
         return None
 
-    filtered_samples = list(samples)
+    all_samples = list(samples)
+    filtered_samples = list(all_samples)
     if bool(getattr(module, "velocity_probe_direct_set_anchor_only", False)):
         anchor_samples = [sample for sample in filtered_samples if sample.get("anchor_family")]
         if anchor_samples:
@@ -2009,52 +2341,94 @@ def _build_velocity_replay_batch(module, samples):
     samples = filtered_samples
 
     newicks = [sample["newick_tree"] for sample in samples]
+    structural_trees = _structuralize_trees_with_cache(module, newicks)
     with torch.no_grad():
         tokenized = _move_tokenized_batch_to_device(
-            module.model.tokenizer(newicks),
+            module.model.tokenizer(structural_trees),
             module.device,
         )
-    family_canonical_targets = {}
+    canonical_targets_by_topology = {}
+    canonical_targets_by_state = {}
     if bool(getattr(module, "velocity_probe_direct_set_loss", False)):
         try:
-            family_samples = {}
-            for sample in samples:
-                family = sample.get("anchor_family")
-                if family:
-                    family_samples.setdefault(str(family), sample)
-            start_sample = family_samples.get("O0")
-            target_tree = samples[0].get("target_tree")
+            start_sample = None
+            for candidate in all_samples:
+                if int(candidate.get("path_index", -1)) == 0 and not candidate.get("anchor_family"):
+                    start_sample = candidate
+                    break
+            if start_sample is None:
+                for candidate in all_samples:
+                    if not candidate.get("anchor_family"):
+                        start_sample = candidate
+                        break
+            if start_sample is None and all_samples:
+                start_sample = all_samples[0]
+            target_tree = None if start_sample is None else start_sample.get("target_tree")
             if start_sample is not None and target_tree is not None:
                 canonical_map, _ = _build_pair_oracle_orthant_velocity_label_map(
                     str(start_sample["newick_tree"]),
                     str(target_tree),
                 )
-                for family, sample in family_samples.items():
-                    topo_key = tuple(_topology_key(str(sample["newick_tree"])))
+                for sample in samples:
+                    topo_key, _ = _velocity_replay_state_key(
+                        sample.get("newick_tree"),
+                        sample.get("velocity_next_boundary_tree"),
+                    )
+                    if topo_key is None:
+                        continue
                     canonical = canonical_map.get(topo_key)
-                    if canonical is not None:
-                        canonical_sample = {
-                            **dict(canonical),
-                            "num_leaves": int(sample["num_leaves"]),
-                        }
-                        family_canonical_targets[family] = _target_splits_from_velocity_sample(
-                            canonical_sample
-                        )
+                    if canonical is None:
+                        continue
+                    canonical_sample = {
+                        **dict(canonical),
+                        "num_leaves": int(sample["num_leaves"]),
+                    }
+                    target_splits = _target_splits_from_velocity_sample(canonical_sample)
+                    canonical_targets_by_topology[topo_key] = target_splits
+                    canonical_state_key = _velocity_replay_state_key(
+                        canonical_sample.get("newick_tree"),
+                        canonical_sample.get("velocity_next_boundary_tree"),
+                    )
+                    canonical_targets_by_state[canonical_state_key] = target_splits
         except Exception:
-            family_canonical_targets = {}
+            canonical_targets_by_topology = {}
+            canonical_targets_by_state = {}
     probe_direct_set_targets = []
     probe_direct_set_mask = []
+    include_base_samples = bool(
+        getattr(module, "velocity_probe_direct_set_include_base_samples", False)
+    )
     for sample in samples:
         use_direct = bool(
             getattr(module, "velocity_probe_direct_set_loss", False)
-            and sample.get("anchor_family")
+            and (sample.get("anchor_family") or include_base_samples)
         )
         probe_direct_set_mask.append(bool(use_direct))
-        family = None if sample.get("anchor_family") is None else str(sample.get("anchor_family"))
+        if not use_direct:
+            probe_direct_set_targets.append([])
+            continue
+        topo_key, next_boundary_key = _velocity_replay_state_key(
+            sample.get("newick_tree"),
+            sample.get("velocity_next_boundary_tree"),
+        )
+        canonical_target = None
+        if topo_key is not None:
+            if sample.get("velocity_next_boundary_tree"):
+                canonical_target = canonical_targets_by_state.get(
+                    (topo_key, next_boundary_key)
+                )
+            else:
+                canonical_target = canonical_targets_by_topology.get(topo_key)
         probe_direct_set_targets.append(
-            family_canonical_targets.get(family, _target_splits_from_velocity_sample(sample))
-            if use_direct
-            else []
+            canonical_target
+            if canonical_target is not None
+            else _target_splits_from_velocity_sample(sample)
+        )
+    first_hit_case_index_tensor = None
+    if getattr(module.model, "first_hit_head_mode", "base") == "case_adapted_mlp":
+        first_hit_case_index_tensor = _build_case_index_tensor_from_group_keys(
+            [sample.get("bank_group_key") for sample in samples],
+            device=module.device,
         )
     return {
         "_is_replay_batch": True,
@@ -2069,6 +2443,9 @@ def _build_velocity_replay_batch(module, samples):
         ),
         "phyla_embeddings": None,
         "original_trees": newicks,
+        "start_trees": [
+            sample.get("start_tree", sample.get("newick_tree")) for sample in samples
+        ],
         "target_trees": [sample["target_tree"] for sample in samples],
         "batched_velocity": [sample["velocity"] for sample in samples],
         "velocity_next_boundary_trees": [
@@ -2077,6 +2454,7 @@ def _build_velocity_replay_batch(module, samples):
         "num_leaves": [int(sample["num_leaves"]) for sample in samples],
         "_probe_direct_set_targets": probe_direct_set_targets,
         "_probe_direct_set_sample_mask": probe_direct_set_mask,
+        "_first_hit_case_indices": first_hit_case_index_tensor,
     }
 
 
@@ -2085,10 +2463,17 @@ def _build_terminal_replay_batch(module, samples):
         return None
 
     newicks = [sample["newick_tree"] for sample in samples]
+    structural_trees = _structuralize_trees_with_cache(module, newicks)
     with torch.no_grad():
         tokenized = _move_tokenized_batch_to_device(
-            module.model.tokenizer(newicks),
+            module.model.tokenizer(structural_trees),
             module.device,
+        )
+    first_hit_case_index_tensor = None
+    if getattr(module.model, "first_hit_head_mode", "base") == "case_adapted_mlp":
+        first_hit_case_index_tensor = _build_case_index_tensor_from_group_keys(
+            [sample.get("bank_group_key") for sample in samples],
+            device=module.device,
         )
     return {
         "_is_replay_batch": True,
@@ -2109,7 +2494,11 @@ def _build_terminal_replay_batch(module, samples):
         ),
         "phyla_embeddings": None,
         "original_trees": newicks,
+        "start_trees": [
+            sample.get("start_tree", sample.get("newick_tree")) for sample in samples
+        ],
         "target_trees": [sample.get("target_tree") for sample in samples],
+        "_first_hit_case_indices": first_hit_case_index_tensor,
     }
 
 
@@ -2118,10 +2507,17 @@ def _build_autoregressive_replay_batch(module, samples):
         return None
 
     newicks = [sample["newick"] for sample in samples]
+    structural_trees = _structuralize_trees_with_cache(module, newicks)
     with torch.no_grad():
         tokenized = _move_tokenized_batch_to_device(
-            module.model.tokenizer(newicks),
+            module.model.tokenizer(structural_trees),
             module.device,
+        )
+    autoregressive_case_index_tensor = None
+    if getattr(module.model, "autoregressive_use_case_conditioning", False):
+        autoregressive_case_index_tensor = _build_case_index_tensor_from_group_keys(
+            [sample.get("bank_group_key") for sample in samples],
+            device=module.device,
         )
     return {
         "_is_replay_batch": True,
@@ -2144,6 +2540,7 @@ def _build_autoregressive_replay_batch(module, samples):
             device=module.device,
         ),
         "phyla_embeddings": None,
+        "_autoregressive_case_indices": autoregressive_case_index_tensor,
     }
 def _make_replay_anchor_state(newick_tree, timepoint, target_tree, num_leaves):
     return {
@@ -2365,6 +2762,21 @@ def _velocity_replay_label_signature(sample):
         except Exception:
             next_boundary_key = str(sample.get("velocity_next_boundary_tree"))
     return velocity_items, next_boundary_key
+
+
+def _velocity_replay_state_key(newick_tree, next_boundary_tree):
+    topology_key = None
+    next_boundary_key = None
+    try:
+        topology_key = tuple(_topology_key(str(newick_tree)))
+    except Exception:
+        topology_key = None
+    if next_boundary_tree:
+        try:
+            next_boundary_key = tuple(_topology_key(str(next_boundary_tree)))
+        except Exception:
+            next_boundary_key = str(next_boundary_tree)
+    return topology_key, next_boundary_key
 
 
 def _build_pair_oracle_orthant_velocity_label_map(start_tree, target_tree):
@@ -2684,6 +3096,139 @@ def _build_full_continuation_replay_samples(
             )
 
     return velocity_samples, autoregressive_samples
+
+
+def _trees_match_topology(tree_a, tree_b):
+    if not tree_a or not tree_b:
+        return False
+    try:
+        return _topology_key(str(tree_a)) == _topology_key(str(tree_b))
+    except Exception:
+        return str(tree_a) == str(tree_b)
+
+
+def _find_first_wrong_velocity_suffix_replay(
+    *,
+    pair,
+    trace,
+):
+    if pair is None or trace is None:
+        return None
+    start_tree = pair.get("start_tree")
+    target_tree = pair.get("target_tree")
+    if not start_tree or not target_tree:
+        return None
+    try:
+        boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
+    except Exception:
+        return None
+    if not boundary_paths:
+        return None
+
+    oracle_phase_start_trees = [str(start_tree)]
+    oracle_phase_start_times = [0.0]
+    for path_item in boundary_paths[:-1]:
+        oracle_phase_start_trees.append(str(path_item["end_newick"]))
+        oracle_phase_start_times.append(float(path_item["global_time"]))
+    oracle_boundary_trees = [str(path_item["start_newick"]) for path_item in boundary_paths]
+
+    sampled_velocity_by_phase = {}
+    for idx, sample in enumerate(trace.get("velocity", []) or []):
+        newick_tree = sample.get("newick_tree")
+        if not newick_tree:
+            continue
+        try:
+            phase_idx = int(sample.get("phase_idx", idx))
+        except Exception:
+            phase_idx = int(idx)
+        sampled_velocity_by_phase[phase_idx] = sample
+
+    if not sampled_velocity_by_phase:
+        return None
+
+    sampled_phase_start_trees = {0: str(start_tree)}
+    autoregressive_trace = trace.get("autoregressive", []) or []
+    for phase_idx in range(1, len(oracle_boundary_trees)):
+        previous_phase = phase_idx - 1
+        previous_phase_ar = []
+        for sample in autoregressive_trace:
+            raw_phase = sample.get("phase_idx")
+            if raw_phase is None:
+                continue
+            try:
+                if int(raw_phase) == previous_phase:
+                    previous_phase_ar.append(sample)
+            except Exception:
+                continue
+        if previous_phase_ar:
+            last_ar = previous_phase_ar[-1]
+            sampled_start_tree = last_ar.get("newick") or last_ar.get("source_newick")
+            if sampled_start_tree:
+                sampled_phase_start_trees[phase_idx] = str(sampled_start_tree)
+                continue
+        previous_velocity = sampled_velocity_by_phase.get(previous_phase)
+        if previous_velocity and previous_velocity.get("newick_tree"):
+            sampled_phase_start_trees[phase_idx] = str(previous_velocity["newick_tree"])
+
+    for phase_idx, oracle_boundary_tree in enumerate(oracle_boundary_trees):
+        sampled_velocity = sampled_velocity_by_phase.get(phase_idx)
+        oracle_start_tree = oracle_phase_start_trees[min(phase_idx, len(oracle_phase_start_trees) - 1)]
+        oracle_start_time = oracle_phase_start_times[min(phase_idx, len(oracle_phase_start_times) - 1)]
+        sampled_start_tree = sampled_phase_start_trees.get(phase_idx, oracle_start_tree)
+        if sampled_velocity is None:
+            return {
+                "first_wrong_phase_idx": int(phase_idx),
+                "sampled_start_tree": str(sampled_start_tree),
+                "oracle_start_tree": str(oracle_start_tree),
+                "oracle_start_time": float(oracle_start_time),
+                "sampled_boundary_tree": None,
+                "oracle_boundary_tree": str(oracle_boundary_tree),
+                "sampled_start_rf_to_oracle_start": float(
+                    calculate_norm_rf(str(sampled_start_tree), str(oracle_start_tree))
+                ),
+            }
+        sampled_boundary_tree = sampled_velocity.get("newick_tree")
+        if _trees_match_topology(sampled_boundary_tree, oracle_boundary_tree):
+            continue
+        payload = {
+            "first_wrong_phase_idx": int(phase_idx),
+            "sampled_start_tree": str(sampled_start_tree),
+            "oracle_start_tree": str(oracle_start_tree),
+            "oracle_start_time": float(oracle_start_time),
+            "sampled_boundary_tree": str(sampled_boundary_tree),
+            "oracle_boundary_tree": str(oracle_boundary_tree),
+            "sampled_start_rf_to_oracle_start": float(
+                calculate_norm_rf(str(sampled_start_tree), str(oracle_start_tree))
+            ),
+        }
+        if sampled_boundary_tree:
+            payload["sampled_boundary_rf_to_oracle_boundary"] = float(
+                calculate_norm_rf(str(sampled_boundary_tree), str(oracle_boundary_tree))
+            )
+        return payload
+
+    return None
+
+
+def _collect_first_wrong_velocity_suffix_replay_samples(
+    module,
+    *,
+    pair,
+    trace,
+):
+    replay_focus = _find_first_wrong_velocity_suffix_replay(
+        pair=pair,
+        trace=trace,
+    )
+    if replay_focus is None:
+        return [], [], None
+    velocity_samples, autoregressive_samples = _build_full_continuation_replay_samples(
+        replay_focus["sampled_start_tree"],
+        pair["target_tree"],
+        anchor_time=float(replay_focus["oracle_start_time"]),
+        num_leaves=pair.get("n_leaves"),
+    )
+    return velocity_samples, autoregressive_samples, replay_focus
 
 
 def _collect_legacy_oracle_replay_samples_from_trace(
@@ -3751,6 +4296,7 @@ def _predsim_overrun_rollout(
     start_tree: str,
     target_tree: str,
     phyla_embeddings,
+    case_index=None,
     *,
     T: float = 1.0,
     eps_len: float = 1e-8,
@@ -3765,6 +4311,11 @@ def _predsim_overrun_rollout(
     blocked_edge_floor: float | None = None,
 ):
     current_newick = start_tree
+    case_index_tensor = (
+        None
+        if case_index is None
+        else torch.tensor([int(case_index)], dtype=torch.long, device=module.device)
+    )
     trace = []
     t = 0.0
     n_events = 0
@@ -4094,6 +4645,7 @@ def _predsim_overrun_rollout(
                     phyla_embeddings,
                     autoregressive=True,
                     autoregressive_component_groups=component_groups,
+                    autoregressive_case_indices=case_index_tensor,
                 )
             td_ar, n_ar, m_ar = _tree_to_model_split_lengths(module, current_newick)
             planned_merges = _plan_autoregressive_boundary_merges(
@@ -4156,6 +4708,10 @@ def _discrete_phase_rollout(
     start_tree,
     target_tree,
     phyla_embeddings,
+    case_index=None,
+    start_topology_features=None,
+    start_topology_embeddings=None,
+    start_topology_pad_mask=None,
     *,
     dt_base: float = 0.02,
     eps_len: float = 1e-8,
@@ -4166,6 +4722,40 @@ def _discrete_phase_rollout(
     return_trace: bool = False,
 ):
     current_newick = str(start_tree)
+    rollout_case_indices = (
+        None
+        if case_index is None
+        else torch.tensor([int(case_index)], dtype=torch.long, device=module.device)
+    )
+    rollout_start_topology_features = start_topology_features
+    if (
+        rollout_start_topology_features is None
+        and getattr(module.model, "first_hit_head_mode", "base")
+        == "start_topology_adapter_mlp"
+    ):
+        rollout_start_topology_features = _build_start_topology_feature_tensor(
+            module,
+            [start_tree],
+            device=module.device,
+        )
+    rollout_start_topology_embeddings = start_topology_embeddings
+    rollout_start_topology_pad_mask = start_topology_pad_mask
+    if (
+        (
+            rollout_start_topology_embeddings is None
+            or rollout_start_topology_pad_mask is None
+        )
+        and getattr(module.model, "first_hit_head_mode", "base")
+        == "start_topology_cross_attn_mlp"
+    ):
+        (
+            rollout_start_topology_embeddings,
+            rollout_start_topology_pad_mask,
+        ) = _build_start_topology_identity_batch(
+            module,
+            [start_tree],
+            device=module.device,
+        )
     phase = 0
     n_events = 0
     n_steps = 0
@@ -4178,7 +4768,72 @@ def _discrete_phase_rollout(
         "skipped_no_valid_boundary_revisits": 0.0,
         "stopped_for_prefix_replay_quota": False,
         "silent_boundary_recoveries": 0.0,
+        "stopped_for_terminal_head": False,
+        "autoregressive_boundary_stop_count": 0.0,
     }
+
+    def _terminal_probability_for_state(state_newick, phase_value):
+        if not bool(getattr(module, "velocity_terminal_head_use_at_sampling", False)):
+            return None
+        if module.velocity_terminal_head is None:
+            return None
+        _td_term, n_term, _ = _tree_to_model_split_lengths(module, state_newick)
+        tokenized_term = module.model.tokenizer([state_newick])
+        with torch.inference_mode():
+            (
+                v_term,
+                edge_splits_term,
+                _edge_split_mask_term,
+                first_hit_term,
+                boundary_vanish_term,
+                edge_features_term,
+            ) = module.forward(
+                tokenized_term,
+                float(phase_value),
+                phyla_embeddings,
+                first_hit_case_indices=rollout_case_indices,
+                first_hit_start_topology_features=rollout_start_topology_features,
+                first_hit_start_topology_embeddings=rollout_start_topology_embeddings,
+                first_hit_start_topology_pad_mask=rollout_start_topology_pad_mask,
+            )
+        aligned_term = _align_model_outputs_to_tree_context(
+            module,
+            state_newick,
+            n_term,
+            edge_splits_term[0],
+            v_term[0, :, 0],
+            first_hit_logits_tree=None
+            if first_hit_term is None
+            else first_hit_term[0, :, 0],
+            boundary_vanish_logits_tree=None
+            if boundary_vanish_term is None
+            else boundary_vanish_term[0, :, 0],
+            edge_features_tree=None
+            if edge_features_term is None
+            else edge_features_term[0],
+            eps_len=eps_len,
+        )
+        aligned_term_first_hit_logits = module._compute_first_hit_logits(
+            aligned_term["first_hit_logits"],
+            lengths=aligned_term["lengths"],
+            velocities=aligned_term["velocities"],
+            edge_features=aligned_term["edge_features"],
+            group_sizes=[int(aligned_term["lengths"].numel())],
+        )
+        term_logit = module._predict_terminal_stop_logit(
+            aligned_term["lengths"],
+            aligned_term["velocities"],
+            time_value=float(phase_value),
+            first_hit_logits=aligned_term_first_hit_logits,
+            boundary_vanish_logits=aligned_term["boundary_vanish_logits"],
+            edge_features=aligned_term["edge_features"],
+            aligned_model_masks=aligned_term["aligned_model_masks"],
+            supervised_mask=aligned_term["supervised_mask"],
+            case_index=case_index,
+        )
+        if term_logit is None:
+            return None
+        return float(torch.sigmoid(term_logit).detach().cpu().item())
 
     effective_max_events = (
         1000000 if max_events is None or int(max_events) < 0 else int(max_events)
@@ -4194,6 +4849,36 @@ def _discrete_phase_rollout(
         and n_steps < effective_max_steps
     ):
         n_steps += 1
+        terminal_prob = _terminal_probability_for_state(current_newick, phase)
+        terminal_requested = (
+            terminal_prob is not None and float(terminal_prob) > 0.5
+        )
+        terminal_sampling_action = str(
+            getattr(module, "velocity_terminal_head_sampling_action", "after_phase")
+        ).lower()
+        stop_immediately_for_terminal = (
+            terminal_requested and terminal_sampling_action == "immediate"
+        )
+        stop_after_current_phase = (
+            terminal_requested and not stop_immediately_for_terminal
+        )
+        trace["terminal"].append(
+            {
+                "newick": current_newick,
+                "target_tree": target_tree,
+                "timepoint": float(phase),
+                "phase_idx": int(phase),
+                "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                "pred_terminal_prob": terminal_prob,
+                "position": "phase_start",
+                "stop_after_phase": bool(stop_after_current_phase),
+                "stop_immediately": bool(stop_immediately_for_terminal),
+                "sampling_action": terminal_sampling_action,
+            }
+        )
+        if stop_immediately_for_terminal:
+            trace["stopped_for_terminal_head"] = True
+            break
         td, n_leaves, mapping = _tree_to_model_split_lengths(module, current_newick)
         tokenized = module.model.tokenizer([current_newick])
         with torch.inference_mode():
@@ -4204,7 +4889,15 @@ def _discrete_phase_rollout(
                 first_hit_logits,
                 boundary_vanish_logits,
                 edge_features,
-            ) = module.forward(tokenized, float(phase), phyla_embeddings)
+            ) = module.forward(
+                tokenized,
+                float(phase),
+                phyla_embeddings,
+                first_hit_case_indices=rollout_case_indices,
+                first_hit_start_topology_features=rollout_start_topology_features,
+                first_hit_start_topology_embeddings=rollout_start_topology_embeddings,
+                first_hit_start_topology_pad_mask=rollout_start_topology_pad_mask,
+            )
 
         aligned = _align_model_outputs_to_tree_context(
             module,
@@ -4325,6 +5018,8 @@ def _discrete_phase_rollout(
         )
 
         phase_exhausted = False
+        ar_boundary_complete = False
+        rollout_terminal_stop = False
         while (
             has_polytomy_fast(current_newick, unrooted_ok=False)
             and n_events < effective_max_events
@@ -4344,6 +5039,7 @@ def _discrete_phase_rollout(
                     phyla_embeddings,
                     autoregressive=True,
                     autoregressive_component_groups=component_groups,
+                    autoregressive_case_indices=rollout_case_indices,
                 )
             td_ar, n_ar, m_ar = _tree_to_model_split_lengths(module, current_newick)
             planned_merges = _plan_autoregressive_boundary_merges(
@@ -4371,6 +5067,37 @@ def _discrete_phase_rollout(
 
             planned = planned_merges[0]
             _, new_split = planned["subsets"][0]
+            stop_after_merge_logit = planned.get("stop_after_merge_logit")
+            stop_after_merge_logit_value = (
+                None
+                if stop_after_merge_logit is None
+                else float(stop_after_merge_logit)
+            )
+            stop_after_merge_prob = (
+                None
+                if stop_after_merge_logit_value is None
+                else float(
+                    1.0
+                    / (
+                        1.0
+                        + math.exp(
+                            -max(min(float(stop_after_merge_logit_value), 60.0), -60.0)
+                        )
+                    )
+                )
+            )
+            stop_after_merge_requested = (
+                bool(
+                    getattr(
+                        module,
+                        "autoregressive_stop_after_merge_use_at_sampling",
+                        False,
+                    )
+                )
+                and planned.get("decoder_mode") == "structured_subset"
+                and stop_after_merge_logit_value is not None
+                and stop_after_merge_logit_value > 0.0
+            )
             source_newick = current_newick
             td_ar[int(new_split)] = float(autoregressive_birth_length)
             n_events += 1
@@ -4391,69 +5118,56 @@ def _discrete_phase_rollout(
                     "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
                     "planned_merge_count": int(len(planned_merges)),
                     "selected_result_split": int(new_split),
+                    "stop_after_merge_logit": stop_after_merge_logit_value,
+                    "stop_after_merge_prob": stop_after_merge_prob,
+                    "stop_after_merge_requested": bool(stop_after_merge_requested),
                 }
             )
-
-        terminal_prob = None
-        if module.velocity_terminal_head is not None:
-            td_term, n_term, _ = _tree_to_model_split_lengths(module, current_newick)
-            tokenized_term = module.model.tokenizer([current_newick])
-            with torch.inference_mode():
-                (
-                    v_term,
-                    edge_splits_term,
-                    _edge_split_mask_term,
-                    first_hit_term,
-                    boundary_vanish_term,
-                    edge_features_term,
-                ) = module.forward(tokenized_term, float(phase), phyla_embeddings)
-            aligned_term = _align_model_outputs_to_tree_context(
-                module,
+            post_ar_terminal_prob = _terminal_probability_for_state(
                 current_newick,
-                n_term,
-                edge_splits_term[0],
-                v_term[0, :, 0],
-                first_hit_logits_tree=None
-                if first_hit_term is None
-                else first_hit_term[0, :, 0],
-                boundary_vanish_logits_tree=None
-                if boundary_vanish_term is None
-                else boundary_vanish_term[0, :, 0],
-                edge_features_tree=None
-                if edge_features_term is None
-                else edge_features_term[0],
-                eps_len=eps_len,
+                phase,
             )
-            aligned_term_first_hit_logits = module._compute_first_hit_logits(
-                aligned_term["first_hit_logits"],
-                lengths=aligned_term["lengths"],
-                velocities=aligned_term["velocities"],
-                edge_features=aligned_term["edge_features"],
-                group_sizes=[int(aligned_term["lengths"].numel())],
+            post_ar_terminal_requested = (
+                post_ar_terminal_prob is not None
+                and float(post_ar_terminal_prob) > 0.5
             )
-            term_logit = module._predict_terminal_stop_logit(
-                aligned_term["lengths"],
-                aligned_term["velocities"],
-                time_value=float(phase),
-                first_hit_logits=aligned_term_first_hit_logits,
-                boundary_vanish_logits=aligned_term["boundary_vanish_logits"],
-                edge_features=aligned_term["edge_features"],
+            trace["terminal"].append(
+                {
+                    "newick": current_newick,
+                    "target_tree": target_tree,
+                    "timepoint": float(phase),
+                    "phase_idx": int(phase),
+                    "rf_to_target": float(
+                        calculate_norm_rf(current_newick, target_tree)
+                    ),
+                    "pred_terminal_prob": post_ar_terminal_prob,
+                    "position": "post_ar_merge",
+                    "selected_result_split": int(new_split),
+                    "stop_after_phase": False,
+                    "stop_immediately": bool(post_ar_terminal_requested),
+                    "sampling_action": terminal_sampling_action,
+                }
             )
-            if term_logit is not None:
-                terminal_prob = float(torch.sigmoid(term_logit).detach().cpu().item())
-        trace["terminal"].append(
-            {
-                "newick": current_newick,
-                "target_tree": target_tree,
-                "timepoint": float(phase),
-                "phase_idx": int(phase),
-                "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
-                "pred_terminal_prob": terminal_prob,
-            }
-        )
-        if terminal_prob is not None and terminal_prob > 0.5:
+            if post_ar_terminal_requested:
+                trace["stopped_for_terminal_head"] = True
+                rollout_terminal_stop = True
+                ar_boundary_complete = True
+                break
+            if stop_after_merge_requested:
+                trace["autoregressive_boundary_stop_count"] += 1.0
+                ar_boundary_complete = True
+                break
+
+        if rollout_terminal_stop:
             break
-        if phase_exhausted or not has_polytomy_fast(current_newick, unrooted_ok=False):
+        if stop_after_current_phase:
+            trace["stopped_for_terminal_head"] = True
+            break
+        if (
+            ar_boundary_complete
+            or phase_exhausted
+            or not has_polytomy_fast(current_newick, unrooted_ok=False)
+        ):
             phase += 1
             continue
         break
@@ -4564,12 +5278,21 @@ class TrainingModule(LightningModule):
         velocity_boundary_time_hidden_dim: int = 64,
         velocity_terminal_head_weight: float = 0.0,
         velocity_terminal_head_use_at_sampling: bool = False,
+        velocity_terminal_head_sampling_action: str = "after_phase",
         velocity_terminal_head_hidden_dim: int = 64,
         velocity_terminal_head_probe_features: bool = False,
+        velocity_terminal_head_input_mode: str | None = None,
+        velocity_terminal_head_use_case_adapt: bool = False,
+        velocity_terminal_head_balance_loss: bool = False,
+        velocity_terminal_head_topology_pool: str = "mean",
         velocity_probe_direct_set_loss: bool = False,
         velocity_probe_direct_set_anchor_only: bool = False,
         velocity_probe_direct_set_target_negative_weight: float = 1.0,
         velocity_probe_direct_set_nontarget_nonnegative_weight: float = 0.0,
+        velocity_probe_direct_set_positive_reweight: bool = False,
+        velocity_probe_direct_set_include_base_samples: bool = False,
+        velocity_probe_direct_set_positive_reweight_power: float = 1.0,
+        velocity_probe_direct_set_positive_reweight_max: float | None = None,
         training_step_probe_parity_joint_update: bool = False,
         skip_repeated_no_valid_boundary_use_at_sampling: bool = False,
         sampling_discrete_phase_rollout_use_at_sampling: bool = False,
@@ -4577,6 +5300,8 @@ class TrainingModule(LightningModule):
         sampling_discrete_phase_max_phases: int = 8,
         sample_metrics_trace_path: str | None = None,
         sample_metrics_num_pairs: int = 1,
+        metric_log_exact_keys=None,
+        metric_log_prefixes=None,
         rollout_replay_velocity_weight: float = 0.0,
         rollout_replay_autoregressive_weight: float = 0.0,
         rollout_replay_start_step: int = 0,
@@ -5024,6 +5749,7 @@ class TrainingModule(LightningModule):
             "legacy_prefix_oracle",
             "legacy_start_end_oracle",
             "filtered_polytomy_bank_oracle",
+            "first_wrong_velocity_suffix_oracle",
         }
         if str(rollout_replay_mode) not in valid_rollout_replay_modes:
             raise ValueError(
@@ -5232,6 +5958,7 @@ class TrainingModule(LightningModule):
         self.velocity_first_hit_attention_out = None
         self.velocity_boundary_time_head = None
         self.velocity_terminal_head = None
+        self.velocity_terminal_head_edge_topology_fusion = None
         if self.velocity_first_hit_predictor_mode == "residual_geometry":
             self.velocity_first_hit_geometry_head = nn.Sequential(
                 nn.LayerNorm(5),
@@ -5342,11 +6069,32 @@ class TrainingModule(LightningModule):
             or bool(velocity_terminal_head_use_at_sampling)
             or bool(sampling_discrete_phase_rollout_use_at_sampling)
         ):
+            terminal_input_mode = (
+                "probe"
+                if velocity_terminal_head_input_mode is None
+                and bool(velocity_terminal_head_probe_features)
+                else (
+                    "edge_summary"
+                    if velocity_terminal_head_input_mode is None
+                    else str(velocity_terminal_head_input_mode).lower()
+                )
+            )
             terminal_input_dim = (
                 18
-                if bool(velocity_terminal_head_probe_features)
+                if terminal_input_mode == "probe"
+                else int(self.model.embed_dim)
+                if terminal_input_mode in {"topology_only", "edge_only", "edge_topology"}
                 else int(self.model.embed_dim) + 5
             )
+            if bool(velocity_terminal_head_use_case_adapt):
+                terminal_input_dim += int(self.model.first_hit_head_case_dim)
+            if terminal_input_mode == "edge_topology":
+                self.velocity_terminal_head_edge_topology_fusion = nn.Sequential(
+                    nn.LayerNorm(2 * int(self.model.embed_dim)),
+                    nn.Linear(2 * int(self.model.embed_dim), int(self.model.embed_dim)),
+                    nn.GELU(),
+                    nn.Linear(int(self.model.embed_dim), int(self.model.embed_dim)),
+                )
             self.velocity_terminal_head = nn.Sequential(
                 nn.LayerNorm(terminal_input_dim),
                 nn.Linear(
@@ -5435,11 +6183,47 @@ class TrainingModule(LightningModule):
         self.velocity_terminal_head_use_at_sampling = bool(
             velocity_terminal_head_use_at_sampling
         )
+        self.velocity_terminal_head_balance_loss = bool(
+            velocity_terminal_head_balance_loss
+        )
+        terminal_topology_pool = str(velocity_terminal_head_topology_pool).lower()
+        if terminal_topology_pool not in {"mean", "sum"}:
+            raise ValueError(
+                "velocity_terminal_head_topology_pool must be "
+                f"'mean' or 'sum', got {terminal_topology_pool!r}."
+            )
+        self.velocity_terminal_head_topology_pool = terminal_topology_pool
+        terminal_sampling_action = str(velocity_terminal_head_sampling_action).lower()
+        if terminal_sampling_action not in {"after_phase", "immediate"}:
+            raise ValueError(
+                "velocity_terminal_head_sampling_action must be "
+                f"'after_phase' or 'immediate', got {terminal_sampling_action!r}."
+            )
+        self.velocity_terminal_head_sampling_action = terminal_sampling_action
         self.velocity_terminal_head_hidden_dim = int(
             velocity_terminal_head_hidden_dim
         )
         self.velocity_terminal_head_probe_features = bool(
             velocity_terminal_head_probe_features
+        )
+        self.velocity_terminal_head_use_case_adapt = bool(
+            velocity_terminal_head_use_case_adapt
+        )
+        if self.velocity_terminal_head_use_case_adapt and not hasattr(
+            self.model, "first_hit_case_embedding"
+        ):
+            raise ValueError(
+                "velocity_terminal_head_use_case_adapt requires a model with first_hit_case_embedding."
+            )
+        self.velocity_terminal_head_input_mode = (
+            "probe"
+            if velocity_terminal_head_input_mode is None
+            and self.velocity_terminal_head_probe_features
+            else (
+                "edge_summary"
+                if velocity_terminal_head_input_mode is None
+                else str(velocity_terminal_head_input_mode).lower()
+            )
         )
         self.velocity_probe_direct_set_loss = bool(
             velocity_probe_direct_set_loss
@@ -5452,6 +6236,20 @@ class TrainingModule(LightningModule):
         )
         self.velocity_probe_direct_set_nontarget_nonnegative_weight = float(
             velocity_probe_direct_set_nontarget_nonnegative_weight
+        )
+        self.velocity_probe_direct_set_positive_reweight = bool(
+            velocity_probe_direct_set_positive_reweight
+        )
+        self.velocity_probe_direct_set_include_base_samples = bool(
+            velocity_probe_direct_set_include_base_samples
+        )
+        self.velocity_probe_direct_set_positive_reweight_power = float(
+            velocity_probe_direct_set_positive_reweight_power
+        )
+        self.velocity_probe_direct_set_positive_reweight_max = (
+            None
+            if velocity_probe_direct_set_positive_reweight_max is None
+            else float(velocity_probe_direct_set_positive_reweight_max)
         )
         self.training_step_probe_parity_joint_update = bool(
             training_step_probe_parity_joint_update
@@ -5474,6 +6272,20 @@ class TrainingModule(LightningModule):
             else None
         )
         self.sample_metrics_num_pairs = max(1, int(sample_metrics_num_pairs))
+        self.metric_log_exact_keys = (
+            {
+                str(key).strip()
+                for key in metric_log_exact_keys
+                if str(key).strip()
+            }
+            if metric_log_exact_keys
+            else None
+        )
+        self.metric_log_prefixes = tuple(
+            str(prefix).strip()
+            for prefix in (metric_log_prefixes or [])
+            if str(prefix).strip()
+        )
         self.rollout_replay_velocity_weight = float(rollout_replay_velocity_weight)
         self.rollout_replay_autoregressive_weight = float(
             rollout_replay_autoregressive_weight
@@ -5648,6 +6460,7 @@ class TrainingModule(LightningModule):
                 "logs": {},
             },
         }
+        self._posterior_reference_bundle_cache = {}
 
     def on_train_start(self):
         super().on_train_start()
@@ -5681,6 +6494,38 @@ class TrainingModule(LightningModule):
         current_step = int(self.global_step)
         while int(self._next_training_sample_step) <= current_step:
             self._next_training_sample_step += frequency
+
+    def _metric_key_allowed(self, key):
+        key = str(key)
+        if self.metric_log_exact_keys is None and not self.metric_log_prefixes:
+            return True
+        if self.metric_log_exact_keys is not None and key in self.metric_log_exact_keys:
+            return True
+        return any(key.startswith(prefix) for prefix in self.metric_log_prefixes)
+
+    def _filter_metric_dict(self, metrics):
+        return {
+            key: value
+            for key, value in metrics.items()
+            if self._metric_key_allowed(key)
+        }
+
+    def _log_scalar_filtered(self, key, value, **kwargs):
+        if not self._metric_key_allowed(key):
+            return
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return
+        elif not isinstance(value, numbers.Number):
+            return
+        self.log(key, value, **kwargs)
+
+    def _wandb_log_filtered(self, metrics, step=None):
+        if not self.record:
+            return
+        filtered = self._filter_metric_dict(metrics)
+        if filtered:
+            wandb.log(filtered, step=self.stepper if step is None else step)
 
     def _append_dynamic_start_bank_trace(self, payload):
         if not self.dynamic_start_bank_trace_path:
@@ -6399,6 +7244,41 @@ class TrainingModule(LightningModule):
             return None
         return torch.cat(outputs, dim=0).reshape(-1)
 
+    def _augment_terminal_head_input_with_case_feature(
+        self,
+        terminal_input,
+        *,
+        case_index=None,
+    ):
+        if terminal_input is None or not self.velocity_terminal_head_use_case_adapt:
+            return terminal_input
+        if case_index is None:
+            raise ValueError(
+                "case_index is required when velocity_terminal_head_use_case_adapt is enabled."
+            )
+        case_index_tensor = torch.as_tensor(
+            case_index,
+            dtype=torch.long,
+            device=terminal_input.device,
+        ).reshape(-1)
+        case_features = self.model.first_hit_case_embedding(case_index_tensor).to(
+            device=terminal_input.device,
+            dtype=terminal_input.dtype,
+        )
+        if terminal_input.ndim == 1:
+            if case_features.shape[0] != 1:
+                raise ValueError(
+                    "A single terminal input requires exactly one case index."
+                )
+            return torch.cat([terminal_input, case_features[0]], dim=0)
+        if case_features.shape[0] == 1 and int(terminal_input.shape[0]) > 1:
+            case_features = case_features.expand(int(terminal_input.shape[0]), -1)
+        if case_features.shape[0] != int(terminal_input.shape[0]):
+            raise ValueError(
+                "Terminal case feature batch size must match terminal_input batch size."
+            )
+        return torch.cat([terminal_input, case_features], dim=-1)
+
     def _predict_terminal_stop_logit(
         self,
         lengths,
@@ -6408,16 +7288,69 @@ class TrainingModule(LightningModule):
         first_hit_logits=None,
         boundary_vanish_logits=None,
         edge_features=None,
+        aligned_model_masks=None,
+        supervised_mask=None,
+        case_index=None,
     ):
         if self.velocity_terminal_head is None:
             return None
 
-        if self.velocity_terminal_head_probe_features:
+        if self.velocity_terminal_head_input_mode == "probe":
             terminal_input = _build_probe_terminal_feature(
                 lengths,
                 velocities,
                 first_hit_logits,
                 boundary_vanish_logits,
+            )
+            terminal_input = self._augment_terminal_head_input_with_case_feature(
+                terminal_input,
+                case_index=case_index,
+            )
+            return self.velocity_terminal_head(terminal_input).reshape(())
+
+        if self.velocity_terminal_head_input_mode == "topology_only":
+            terminal_input = _build_topology_terminal_feature(
+                self,
+                aligned_model_masks,
+                supervised_mask=supervised_mask,
+                device=lengths.device,
+                dtype=lengths.dtype,
+            )
+            terminal_input = self._augment_terminal_head_input_with_case_feature(
+                terminal_input,
+                case_index=case_index,
+            )
+            return self.velocity_terminal_head(terminal_input).reshape(())
+
+        if self.velocity_terminal_head_input_mode == "edge_only":
+            terminal_input = _build_edge_terminal_feature(
+                edge_features,
+                supervised_mask=supervised_mask,
+                device=lengths.device,
+                dtype=lengths.dtype,
+            )
+            if terminal_input is None:
+                return None
+            terminal_input = self._augment_terminal_head_input_with_case_feature(
+                terminal_input,
+                case_index=case_index,
+            )
+            return self.velocity_terminal_head(terminal_input).reshape(())
+
+        if self.velocity_terminal_head_input_mode == "edge_topology":
+            terminal_input = _build_edge_topology_terminal_feature(
+                self,
+                edge_features,
+                aligned_model_masks,
+                supervised_mask=supervised_mask,
+                device=lengths.device,
+                dtype=lengths.dtype,
+            )
+            if terminal_input is None:
+                return None
+            terminal_input = self._augment_terminal_head_input_with_case_feature(
+                terminal_input,
+                case_index=case_index,
             )
             return self.velocity_terminal_head(terminal_input).reshape(())
 
@@ -6456,6 +7389,10 @@ class TrainingModule(LightningModule):
             dim=0,
         )
         terminal_input = torch.cat([pooled_features, summary], dim=0)
+        terminal_input = self._augment_terminal_head_input_with_case_feature(
+            terminal_input,
+            case_index=case_index,
+        )
         return self.velocity_terminal_head(terminal_input).reshape(())
 
         phyla_config_path = "configs/sample_eval_config.yaml"
@@ -6692,7 +7629,80 @@ class TrainingModule(LightningModule):
             "time": self._effective_autoregressive_time_value(current_time),
         }
 
+    def _attach_case_indices_to_batch(self, batch):
+        if batch is None:
+            return batch
+        if getattr(self.model, "first_hit_head_mode", "base") != "case_adapted_mlp":
+            return batch
+        if batch.get("_first_hit_case_indices") is not None:
+            return batch
+        group_keys = batch.get("bank_group_key")
+        if group_keys is None:
+            return batch
+        if isinstance(group_keys, str):
+            group_keys = [group_keys]
+        case_index_tensor = _build_case_index_tensor_from_group_keys(
+            group_keys,
+            device=self.device,
+        )
+        if case_index_tensor is None:
+            return batch
+        updated_batch = dict(batch)
+        updated_batch["_first_hit_case_indices"] = case_index_tensor
+        return updated_batch
+
+    def _attach_start_topology_features_to_batch(self, batch):
+        if batch is None:
+            return batch
+        mode = getattr(self.model, "first_hit_head_mode", "base")
+        if mode not in {
+            "start_topology_adapter_mlp",
+            "start_topology_cross_attn_mlp",
+        }:
+            return batch
+        if (
+            mode == "start_topology_adapter_mlp"
+            and batch.get("_first_hit_start_topology_features") is not None
+        ):
+            return batch
+        if (
+            mode == "start_topology_cross_attn_mlp"
+            and batch.get("_first_hit_start_topology_embeddings") is not None
+            and batch.get("_first_hit_start_topology_pad_mask") is not None
+        ):
+            return batch
+        start_trees = batch.get("start_trees")
+        if start_trees is None:
+            start_trees = batch.get("original_trees")
+        if start_trees is None:
+            return batch
+        if isinstance(start_trees, str):
+            start_trees = [start_trees]
+        updated_batch = dict(batch)
+        if mode == "start_topology_adapter_mlp":
+            feature_tensor = _build_start_topology_feature_tensor(
+                self,
+                list(start_trees),
+                device=self.device,
+            )
+            if feature_tensor is None:
+                return batch
+            updated_batch["_first_hit_start_topology_features"] = feature_tensor
+        else:
+            embeddings, pad_mask = _build_start_topology_identity_batch(
+                self,
+                list(start_trees),
+                device=self.device,
+            )
+            if embeddings is None or pad_mask is None:
+                return batch
+            updated_batch["_first_hit_start_topology_embeddings"] = embeddings
+            updated_batch["_first_hit_start_topology_pad_mask"] = pad_mask
+        return updated_batch
+
     def _prepare_velocity_training_batch(self, batch):
+        batch = self._attach_case_indices_to_batch(batch)
+        batch = self._attach_start_topology_features_to_batch(batch)
         if batch.get("_skip_training_augmentations", False):
             return batch, {"attempted": 0.0, "applied": 0.0}
         if (
@@ -6754,6 +7764,21 @@ class TrainingModule(LightningModule):
         return updated_batch, {"attempted": float(attempted), "applied": float(applied)}
 
     def _prepare_autoregressive_training_batch(self, batch):
+        if (
+            getattr(self.model, "autoregressive_use_case_conditioning", False)
+            and batch.get("_autoregressive_case_indices") is None
+        ):
+            group_keys = batch.get("bank_group_key")
+            if group_keys is not None:
+                if isinstance(group_keys, str):
+                    group_keys = [group_keys]
+                case_index_tensor = _build_case_index_tensor_from_group_keys(
+                    group_keys,
+                    device=self.device,
+                )
+                if case_index_tensor is not None:
+                    batch = dict(batch)
+                    batch["_autoregressive_case_indices"] = case_index_tensor
         if batch.get("_skip_training_augmentations", False):
             return batch, {
                 "rollin_attempted": 0.0,
@@ -6916,6 +7941,11 @@ class TrainingModule(LightningModule):
             "timestamp": time.time(),
         }
         for key, value in metrics.items():
+            if not (
+                self._metric_key_allowed(key)
+                or self._metric_key_allowed(f"sample_metrics/{key}")
+            ):
+                continue
             if torch.is_tensor(value):
                 payload[key] = float(value.detach().cpu().item())
             elif isinstance(value, np.generic):
@@ -6954,6 +7984,7 @@ class TrainingModule(LightningModule):
                 return {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
+                    "bank_group_key": sampled_pair.get("bank_group_key"),
                     "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                     "max_events": int(len(sampled_pair.get("final_labels", []))),
                     "name_mapping": (
@@ -6970,6 +8001,7 @@ class TrainingModule(LightningModule):
                 return {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
+                    "bank_group_key": bank_group_key_value,
                     "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                     "max_events": int(sampled.get("fixed_pair_num_events", 1024)),
                     "name_mapping": (
@@ -7065,7 +8097,16 @@ class TrainingModule(LightningModule):
         dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
         if dataset_split is None or not getattr(dataset_split, "overfit_fixed_pair", False):
             return None
-        return dataset_split.get_overfit_fixed_pair(0)
+        pair = dataset_split.get_overfit_fixed_pair(0)
+        if pair is None:
+            return None
+        if pair.get("name_mapping") is None and hasattr(dataset_split, "return_nexus_number_to_name"):
+            try:
+                pair = dict(pair)
+                pair["name_mapping"] = dataset_split.return_nexus_number_to_name(0)
+            except Exception:
+                pass
+        return pair
 
     def _evaluate_fixed_pair_velocity_rows(self, fixed_pair):
         boundary_paths = fixed_pair["boundary_paths"]
@@ -7075,6 +8116,26 @@ class TrainingModule(LightningModule):
         timepoints = [0.0]
         timepoints.extend(float(path["global_time"]) for path in boundary_paths[:-1])
         next_boundary_trees = [path["start_newick"] for path in boundary_paths]
+        pair = {
+            "start_tree": fixed_pair["random_tree"],
+            "target_tree": effective_target_tree,
+            "bank_group_key": fixed_pair.get("bank_group_key"),
+            "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
+            "name_mapping": fixed_pair.get("name_mapping"),
+            "max_events": len(fixed_pair.get("final_labels", []) or []),
+        }
+        sample_kwargs = self._build_harness_sample_kwargs(pair, train=True)
+        phyla_embeddings = sample_kwargs.get("phyla_embeddings")
+        case_indices = sample_kwargs.get("case_indices")
+        start_topology_features = sample_kwargs.get(
+            "first_hit_start_topology_features"
+        )
+        start_topology_embeddings = sample_kwargs.get(
+            "first_hit_start_topology_embeddings"
+        )
+        start_topology_pad_mask = sample_kwargs.get(
+            "first_hit_start_topology_pad_mask"
+        )
 
         rows = []
         for idx, (source_tree, next_boundary_tree, model_time) in enumerate(
@@ -7097,7 +8158,15 @@ class TrainingModule(LightningModule):
                     first_hit_logits,
                     boundary_vanish_logits,
                     edge_features,
-                ) = self.forward(tokenized, float(model_time), None)
+                ) = self.forward(
+                    tokenized,
+                    float(model_time),
+                    phyla_embeddings,
+                    first_hit_case_indices=case_indices,
+                    first_hit_start_topology_features=start_topology_features,
+                    first_hit_start_topology_embeddings=start_topology_embeddings,
+                    first_hit_start_topology_pad_mask=start_topology_pad_mask,
+                )
 
             model_masks = [int(mask) for mask in edge_splits[0]]
             mask_to_idx = {mask: i for i, mask in enumerate(model_masks)}
@@ -7144,24 +8213,50 @@ class TrainingModule(LightningModule):
                 if int(mask) in active_current and int(mask) not in active_next:
                     vanish_target[idx_mask] = 1.0
 
+            candidate_mask = _sampling_supervised_candidate_mask(
+                model_masks,
+                lengths.cpu().numpy(),
+                pair["n_leaves"],
+            )
+
             first_hit_stats = {
                 "precision": 0.0,
                 "recall": 0.0,
             }
             if first_hit_logits is not None:
-                refined_first_hit_logits = self._compute_first_hit_logits(
-                    first_hit_logits[0].squeeze(1).detach(),
-                    lengths=lengths.to(self.device),
-                    velocities=pred_velocity[0].squeeze(1).detach(),
-                    edge_features=(
-                        edge_features[0].detach() if edge_features is not None else None
-                    ),
+                pred_first_mask, _raw_first_count, _used_first_fallback = (
+                    _predict_first_hit_mask_with_fallback(
+                        first_hit_logits[0].squeeze(1).detach().cpu().numpy(),
+                        candidate_mask,
+                        max_edges=getattr(
+                            self, "velocity_first_hit_sampling_max_edges", -1
+                        ),
+                        fallback_threshold=getattr(
+                            self,
+                            "velocity_first_hit_sampling_fallback_threshold",
+                            -1,
+                        ),
+                        fallback_top_k=getattr(
+                            self,
+                            "velocity_first_hit_sampling_fallback_top_k",
+                            -1,
+                        ),
+                    )
                 )
-                _, first_hit_stats = _first_hit_set_bce_loss(
-                    lengths=lengths,
-                    y_true=target_vals,
-                    first_hit_logits=refined_first_hit_logits.cpu(),
+                true_first_mask = _oracle_first_hit_mask_for_sampling(
+                    input_newick,
+                    effective_target_tree,
+                    masks=model_masks,
+                    lengths=lengths.cpu().numpy(),
+                    n_leaves=pair["n_leaves"],
+                    supervised_mask=candidate_mask,
                     velocity_sign_eps=float(self.velocity_sign_eps),
+                    dt_eps=float(self.velocity_dt_eps),
+                    first_hit_tol=1e-4,
+                )
+                first_hit_stats = _mask_precision_recall(
+                    pred_first_mask,
+                    true_first_mask,
                 )
 
             vanish_stats = {
@@ -7169,9 +8264,20 @@ class TrainingModule(LightningModule):
                 "recall": 0.0,
             }
             if boundary_vanish_logits is not None:
-                _, vanish_stats = _edge_set_bce_loss(
-                    boundary_vanish_logits[0].squeeze(1).detach().cpu(),
-                    vanish_target,
+                pred_vanish_mask = _predict_boundary_vanish_mask_from_logits(
+                    boundary_vanish_logits[0].squeeze(1).detach().cpu().numpy(),
+                    candidate_mask,
+                )
+                true_vanish_mask = _oracle_boundary_vanish_mask_for_sampling(
+                    input_newick,
+                    effective_target_tree,
+                    masks=model_masks,
+                    n_leaves=pair["n_leaves"],
+                    candidate_mask=candidate_mask,
+                )
+                vanish_stats = _mask_precision_recall(
+                    pred_vanish_mask,
+                    true_vanish_mask,
                 )
 
             rows.append(
@@ -7200,6 +8306,17 @@ class TrainingModule(LightningModule):
         rows = []
         final_labels = fixed_pair["final_labels"]
         max_events = len(final_labels)
+        pair = {
+            "start_tree": fixed_pair["random_tree"],
+            "target_tree": fixed_pair["effective_target_tree"],
+            "bank_group_key": fixed_pair.get("bank_group_key"),
+            "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
+            "name_mapping": fixed_pair.get("name_mapping"),
+            "max_events": len(final_labels),
+        }
+        sample_kwargs = self._build_harness_sample_kwargs(pair, train=True)
+        phyla_embeddings = sample_kwargs.get("phyla_embeddings")
+        case_indices = sample_kwargs.get("case_indices")
         for event_idx, event in enumerate(final_labels):
             current_newick = event["newick"]
             component_groups = [get_structural_polytomy_groups_from_newick(current_newick)]
@@ -7215,9 +8332,10 @@ class TrainingModule(LightningModule):
                         event_index=event_idx,
                         max_events=max_events,
                     ),
-                    None,
+                    phyla_embeddings,
                     autoregressive=True,
                     autoregressive_component_groups=component_groups,
+                    autoregressive_case_indices=case_indices,
                 )
             existing_splits = {
                 int(mask)
@@ -7247,7 +8365,61 @@ class TrainingModule(LightningModule):
 
         velocity_rows = self._evaluate_fixed_pair_velocity_rows(fixed_pair)
         autoregressive_rows = self._evaluate_fixed_pair_autoregressive_rows(fixed_pair)
-        return _summarize_fixed_pair_eval_rows(velocity_rows, autoregressive_rows)
+        metrics = _summarize_fixed_pair_eval_rows(velocity_rows, autoregressive_rows)
+
+        pair = {
+            "start_tree": fixed_pair["random_tree"],
+            "target_tree": fixed_pair["effective_target_tree"],
+            "bank_group_key": fixed_pair.get("bank_group_key"),
+            "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
+            "name_mapping": fixed_pair.get("name_mapping"),
+            "max_events": len(fixed_pair.get("final_labels", []) or []),
+        }
+        sample_kwargs = self._build_harness_sample_kwargs(pair, train=train)
+        sample_kwargs.pop("return_trace", None)
+        with torch.no_grad():
+            sampled_trees, _, _, _, _, trace = self.sample(
+                [pair["start_tree"]],
+                return_trace=True,
+                **sample_kwargs,
+            )
+        sampled_tree = sampled_trees[0]
+        sampled_velocity = len(trace.get("velocity", []))
+        sampled_ar = len(trace.get("autoregressive", []))
+        expected_velocity = len(fixed_pair.get("boundary_paths", []) or [])
+        expected_ar = len(fixed_pair.get("final_labels", []) or [])
+        metrics.update(
+            {
+                "fixed_path_sample_rf_norm": float(
+                    calculate_norm_rf(sampled_tree, pair["target_tree"])
+                ),
+                "fixed_path_sampled_num_velocity_states": float(sampled_velocity),
+                "fixed_path_sampled_num_autoregressive_events": float(sampled_ar),
+                "fixed_path_expected_num_velocity_states": float(expected_velocity),
+                "fixed_path_expected_num_autoregressive_events": float(expected_ar),
+                "fixed_path_extra_velocity_states": float(
+                    max(0, sampled_velocity - expected_velocity)
+                ),
+                "fixed_path_extra_autoregressive_events": float(
+                    max(0, sampled_ar - expected_ar)
+                ),
+                "fixed_path_missing_velocity_states": float(
+                    max(0, expected_velocity - sampled_velocity)
+                ),
+                "fixed_path_missing_autoregressive_events": float(
+                    max(0, expected_ar - sampled_ar)
+                ),
+                "fixed_path_stopped_for_no_valid_merge": float(
+                    1.0 if trace.get("stopped_for_no_valid_merge", False) else 0.0
+                ),
+                "fixed_path_stopped_for_repeated_topology": float(
+                    1.0
+                    if trace.get("stopped_for_repeated_topology", False)
+                    else 0.0
+                ),
+            }
+        )
+        return metrics
 
     def _build_harness_sample_kwargs(
         self,
@@ -7257,8 +8429,8 @@ class TrainingModule(LightningModule):
         **overrides,
     ):
         if self.use_historical_sampling_impl:
-            historical_module = _load_historical_training_module_for_step()
-            return historical_module.TrainingModule._build_harness_sample_kwargs(
+            return _call_historical_trainingmodule_method(
+                "_build_harness_sample_kwargs",
                 self,
                 pair,
                 train=train,
@@ -7319,8 +8491,290 @@ class TrainingModule(LightningModule):
             "target_trees": [pair["target_tree"]],
             "split_multi_label_events": split_multi_label_events,
         }
+        if (
+            getattr(self.model, "first_hit_head_mode", "base") == "case_adapted_mlp"
+            or getattr(self.model, "autoregressive_use_case_conditioning", False)
+        ):
+            case_index = _extract_case_index_from_group_key(pair.get("bank_group_key"))
+            if case_index is not None:
+                sample_kwargs["case_indices"] = [int(case_index)]
+        if (
+            getattr(self.model, "first_hit_head_mode", "base")
+            == "start_topology_adapter_mlp"
+        ):
+            sample_kwargs["first_hit_start_topology_features"] = (
+                _build_start_topology_feature_tensor(
+                    self,
+                    [pair["start_tree"]],
+                    device=self.device,
+                )
+            )
+        if (
+            getattr(self.model, "first_hit_head_mode", "base")
+            == "start_topology_cross_attn_mlp"
+        ):
+            embeddings, pad_mask = _build_start_topology_identity_batch(
+                self,
+                [pair["start_tree"]],
+                device=self.device,
+            )
+            sample_kwargs["first_hit_start_topology_embeddings"] = embeddings
+            sample_kwargs["first_hit_start_topology_pad_mask"] = pad_mask
         sample_kwargs.update(overrides)
         return sample_kwargs
+
+    def _build_harness_lexicographic_ordering_map(self, reference_tree_newick):
+        tree = EteTree(reference_tree_newick, format=1)
+        leaves = list(tree.get_leaves())
+        leaves.sort(key=lambda leaf: str(leaf.name))
+        return {str(leaf.name): str(i) for i, leaf in enumerate(leaves)}
+
+    def _build_numeric_to_harness_lexicographic_ordering_map(
+        self,
+        reference_tree_newick,
+    ):
+        tree = EteTree(reference_tree_newick, format=1)
+        original_names = [str(leaf.name) for leaf in tree.get_leaves()]
+        numeric_sorted = sorted(original_names, key=lambda name: int(str(name)))
+        lex_sorted = sorted(original_names, key=lambda name: str(name))
+        original_to_numeric = {str(name): str(i) for i, name in enumerate(numeric_sorted)}
+        original_to_lex = {str(name): str(i) for i, name in enumerate(lex_sorted)}
+        return {
+            original_to_numeric[str(name)]: original_to_lex[str(name)]
+            for name in original_names
+        }
+
+    def _remap_tree_with_ordering_map(self, tree_newick, ordering_map):
+        tree = EteTree(tree_newick, format=1)
+        for leaf in tree.get_leaves():
+            original_name = str(leaf.name)
+            mapped_name = ordering_map.get(original_name)
+            if mapped_name is None:
+                raise KeyError(
+                    f"Leaf {original_name!r} is missing from the harness ordering map."
+                )
+            leaf.name = str(mapped_name)
+        return tree.write(format=1)
+
+    def _infer_golden_posterior_root(self, short_root):
+        if not short_root:
+            return None
+        short_root = str(short_root)
+        if "short_run_data_DS1-8" in short_root:
+            return short_root.replace("short_run_data_DS1-8", "golden_run_data_DS1-8")
+        base_name = os.path.basename(short_root.rstrip("/"))
+        if base_name.startswith("short_run_data_"):
+            return os.path.join(
+                os.path.dirname(short_root.rstrip("/")),
+                base_name.replace("short_run_data_", "golden_run_data_", 1),
+            )
+        return None
+
+    def _canonical_tree_topology_counts(self, trees):
+        counts = Counter()
+        for tree in trees:
+            try:
+                counts[canonicalize_topology_newick(str(tree))] += 1
+            except Exception:
+                continue
+        return counts
+
+    def _support_rate(self, sampled_trees, support_counts):
+        if not sampled_trees:
+            return float("nan")
+        if not support_counts:
+            return 0.0
+        support_keys = set(support_counts.keys())
+        hits = 0
+        total = 0
+        for tree in sampled_trees:
+            try:
+                key = canonicalize_topology_newick(str(tree))
+            except Exception:
+                continue
+            total += 1
+            if key in support_keys:
+                hits += 1
+        if total <= 0:
+            return float("nan")
+        return float(hits) / float(total)
+
+    def _sampled_topology_distribution_metrics(self, sampled_trees, reference_support_size=None):
+        counts = self._canonical_tree_topology_counts(sampled_trees)
+        total = float(sum(counts.values()))
+        if total <= 0:
+            return {
+                "sampled_topology_unique_count": 0.0,
+                "sampled_topology_mode_mass": float("nan"),
+                "sampled_topology_entropy": float("nan"),
+                "sampled_topology_entropy_normalized": float("nan"),
+            }
+        probs = [float(count) / total for count in counts.values()]
+        entropy = -sum(p * math.log(p) for p in probs if p > 0.0)
+        norm_base = int(reference_support_size or 0)
+        if norm_base <= 1:
+            entropy_normalized = 0.0
+        else:
+            entropy_normalized = float(entropy) / float(math.log(norm_base))
+        return {
+            "sampled_topology_unique_count": float(len(counts)),
+            "sampled_topology_mode_mass": float(max(probs)),
+            "sampled_topology_entropy": float(entropy),
+            "sampled_topology_entropy_normalized": float(entropy_normalized),
+        }
+
+    def _prefix_metric_block(self, metrics, prefix):
+        return {f"{prefix}_{key}": value for key, value in metrics.items()}
+
+    def _load_posterior_reference_bundle(self, train=True):
+        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        posterior_root = getattr(dataset_split, "posterior_trprobs_root", None)
+        posterior_ids = list(getattr(dataset_split, "posterior_dataset_ids", []) or [])
+        if not posterior_root or len(posterior_ids) != 1:
+            return None
+        dataset_id = str(posterior_ids[0])
+        trprobs_sample_count = int(
+            getattr(dataset_split, "trprobs_sample_count_per_file", 1000)
+        )
+        golden_root = self._infer_golden_posterior_root(posterior_root)
+        cache_key = (
+            str(posterior_root),
+            str(golden_root),
+            dataset_id,
+            int(trprobs_sample_count),
+        )
+        cache = getattr(self, "_posterior_reference_bundle_cache", None)
+        if cache is None:
+            cache = {}
+            self._posterior_reference_bundle_cache = cache
+        if cache_key in cache:
+            return cache[cache_key]
+
+        short_dataset = TreeDataset(
+            nexus_root="unused",
+            mrbayes_root="unused",
+            posterior_trprobs_root=str(posterior_root),
+            posterior_dataset_id=str(dataset_id),
+            trprobs_sample_count_per_file=int(trprobs_sample_count),
+        )
+        short_raw = list(short_dataset.return_posterior_trees(str(dataset_id)))
+        golden_raw = []
+        if golden_root and os.path.isdir(str(golden_root)):
+            golden_dataset = TreeDataset(
+                nexus_root="unused",
+                mrbayes_root="unused",
+                posterior_trprobs_root=str(golden_root),
+                posterior_dataset_id=str(dataset_id),
+                trprobs_sample_count_per_file=int(trprobs_sample_count),
+            )
+            golden_raw = list(golden_dataset.return_posterior_trees(str(dataset_id)))
+
+        reference_tree = short_raw[0] if short_raw else (golden_raw[0] if golden_raw else None)
+        if reference_tree is None:
+            cache[cache_key] = None
+            return None
+
+        posterior_raw_to_lex = self._build_harness_lexicographic_ordering_map(reference_tree)
+        numeric_to_lex = self._build_numeric_to_harness_lexicographic_ordering_map(reference_tree)
+
+        short_lex = [
+            self._remap_tree_with_ordering_map(tree, posterior_raw_to_lex)
+            for tree in short_raw
+        ]
+        golden_lex = [
+            self._remap_tree_with_ordering_map(tree, posterior_raw_to_lex)
+            for tree in golden_raw
+        ]
+        bundle = {
+            "dataset_id": str(dataset_id),
+            "short_root": str(posterior_root),
+            "golden_root": str(golden_root) if golden_root else None,
+            "short_lex": short_lex,
+            "golden_lex": golden_lex,
+            "short_counts": self._canonical_tree_topology_counts(short_lex),
+            "golden_counts": self._canonical_tree_topology_counts(golden_lex),
+            "posterior_raw_to_lex": posterior_raw_to_lex,
+            "numeric_to_lex": numeric_to_lex,
+            "num_leaves": len(EteTree(short_lex[0] if short_lex else golden_lex[0], format=1).get_leaves()),
+        }
+        cache[cache_key] = bundle
+        return bundle
+
+    def _remap_sampled_tree_to_reference_lex(self, tree_newick, bundle):
+        tree_newick = str(tree_newick)
+        leaf_names = [str(leaf.name) for leaf in EteTree(tree_newick, format=1).iter_leaves()]
+        posterior_raw_to_lex = bundle["posterior_raw_to_lex"]
+        numeric_to_lex = bundle["numeric_to_lex"]
+        if all(name in posterior_raw_to_lex for name in leaf_names):
+            return self._remap_tree_with_ordering_map(tree_newick, posterior_raw_to_lex)
+        if all(name in numeric_to_lex for name in leaf_names):
+            return self._remap_tree_with_ordering_map(tree_newick, numeric_to_lex)
+        return tree_newick
+
+    def _posterior_reference_metrics(self, sampled_trees, train=True):
+        bundle = self._load_posterior_reference_bundle(train=train)
+        if bundle is None or not sampled_trees:
+            return {}
+
+        remapped_sampled = [
+            self._remap_sampled_tree_to_reference_lex(tree, bundle)
+            for tree in sampled_trees
+        ]
+
+        metrics = {}
+        short_ref = bundle.get("short_lex") or []
+        golden_ref = bundle.get("golden_lex") or []
+        support_size = len(bundle.get("short_counts") or {}) or len(bundle.get("golden_counts") or {})
+        metrics.update(
+            self._sampled_topology_distribution_metrics(
+                remapped_sampled,
+                reference_support_size=support_size,
+            )
+        )
+        metrics["short_support_rate"] = self._support_rate(
+            remapped_sampled, bundle.get("short_counts") or {}
+        )
+        if golden_ref:
+            metrics["golden_support_rate"] = self._support_rate(
+                remapped_sampled, bundle.get("golden_counts") or {}
+            )
+
+        num_leaves = int(bundle["num_leaves"])
+        if short_ref:
+            short_block = {}
+            short_block.update(
+                kl_divergence_topological_distributions(
+                    short_ref,
+                    remapped_sampled,
+                    num_leaves=num_leaves,
+                )
+            )
+            short_block.update(
+                kl_divergence_tree_topology_distributions(
+                    short_ref,
+                    remapped_sampled,
+                )
+            )
+            short_block.update(topk_posterior_tree_recall(short_ref, remapped_sampled))
+            metrics.update(self._prefix_metric_block(short_block, "short"))
+        if golden_ref:
+            golden_block = {}
+            golden_block.update(
+                kl_divergence_topological_distributions(
+                    golden_ref,
+                    remapped_sampled,
+                    num_leaves=num_leaves,
+                )
+            )
+            golden_block.update(
+                kl_divergence_tree_topology_distributions(
+                    golden_ref,
+                    remapped_sampled,
+                )
+            )
+            golden_block.update(topk_posterior_tree_recall(golden_ref, remapped_sampled))
+            metrics.update(self._prefix_metric_block(golden_block, "golden"))
+        return metrics
 
     def _sample_compare_harness_once(self, pair, train=True):
         sampled_trees, _, _, _, _, trace = self.sample(
@@ -7333,6 +8787,9 @@ class TrainingModule(LightningModule):
             "start_rf_norm": float(
                 calculate_norm_rf(pair["start_tree"], pair["target_tree"])
             ),
+            "_sampled_tree": str(sampled_tree),
+            "_target_tree": str(pair["target_tree"]),
+            "_n_leaves": int(pair["n_leaves"]),
         }
         metrics.update(_summarize_trace_topology_repeats(trace))
         metrics["stopped_for_repeated_topology"] = float(
@@ -7346,7 +8803,7 @@ class TrainingModule(LightningModule):
         )
         return metrics
 
-    def _summarize_sample_compare_harness_rows(self, rows):
+    def _summarize_sample_compare_harness_rows(self, rows, train=True):
         if len(rows) == 1:
             row = dict(rows[0])
             metrics = {"num_pairs": 1}
@@ -7359,6 +8816,8 @@ class TrainingModule(LightningModule):
                     metrics[f"{key}_median"] = scalar
                     metrics[f"{key}_best"] = scalar
                     metrics[f"{key}_worst"] = scalar
+                    metrics[f"{key}_min"] = scalar
+                    metrics[f"{key}_max"] = scalar
                     metrics[f"{key}_p10"] = scalar
                     metrics[f"{key}_p90"] = scalar
             metrics.update(row)
@@ -7383,15 +8842,48 @@ class TrainingModule(LightningModule):
             metrics[f"{key}_median"] = float(np.median(arr))
             metrics[f"{key}_best"] = float(arr.min())
             metrics[f"{key}_worst"] = float(arr.max())
+            metrics[f"{key}_min"] = float(arr.min())
+            metrics[f"{key}_max"] = float(arr.max())
             metrics[f"{key}_p10"] = float(np.quantile(arr, 0.10))
             metrics[f"{key}_p90"] = float(np.quantile(arr, 0.90))
+
+        sampled_trees = [row.get("_sampled_tree") for row in rows]
+        target_trees = [row.get("_target_tree") for row in rows]
+        n_leaves_values = [
+            int(row.get("_n_leaves"))
+            for row in rows
+            if row.get("_n_leaves") is not None
+        ]
+        if (
+            len(sampled_trees) == len(rows)
+            and len(target_trees) == len(rows)
+            and all(sampled_trees)
+            and all(target_trees)
+        ):
+            if n_leaves_values and len(set(n_leaves_values)) == 1:
+                metrics.update(
+                    kl_divergence_topological_distributions(
+                        target_trees,
+                        sampled_trees,
+                        num_leaves=int(n_leaves_values[0]),
+                    )
+                )
+            metrics.update(
+                kl_divergence_tree_topology_distributions(
+                    target_trees,
+                    sampled_trees,
+                )
+            )
+            metrics.update(
+                self._posterior_reference_metrics(sampled_trees, train=train)
+            )
 
         aggregate_keys = sorted(
             {
                 key
                 for row in rows
                 for key in row.keys()
-                if key not in {"rf_norm", "start_rf_norm"}
+                if key not in {"rf_norm", "start_rf_norm"} and not str(key).startswith("_")
             }
         )
         for key in aggregate_keys:
@@ -7405,13 +8897,47 @@ class TrainingModule(LightningModule):
 
     def sample_compare_harness(self, train=True):
         if self.use_historical_sampling_impl:
-            historical_module = _load_historical_training_module_for_step()
-            return historical_module.TrainingModule.sample_compare_harness(
-                self, train=train
+            return _call_historical_trainingmodule_method(
+                "sample_compare_harness",
+                self,
+                train=train,
             )
         num_pairs = max(1, int(getattr(self, "sample_metrics_num_pairs", 1)))
         rows = []
         dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        if getattr(dataset_split, "overfit_fixed_pair", False) and int(num_pairs) == 1:
+            fixed_pair = self._get_fixed_pair_sampling_details(train=train)
+            if fixed_pair is not None:
+                pair = {
+                    "start_tree": fixed_pair.get("random_tree", fixed_pair.get("start_tree")),
+                    "target_tree": fixed_pair.get(
+                        "effective_target_tree", fixed_pair.get("target_tree")
+                    ),
+                    "bank_group_key": fixed_pair.get("bank_group_key"),
+                    "n_leaves": len(
+                        EteTree(
+                            fixed_pair.get("random_tree", fixed_pair.get("start_tree")),
+                            format=1,
+                        ).get_leaves()
+                    ),
+                    "max_events": int(
+                        len(fixed_pair.get("final_labels", []) or [])
+                        or fixed_pair.get("fixed_pair_num_events", 1024)
+                    ),
+                    "name_mapping": (
+                        fixed_pair.get("name_mapping")
+                        if fixed_pair.get("name_mapping") is not None
+                        else (
+                            dataset_split.return_nexus_number_to_name(0)
+                            if hasattr(dataset_split, "return_nexus_number_to_name")
+                            else None
+                        )
+                    ),
+                }
+                rows.append(self._sample_compare_harness_once(pair, train=train))
+                metrics = self._summarize_sample_compare_harness_rows(rows, train=train)
+                metrics.update(self._evaluate_fixed_pair_path_metrics(train=train))
+                return metrics
         if (
             getattr(dataset_split, "overfit_full_path_control_mode", False)
             and getattr(dataset_split, "_frozen_full_path_control_selections", None)
@@ -7421,16 +8947,45 @@ class TrainingModule(LightningModule):
                 len(getattr(dataset_split, "_frozen_full_path_control_selections", [])),
             )
             for pair_index in range(max_pairs):
-                sampled = dataset_split[pair_index]
+                fixed_pair = None
+                if hasattr(dataset_split, "get_overfit_fixed_pair"):
+                    fixed_pair = dataset_split.get_overfit_fixed_pair(pair_index)
+                sampled = None
+                if fixed_pair is None:
+                    sampled = dataset_split[pair_index]
+                    if hasattr(dataset_split, "get_overfit_fixed_pair"):
+                        fixed_pair = dataset_split.get_overfit_fixed_pair(pair_index)
+                if fixed_pair is not None:
+                    start_tree = fixed_pair.get("random_tree", fixed_pair.get("start_tree"))
+                    target_tree = fixed_pair.get(
+                        "effective_target_tree", fixed_pair.get("target_tree")
+                    )
+                    max_events_value = int(
+                        len(fixed_pair.get("final_labels", []) or [])
+                        or fixed_pair.get("fixed_pair_num_events", 1024)
+                    )
+                    name_mapping_value = fixed_pair.get("name_mapping")
+                    bank_group_key_value = fixed_pair.get("bank_group_key")
+                else:
+                    start_tree = sampled.get("start_tree")
+                    target_tree = sampled.get("target_tree")
+                    max_events_value = int(sampled.get("fixed_pair_num_events", 1024))
+                    name_mapping_value = None
+                    bank_group_key_value = sampled.get("bank_group_key")
                 pair = {
-                    "start_tree": sampled.get("start_tree"),
-                    "target_tree": sampled.get("target_tree"),
-                    "n_leaves": len(EteTree(sampled.get("start_tree"), format=1).get_leaves()),
-                    "max_events": int(sampled.get("fixed_pair_num_events", 1024)),
+                    "start_tree": start_tree,
+                    "target_tree": target_tree,
+                    "bank_group_key": bank_group_key_value,
+                    "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
+                    "max_events": max_events_value,
                     "name_mapping": (
-                        dataset_split.return_nexus_number_to_name(0)
-                        if hasattr(dataset_split, "return_nexus_number_to_name")
-                        else None
+                        name_mapping_value
+                        if name_mapping_value is not None
+                        else (
+                            dataset_split.return_nexus_number_to_name(0)
+                            if hasattr(dataset_split, "return_nexus_number_to_name")
+                            else None
+                        )
                     ),
                 }
                 rows.append(self._sample_compare_harness_once(pair, train=train))
@@ -7442,7 +8997,7 @@ class TrainingModule(LightningModule):
                 )
                 rows.append(self._sample_compare_harness_once(pair, train=train))
 
-        metrics = self._summarize_sample_compare_harness_rows(rows)
+        metrics = self._summarize_sample_compare_harness_rows(rows, train=train)
         if num_pairs == 1:
             metrics.update(self._evaluate_fixed_pair_path_metrics(train=train))
         return metrics
@@ -7666,6 +9221,7 @@ class TrainingModule(LightningModule):
             return unique
 
         anchor_states = []
+        first_wrong_velocity_replay = None
         if self.rollout_replay_mode == "anchor_oracle":
             anchor_states = _select_rollout_replay_anchors(
                 trace,
@@ -7681,6 +9237,16 @@ class TrainingModule(LightningModule):
                     self.rollout_replay_oracle_horizon,
                     split_multi_label_events=split_multi_label_events,
                 )
+            )
+        elif self.rollout_replay_mode == "first_wrong_velocity_suffix_oracle":
+            (
+                velocity_samples,
+                autoregressive_samples,
+                first_wrong_velocity_replay,
+            ) = _collect_first_wrong_velocity_suffix_replay_samples(
+                self,
+                pair=pair,
+                trace=trace,
             )
         elif self.rollout_replay_mode == "legacy_prefix_oracle":
             velocity_samples, autoregressive_samples = (
@@ -7802,7 +9368,7 @@ class TrainingModule(LightningModule):
                 autoregressive_samples,
                 max_autoregressive_states,
             )
-        elif self.rollout_replay_mode == "legacy_prefix_oracle":
+        elif self.rollout_replay_mode in {"legacy_prefix_oracle", "first_wrong_velocity_suffix_oracle"}:
             velocity_samples = velocity_samples[:max_velocity_states]
             autoregressive_samples = autoregressive_samples[:max_autoregressive_states]
         elif use_bank_sampling:
@@ -7926,6 +9492,39 @@ class TrainingModule(LightningModule):
         for key, value in repeat_summary.items():
             replay_logs[f"replay/{key}"] = torch.tensor(
                 float(value),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if first_wrong_velocity_replay is not None:
+            replay_logs["replay/first_wrong_velocity_phase"] = torch.tensor(
+                float(first_wrong_velocity_replay.get("first_wrong_phase_idx", -1)),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            replay_logs["replay/found_first_wrong_velocity_state"] = torch.tensor(
+                1.0,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            replay_logs["replay/first_wrong_velocity_start_rf_to_oracle_start"] = torch.tensor(
+                float(first_wrong_velocity_replay.get("sampled_start_rf_to_oracle_start", 0.0)),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if first_wrong_velocity_replay.get("sampled_boundary_rf_to_oracle_boundary") is not None:
+                replay_logs["replay/first_wrong_velocity_boundary_rf_to_oracle_boundary"] = torch.tensor(
+                    float(first_wrong_velocity_replay.get("sampled_boundary_rf_to_oracle_boundary", 0.0)),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+        elif self.rollout_replay_mode == "first_wrong_velocity_suffix_oracle":
+            replay_logs["replay/first_wrong_velocity_phase"] = torch.tensor(
+                -1.0,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            replay_logs["replay/found_first_wrong_velocity_state"] = torch.tensor(
+                0.0,
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -8272,6 +9871,11 @@ class TrainingModule(LightningModule):
         phyla_embeddings,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_case_indices=None,
+        first_hit_case_indices=None,
+        first_hit_start_topology_features=None,
+        first_hit_start_topology_embeddings=None,
+        first_hit_start_topology_pad_mask=None,
     ):
         batched_tokenized_trees = _move_tokenized_batch_to_device(
             batched_tokenized_trees,
@@ -8313,6 +9917,10 @@ class TrainingModule(LightningModule):
                 return_edge_features=return_edge_features,
                 return_first_hit_logits=return_first_hit_logits,
                 return_boundary_vanish_logits=return_boundary_vanish_logits,
+                first_hit_case_indices=first_hit_case_indices,
+                first_hit_start_topology_features=first_hit_start_topology_features,
+                first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
+                first_hit_start_topology_pad_mask=first_hit_start_topology_pad_mask,
             )
             edge_features = None
             first_hit_logits = None
@@ -8375,6 +9983,15 @@ class TrainingModule(LightningModule):
                 model_kwargs["autoregressive_component_groups"] = (
                     autoregressive_component_groups
                 )
+            supports_case_indices = (
+                "autoregressive_case_indices" in model_signature.parameters
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in model_signature.parameters.values()
+                )
+            )
+            if autoregressive_case_indices is not None and supports_case_indices:
+                model_kwargs["autoregressive_case_indices"] = autoregressive_case_indices
 
             all_group_logits = self.model(
                 batched_tokenized_trees,
@@ -8398,6 +10015,8 @@ class TrainingModule(LightningModule):
                     0.0, dtype=torch.float32, device=self.device
                 ),
             }
+        batch = self._attach_case_indices_to_batch(batch)
+        batch = self._attach_start_topology_features_to_batch(batch)
 
         (
             v_pred,
@@ -8410,6 +10029,16 @@ class TrainingModule(LightningModule):
             batch["tokenized_trees"],
             batch["batched_time"],
             batch["phyla_embeddings"],
+            first_hit_case_indices=batch.get("_first_hit_case_indices"),
+            first_hit_start_topology_features=batch.get(
+                "_first_hit_start_topology_features"
+            ),
+            first_hit_start_topology_embeddings=batch.get(
+                "_first_hit_start_topology_embeddings"
+            ),
+            first_hit_start_topology_pad_mask=batch.get(
+                "_first_hit_start_topology_pad_mask"
+            ),
         )
 
         logits = []
@@ -8417,6 +10046,7 @@ class TrainingModule(LightningModule):
         original_trees = batch.get("original_trees", [])
         batched_time = batch.get("batched_time")
         batched_targets = batch.get("batched_terminal_stop")
+        batched_case_indices = batch.get("_first_hit_case_indices")
         for num, current_newick in enumerate(original_trees):
             if current_newick is None:
                 continue
@@ -8453,6 +10083,11 @@ class TrainingModule(LightningModule):
                 first_hit_logits=aligned_first_hit_logits,
                 boundary_vanish_logits=aligned["boundary_vanish_logits"],
                 edge_features=aligned["edge_features"],
+                aligned_model_masks=aligned["aligned_model_masks"],
+                supervised_mask=aligned["supervised_mask"],
+                case_index=None
+                if batched_case_indices is None
+                else int(batched_case_indices[num].item()),
             )
             if term_logit is None:
                 continue
@@ -8478,7 +10113,18 @@ class TrainingModule(LightningModule):
         target_tensor = torch.stack(targets).to(
             logits_tensor.device, dtype=logits_tensor.dtype
         )
-        loss = F.binary_cross_entropy_with_logits(logits_tensor, target_tensor)
+        pos_weight = None
+        if bool(getattr(self, "velocity_terminal_head_balance_loss", False)):
+            with torch.no_grad():
+                pos = target_tensor.sum()
+                neg = target_tensor.numel() - pos
+                if float(pos.item()) > 0.0 and float(neg.item()) > 0.0:
+                    pos_weight = torch.clamp(neg / pos, min=1.0).detach()
+        loss = F.binary_cross_entropy_with_logits(
+            logits_tensor,
+            target_tensor,
+            pos_weight=pos_weight,
+        )
         with torch.no_grad():
             probs = torch.sigmoid(logits_tensor)
             preds = probs > 0.5
@@ -8568,6 +10214,16 @@ class TrainingModule(LightningModule):
                 batch["tokenized_trees"],
                 batch["batched_time"],
                 batch["phyla_embeddings"],
+                first_hit_case_indices=batch.get("_first_hit_case_indices"),
+                first_hit_start_topology_features=batch.get(
+                    "_first_hit_start_topology_features"
+                ),
+                first_hit_start_topology_embeddings=batch.get(
+                    "_first_hit_start_topology_embeddings"
+                ),
+                first_hit_start_topology_pad_mask=batch.get(
+                    "_first_hit_start_topology_pad_mask"
+                ),
             )
 
             if self.train_tokenized_trees is None:
@@ -8585,6 +10241,7 @@ class TrainingModule(LightningModule):
                 direct_losses = []
                 exact_flags = []
                 jaccards = []
+                direct_set_pos_weights = []
                 target_negative_rates = []
                 target_negative_losses = []
                 nontarget_nonnegative_losses = []
@@ -8600,12 +10257,21 @@ class TrainingModule(LightningModule):
                         [[] for _ in batch.get("original_trees", [])],
                     )
                 )
+                direct_set_debug_enabled = (
+                    os.environ.get("PHYLAFLOW_DEBUG_DIRECT_SET", "0") == "1"
+                )
+                autoregressive_first_hit_mode = (
+                    getattr(self.model, "first_hit_head_mode", "base")
+                    == "autoregressive_set"
+                )
                 for num, current_newick in enumerate(batch.get("original_trees", [])):
                     if num >= len(sample_mask) or not bool(sample_mask[num]):
                         continue
                     if current_newick is None:
                         continue
-                    if first_hit_logits is None:
+                    if first_hit_logits is None and not autoregressive_first_hit_mode:
+                        continue
+                    if autoregressive_first_hit_mode and edge_features is None:
                         continue
                     try:
                         tree_obj = Tree(current_newick)
@@ -8633,6 +10299,7 @@ class TrainingModule(LightningModule):
                     targets = []
                     velocity_preds = []
                     matched_masks = []
+                    edge_feature_rows = []
                     for edge_idx, mask in enumerate(split_masks_num):
                         if mask == 0:
                             continue
@@ -8644,24 +10311,85 @@ class TrainingModule(LightningModule):
                             edge_length = bhv_len_map.get(full_mask ^ int(mask))
                         if edge_length is None or float(edge_length) <= 1e-8:
                             continue
-                        logits.append(first_hit_logits[num, edge_idx, 0])
+                        if not autoregressive_first_hit_mode:
+                            logits.append(first_hit_logits[num, edge_idx, 0])
                         velocity_preds.append(v_pred[num, edge_idx, 0])
                         matched_masks.append(int(mask))
                         targets.append(1.0 if int(mask) in target_set else 0.0)
-                    if not logits:
+                        if edge_features is not None:
+                            edge_feature_rows.append(edge_features[num, edge_idx])
+                    if not velocity_preds:
                         continue
-                    logits_tensor = torch.stack(logits).reshape(-1)
                     velocity_tensor = torch.stack(velocity_preds).reshape(-1)
                     target_tensor = torch.tensor(
                         targets,
-                        device=logits_tensor.device,
-                        dtype=logits_tensor.dtype,
-                    )
-                    sample_loss = F.binary_cross_entropy_with_logits(
-                        logits_tensor,
-                        target_tensor,
+                        device=velocity_tensor.device,
+                        dtype=velocity_tensor.dtype,
                     )
                     target_mask = target_tensor > 0.5
+                    if autoregressive_first_hit_mode:
+                        if not edge_feature_rows:
+                            continue
+                        edge_feature_tensor = torch.stack(edge_feature_rows, dim=0).to(
+                            device=velocity_tensor.device,
+                            dtype=edge_features.dtype,
+                        )
+                        sample_loss, ar_stats = self.model.first_hit_autoregressive_group_loss(
+                            edge_feature_tensor,
+                            target_mask,
+                        )
+                        direct_set_pos_weights.append(1.0)
+                    else:
+                        logits_tensor = torch.stack(logits).reshape(-1)
+                        pos_weight = None
+                        if bool(
+                            getattr(
+                                self,
+                                "velocity_probe_direct_set_positive_reweight",
+                                False,
+                            )
+                        ):
+                            pos = target_tensor.sum()
+                            neg = target_tensor.numel() - pos
+                            if (
+                                float(pos.item()) > 0.0
+                                and float(neg.item()) > 0.0
+                            ):
+                                pos_weight_value = torch.clamp(
+                                    neg / pos, min=1.0
+                                )
+                                pos_weight_value = torch.pow(
+                                    pos_weight_value,
+                                    float(
+                                        getattr(
+                                            self,
+                                            "velocity_probe_direct_set_positive_reweight_power",
+                                            1.0,
+                                        )
+                                    ),
+                                )
+                                pos_weight_max = getattr(
+                                    self,
+                                    "velocity_probe_direct_set_positive_reweight_max",
+                                    None,
+                                )
+                                if pos_weight_max is not None and pos_weight_max > 0.0:
+                                    pos_weight_value = torch.clamp(
+                                        pos_weight_value,
+                                        min=1.0,
+                                        max=float(pos_weight_max),
+                                    )
+                                pos_weight = pos_weight_value.detach()
+                        sample_loss = F.binary_cross_entropy_with_logits(
+                            logits_tensor,
+                            target_tensor,
+                            pos_weight=pos_weight,
+                        )
+                        direct_set_pos_weights.append(
+                            float(pos_weight.detach().item())
+                            if pos_weight is not None
+                            else 1.0
+                        )
                     target_negative_weight = float(
                         getattr(
                             self,
@@ -8705,12 +10433,22 @@ class TrainingModule(LightningModule):
                         )
                     direct_losses.append(sample_loss)
                     with torch.no_grad():
-                        pred_mask = torch.sigmoid(logits_tensor) > 0.5
-                        pred_set = {
-                            matched_masks[i]
-                            for i in range(len(matched_masks))
-                            if bool(pred_mask[i].item())
-                        }
+                        if autoregressive_first_hit_mode:
+                            pred_mask = self.model.predict_first_hit_autoregressive_mask(
+                                edge_feature_tensor
+                            )
+                            pred_set = {
+                                matched_masks[i]
+                                for i in range(len(matched_masks))
+                                if bool(pred_mask[i].item())
+                            }
+                        else:
+                            pred_mask = torch.sigmoid(logits_tensor) > 0.5
+                            pred_set = {
+                                matched_masks[i]
+                                for i in range(len(matched_masks))
+                                if bool(pred_mask[i].item())
+                            }
                         exact_flags.append(float(pred_set == target_set))
                         union = len(pred_set | target_set)
                         inter = len(pred_set & target_set)
@@ -8768,6 +10506,13 @@ class TrainingModule(LightningModule):
                         device=loss.device,
                         dtype=torch.float32,
                     ),
+                    "velocity/probe_direct_set_pos_weight": torch.tensor(
+                        float(sum(direct_set_pos_weights) / len(direct_set_pos_weights))
+                        if direct_set_pos_weights
+                        else 1.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ),
                     "velocity/full_path_control_mode": torch.tensor(
                         1.0
                         if batch.get("_use_full_path_control_velocity_loss", False)
@@ -8776,6 +10521,16 @@ class TrainingModule(LightningModule):
                         dtype=torch.float32,
                     ),
                 }
+                if direct_set_debug_enabled:
+                    logging.info(
+                        "DIRECT_SET_DEBUG use_probe=%s pos_reweight=%s mean_pos_weight=%.6f samples=%d exact_rate=%.6f mean_jaccard=%.6f",
+                        bool(batch.get("_use_probe_parity_direct_set_loss", False)),
+                        bool(self.velocity_probe_direct_set_positive_reweight),
+                        float(logs["velocity/probe_direct_set_pos_weight"].detach().item()),
+                        int(len(direct_losses)),
+                        float(logs["velocity/probe_direct_set_exact_rate"].detach().item()),
+                        float(logs["velocity/probe_direct_set_mean_jaccard"].detach().item()),
+                    )
                 return logs
 
             velocity_labels = batch["batched_velocity"]
@@ -9812,7 +11567,7 @@ class TrainingModule(LightningModule):
                         "velocity/length_jitter_attempted": velocity_perturb_stats["attempted"],
                         "velocity/length_jitter_applied": velocity_perturb_stats["applied"],
                     })
-                wandb.log(vel_wandb, step=self.stepper)
+                self._wandb_log_filtered(vel_wandb, step=self.stepper)
             # import pdb
 
             # pdb.set_trace()
@@ -9853,6 +11608,7 @@ class TrainingModule(LightningModule):
                 batch["phyla_embeddings"],
                 autoregressive=True,
                 autoregressive_component_groups=autoregressive_component_groups,
+                autoregressive_case_indices=batch.get("_autoregressive_case_indices"),
             )
 
             found = {}
@@ -10104,7 +11860,7 @@ class TrainingModule(LightningModule):
 
                 logger.info(f"Polytomy choosing loss: {L_polytomy_choosing.item()}")
                 if self.record:
-                    wandb.log(
+                    self._wandb_log_filtered(
                         {
                             "train/polytomy_choosing_loss": L_polytomy_choosing.item(),
                             "train/polytomy_choosing_loss_weighted": (
@@ -10251,7 +12007,7 @@ class TrainingModule(LightningModule):
                 wandb_metrics.update(
                     {f"{key}": aggregated_metrics[key] for key in aggregated_metrics}
                 )
-                wandb.log(wandb_metrics, step=self.stepper)
+                self._wandb_log_filtered(wandb_metrics, step=self.stepper)
 
         return logs
 
@@ -10259,6 +12015,7 @@ class TrainingModule(LightningModule):
         self,
         newick_starting_trees: list[str],
         phyla_embeddings,
+        case_indices=None,
         num_samples=None,
         mapping=None,
         T=1.0,
@@ -10277,6 +12034,9 @@ class TrainingModule(LightningModule):
         debug_real_tree=None,
         return_trace: bool = False,
         target_trees: list[str] | None = None,
+        first_hit_start_topology_features=None,
+        first_hit_start_topology_embeddings=None,
+        first_hit_start_topology_pad_mask=None,
         split_multi_label_events: bool = False,
         max_allowed_polytomy_size: int = -1,
         oversize_polytomy_policy: str = "none",
@@ -10292,11 +12052,12 @@ class TrainingModule(LightningModule):
         oracle_boundary_vanish_use_at_sampling: bool = False,
     ):
         if self.use_historical_sampling_impl:
-            historical_module = _load_historical_training_module_for_step()
-            return historical_module.TrainingModule.sample(
+            return _call_historical_trainingmodule_method(
+                "sample",
                 self,
                 newick_starting_trees,
                 phyla_embeddings,
+                case_indices=case_indices,
                 num_samples=num_samples,
                 mapping=mapping,
                 T=T,
@@ -10340,6 +12101,12 @@ class TrainingModule(LightningModule):
                 newick_starting_trees[0],
                 target_trees[0],
                 phyla_embeddings,
+                case_index=None
+                if case_indices is None
+                else int(torch.as_tensor(case_indices).reshape(-1)[0].item()),
+                start_topology_features=first_hit_start_topology_features,
+                start_topology_embeddings=first_hit_start_topology_embeddings,
+                start_topology_pad_mask=first_hit_start_topology_pad_mask,
                 dt_base=float(dt_base),
                 eps_len=float(eps_len),
                 autoregressive_birth_length=float(autoregressive_birth_length),
@@ -10379,6 +12146,9 @@ class TrainingModule(LightningModule):
                 newick_starting_trees[0],
                 target_trees[0],
                 phyla_embeddings,
+                case_index=None
+                if case_indices is None
+                else int(torch.as_tensor(case_indices).reshape(-1)[0].item()),
                 T=float(T),
                 eps_len=float(eps_len),
                 first_hit_tol=float(first_hit_tol),
@@ -10419,6 +12189,47 @@ class TrainingModule(LightningModule):
             return result
         if num_samples is None:
             num_samples = self.num_samples
+
+        case_index_tensor = None
+        if case_indices is not None:
+            case_index_tensor = torch.as_tensor(
+                case_indices,
+                dtype=torch.long,
+                device=self.device,
+            ).reshape(-1)
+            if int(case_index_tensor.shape[0]) != int(len(newick_starting_trees)):
+                raise ValueError(
+                    "case_indices must have one entry per starting tree in sample()."
+                )
+        start_topology_feature_tensor = first_hit_start_topology_features
+        if (
+            start_topology_feature_tensor is None
+            and getattr(self.model, "first_hit_head_mode", "base")
+            == "start_topology_adapter_mlp"
+        ):
+            start_topology_feature_tensor = _build_start_topology_feature_tensor(
+                self,
+                newick_starting_trees,
+                device=self.device,
+            )
+        start_topology_embeddings_tensor = first_hit_start_topology_embeddings
+        start_topology_pad_mask_tensor = first_hit_start_topology_pad_mask
+        if (
+            (
+                start_topology_embeddings_tensor is None
+                or start_topology_pad_mask_tensor is None
+            )
+            and getattr(self.model, "first_hit_head_mode", "base")
+            == "start_topology_cross_attn_mlp"
+        ):
+            (
+                start_topology_embeddings_tensor,
+                start_topology_pad_mask_tensor,
+            ) = _build_start_topology_identity_batch(
+                self,
+                newick_starting_trees,
+                device=self.device,
+            )
 
         self.model.eval()
         max_logits = []
@@ -10703,7 +12514,15 @@ class TrainingModule(LightningModule):
                     first_hit_logits,
                     boundary_vanish_logits,
                     edge_features,
-                ) = self.forward(tokenized, t, phyla_embeddings)
+                ) = self.forward(
+                    tokenized,
+                    t,
+                    phyla_embeddings,
+                    first_hit_case_indices=case_index_tensor,
+                    first_hit_start_topology_features=start_topology_feature_tensor,
+                    first_hit_start_topology_embeddings=start_topology_embeddings_tensor,
+                    first_hit_start_topology_pad_mask=start_topology_pad_mask_tensor,
+                )
 
             # ---- FIRST PASS: compute per-tree dt_hit, cache per-tree arrays ----
 
@@ -11127,23 +12946,42 @@ class TrainingModule(LightningModule):
                             first_hit_tol=first_hit_tol,
                         )
                     else:
-                        predicted_first_mask, _raw_first_count, _used_first_fallback = _predict_first_hit_mask_with_fallback(
-                            H,
-                            candidate_mask,
-                            max_edges=getattr(
-                                self, "velocity_first_hit_sampling_max_edges", -1
-                            ),
-                            fallback_threshold=getattr(
-                                self,
-                                "velocity_first_hit_sampling_fallback_threshold",
-                                -1,
-                            ),
-                            fallback_top_k=getattr(
-                                self,
-                                "velocity_first_hit_sampling_fallback_top_k",
-                                -1,
-                            ),
-                        )
+                        if (
+                            getattr(self.model, "first_hit_head_mode", "base")
+                            == "autoregressive_set"
+                            and E is not None
+                        ):
+                            predicted_first_mask = self.model.predict_first_hit_autoregressive_mask(
+                                E.to(self.device, dtype=torch.float32),
+                                candidate_mask=torch.as_tensor(
+                                    candidate_mask,
+                                    device=self.device,
+                                    dtype=torch.bool,
+                                ),
+                                max_steps=getattr(
+                                    self,
+                                    "velocity_first_hit_sampling_max_edges",
+                                    -1,
+                                ),
+                            ).detach().cpu().numpy().astype(bool)
+                        else:
+                            predicted_first_mask, _raw_first_count, _used_first_fallback = _predict_first_hit_mask_with_fallback(
+                                H,
+                                candidate_mask,
+                                max_edges=getattr(
+                                    self, "velocity_first_hit_sampling_max_edges", -1
+                                ),
+                                fallback_threshold=getattr(
+                                    self,
+                                    "velocity_first_hit_sampling_fallback_threshold",
+                                    -1,
+                                ),
+                                fallback_top_k=getattr(
+                                    self,
+                                    "velocity_first_hit_sampling_fallback_top_k",
+                                    -1,
+                                ),
+                            )
                     if np.any(predicted_first_mask):
                         rates = (
                             F.softplus(
@@ -11191,28 +13029,54 @@ class TrainingModule(LightningModule):
                         )
                     if (
                         self.velocity_first_hit_head_use_at_sampling
-                        and H is not None
+                        and (
+                            H is not None
+                            or (
+                                getattr(self.model, "first_hit_head_mode", "base")
+                                == "autoregressive_set"
+                                and E is not None
+                            )
+                        )
                         and oracle_first_hit_mask is not None
                         and np.any(oracle_first_hit_mask)
                     ):
                         candidate_mask = supervised_mask & (L > eps_len)
-                        predicted_first_mask, _raw_first_count, _used_first_fallback = _predict_first_hit_mask_with_fallback(
-                            H,
-                            candidate_mask,
-                            max_edges=getattr(
-                                self, "velocity_first_hit_sampling_max_edges", -1
-                            ),
-                            fallback_threshold=getattr(
-                                self,
-                                "velocity_first_hit_sampling_fallback_threshold",
-                                -1,
-                            ),
-                            fallback_top_k=getattr(
-                                self,
-                                "velocity_first_hit_sampling_fallback_top_k",
-                                -1,
-                            ),
-                        )
+                        if (
+                            getattr(self.model, "first_hit_head_mode", "base")
+                            == "autoregressive_set"
+                            and E is not None
+                        ):
+                            predicted_first_mask = self.model.predict_first_hit_autoregressive_mask(
+                                E.to(self.device, dtype=torch.float32),
+                                candidate_mask=torch.as_tensor(
+                                    candidate_mask,
+                                    device=self.device,
+                                    dtype=torch.bool,
+                                ),
+                                max_steps=getattr(
+                                    self,
+                                    "velocity_first_hit_sampling_max_edges",
+                                    -1,
+                                ),
+                            ).detach().cpu().numpy().astype(bool)
+                        else:
+                            predicted_first_mask, _raw_first_count, _used_first_fallback = _predict_first_hit_mask_with_fallback(
+                                H,
+                                candidate_mask,
+                                max_edges=getattr(
+                                    self, "velocity_first_hit_sampling_max_edges", -1
+                                ),
+                                fallback_threshold=getattr(
+                                    self,
+                                    "velocity_first_hit_sampling_fallback_threshold",
+                                    -1,
+                                ),
+                                fallback_top_k=getattr(
+                                    self,
+                                    "velocity_first_hit_sampling_fallback_top_k",
+                                    -1,
+                                ),
+                            )
                         if np.any(predicted_first_mask):
                             rates = (
                                 F.softplus(
@@ -11694,6 +13558,7 @@ class TrainingModule(LightningModule):
                                 phyla_embeddings,
                                 autoregressive=True,
                                 autoregressive_component_groups=autoregressive_component_groups,
+                                autoregressive_case_indices=case_index_tensor,
                             )
                         
                         planned_merges = _plan_autoregressive_boundary_merges(
@@ -12067,7 +13932,7 @@ class TrainingModule(LightningModule):
         avg_num_polytomies_resolved = np.mean(num_polytomies_resolved)
         print(f"Average number of polytomies resolved during sampling: {avg_num_polytomies_resolved}")
         if self.record:
-            wandb.log(
+            self._wandb_log_filtered(
                 {
                     "samples/number_of_polytomies_resolved": num_polytomies,
                     "samples/average_topology_changes": np.mean(num_topology_changes),
@@ -12758,7 +14623,7 @@ class TrainingModule(LightningModule):
         # print(f"Entering a new world with status {failed}")
         if not failed and logs is not None:
             for k, v in logs.items():
-                self.log(
+                self._log_scalar_filtered(
                     k,
                     v.to("cuda"),
                     on_step=True,
@@ -12770,11 +14635,11 @@ class TrainingModule(LightningModule):
 
             index, sub_tree_size, num_subtrees = self.dataset.chosen_tree
             lr = opt.optimizer.param_groups[0]["lr"]
-            self.log("num_seq_per_subtree", sub_tree_size)
+            self._log_scalar_filtered("num_seq_per_subtree", sub_tree_size)
             logs["num_seq_per_subtree"] = sub_tree_size
-            self.log("num_subtrees", num_subtrees)
+            self._log_scalar_filtered("num_subtrees", num_subtrees)
             logs["num_subtrees"] = num_subtrees
-            self.log("lr", lr)
+            self._log_scalar_filtered("lr", lr)
             logs["lr"] = lr
             if self.logger_ is not None:
                 self.logger_.log(logs, level=logging.INFO)
@@ -12783,8 +14648,7 @@ class TrainingModule(LightningModule):
 
         if logs is not None:
             if self.record:
-                # wandb.log(logs)
-                wandb.log(logs, step=self.stepper)
+                self._wandb_log_filtered(logs, step=self.stepper)
             if not self.dataset.msa_distance:
                 self.dataset.update_normrf(logs["norm_rf_distance"])
 
@@ -12832,11 +14696,19 @@ class TrainingModule(LightningModule):
                     metrics = self.sample_compare(batch, train=True, dt=self.dt)
                 
                 for k, v in metrics.items():
-                    self.log(f"sample_metrics/{k}", v, on_step=True, logger=True)
+                    self._log_scalar_filtered(
+                        f"sample_metrics/{k}",
+                        v,
+                        on_step=True,
+                        logger=True,
+                    )
                 self._append_sample_metrics_trace(metrics)
                 self._advance_training_sampling_schedule()
                 if self.record:
-                    wandb.log({f"sample_metrics/{k}": v for k, v in metrics.items()}, step=self.stepper)
+                    self._wandb_log_filtered(
+                        {f"sample_metrics/{k}": v for k, v in metrics.items()},
+                        step=self.stepper,
+                    )
                 print(metrics)
                 rf_norm = metrics.get("rf_norm")
                 stop_threshold = self.training_sampling_stop_rf_threshold
@@ -12886,8 +14758,12 @@ class TrainingModule(LightningModule):
             max_grad = 0.0
             mean_grad = 0.0
 
-        self.log("grad_norm_max", max_grad, prog_bar=True, on_step=True)
-        self.log("grad_norm_mean", mean_grad, prog_bar=False, on_step=True)
+        self._log_scalar_filtered(
+            "grad_norm_max", max_grad, prog_bar=True, on_step=True
+        )
+        self._log_scalar_filtered(
+            "grad_norm_mean", mean_grad, prog_bar=False, on_step=True
+        )
 
         # Print a warning if exploding
         if max_grad > 1:
@@ -12895,16 +14771,19 @@ class TrainingModule(LightningModule):
                 f"[Warning] Gradient norm unusually high: max={max_grad:.2e}, mean={mean_grad:.2e}"
             )
 
-        self.log("grad_norm_total", total)
+        self._log_scalar_filtered("grad_norm_total", total)
         print(
             f"step {self.global_step:4d}  total_grad_norm = {total:.2f} mean is {mean_grad:.2f} max is {max_grad:.2f}"
         )
         if self.record:
-            wandb.log({
-                "grad/grad_norm_total": total,
-                "grad/grad_norm_max": max_grad,
-                "grad/grad_norm_mean": mean_grad,
-            }, step=self.stepper)
+            self._wandb_log_filtered(
+                {
+                    "grad/grad_norm_total": total,
+                    "grad/grad_norm_max": max_grad,
+                    "grad/grad_norm_mean": mean_grad,
+                },
+                step=self.stepper,
+            )
 
     def configure_optimizers(self):
         if self.deepspeed:

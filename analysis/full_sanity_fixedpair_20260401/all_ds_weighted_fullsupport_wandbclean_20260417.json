@@ -1,0 +1,82 @@
+[
+  {
+    "dataset_id": "DS1",
+    "unique_topologies": 78,
+    "num_cases": 234,
+    "epochs": 26,
+    "config_yaml": "/home/yektefai/PhylaFlow/configs/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml",
+    "manifest_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json",
+    "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_metrics.jsonl",
+    "status": "existing"
+  },
+  {
+    "dataset_id": "DS2",
+    "unique_topologies": 14,
+    "num_cases": 42,
+    "epochs": 143,
+    "config_yaml": "/home/yektefai/PhylaFlow/configs/ds2_short_multipair42_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml",
+    "manifest_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds2_short_multipair42_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json",
+    "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds2_short_multipair42_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_metrics.jsonl",
+    "status": "generated"
+  },
+  {
+    "dataset_id": "DS3",
+    "unique_topologies": 81,
+    "num_cases": 243,
+    "epochs": 25,
+    "config_yaml": "/home/yektefai/PhylaFlow/configs/ds3_short_multipair243_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml",
+    "manifest_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds3_short_multipair243_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json",
+    "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds3_short_multipair243_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_metrics.jsonl",
+    "status": "generated"
+  },
+  {
+    "dataset_id": "DS4",
+    "unique_topologies": 191,
+    "num_cases": 573,
+    "epochs": 11,
+    "config_yaml": "/home/yektefai/PhylaFlow/configs/ds4_short_multipair573_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml",
+    "manifest_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds4_short_multipair573_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json",
+    "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds4_short_multipair573_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_metrics.jsonl",
+    "status": "generated"
+  },
+  {
+    "dataset_id": "DS5",
+    "unique_topologies": 175,
+    "num_cases": 525,
+    "epochs": 12,
+    "config_yaml": "/home/yektefai/PhylaFlow/configs/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml",
+    "manifest_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json",
+    "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_metrics.jsonl",
+    "status": "generated"
+  },
+  {
+    "dataset_id": "DS6",
+    "unique_topologies": 73,
+    "num_cases": 219,
+    "epochs": 28,
+    "config_yaml": "/home/yektefai/PhylaFlow/configs/ds6_short_multipair219_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml",
+    "manifest_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds6_short_multipair219_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json",
+    "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds6_short_multipair219_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_metrics.jsonl",
+    "status": "generated"
+  },
+  {
+    "dataset_id": "DS7",
+    "unique_topologies": 448,
+    "num_cases": 1344,
+    "epochs": 5,
+    "config_yaml": "/home/yektefai/PhylaFlow/configs/ds7_short_multipair1344_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml",
+    "manifest_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds7_short_multipair1344_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json",
+    "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds7_short_multipair1344_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_metrics.jsonl",
+    "status": "generated"
+  },
+  {
+    "dataset_id": "DS8",
+    "unique_topologies": 374,
+    "num_cases": 1122,
+    "epochs": 6,
+    "config_yaml": "/home/yektefai/PhylaFlow/configs/ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417.yaml",
+    "manifest_json": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_manifest.json",
+    "metrics_path": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_metrics.jsonl",
+    "status": "generated"
+  }
+]

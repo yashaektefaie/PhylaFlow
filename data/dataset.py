@@ -36,6 +36,7 @@ from model.treeTokenizer import TreeFeatureTokenizer
 from utils.random_tree import Tree
 from ete3 import Tree as EteTree
 from utils.utils import remove_bit
+from utils.bhv_movie import build_tree_from_splits
 
 
 def _detach_tensors(value):
@@ -293,6 +294,9 @@ class TreeDataset(Dataset):
         overfit_full_path_control_mode: bool = False,
         overfit_full_path_control_seed: int = 42,
         overfit_full_path_control_use_discrete_phase_time: bool = False,
+        overfit_full_path_control_terminal_label_mode: str = "phase_start",
+        overfit_full_path_control_terminal_include_ar_states: bool = False,
+        overfit_full_path_control_terminal_include_target_one_split_off: bool = False,
         overfit_full_path_control_extra_velocity_samples_json_path: Optional[str] = None,
         overfit_oracle_prefix_start_prob: float = 0.0,
         overfit_oracle_prefix_max_fraction: float = 0.5,
@@ -359,6 +363,19 @@ class TreeDataset(Dataset):
         self.overfit_full_path_control_seed = int(overfit_full_path_control_seed)
         self.overfit_full_path_control_use_discrete_phase_time = bool(
             overfit_full_path_control_use_discrete_phase_time
+        )
+        terminal_label_mode = str(overfit_full_path_control_terminal_label_mode).lower()
+        if terminal_label_mode not in {"phase_start", "target"}:
+            raise ValueError(
+                "overfit_full_path_control_terminal_label_mode must be "
+                f"'phase_start' or 'target', got {terminal_label_mode!r}."
+            )
+        self.overfit_full_path_control_terminal_label_mode = terminal_label_mode
+        self.overfit_full_path_control_terminal_include_ar_states = bool(
+            overfit_full_path_control_terminal_include_ar_states
+        )
+        self.overfit_full_path_control_terminal_include_target_one_split_off = bool(
+            overfit_full_path_control_terminal_include_target_one_split_off
         )
         self.overfit_full_path_control_extra_velocity_samples = (
             _load_full_path_control_extra_velocity_samples(
@@ -877,6 +894,68 @@ class TreeDataset(Dataset):
             start_tree_newick,
         )
 
+    def _build_target_one_split_off_terminal_samples(
+        self,
+        target_tree: str,
+        *,
+        path_index: int,
+        timepoint: float,
+    ) -> List[Dict[str, Any]]:
+        target_obj = Tree(target_tree)
+        n_leaves = int(target_obj.n_leaves)
+        if n_leaves <= 3:
+            return []
+
+        masks, lengths = BHVEncoder().return_BHV_encoding(target_obj)
+        full_mask = (1 << n_leaves) - 1
+        split_lengths = {
+            int(mask): float(length)
+            for mask, length in zip(masks, lengths)
+            if int(mask) != 0 and length is not None and float(length) > 1e-8
+        }
+        if not split_lengths:
+            return []
+
+        removable_splits = []
+        for mask in split_lengths:
+            side_a = int(mask).bit_count()
+            side_b = int(full_mask ^ int(mask)).bit_count()
+            if min(side_a, side_b) > 1:
+                removable_splits.append(int(mask))
+
+        samples: List[Dict[str, Any]] = []
+        seen_newicks = set()
+        for removed_split in sorted(set(removable_splits)):
+            remaining_splits = [
+                split for split in split_lengths if int(split) != int(removed_split)
+            ]
+            try:
+                _, near_target_newick = build_tree_from_splits(
+                    remaining_splits,
+                    split_lengths,
+                    n_leaves,
+                    root_leaf=n_leaves - 1,
+                    mapping=target_obj.id_to_name,
+                )
+            except Exception:
+                continue
+            if near_target_newick in seen_newicks:
+                continue
+            seen_newicks.add(near_target_newick)
+            samples.append(
+                {
+                    "path_index": int(path_index),
+                    "newick_tree": str(near_target_newick),
+                    "timepoint": float(timepoint),
+                    "terminal_stop": False,
+                    "target_tree": str(target_tree),
+                    "terminal_hard_negative_kind": "target_minus_one_split",
+                    "removed_split": int(removed_split),
+                }
+            )
+
+        return samples
+
     def _build_full_path_control_samples(
         self,
         pair: Dict[str, Any],
@@ -885,6 +964,13 @@ class TreeDataset(Dataset):
         start_tree = str(pair["random_tree"])
         target_tree = str(pair["effective_target_tree"])
         boundary_paths = list(pair["boundary_paths"])
+        pair_group_key = pair.get("bank_group_key")
+
+        def _attach_pair_group(sample: Dict[str, Any]) -> Dict[str, Any]:
+            sample.setdefault("start_tree", start_tree)
+            if pair_group_key is not None:
+                sample["bank_group_key"] = str(pair_group_key)
+            return sample
 
         velocity_samples: List[Dict[str, Any]] = []
         autoregressive_samples: List[Dict[str, Any]] = []
@@ -895,6 +981,11 @@ class TreeDataset(Dataset):
                 start_tree
                 if int(path_index) == 0
                 else str(boundary_paths[int(path_index) - 1]["end_newick"])
+            )
+            path_start_time = (
+                float(path_index)
+                if self.overfit_full_path_control_use_discrete_phase_time
+                else float(prev_time)
             )
             velocity_newick, velocity = return_sampled_tree_orthant_velocity(
                 source_tree,
@@ -910,7 +1001,7 @@ class TreeDataset(Dataset):
                     f"Unknown overfit_velocity_explicit_boundary_label_scale_mode={label_scale_mode!r}."
                 )
             velocity_samples.append(
-                {
+                _attach_pair_group({
                     "path_index": int(path_index),
                     "newick_tree": str(velocity_newick),
                     "target_tree": target_tree,
@@ -919,13 +1010,9 @@ class TreeDataset(Dataset):
                         for k, v in velocity.items()
                     },
                     "velocity_next_boundary_tree": str(path["start_newick"]),
-                    "timepoint": (
-                        float(path_index)
-                        if self.overfit_full_path_control_use_discrete_phase_time
-                        else float(prev_time)
-                    ),
+                    "timepoint": path_start_time,
                     "num_leaves": int(Tree(source_tree).n_leaves),
-                }
+                })
             )
             boundary_time = (
                 float(path_index)
@@ -945,7 +1032,7 @@ class TreeDataset(Dataset):
             boundary_events = _split_multi_label_training_events(boundary_events)
             for event in boundary_events:
                 autoregressive_samples.append(
-                    {
+                    _attach_pair_group({
                         "path_index": int(path_index),
                         "newick": str(event["newick"]),
                         "target_tree": target_tree,
@@ -954,18 +1041,66 @@ class TreeDataset(Dataset):
                             event.get("stop_after_merge", False)
                         ),
                         "time": boundary_time,
-                    }
+                    })
                 )
-            terminal_samples.append(
-                {
-                    "path_index": int(path_index),
-                    "newick_tree": str(path["end_newick"]),
-                    "timepoint": boundary_time,
-                    "terminal_stop": bool(int(path_index) == (len(boundary_paths) - 1)),
-                    "target_tree": target_tree,
-                }
-            )
+                if self.overfit_full_path_control_terminal_include_ar_states:
+                    terminal_samples.append(
+                        _attach_pair_group({
+                            "path_index": int(path_index),
+                            "newick_tree": str(event["newick"]),
+                            "timepoint": boundary_time,
+                            "terminal_stop": False,
+                            "target_tree": target_tree,
+                        })
+                    )
+            if self.overfit_full_path_control_terminal_label_mode == "phase_start":
+                terminal_samples.append(
+                    _attach_pair_group({
+                        "path_index": int(path_index),
+                        "newick_tree": str(source_tree),
+                        "timepoint": path_start_time,
+                        "terminal_stop": bool(
+                            int(path_index) == (len(boundary_paths) - 1)
+                        ),
+                        "target_tree": target_tree,
+                    })
+                )
+            else:
+                terminal_samples.append(
+                    _attach_pair_group({
+                        "path_index": int(path_index),
+                        "newick_tree": str(source_tree),
+                        "timepoint": path_start_time,
+                        "terminal_stop": False,
+                        "target_tree": target_tree,
+                    })
+                )
             prev_time = boundary_time
+
+        if self.overfit_full_path_control_terminal_label_mode == "target":
+            target_time = (
+                float(len(boundary_paths))
+                if self.overfit_full_path_control_use_discrete_phase_time
+                else 1.0
+            )
+            terminal_samples.append(
+                _attach_pair_group({
+                    "path_index": int(len(boundary_paths)),
+                    "newick_tree": str(target_tree),
+                    "timepoint": target_time,
+                    "terminal_stop": True,
+                    "target_tree": target_tree,
+                })
+            )
+            if self.overfit_full_path_control_terminal_include_target_one_split_off:
+                for hard_negative in self._build_target_one_split_off_terminal_samples(
+                    target_tree,
+                    path_index=int(len(boundary_paths)),
+                    timepoint=target_time,
+                ):
+                    terminal_samples.append(
+                        _attach_pair_group(hard_negative)
+                    )
 
         for extra_sample in self.overfit_full_path_control_extra_velocity_samples:
             sample_group_key = extra_sample.get("bank_group_key")
@@ -975,6 +1110,7 @@ class TreeDataset(Dataset):
             ):
                 continue
             relabeled_sample = dict(extra_sample)
+            relabeled_sample["start_tree"] = start_tree
             relabeled_sample["target_tree"] = target_tree
             relabeled_sample["path_index"] = int(
                 extra_sample.get("path_index", extra_sample.get("phase_idx", 0))
@@ -990,6 +1126,8 @@ class TreeDataset(Dataset):
                 relabeled_sample["timepoint"] = float(
                     extra_sample.get("timepoint", 0.0)
                 )
+            if pair_group_key is not None:
+                relabeled_sample["bank_group_key"] = str(pair_group_key)
             velocity_samples.append(relabeled_sample)
 
         return velocity_samples, autoregressive_samples, terminal_samples
@@ -1294,9 +1432,23 @@ class TreeDataset(Dataset):
                 )
                 random_tree = _remap_random_tree_to_dataset_indexing(random_tree_raw)
 
-            target_tree_newick = (
+            chosen_target_tree_newick = (
                 str(forced_target_tree_newick)
                 if forced_target_tree_newick is not None
+                else None
+            )
+            if (
+                chosen_target_tree_newick is None
+                and self.overfit_fixed_pair
+                and self.overfit_fixed_pair_target_tree_newick
+            ):
+                chosen_target_tree_newick = str(
+                    self.overfit_fixed_pair_target_tree_newick
+                )
+
+            target_tree_newick = (
+                chosen_target_tree_newick
+                if chosen_target_tree_newick is not None
                 else real_tree_newick
             )
             cache_key = None
@@ -1330,9 +1482,10 @@ class TreeDataset(Dataset):
                 split_multi_label_events=self.overfit_split_multi_subset_events,
                 legacy_training_semantics=False,
             )
+            allow_velocity_only_pair = bool(boundary_paths) and not final_labels
 
             # If final_labels is empty, resample random tree until we get valid labels
-            while not final_labels:
+            while not final_labels and not allow_velocity_only_pair:
                 if chosen_start_tree_newick is not None:
                     raise ValueError(
                         "Configured overfit_fixed_pair_start_tree_newick did not "
@@ -1366,6 +1519,7 @@ class TreeDataset(Dataset):
                     split_multi_label_events=self.overfit_split_multi_subset_events,
                     legacy_training_semantics=False,
                 )
+                allow_velocity_only_pair = bool(boundary_paths) and not final_labels
 
             pair = {
                 "base_random_tree": base_random_tree,
@@ -1483,6 +1637,56 @@ class TreeDataset(Dataset):
         effective_target_tree = pair["effective_target_tree"]
         boundary_paths = pair["boundary_paths"]
         final_labels = pair["final_labels"]
+
+        if len(final_labels) == 0:
+            velocity_next_boundary_tree = (
+                str(boundary_paths[0]["start_newick"])
+                if boundary_paths
+                else str(effective_target_tree)
+            )
+            newick, velocity = return_sampled_tree_orthant_velocity(
+                random_tree,
+                effective_target_tree,
+                0.0,
+                legacy_training_semantics=False,
+            )
+            sample = {
+                "id": meta["id"],
+                "nexus_path": meta["nexus_path"],
+                "tree_paths": meta["tree_paths"],
+                "sequences": new_seqs,
+                "taxa_order": list(new_seqs.keys()),
+                "start_tree": random_tree,
+                "newick_tree": newick,
+                "target_tree": effective_target_tree,
+                "fixed_pair_num_events": 0,
+                "velocity": velocity,
+                "velocity_next_boundary_tree": velocity_next_boundary_tree,
+                "timepoint": 0.0,
+                "autoregressive_newick": velocity_next_boundary_tree,
+                "autoregressive_labels": [],
+                "autoregressive_stop_after_merge": True,
+                "autoregressive_event_index": -1,
+                "autoregressive_newick_time": 0.0,
+                "num_to_name": original_names_map,
+                "seq_ordering_map": seq_ordering_map,
+            }
+            if "bank_group_key" in pair:
+                sample["bank_group_key"] = pair["bank_group_key"]
+            if "oracle_prefix_start_tree" in pair:
+                sample["oracle_prefix_start_tree"] = pair["oracle_prefix_start_tree"]
+                sample["oracle_prefix_base_start_tree"] = pair[
+                    "oracle_prefix_base_start_tree"
+                ]
+                sample["oracle_prefix_target_tree"] = pair["oracle_prefix_target_tree"]
+            if self.overfit_full_path_control_mode:
+                (
+                    sample["full_path_velocity_samples"],
+                    sample["full_path_autoregressive_samples"],
+                    sample["full_path_terminal_samples"],
+                ) = self._build_full_path_control_samples(pair)
+                sample["_full_path_control_mode"] = True
+            return sample
 
         horizon = min(self.overfit_event_horizon, len(final_labels))
         max_start_index = max(0, len(final_labels) - horizon)
@@ -2317,6 +2521,16 @@ class PhylaDataModule(pl.LightningDataModule):
             overfit_full_path_control_use_discrete_phase_time=config["data"].get(
                 "overfit_full_path_control_use_discrete_phase_time", False
             ),
+            overfit_full_path_control_terminal_label_mode=config["data"].get(
+                "overfit_full_path_control_terminal_label_mode", "phase_start"
+            ),
+            overfit_full_path_control_terminal_include_ar_states=config["data"].get(
+                "overfit_full_path_control_terminal_include_ar_states", False
+            ),
+            overfit_full_path_control_terminal_include_target_one_split_off=config["data"].get(
+                "overfit_full_path_control_terminal_include_target_one_split_off",
+                False,
+            ),
             overfit_full_path_control_extra_velocity_samples_json_path=config["data"].get(
                 "overfit_full_path_control_extra_velocity_samples_json_path"
             ),
@@ -2408,6 +2622,16 @@ class PhylaDataModule(pl.LightningDataModule):
             ),
             overfit_full_path_control_use_discrete_phase_time=config["data"].get(
                 "overfit_full_path_control_use_discrete_phase_time", False
+            ),
+            overfit_full_path_control_terminal_label_mode=config["data"].get(
+                "overfit_full_path_control_terminal_label_mode", "phase_start"
+            ),
+            overfit_full_path_control_terminal_include_ar_states=config["data"].get(
+                "overfit_full_path_control_terminal_include_ar_states", False
+            ),
+            overfit_full_path_control_terminal_include_target_one_split_off=config["data"].get(
+                "overfit_full_path_control_terminal_include_target_one_split_off",
+                False,
             ),
             overfit_full_path_control_extra_velocity_samples_json_path=config["data"].get(
                 "overfit_full_path_control_extra_velocity_samples_json_path"
@@ -2590,6 +2814,9 @@ class PhylaDataModule(pl.LightningDataModule):
                 "nexus_filepaths": [item["nexus_path"] for item in batch],
                 "tree_paths": [item["tree_paths"] for item in batch],
                 "original_trees": [item["newick_tree"] for item in batch],
+                "start_trees": [
+                    item.get("start_tree", item["newick_tree"]) for item in batch
+                ],
                 "target_trees": [item["target_tree"] for item in batch],
                 "batched_velocity": [item["velocity"] for item in batch],
                 "velocity_next_boundary_trees": [
@@ -2615,6 +2842,9 @@ class PhylaDataModule(pl.LightningDataModule):
                 "num_leaves": num_leaves,
                 "ids": ids,
                 "mappings": mappings,
+                "bank_group_key": [
+                    item.get("bank_group_key") for item in batch
+                ],
             }
             if full_path_control_mode:
                 to_run["full_path_velocity_samples"] = list(
@@ -2763,6 +2993,9 @@ class PhylaDataModule(pl.LightningDataModule):
             "nexus_filepaths": [item["nexus_path"] for item in batch],
             "tree_paths": [item["tree_paths"] for item in batch],
             "original_trees": [item["newick_tree"] for item in batch],
+            "start_trees": [
+                item.get("start_tree", item["newick_tree"]) for item in batch
+            ],
             "target_trees": [item["target_tree"] for item in batch],
             "batched_velocity": [item["velocity"] for item in batch],
             "tokenized_tree_edge_lengths": tokenized_tree_edge_lengths,
@@ -2790,6 +3023,7 @@ class PhylaDataModule(pl.LightningDataModule):
             "ids": ids,
             "mappings": mappings,
             "sequence_ordering_maps": [item["seq_ordering_map"] for item in batch],
+            "bank_group_key": [item.get("bank_group_key") for item in batch],
         }
         if full_path_control_mode:
             to_run["full_path_velocity_samples"] = list(full_path_velocity_samples)

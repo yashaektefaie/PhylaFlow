@@ -1,0 +1,193 @@
+{
+  "committed_configs": {
+    "ds1_caseadaptboth_234": {
+      "bytes": 94543,
+      "exists_locally": true,
+      "path": "configs/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421.yaml",
+      "sha256": "de2ecce4a1419c9298e7a9f5dc7132a010e5fd0ea77d0f3a3369dab841956f58"
+    },
+    "ds5_caseadaptfhonly_525_current": {
+      "bytes": 202597,
+      "exists_locally": true,
+      "path": "configs/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260424.yaml",
+      "sha256": "993f7db768a4dc461903aac111eab3b567c6db1f6580b2fd2f4de3c9bdb8f5be"
+    }
+  },
+  "committed_training_metric_traces": {
+    "ds1_caseadaptboth_234": {
+      "bytes": 17328,
+      "exists_locally": true,
+      "path": "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421_metrics.jsonl",
+      "sha256": "84dd39eb29adf18c0325abb66bc153280efb3d15d6aa24f1f9ed3f960732d46d"
+    },
+    "ds5_caseadaptfhonly_525_current": {
+      "bytes": 4409,
+      "exists_locally": true,
+      "path": "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260424_metrics.jsonl",
+      "sha256": "6eff015a7795d664da6b7a46617ca87fc4175f51bc1561bb2e6674ef68df7a3e"
+    }
+  },
+  "gcp_artifact_groups": [
+    {
+      "description": "DS1 velocity anchors plus 234 start JSONs and 234 target JSONs required by the DS1 config.",
+      "local_file_count": 469,
+      "local_total_bytes": 13415886,
+      "name": "ds1_training_bank",
+      "patterns": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_20260418_velocity_anchors.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case*_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case*_target.json"
+      ],
+      "restore_prefix": "analysis/full_sanity_fixedpair_20260401/",
+      "sample_paths": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case00_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case00_target.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case01_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case01_target.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case02_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case02_target.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case03_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case03_target.json"
+      ]
+    },
+    {
+      "description": "DS5 velocity anchors plus 525 start JSONs and 525 target JSONs required by the DS5 config.",
+      "local_file_count": 1051,
+      "local_total_bytes": 54452433,
+      "name": "ds5_training_bank",
+      "patterns": [
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_velocity_anchors.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case*_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case*_target.json"
+      ],
+      "restore_prefix": "analysis/full_sanity_fixedpair_20260401/",
+      "sample_paths": [
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case00_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case00_target.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case01_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case01_target.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case02_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case02_target.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case03_start.json",
+        "analysis/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case03_target.json"
+      ]
+    },
+    {
+      "description": "Small but generated checkpoints used for exact DS1 reproduction and DS5 snapshot.",
+      "local_file_count": 3,
+      "local_total_bytes": 10018618,
+      "name": "ds1_checkpoints",
+      "patterns": [
+        "checkpoints/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421/2026-04-21_02-28-40/epoch=94-step=022000.ckpt",
+        "checkpoints/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421/2026-04-21_02-28-40/epoch=102-step=024000.ckpt",
+        "checkpoints/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260424/2026-04-24_23-44-20/epoch=09-step=005000.ckpt"
+      ],
+      "restore_prefix": "checkpoints/full_sanity_fixedpair_20260401/",
+      "sample_paths": [
+        "checkpoints/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421/2026-04-21_02-28-40/epoch=102-step=024000.ckpt",
+        "checkpoints/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421/2026-04-21_02-28-40/epoch=94-step=022000.ckpt",
+        "checkpoints/full_sanity_fixedpair_20260401/ds5_short_multipair525_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260424/2026-04-24_23-44-20/epoch=09-step=005000.ckpt"
+      ]
+    },
+    {
+      "description": "Exact 234 PhylaFlow and 234 random start trees plus MrBayes curve JSON/summary results.",
+      "local_file_count": 475,
+      "local_total_bytes": 486465,
+      "name": "ds1_mrbayes_full234_exact_starts_and_results",
+      "patterns": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/*.md",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/*.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/starts/*.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/starts/*start_trees.txt",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/starts/*manifest.json"
+      ],
+      "restore_prefix": "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/",
+      "sample_paths": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/full234_random_vs_phylaflow_equal_chain_summary.md",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/full234_vs_78_baselines_summary.md",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/phylaflow_caseadaptboth_step22000_full234_g100000_curve.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/random_original_full234_g100000_curve.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/starts/full234_start_manifest.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/starts/phylaflow_sampled_caseadaptboth_step22000_full234_0000.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/starts/phylaflow_sampled_caseadaptboth_step22000_full234_0001.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_full234_20260425/starts/phylaflow_sampled_caseadaptboth_step22000_full234_0002.nwk"
+      ]
+    },
+    {
+      "description": "Historical first78 and repaired first78 starts/results kept off git to avoid overwhelming the repo.",
+      "local_file_count": 164,
+      "local_total_bytes": 228169,
+      "name": "ds1_mrbayes_first78_historical_starts_and_results",
+      "patterns": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/*.md",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/*.tsv",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/*.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts/*.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts/*start_trees.txt",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts/*manifest.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts_repaired/*.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts_repaired/*start_trees.txt",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts_repaired/*manifest.json"
+      ],
+      "restore_prefix": "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/",
+      "sample_paths": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/caseadaptboth_step22000_vs_baselines_summary.md",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/caseadaptboth_step22000_vs_baselines_treeKL_curve.tsv",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/phylaflow_caseadaptboth_step22000_first78_g100000_curve.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/phylaflow_caseadaptboth_step22000_first78_repaired_g100000_curve.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts/phylaflow_caseadaptboth_step22000_first78_0000.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts/phylaflow_caseadaptboth_step22000_first78_0001.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts/phylaflow_caseadaptboth_step22000_first78_0002.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_mrbayes_generation_curves_100k_caseadaptboth_step22000_20260425/starts/phylaflow_caseadaptboth_step22000_first78_0003.nwk"
+      ]
+    },
+    {
+      "description": "IQ-TREE ML and UShER/matOptimize baseline starts/results used for optional initializer comparisons.",
+      "local_file_count": 725,
+      "local_total_bytes": 5049344,
+      "name": "ds1_ml_parsimony_baseline_starts",
+      "patterns": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_iqtree_mfp_runs10_ml_20260424.treefile",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_20260424/**/*",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_multistart78_20260424/**/*"
+      ],
+      "restore_prefix": "analysis/full_sanity_fixedpair_20260401/",
+      "sample_paths": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_iqtree_mfp_runs10_ml_20260424.treefile",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_20260424/closest_pair_start_cherry.nh",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_20260424/ds1_numeric_consensus_ref_for_usher.fa",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_20260424/ds1_numeric_consensus_ref_for_usher.vcf",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_20260424/fatovcf.log",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_20260424/matopt_optimized.nwk",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_20260424/matopt_optimized.pb",
+        "analysis/full_sanity_fixedpair_20260401/ds1_usher_matopt_mp_20260424/matopt_optimized_epps.nwk"
+      ]
+    },
+    {
+      "description": "Sampled topology, basin, split-score, and replay analysis for selecting/interpreting the DS1 step 22000 result.",
+      "local_file_count": 5,
+      "local_total_bytes": 1466948,
+      "name": "ds1_step22000_sampled_analysis_json",
+      "patterns": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_caseadaptboth_step22000_*.json"
+      ],
+      "restore_prefix": "analysis/full_sanity_fixedpair_20260401/",
+      "sample_paths": [
+        "analysis/full_sanity_fixedpair_20260401/ds1_caseadaptboth_step22000_all234_split_score_analysis_20260421.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_caseadaptboth_step22000_basin_coverage.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_caseadaptboth_step22000_split_filter_treekl_sweep_20260421.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_caseadaptboth_step22000_top_sampled_topologies_20260421.json",
+        "analysis/full_sanity_fixedpair_20260401/ds1_caseadaptboth_step22000_tree_level_replay_exact_20260421.json"
+      ]
+    }
+  ],
+  "generated_at_utc": "2026-04-25T13:23:09.360366+00:00",
+  "other_external_dependencies": [
+    "/home/yektefai/30272299/DS1.pickle",
+    "/home/yektefai/30272299/golden_run_data_DS1-8/DS1/rep_*/DS1.trprobs",
+    "/home/yektefai/30272299/short_run_data_DS1-8",
+    "/opt/conda/envs/phylaflow-mrbayes/bin/mb"
+  ],
+  "policy": "Large/generated artifacts live on GCP. The git commit keeps code, configs, small metrics, and documentation only.",
+  "repo_root_at_generation": "/home/yektefai/PhylaFlow"
+}

@@ -151,6 +151,7 @@ def _build_anchor_payloads(
     o0_count: int,
     a1_count: int,
     o2_count: int,
+    full_path_count: int | None = None,
 ):
     boundary_paths = return_tree_boundary_merge_paths(start_tree, target_tree)
     if len(boundary_paths) < 3:
@@ -158,6 +159,55 @@ def _build_anchor_payloads(
             f"Need at least 3 boundary paths for the parity case, got {len(boundary_paths)}."
         )
     num_leaves = int(Tree(start_tree).n_leaves)
+
+    if full_path_count is not None:
+        def _phase_family_name(phase_idx: int) -> str:
+            if int(phase_idx) == 0:
+                return "O0"
+            if int(phase_idx) == 1:
+                return "A1"
+            if int(phase_idx) == 2:
+                return "O2"
+            return f"P{int(phase_idx)}"
+
+        anchors = []
+        phase_sources = [str(start_tree)]
+        phase_sources.extend(str(path["end_newick"]) for path in boundary_paths[:-1])
+        for phase_idx, phase_source in enumerate(phase_sources):
+            family = _phase_family_name(int(phase_idx))
+            phase_anchors = _sample_phase_family_anchors(
+                phase_source,
+                target_tree,
+                bank_group_key=str(bank_group_key),
+                anchor_family=family,
+                phase_idx=int(phase_idx),
+                num_leaves=num_leaves,
+                count=int(full_path_count),
+            )
+            canonical = _build_legacy_velocity_oracle_sample(
+                phase_source,
+                target_tree,
+                timepoint=float(phase_idx),
+                num_leaves=num_leaves,
+            )
+            if phase_anchors and canonical is not None:
+                phase_anchors[0].update(
+                    {
+                        "velocity": dict(canonical.get("velocity", {})),
+                        "velocity_next_boundary_tree": canonical.get(
+                            "velocity_next_boundary_tree"
+                        ),
+                        "source_checkpoint": None,
+                    }
+                )
+            anchors.extend(phase_anchors)
+
+        return {
+            "num_leaves": int(num_leaves),
+            "boundary_path_count": int(len(boundary_paths)),
+            "anchors": anchors,
+            "full_path_anchor_count": int(full_path_count),
+        }
 
     o0 = _build_legacy_velocity_oracle_sample(
         start_tree,
@@ -266,6 +316,15 @@ def main():
     parser.add_argument("--o0-count", type=int, default=4)
     parser.add_argument("--a1-count", type=int, default=4)
     parser.add_argument("--o2-count", type=int, default=4)
+    parser.add_argument(
+        "--full-path-anchor-count",
+        type=int,
+        default=None,
+        help=(
+            "If set, generate this many anchors for every phase of the oracle path "
+            "instead of only O0/A1/O2."
+        ),
+    )
     parser.add_argument("--min-boundary-paths", type=int, default=3)
     parser.add_argument("--max-start-tries-per-target", type=int, default=200)
     args = parser.parse_args()
@@ -292,6 +351,11 @@ def main():
         o0_count=int(args.o0_count),
         a1_count=int(args.a1_count),
         o2_count=int(args.o2_count),
+        full_path_count=(
+            None
+            if args.full_path_anchor_count is None
+            else int(args.full_path_anchor_count)
+        ),
     )
 
     out_dir = ROOT / "analysis/full_sanity_fixedpair_20260401"
@@ -338,11 +402,14 @@ def main():
         "pair_seed": int(args.pair_seed),
         "boundary_path_count": int(anchor_payload["boundary_path_count"]),
         "num_leaves": int(anchor_payload["num_leaves"]),
+        "anchor_count": int(len(anchor_payload["anchors"])),
         "start_json": str(start_json),
         "target_json": str(target_json),
         "anchors_json": str(anchors_json),
         "config_yaml": str(config_yaml),
     }
+    if anchor_payload.get("full_path_anchor_count") is not None:
+        manifest["full_path_anchor_count"] = int(anchor_payload["full_path_anchor_count"])
     manifest_json.write_text(json.dumps(manifest, indent=2))
     print(json.dumps(manifest, indent=2))
 

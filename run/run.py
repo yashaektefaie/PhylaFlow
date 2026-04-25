@@ -651,17 +651,47 @@ def init_worker(config_file, device_id):
         velocity_terminal_head_use_at_sampling=config["trainer"].get(
             "velocity_terminal_head_use_at_sampling", False
         ),
+        velocity_terminal_head_sampling_action=config["trainer"].get(
+            "velocity_terminal_head_sampling_action", "after_phase"
+        ),
         velocity_terminal_head_hidden_dim=config["trainer"].get(
             "velocity_terminal_head_hidden_dim", 64
         ),
         velocity_terminal_head_probe_features=config["trainer"].get(
             "velocity_terminal_head_probe_features", False
         ),
+        velocity_terminal_head_input_mode=config["trainer"].get(
+            "velocity_terminal_head_input_mode"
+        ),
+        velocity_terminal_head_use_case_adapt=config["trainer"].get(
+            "velocity_terminal_head_use_case_adapt", False
+        ),
+        velocity_terminal_head_balance_loss=config["trainer"].get(
+            "velocity_terminal_head_balance_loss", False
+        ),
+        velocity_terminal_head_topology_pool=config["trainer"].get(
+            "velocity_terminal_head_topology_pool", "mean"
+        ),
         velocity_probe_direct_set_loss=config["trainer"].get(
             "velocity_probe_direct_set_loss", False
         ),
         velocity_probe_direct_set_anchor_only=config["trainer"].get(
             "velocity_probe_direct_set_anchor_only", False
+        ),
+        velocity_probe_direct_set_target_negative_weight=config["trainer"].get(
+            "velocity_probe_direct_set_target_negative_weight", 1.0
+        ),
+        velocity_probe_direct_set_nontarget_nonnegative_weight=config["trainer"].get(
+            "velocity_probe_direct_set_nontarget_nonnegative_weight", 0.0
+        ),
+        velocity_probe_direct_set_positive_reweight=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight", False
+        ),
+        velocity_probe_direct_set_positive_reweight_power=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight_power", 1.0
+        ),
+        velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight_max"
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
@@ -740,6 +770,8 @@ def init_worker(config_file, device_id):
         ),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
+        metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
+        metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -1072,17 +1104,47 @@ def run_test():
         velocity_terminal_head_use_at_sampling=config["trainer"].get(
             "velocity_terminal_head_use_at_sampling", False
         ),
+        velocity_terminal_head_sampling_action=config["trainer"].get(
+            "velocity_terminal_head_sampling_action", "after_phase"
+        ),
         velocity_terminal_head_hidden_dim=config["trainer"].get(
             "velocity_terminal_head_hidden_dim", 64
         ),
         velocity_terminal_head_probe_features=config["trainer"].get(
             "velocity_terminal_head_probe_features", False
         ),
+        velocity_terminal_head_input_mode=config["trainer"].get(
+            "velocity_terminal_head_input_mode"
+        ),
+        velocity_terminal_head_use_case_adapt=config["trainer"].get(
+            "velocity_terminal_head_use_case_adapt", False
+        ),
+        velocity_terminal_head_balance_loss=config["trainer"].get(
+            "velocity_terminal_head_balance_loss", False
+        ),
+        velocity_terminal_head_topology_pool=config["trainer"].get(
+            "velocity_terminal_head_topology_pool", "mean"
+        ),
         velocity_probe_direct_set_loss=config["trainer"].get(
             "velocity_probe_direct_set_loss", False
         ),
         velocity_probe_direct_set_anchor_only=config["trainer"].get(
             "velocity_probe_direct_set_anchor_only", False
+        ),
+        velocity_probe_direct_set_target_negative_weight=config["trainer"].get(
+            "velocity_probe_direct_set_target_negative_weight", 1.0
+        ),
+        velocity_probe_direct_set_nontarget_nonnegative_weight=config["trainer"].get(
+            "velocity_probe_direct_set_nontarget_nonnegative_weight", 0.0
+        ),
+        velocity_probe_direct_set_positive_reweight=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight", False
+        ),
+        velocity_probe_direct_set_positive_reweight_power=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight_power", 1.0
+        ),
+        velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight_max"
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
@@ -1161,6 +1223,8 @@ def run_test():
         ),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
+        metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
+        metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -1573,17 +1637,47 @@ def run_overfit():
         velocity_terminal_head_use_at_sampling=config["trainer"].get(
             "velocity_terminal_head_use_at_sampling", False
         ),
+        velocity_terminal_head_sampling_action=config["trainer"].get(
+            "velocity_terminal_head_sampling_action", "after_phase"
+        ),
         velocity_terminal_head_hidden_dim=config["trainer"].get(
             "velocity_terminal_head_hidden_dim", 64
         ),
         velocity_terminal_head_probe_features=config["trainer"].get(
             "velocity_terminal_head_probe_features", False
         ),
+        velocity_terminal_head_input_mode=config["trainer"].get(
+            "velocity_terminal_head_input_mode"
+        ),
+        velocity_terminal_head_use_case_adapt=config["trainer"].get(
+            "velocity_terminal_head_use_case_adapt", False
+        ),
+        velocity_terminal_head_balance_loss=config["trainer"].get(
+            "velocity_terminal_head_balance_loss", False
+        ),
+        velocity_terminal_head_topology_pool=config["trainer"].get(
+            "velocity_terminal_head_topology_pool", "mean"
+        ),
         velocity_probe_direct_set_loss=config["trainer"].get(
             "velocity_probe_direct_set_loss", False
         ),
         velocity_probe_direct_set_anchor_only=config["trainer"].get(
             "velocity_probe_direct_set_anchor_only", False
+        ),
+        velocity_probe_direct_set_target_negative_weight=config["trainer"].get(
+            "velocity_probe_direct_set_target_negative_weight", 1.0
+        ),
+        velocity_probe_direct_set_nontarget_nonnegative_weight=config["trainer"].get(
+            "velocity_probe_direct_set_nontarget_nonnegative_weight", 0.0
+        ),
+        velocity_probe_direct_set_positive_reweight=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight", False
+        ),
+        velocity_probe_direct_set_positive_reweight_power=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight_power", 1.0
+        ),
+        velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight_max"
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
@@ -1669,6 +1763,8 @@ def run_overfit():
         dt=config["trainer"].get("dt", 0.1),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
+        metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
+        metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -2035,17 +2131,47 @@ def main():
         velocity_terminal_head_use_at_sampling=config["trainer"].get(
             "velocity_terminal_head_use_at_sampling", False
         ),
+        velocity_terminal_head_sampling_action=config["trainer"].get(
+            "velocity_terminal_head_sampling_action", "after_phase"
+        ),
         velocity_terminal_head_hidden_dim=config["trainer"].get(
             "velocity_terminal_head_hidden_dim", 64
         ),
         velocity_terminal_head_probe_features=config["trainer"].get(
             "velocity_terminal_head_probe_features", False
         ),
+        velocity_terminal_head_input_mode=config["trainer"].get(
+            "velocity_terminal_head_input_mode"
+        ),
+        velocity_terminal_head_use_case_adapt=config["trainer"].get(
+            "velocity_terminal_head_use_case_adapt", False
+        ),
+        velocity_terminal_head_balance_loss=config["trainer"].get(
+            "velocity_terminal_head_balance_loss", False
+        ),
+        velocity_terminal_head_topology_pool=config["trainer"].get(
+            "velocity_terminal_head_topology_pool", "mean"
+        ),
         velocity_probe_direct_set_loss=config["trainer"].get(
             "velocity_probe_direct_set_loss", False
         ),
         velocity_probe_direct_set_anchor_only=config["trainer"].get(
             "velocity_probe_direct_set_anchor_only", False
+        ),
+        velocity_probe_direct_set_target_negative_weight=config["trainer"].get(
+            "velocity_probe_direct_set_target_negative_weight", 1.0
+        ),
+        velocity_probe_direct_set_nontarget_nonnegative_weight=config["trainer"].get(
+            "velocity_probe_direct_set_nontarget_nonnegative_weight", 0.0
+        ),
+        velocity_probe_direct_set_positive_reweight=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight", False
+        ),
+        velocity_probe_direct_set_positive_reweight_power=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight_power", 1.0
+        ),
+        velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
+            "velocity_probe_direct_set_positive_reweight_max"
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
@@ -2131,6 +2257,8 @@ def main():
         dt=config["trainer"].get("dt", 0.1),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
+        metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
+        metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -2285,6 +2413,10 @@ def main():
         trainer_args["val_check_interval"] = config["trainer"]["val_callback_freq"]
     if config["trainer"]["limit_val_batches"] == 0:
         trainer_args["limit_val_batches"] = 0.0  # Disable validation
+    if config["trainer"].get("limit_train_batches") is not None:
+        trainer_args["limit_train_batches"] = config["trainer"][
+            "limit_train_batches"
+        ]
 
     trainer_args["accelerator"] = "gpu"
     trainer = Trainer(**trainer_args)

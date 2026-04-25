@@ -334,8 +334,17 @@ class TreeDenoiserTokenGT(nn.Module):
         autoregressive_head_mode="pairwise_threshold",
         autoregressive_group_refinement_layers=0,
         autoregressive_max_subset_size=64,
+        autoregressive_use_case_conditioning=False,
+        autoregressive_num_cases=None,
+        autoregressive_case_dim=16,
         first_hit_head_use_phase_input=False,
         first_hit_head_phase_hidden_dim=None,
+        first_hit_head_mode="base",
+        first_hit_head_hidden_dim=None,
+        first_hit_head_refinement_layers=1,
+        first_hit_head_router_hidden_dim=None,
+        first_hit_head_num_cases=None,
+        first_hit_head_case_dim=16,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -421,6 +430,24 @@ class TreeDenoiserTokenGT(nn.Module):
             if first_hit_head_phase_hidden_dim is None
             else first_hit_head_phase_hidden_dim
         )
+        self.first_hit_head_mode = str(first_hit_head_mode)
+        self.first_hit_head_hidden_dim = int(
+            embed_dim
+            if first_hit_head_hidden_dim is None
+            else first_hit_head_hidden_dim
+        )
+        self.first_hit_head_refinement_layers = max(1, int(first_hit_head_refinement_layers))
+        self.first_hit_head_router_hidden_dim = int(
+            embed_dim
+            if first_hit_head_router_hidden_dim is None
+            else first_hit_head_router_hidden_dim
+        )
+        self.first_hit_head_num_cases = (
+            None
+            if first_hit_head_num_cases is None
+            else int(first_hit_head_num_cases)
+        )
+        self.first_hit_head_case_dim = int(first_hit_head_case_dim)
         self.first_hit_phase_proj = None
         first_hit_head_input_dim = embed_dim
         if self.first_hit_head_use_phase_input:
@@ -437,6 +464,237 @@ class TreeDenoiserTokenGT(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(embed_dim, 1),
         )
+        self.first_hit_edge_head_shared = None
+        self.first_hit_edge_head_out = None
+        self.first_hit_edge_head_router = None
+        self.first_hit_tree_context_proj = None
+        self.first_hit_edge_head_conditioned = None
+        self.first_hit_case_embedding = None
+        self.first_hit_topology_adapter = None
+        self.first_hit_start_topology_adapter = None
+        self.first_hit_edge_head_adapted = None
+        self.first_hit_topology_cross_query = None
+        self.first_hit_topology_cross_key = None
+        self.first_hit_topology_cross_value = None
+        self.first_hit_edge_head_cross_attn = None
+        self.first_hit_edge_head_raw_topology = None
+        self.first_hit_edge_refinement = None
+        self.first_hit_autoregressive_edge_encoder = None
+        self.first_hit_autoregressive_query = None
+        self.first_hit_autoregressive_key = None
+        self.first_hit_autoregressive_update = None
+        self.first_hit_autoregressive_stop = None
+        self.first_hit_autoregressive_start = None
+        if self.first_hit_head_mode == "edge_refined_mlp":
+            self.first_hit_edge_refinement = nn.ModuleList(
+                [
+                    AutoregressiveGroupRefinementBlock(
+                        d_model=embed_dim,
+                        num_heads=n_heads,
+                        dropout=dropout,
+                        ffn_mult=4,
+                        n_layers=n_layers,
+                    )
+                    for _ in range(self.first_hit_head_refinement_layers)
+                ]
+            )
+        if self.first_hit_head_mode in {
+            "shared_mlp",
+            "routed_adapter",
+            "tree_conditioned_mlp",
+        }:
+            self.first_hit_edge_head_shared = nn.Sequential(
+                nn.LayerNorm(first_hit_head_input_dim),
+                nn.Linear(first_hit_head_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.first_hit_edge_head_out = nn.Linear(self.first_hit_head_hidden_dim, 1)
+        if self.first_hit_head_mode == "routed_adapter":
+            router_input_dim = first_hit_head_input_dim + embed_dim
+            self.first_hit_edge_head_router = nn.Sequential(
+                nn.LayerNorm(router_input_dim),
+                nn.Linear(router_input_dim, self.first_hit_head_router_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(
+                    self.first_hit_head_router_hidden_dim,
+                    2 * self.first_hit_head_hidden_dim,
+                ),
+            )
+        if self.first_hit_head_mode == "tree_conditioned_mlp":
+            tree_context_input_dim = first_hit_head_input_dim + embed_dim
+            self.first_hit_tree_context_proj = nn.Sequential(
+                nn.LayerNorm(tree_context_input_dim),
+                nn.Linear(tree_context_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            conditioned_input_dim = first_hit_head_input_dim + self.first_hit_head_hidden_dim
+            self.first_hit_edge_head_conditioned = nn.Sequential(
+                nn.LayerNorm(conditioned_input_dim),
+                nn.Linear(conditioned_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, 1),
+            )
+        if self.first_hit_head_mode in {
+            "case_adapted_mlp",
+            "topology_adapter_mlp",
+            "topology_attention_adapter_mlp",
+            "start_topology_adapter_mlp",
+        }:
+            adapted_input_dim = first_hit_head_input_dim + self.first_hit_head_case_dim
+            self.first_hit_edge_head_adapted = nn.Sequential(
+                nn.LayerNorm(adapted_input_dim),
+                nn.Linear(adapted_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, 1),
+            )
+        if self.first_hit_head_mode == "topology_raw_pool_concat_mlp":
+            raw_topology_input_dim = first_hit_head_input_dim + (2 * embed_dim)
+            self.first_hit_edge_head_raw_topology = nn.Sequential(
+                nn.LayerNorm(raw_topology_input_dim),
+                nn.Linear(raw_topology_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, 1),
+            )
+        if self.first_hit_head_mode in {
+            "topology_cross_attn_mlp",
+            "start_topology_cross_attn_mlp",
+        }:
+            self.first_hit_topology_cross_query = nn.Sequential(
+                nn.LayerNorm(first_hit_head_input_dim + embed_dim),
+                nn.Linear(first_hit_head_input_dim + embed_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_hidden_dim),
+            )
+            self.first_hit_topology_cross_key = nn.Linear(
+                embed_dim,
+                self.first_hit_head_hidden_dim,
+                bias=False,
+            )
+            self.first_hit_topology_cross_value = nn.Linear(
+                embed_dim,
+                self.first_hit_head_hidden_dim,
+                bias=False,
+            )
+            cross_attn_input_dim = (
+                first_hit_head_input_dim + embed_dim + self.first_hit_head_hidden_dim
+            )
+            self.first_hit_edge_head_cross_attn = nn.Sequential(
+                nn.LayerNorm(cross_attn_input_dim),
+                nn.Linear(cross_attn_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, 1),
+            )
+        if self.first_hit_head_mode == "case_adapted_mlp":
+            if self.first_hit_head_num_cases is None or self.first_hit_head_num_cases <= 0:
+                raise ValueError(
+                    "first_hit_head_num_cases must be set for case_adapted_mlp"
+                )
+            self.first_hit_case_embedding = nn.Embedding(
+                self.first_hit_head_num_cases,
+                self.first_hit_head_case_dim,
+            )
+        if self.first_hit_head_mode == "topology_adapter_mlp":
+            topology_context_input_dim = (3 * embed_dim)
+            self.first_hit_topology_adapter = nn.Sequential(
+                nn.LayerNorm(topology_context_input_dim),
+                nn.Linear(topology_context_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_case_dim),
+            )
+        if self.first_hit_head_mode == "start_topology_adapter_mlp":
+            start_topology_context_input_dim = 4 * embed_dim
+            self.first_hit_start_topology_adapter = nn.Sequential(
+                nn.LayerNorm(start_topology_context_input_dim),
+                nn.Linear(start_topology_context_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_case_dim),
+            )
+        self.first_hit_topology_query = None
+        self.first_hit_topology_key = None
+        self.first_hit_topology_value = None
+        if self.first_hit_head_mode == "topology_attention_adapter_mlp":
+            topology_query_input_dim = first_hit_head_input_dim + embed_dim
+            self.first_hit_topology_query = nn.Sequential(
+                nn.LayerNorm(topology_query_input_dim),
+                nn.Linear(topology_query_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_case_dim),
+            )
+            self.first_hit_topology_key = nn.Linear(
+                embed_dim,
+                self.first_hit_head_case_dim,
+                bias=False,
+            )
+            self.first_hit_topology_value = nn.Linear(
+                embed_dim,
+                self.first_hit_head_case_dim,
+                bias=False,
+            )
+            topology_context_input_dim = 4 * self.first_hit_head_case_dim
+            self.first_hit_topology_adapter = nn.Sequential(
+                nn.LayerNorm(topology_context_input_dim),
+                nn.Linear(topology_context_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_case_dim),
+            )
+        if self.first_hit_head_mode == "autoregressive_set":
+            self.first_hit_autoregressive_edge_encoder = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(
+                    self.first_hit_head_hidden_dim,
+                    self.first_hit_head_hidden_dim,
+                ),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.first_hit_autoregressive_query = nn.Linear(
+                self.first_hit_head_hidden_dim,
+                self.first_hit_head_hidden_dim,
+                bias=False,
+            )
+            self.first_hit_autoregressive_key = nn.Linear(
+                self.first_hit_head_hidden_dim,
+                self.first_hit_head_hidden_dim,
+                bias=False,
+            )
+            self.first_hit_autoregressive_update = nn.GRUCell(
+                self.first_hit_head_hidden_dim,
+                self.first_hit_head_hidden_dim,
+            )
+            self.first_hit_autoregressive_stop = nn.Sequential(
+                nn.LayerNorm(self.first_hit_head_hidden_dim),
+                nn.Linear(self.first_hit_head_hidden_dim, 1),
+            )
+            self.first_hit_autoregressive_start = nn.Parameter(
+                torch.zeros(self.first_hit_head_hidden_dim)
+            )
         self.boundary_vanish_edge_head = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
@@ -468,6 +726,29 @@ class TreeDenoiserTokenGT(nn.Module):
             autoregressive_group_refinement_layers
         )
         self.autoregressive_max_subset_size = int(autoregressive_max_subset_size)
+        self.autoregressive_use_case_conditioning = bool(
+            autoregressive_use_case_conditioning
+        )
+        self.autoregressive_num_cases = (
+            None if autoregressive_num_cases is None else int(autoregressive_num_cases)
+        )
+        self.autoregressive_case_dim = int(autoregressive_case_dim)
+        self.autoregressive_case_embedding = None
+        self.autoregressive_case_proj = None
+        if self.autoregressive_use_case_conditioning:
+            if self.autoregressive_num_cases is None or self.autoregressive_num_cases <= 0:
+                raise ValueError(
+                    "autoregressive_num_cases must be set when "
+                    "autoregressive_use_case_conditioning is enabled"
+                )
+            self.autoregressive_case_embedding = nn.Embedding(
+                self.autoregressive_num_cases,
+                self.autoregressive_case_dim,
+            )
+            self.autoregressive_case_proj = nn.Sequential(
+                nn.LayerNorm(self.autoregressive_case_dim),
+                nn.Linear(self.autoregressive_case_dim, embed_dim),
+            )
         self.autoregressive_group_refinement = nn.ModuleList(
             [
                 AutoregressiveGroupRefinementBlock(
@@ -818,6 +1099,545 @@ class TreeDenoiserTokenGT(nn.Module):
         phase_features = phase_features.expand(batch_size, max_edges, self.embed_dim)
         return torch.cat([padded_edges, phase_features], dim=-1)
 
+    def _masked_edge_mean(self, edge_values, edge_pad_mask):
+        if edge_values.numel() == 0:
+            return edge_values.new_zeros(edge_values.shape[0], edge_values.shape[-1])
+        valid = (~edge_pad_mask).unsqueeze(-1).to(edge_values.dtype)
+        denom = valid.sum(dim=1).clamp_min(1.0)
+        return (edge_values * valid).sum(dim=1) / denom
+
+    def _masked_edge_max(self, edge_values, edge_pad_mask):
+        if edge_values.numel() == 0:
+            return edge_values.new_zeros(edge_values.shape[0], edge_values.shape[-1])
+        masked_values = edge_values.masked_fill(
+            edge_pad_mask.unsqueeze(-1),
+            float("-inf"),
+        )
+        max_values = masked_values.max(dim=1).values
+        no_valid = edge_pad_mask.all(dim=1, keepdim=True)
+        return torch.where(
+            no_valid,
+            edge_values.new_zeros(max_values.shape),
+            max_values,
+        )
+
+    def _refine_first_hit_edges(self, padded_edges, edge_pad_mask):
+        if self.first_hit_edge_refinement is None:
+            return padded_edges
+        if padded_edges.numel() == 0:
+            return padded_edges
+        refined = padded_edges.clone()
+        batch_size = int(padded_edges.shape[0])
+        for b in range(batch_size):
+            valid_mask = ~edge_pad_mask[b]
+            if not bool(valid_mask.any().item()):
+                continue
+            edge_values = refined[b, valid_mask]
+            for layer in self.first_hit_edge_refinement:
+                edge_values = layer(edge_values)
+            refined[b, valid_mask] = edge_values
+        return refined
+
+    def _first_hit_autoregressive_encode_edges(self, edge_features):
+        if (
+            edge_features is None
+            or self.first_hit_autoregressive_edge_encoder is None
+        ):
+            return None
+        squeeze_batch = False
+        if edge_features.ndim == 2:
+            edge_features = edge_features.unsqueeze(0)
+            squeeze_batch = True
+        encoded = self.first_hit_autoregressive_edge_encoder(edge_features)
+        if squeeze_batch:
+            encoded = encoded.squeeze(0)
+        return encoded
+
+    def _first_hit_autoregressive_init_state(self, encoded_edges, available_mask=None):
+        state = self.first_hit_autoregressive_start.to(
+            device=encoded_edges.device,
+            dtype=encoded_edges.dtype,
+        )
+        if encoded_edges.numel() == 0:
+            return state
+        if available_mask is None:
+            available_mask = torch.ones(
+                encoded_edges.shape[0],
+                device=encoded_edges.device,
+                dtype=torch.bool,
+            )
+        if bool(available_mask.any().item()):
+            state = state + encoded_edges[available_mask].mean(dim=0)
+        return state
+
+    def _first_hit_autoregressive_step_logits(
+        self,
+        encoded_edges,
+        state,
+        available_mask,
+    ):
+        query = self.first_hit_autoregressive_query(state)
+        keys = self.first_hit_autoregressive_key(encoded_edges)
+        edge_logits = torch.matmul(keys, query.unsqueeze(-1)).squeeze(-1)
+        edge_logits = edge_logits / math.sqrt(float(self.first_hit_head_hidden_dim))
+        if edge_logits.numel() > 0:
+            edge_logits = edge_logits.masked_fill(
+                ~available_mask.bool(),
+                float("-inf"),
+            )
+        stop_logit = self.first_hit_autoregressive_stop(state).reshape(1)
+        return torch.cat([edge_logits, stop_logit], dim=0)
+
+    def predict_first_hit_autoregressive_mask(
+        self,
+        edge_features,
+        candidate_mask=None,
+        max_steps=None,
+    ):
+        encoded_edges = self._first_hit_autoregressive_encode_edges(edge_features)
+        if encoded_edges is None or encoded_edges.numel() == 0:
+            device = (
+                edge_features.device
+                if edge_features is not None and hasattr(edge_features, "device")
+                else None
+            )
+            return torch.zeros(0, dtype=torch.bool, device=device)
+        n_edges = int(encoded_edges.shape[0])
+        if candidate_mask is None:
+            available_mask = torch.ones(
+                n_edges,
+                device=encoded_edges.device,
+                dtype=torch.bool,
+            )
+        else:
+            available_mask = candidate_mask.to(
+                device=encoded_edges.device,
+                dtype=torch.bool,
+            )
+        selected = torch.zeros(
+            n_edges,
+            device=encoded_edges.device,
+            dtype=torch.bool,
+        )
+        if not bool(available_mask.any().item()):
+            return selected
+        state = self._first_hit_autoregressive_init_state(
+            encoded_edges,
+            available_mask=available_mask,
+        )
+        if max_steps is None or int(max_steps) <= 0:
+            max_decode_steps = int(available_mask.sum().item()) + 1
+        else:
+            max_decode_steps = int(max_steps)
+        for _ in range(max_decode_steps):
+            step_available = available_mask & (~selected)
+            logits = self._first_hit_autoregressive_step_logits(
+                encoded_edges,
+                state,
+                step_available,
+            )
+            choice = int(torch.argmax(logits).item())
+            if choice >= n_edges:
+                break
+            if not bool(step_available[choice].item()):
+                break
+            selected[choice] = True
+            state = self.first_hit_autoregressive_update(
+                encoded_edges[choice].unsqueeze(0),
+                state.unsqueeze(0),
+            ).squeeze(0)
+        return selected
+
+    def first_hit_autoregressive_group_loss(self, edge_features, target_mask):
+        encoded_edges = self._first_hit_autoregressive_encode_edges(edge_features)
+        if encoded_edges is None or encoded_edges.numel() == 0:
+            zero = target_mask.new_zeros(())
+            return zero, {
+                "target_first_size": int(target_mask.sum().item()),
+                "pred_first_size": 0,
+                "recall": 0.0,
+                "precision": 0.0,
+                "jaccard": 0.0,
+                "exact": 0.0,
+            }
+        target_mask = target_mask.to(device=encoded_edges.device, dtype=torch.bool)
+        available_mask = torch.ones(
+            encoded_edges.shape[0],
+            device=encoded_edges.device,
+            dtype=torch.bool,
+        )
+        state = self._first_hit_autoregressive_init_state(
+            encoded_edges,
+            available_mask=available_mask,
+        )
+        selected = torch.zeros_like(target_mask)
+        losses = []
+        while True:
+            remaining_target = target_mask & (~selected)
+            step_available = available_mask & (~selected)
+            logits = self._first_hit_autoregressive_step_logits(
+                encoded_edges,
+                state,
+                step_available,
+            )
+            if bool(remaining_target.any().item()):
+                log_probs = torch.log_softmax(logits, dim=0)
+                step_loss = -torch.logsumexp(log_probs[:-1][remaining_target], dim=0)
+                losses.append(step_loss)
+                candidate_scores = logits[:-1].masked_fill(
+                    ~remaining_target,
+                    float('-inf'),
+                )
+                chosen_idx = int(torch.argmax(candidate_scores).item())
+                selected[chosen_idx] = True
+                state = self.first_hit_autoregressive_update(
+                    encoded_edges[chosen_idx].unsqueeze(0),
+                    state.unsqueeze(0),
+                ).squeeze(0)
+                continue
+            stop_target = torch.tensor(
+                [int(encoded_edges.shape[0])],
+                device=encoded_edges.device,
+                dtype=torch.long,
+            )
+            losses.append(F.cross_entropy(logits.unsqueeze(0), stop_target))
+            break
+        loss = torch.stack(losses).mean()
+        with torch.no_grad():
+            pred_mask = self.predict_first_hit_autoregressive_mask(
+                edge_features,
+                candidate_mask=available_mask,
+            )
+            tp = (pred_mask & target_mask).sum().float()
+            pred_n = pred_mask.sum().float()
+            true_n = target_mask.sum().float()
+            union = (pred_mask | target_mask).sum().float()
+            exact = float(torch.equal(pred_mask, target_mask))
+        stats = {
+            "target_first_size": int(true_n.item()),
+            "pred_first_size": int(pred_n.item()),
+            "recall": float((tp / true_n.clamp_min(1.0)).item()) if int(true_n.item()) > 0 else 1.0,
+            "precision": float((tp / pred_n.clamp_min(1.0)).item()) if int(pred_n.item()) > 0 else (1.0 if int(true_n.item()) == 0 else 0.0),
+            "jaccard": float((tp / union.clamp_min(1.0)).item()) if int(union.item()) > 0 else 1.0,
+            "exact": exact,
+        }
+        return loss, stats
+
+    def _compute_first_hit_logits_from_edges(
+        self,
+        padded_edges,
+        edge_pad_mask,
+        *,
+        t=None,
+        graph_context=None,
+        case_indices=None,
+        topology_identity_embeddings=None,
+        start_topology_features=None,
+        start_topology_embeddings=None,
+        start_topology_pad_mask=None,
+    ):
+        if self.first_hit_head_mode == "edge_refined_mlp":
+            padded_edges = self._refine_first_hit_edges(padded_edges, edge_pad_mask)
+        first_hit_head_input = self._build_first_hit_head_input(
+            padded_edges,
+            t=t,
+        )
+        if self.first_hit_head_mode == "base":
+            return self.first_hit_edge_head(first_hit_head_input)
+        if self.first_hit_head_mode == "edge_refined_mlp":
+            return self.first_hit_edge_head(first_hit_head_input)
+        if self.first_hit_head_mode == "shared_mlp":
+            hidden = self.first_hit_edge_head_shared(first_hit_head_input)
+            return self.first_hit_edge_head_out(hidden)
+        if self.first_hit_head_mode == "autoregressive_set":
+            return self.first_hit_edge_head(first_hit_head_input)
+        if self.first_hit_head_mode == "routed_adapter":
+            hidden = self.first_hit_edge_head_shared(first_hit_head_input)
+            pooled_input = self._masked_edge_mean(first_hit_head_input, edge_pad_mask)
+            if graph_context is None:
+                graph_context = padded_edges.new_zeros(
+                    padded_edges.shape[0], self.embed_dim
+                )
+            router_input = torch.cat([pooled_input, graph_context], dim=-1)
+            gamma_beta = self.first_hit_edge_head_router(router_input)
+            gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+            hidden = hidden * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            return self.first_hit_edge_head_out(hidden)
+        if self.first_hit_head_mode == "tree_conditioned_mlp":
+            pooled_input = self._masked_edge_mean(first_hit_head_input, edge_pad_mask)
+            if graph_context is None:
+                graph_context = padded_edges.new_zeros(
+                    padded_edges.shape[0], self.embed_dim
+                )
+            tree_context = self.first_hit_tree_context_proj(
+                torch.cat([pooled_input, graph_context], dim=-1)
+            )
+            conditioned_input = torch.cat(
+                [
+                    first_hit_head_input,
+                    tree_context.unsqueeze(1).expand(
+                        -1, first_hit_head_input.shape[1], -1
+                    ),
+                ],
+                dim=-1,
+            )
+            return self.first_hit_edge_head_conditioned(conditioned_input)
+        if self.first_hit_head_mode == "case_adapted_mlp":
+            if case_indices is None:
+                raise ValueError("case_indices are required for case_adapted_mlp")
+            case_indices = case_indices.to(device=padded_edges.device, dtype=torch.long)
+            if case_indices.ndim != 1 or case_indices.shape[0] != padded_edges.shape[0]:
+                raise ValueError(
+                    "case_indices must have shape [batch] for case_adapted_mlp"
+                )
+            case_features = self.first_hit_case_embedding(case_indices)
+            case_features = case_features.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            return self.first_hit_edge_head_adapted(
+                torch.cat([first_hit_head_input, case_features], dim=-1)
+            )
+        if self.first_hit_head_mode == "start_topology_adapter_mlp":
+            if start_topology_features is None:
+                raise ValueError(
+                    "start_topology_features are required for start_topology_adapter_mlp"
+                )
+            start_topology_features = start_topology_features.to(
+                device=padded_edges.device,
+                dtype=padded_edges.dtype,
+            )
+            if (
+                start_topology_features.ndim != 2
+                or start_topology_features.shape[0] != padded_edges.shape[0]
+                or start_topology_features.shape[1] != 3 * self.embed_dim
+            ):
+                raise ValueError(
+                    "start_topology_features must have shape [batch, 3 * embed_dim] "
+                    "for start_topology_adapter_mlp"
+                )
+            if graph_context is None:
+                graph_context = padded_edges.new_zeros(
+                    padded_edges.shape[0], self.embed_dim
+                )
+            topology_code = self.first_hit_start_topology_adapter(
+                torch.cat([start_topology_features, graph_context], dim=-1)
+            )
+            topology_code = topology_code.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            return self.first_hit_edge_head_adapted(
+                torch.cat([first_hit_head_input, topology_code], dim=-1)
+            )
+        if self.first_hit_head_mode == "topology_adapter_mlp":
+            if topology_identity_embeddings is None:
+                raise ValueError(
+                    "topology_identity_embeddings are required for topology_adapter_mlp"
+                )
+            topology_mean = self._masked_edge_mean(
+                topology_identity_embeddings,
+                edge_pad_mask,
+            )
+            topology_max = self._masked_edge_max(
+                topology_identity_embeddings,
+                edge_pad_mask,
+            )
+            if graph_context is None:
+                graph_context = padded_edges.new_zeros(
+                    padded_edges.shape[0], self.embed_dim
+                )
+            topology_code = self.first_hit_topology_adapter(
+                torch.cat([topology_mean, topology_max, graph_context], dim=-1)
+            )
+            topology_code = topology_code.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            return self.first_hit_edge_head_adapted(
+                torch.cat([first_hit_head_input, topology_code], dim=-1)
+            )
+        if self.first_hit_head_mode == "topology_raw_pool_concat_mlp":
+            if topology_identity_embeddings is None:
+                raise ValueError(
+                    "topology_identity_embeddings are required for topology_raw_pool_concat_mlp"
+                )
+            topology_mean = self._masked_edge_mean(
+                topology_identity_embeddings,
+                edge_pad_mask,
+            )
+            topology_max = self._masked_edge_max(
+                topology_identity_embeddings,
+                edge_pad_mask,
+            )
+            topology_summary = torch.cat([topology_mean, topology_max], dim=-1)
+            topology_summary = topology_summary.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            return self.first_hit_edge_head_raw_topology(
+                torch.cat([first_hit_head_input, topology_summary], dim=-1)
+            )
+        if self.first_hit_head_mode == "topology_attention_adapter_mlp":
+            if topology_identity_embeddings is None:
+                raise ValueError(
+                    "topology_identity_embeddings are required for topology_attention_adapter_mlp"
+                )
+            pooled_input = self._masked_edge_mean(first_hit_head_input, edge_pad_mask)
+            if graph_context is None:
+                graph_context = padded_edges.new_zeros(
+                    padded_edges.shape[0], self.embed_dim
+                )
+            topology_query = self.first_hit_topology_query(
+                torch.cat([pooled_input, graph_context], dim=-1)
+            )
+            topology_keys = self.first_hit_topology_key(topology_identity_embeddings)
+            topology_values = self.first_hit_topology_value(topology_identity_embeddings)
+            attention_scores = (
+                torch.sum(topology_keys * topology_query.unsqueeze(1), dim=-1)
+                / math.sqrt(float(self.first_hit_head_case_dim))
+            )
+            attention_scores = attention_scores.masked_fill(
+                edge_pad_mask,
+                float("-inf"),
+            )
+            attention_weights = torch.softmax(attention_scores, dim=1)
+            no_valid = edge_pad_mask.all(dim=1, keepdim=True)
+            attention_weights = torch.where(
+                no_valid,
+                attention_weights.new_zeros(attention_weights.shape),
+                attention_weights,
+            )
+            attention_summary = torch.sum(
+                topology_values * attention_weights.unsqueeze(-1),
+                dim=1,
+            )
+            topology_mean = self._masked_edge_mean(
+                topology_values,
+                edge_pad_mask,
+            )
+            topology_max = self._masked_edge_max(
+                topology_values,
+                edge_pad_mask,
+            )
+            topology_code = self.first_hit_topology_adapter(
+                torch.cat(
+                    [
+                        topology_query,
+                        attention_summary,
+                        topology_mean,
+                        topology_max,
+                    ],
+                    dim=-1,
+                )
+            )
+            topology_code = topology_code.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            return self.first_hit_edge_head_adapted(
+                torch.cat([first_hit_head_input, topology_code], dim=-1)
+            )
+        if self.first_hit_head_mode == "topology_cross_attn_mlp":
+            if topology_identity_embeddings is None:
+                raise ValueError(
+                    "topology_identity_embeddings are required for topology_cross_attn_mlp"
+                )
+            if graph_context is None:
+                graph_context = padded_edges.new_zeros(
+                    padded_edges.shape[0], self.embed_dim
+                )
+            graph_context_expanded = graph_context.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            cross_query = self.first_hit_topology_cross_query(
+                torch.cat([first_hit_head_input, graph_context_expanded], dim=-1)
+            )
+            topology_keys = self.first_hit_topology_cross_key(
+                topology_identity_embeddings
+            )
+            topology_values = self.first_hit_topology_cross_value(
+                topology_identity_embeddings
+            )
+            attention_scores = torch.matmul(
+                cross_query,
+                topology_keys.transpose(1, 2),
+            ) / math.sqrt(float(self.first_hit_head_hidden_dim))
+            attention_scores = attention_scores.masked_fill(
+                edge_pad_mask.unsqueeze(1),
+                float("-inf"),
+            )
+            attention_weights = torch.softmax(attention_scores, dim=-1)
+            no_valid = edge_pad_mask.all(dim=1, keepdim=True).unsqueeze(-1)
+            attention_weights = torch.where(
+                no_valid,
+                attention_weights.new_zeros(attention_weights.shape),
+                attention_weights,
+            )
+            topology_context = torch.matmul(attention_weights, topology_values)
+            return self.first_hit_edge_head_cross_attn(
+                torch.cat(
+                    [
+                        first_hit_head_input,
+                        graph_context_expanded,
+                        topology_context,
+                    ],
+                    dim=-1,
+                )
+            )
+        if self.first_hit_head_mode == "start_topology_cross_attn_mlp":
+            if start_topology_embeddings is None or start_topology_pad_mask is None:
+                raise ValueError(
+                    "start_topology_embeddings and start_topology_pad_mask are "
+                    "required for start_topology_cross_attn_mlp"
+                )
+            start_topology_embeddings = start_topology_embeddings.to(
+                device=padded_edges.device,
+                dtype=padded_edges.dtype,
+            )
+            start_topology_pad_mask = start_topology_pad_mask.to(
+                device=padded_edges.device,
+                dtype=torch.bool,
+            )
+            if graph_context is None:
+                graph_context = padded_edges.new_zeros(
+                    padded_edges.shape[0], self.embed_dim
+                )
+            graph_context_expanded = graph_context.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            cross_query = self.first_hit_topology_cross_query(
+                torch.cat([first_hit_head_input, graph_context_expanded], dim=-1)
+            )
+            topology_keys = self.first_hit_topology_cross_key(
+                start_topology_embeddings
+            )
+            topology_values = self.first_hit_topology_cross_value(
+                start_topology_embeddings
+            )
+            attention_scores = torch.matmul(
+                cross_query,
+                topology_keys.transpose(1, 2),
+            ) / math.sqrt(float(self.first_hit_head_hidden_dim))
+            attention_scores = attention_scores.masked_fill(
+                start_topology_pad_mask.unsqueeze(1),
+                float("-inf"),
+            )
+            attention_weights = torch.softmax(attention_scores, dim=-1)
+            no_valid = start_topology_pad_mask.all(dim=1, keepdim=True).unsqueeze(-1)
+            attention_weights = torch.where(
+                no_valid,
+                attention_weights.new_zeros(attention_weights.shape),
+                attention_weights,
+            )
+            topology_context = torch.matmul(attention_weights, topology_values)
+            return self.first_hit_edge_head_cross_attn(
+                torch.cat(
+                    [
+                        first_hit_head_input,
+                        graph_context_expanded,
+                        topology_context,
+                    ],
+                    dim=-1,
+                )
+            )
+        raise ValueError(f"Unknown first_hit_head_mode: {self.first_hit_head_mode}")
+
     def _decode_outputs(
         self,
         x,
@@ -834,6 +1654,11 @@ class TreeDenoiserTokenGT(nn.Module):
         return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_case_indices=None,
+        first_hit_case_indices=None,
+        first_hit_start_topology_features=None,
+        first_hit_start_topology_embeddings=None,
+        first_hit_start_topology_pad_mask=None,
     ):
         B, _T, D = x.shape
         leaf_idx_list = list(leaf_idx) if isinstance(leaf_idx, (list, tuple)) else [leaf_idx]
@@ -899,6 +1724,28 @@ class TreeDenoiserTokenGT(nn.Module):
                     )
                 )
 
+            autoregressive_case_context = None
+            if self.autoregressive_use_case_conditioning:
+                if autoregressive_case_indices is None:
+                    raise ValueError(
+                        "autoregressive_case_indices are required when "
+                        "autoregressive_use_case_conditioning is enabled"
+                    )
+                autoregressive_case_indices = autoregressive_case_indices.to(
+                    device=x.device,
+                    dtype=torch.long,
+                )
+                if (
+                    autoregressive_case_indices.ndim != 1
+                    or autoregressive_case_indices.shape[0] != B
+                ):
+                    raise ValueError(
+                        "autoregressive_case_indices must have shape [batch]"
+                    )
+                autoregressive_case_context = self.autoregressive_case_proj(
+                    self.autoregressive_case_embedding(autoregressive_case_indices)
+                )
+
             for b, groups in enumerate(batch_polytomy_index):
                 for num, group in enumerate(groups):
                     if group.size(0) <= 1:
@@ -912,6 +1759,10 @@ class TreeDenoiserTokenGT(nn.Module):
                     group_embeddings = group_embeddings + (
                         self.split_identity_scale * group_identity
                     )
+                    if autoregressive_case_context is not None:
+                        group_embeddings = group_embeddings + autoregressive_case_context[
+                            b
+                        ].unsqueeze(0)
                     for refinement_block in self.autoregressive_group_refinement:
                         group_embeddings = refinement_block(group_embeddings)
                     if self.autoregressive_head_mode == "structured_subset":
@@ -940,6 +1791,18 @@ class TreeDenoiserTokenGT(nn.Module):
             x_no_graph = x[:, 1:, :]
             edge_mask_bool = edge_mask.bool()
             edge_lists = [x_no_graph[b][edge_mask_bool[b]] for b in range(B)]
+            split_identity_lists = []
+            for b in range(B):
+                n_b = edge_lists[b].size(0)
+                if n_b == 0:
+                    split_identity_lists.append(torch.zeros(0, D, device=x.device, dtype=x.dtype))
+                    continue
+                split_identity_lists.append(
+                    self.create_split_identity_embedding(
+                        edge_split_masks[b][:n_b],
+                        x.device,
+                    ).to(dtype=x.dtype)
+                )
             max_edges = max((e.size(0) for e in edge_lists), default=0)
 
             if max_edges == 0:
@@ -948,18 +1811,20 @@ class TreeDenoiserTokenGT(nn.Module):
                 )
 
             padded_edges = torch.zeros(B, max_edges, D, device=x.device, dtype=x.dtype)
+            padded_split_identity = torch.zeros(
+                B, max_edges, D, device=x.device, dtype=x.dtype
+            )
             edge_pad_mask = torch.ones(B, max_edges, device=x.device, dtype=torch.bool)
 
             for b, edges_b in enumerate(edge_lists):
                 n_b = edges_b.size(0)
                 if n_b == 0:
                     continue
-                split_identity = self.create_split_identity_embedding(
-                    edge_split_masks[b][:n_b], x.device
-                )
+                split_identity = split_identity_lists[b]
                 padded_edges[b, :n_b] = edges_b + (
                     self.split_identity_scale * split_identity
                 )
+                padded_split_identity[b, :n_b] = split_identity
                 edge_pad_mask[b, :n_b] = False
 
             edge_outputs = self.edge_output_layer(padded_edges)
@@ -967,12 +1832,16 @@ class TreeDenoiserTokenGT(nn.Module):
                 first_hit_logits = None
                 boundary_vanish_logits = None
                 if return_first_hit_logits:
-                    first_hit_head_input = self._build_first_hit_head_input(
+                    first_hit_logits = self._compute_first_hit_logits_from_edges(
                         padded_edges,
+                        edge_pad_mask,
                         t=t,
-                    )
-                    first_hit_logits = self.first_hit_edge_head(
-                        first_hit_head_input
+                        graph_context=x[:, 0, :],
+                        case_indices=first_hit_case_indices,
+                        topology_identity_embeddings=padded_split_identity,
+                        start_topology_features=first_hit_start_topology_features,
+                        start_topology_embeddings=first_hit_start_topology_embeddings,
+                        start_topology_pad_mask=first_hit_start_topology_pad_mask,
                     )
                 if return_boundary_vanish_logits:
                     boundary_vanish_logits = self.boundary_vanish_edge_head(
@@ -1022,6 +1891,11 @@ class TreeDenoiserTokenGT(nn.Module):
         return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_case_indices=None,
+        first_hit_case_indices=None,
+        first_hit_start_topology_features=None,
+        first_hit_start_topology_embeddings=None,
+        first_hit_start_topology_pad_mask=None,
     ):
         x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
             self._prepare_encoder_inputs(
@@ -1051,6 +1925,11 @@ class TreeDenoiserTokenGT(nn.Module):
             return_boundary_vanish_logits=return_boundary_vanish_logits,
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
+            autoregressive_case_indices=autoregressive_case_indices,
+            first_hit_case_indices=first_hit_case_indices,
+            first_hit_start_topology_features=first_hit_start_topology_features,
+            first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
+            first_hit_start_topology_pad_mask=first_hit_start_topology_pad_mask,
         )
 
 
@@ -1143,6 +2022,8 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
         return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_case_indices=None,
+        first_hit_case_indices=None,
     ):
         x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
             self._prepare_encoder_inputs(
@@ -1179,6 +2060,8 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
             return_boundary_vanish_logits=return_boundary_vanish_logits,
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
+            autoregressive_case_indices=autoregressive_case_indices,
+            first_hit_case_indices=first_hit_case_indices,
         )
 
 
@@ -1292,6 +2175,8 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
         return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_case_indices=None,
+        first_hit_case_indices=None,
     ):
         x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
             self._prepare_encoder_inputs(
@@ -1334,6 +2219,8 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
             return_boundary_vanish_logits=return_boundary_vanish_logits,
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
+            autoregressive_case_indices=autoregressive_case_indices,
+            first_hit_case_indices=first_hit_case_indices,
         )
 
 
@@ -1384,12 +2271,25 @@ def return_model(config):
         autoregressive_max_subset_size=config["model"].get(
             "autoregressive_max_subset_size", 64
         ),
+        autoregressive_use_case_conditioning=config["model"].get(
+            "autoregressive_use_case_conditioning", False
+        ),
+        autoregressive_num_cases=config["model"].get("autoregressive_num_cases"),
+        autoregressive_case_dim=config["model"].get("autoregressive_case_dim", 16),
         first_hit_head_use_phase_input=config["model"].get(
             "first_hit_head_use_phase_input", False
         ),
         first_hit_head_phase_hidden_dim=config["model"].get(
             "first_hit_head_phase_hidden_dim"
         ),
+        first_hit_head_mode=config["model"].get("first_hit_head_mode", "base"),
+        first_hit_head_hidden_dim=config["model"].get("first_hit_head_hidden_dim"),
+        first_hit_head_refinement_layers=config["model"].get("first_hit_head_refinement_layers", 1),
+        first_hit_head_router_hidden_dim=config["model"].get(
+            "first_hit_head_router_hidden_dim"
+        ),
+        first_hit_head_num_cases=config["model"].get("first_hit_head_num_cases"),
+        first_hit_head_case_dim=config["model"].get("first_hit_head_case_dim", 16),
     )
     model_variant = str(config["model"].get("model_variant", "base"))
     if model_variant == "two_block_refine":

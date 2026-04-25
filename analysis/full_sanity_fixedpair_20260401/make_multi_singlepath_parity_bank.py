@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -50,10 +51,19 @@ def _write_case_files(case_name: str, pair, anchor_payload):
         "start_try": int(pair["start_try"]),
         "boundary_path_count": int(anchor_payload["boundary_path_count"]),
         "num_leaves": int(anchor_payload["num_leaves"]),
+        "anchor_count": int(len(anchor_payload["anchors"])),
         "start_json": str(paths["start_json"]),
         "target_json": str(paths["target_json"]),
         "anchors_json": str(paths["anchors_json"]),
     }
+    if anchor_payload.get("full_path_anchor_count") is not None:
+        manifest["full_path_anchor_count"] = int(anchor_payload["full_path_anchor_count"])
+    if pair.get("topology_key") is not None:
+        manifest["topology_key"] = str(pair["topology_key"])
+    if pair.get("topology_count") is not None:
+        manifest["topology_count"] = int(pair["topology_count"])
+    if pair.get("topology_probability") is not None:
+        manifest["topology_probability"] = float(pair["topology_probability"])
     paths["manifest_json"].write_text(json.dumps(manifest, indent=2))
     return manifest, paths
 
@@ -62,6 +72,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--template-config", type=Path, default=DEFAULT_TEMPLATE)
     parser.add_argument("--exclude-target-json", type=Path, default=DEFAULT_CURRENT_TARGET)
+    parser.add_argument(
+        "--no-exclude-target",
+        action="store_true",
+        help="Do not exclude the default current target topology when building the bank.",
+    )
     parser.add_argument("--bank-name", required=True)
     parser.add_argument("--num-cases", type=int, default=8)
     parser.add_argument("--dataset-index", type=int, default=0)
@@ -69,6 +84,15 @@ def main():
     parser.add_argument("--o0-count", type=int, default=4)
     parser.add_argument("--a1-count", type=int, default=4)
     parser.add_argument("--o2-count", type=int, default=4)
+    parser.add_argument(
+        "--full-path-anchor-count",
+        type=int,
+        default=None,
+        help=(
+            "If set, generate this many anchors for every phase of every case "
+            "instead of only O0/A1/O2."
+        ),
+    )
     parser.add_argument("--min-boundary-paths", type=int, default=3)
     parser.add_argument("--max-start-tries-per-target", type=int, default=200)
     parser.add_argument(
@@ -76,17 +100,36 @@ def main():
         action="store_true",
         help="Use at most one representative target tree per unique posterior topology.",
     )
+    parser.add_argument(
+        "--weight-target-topologies-by-posterior-frequency",
+        action="store_true",
+        help=(
+            "Allocate repeated target topologies in proportion to their frequency in "
+            "the posterior tree sample. This allows duplicate target topologies in the bank."
+        ),
+    )
+    parser.add_argument(
+        "--ensure-all-topologies-represented",
+        action="store_true",
+        help=(
+            "When using weighted topology allocation, give every unique posterior "
+            "topology at least one case before distributing remaining cases by frequency."
+        ),
+    )
     args = parser.parse_args()
 
     template_config = yaml.safe_load(args.template_config.read_text())
     set_seed(int(template_config["trainer"].get("seed", 42)))
     dataset = build_dataset(template_config)
     rng = random.Random(int(args.pair_seed))
-    exclude_target = _load_current_target(args.exclude_target_json)
+    exclude_target = None
+    if not bool(args.no_exclude_target):
+        exclude_target = _load_current_target(args.exclude_target_json)
 
     seen_targets = set()
     if exclude_target is not None:
         seen_targets.add(str(exclude_target).strip())
+    seen_start_target_pairs = set()
 
     manifests = []
     combined_anchor_samples = []
@@ -94,8 +137,87 @@ def main():
     target_paths = []
     pair_attempt = 0
     target_index_schedule = None
-    if bool(args.require_unique_target_topologies):
-        posterior_trees = list(dataset.dataset_train.return_posterior_trees(int(args.dataset_index)))
+    target_schedule_entries = None
+    posterior_trees = list(
+        dataset.dataset_train.return_posterior_trees(int(args.dataset_index))
+    )
+    topology_to_indices = {}
+    for idx, tree in enumerate(posterior_trees):
+        key = canonicalize_topology_newick(str(tree).strip())
+        topology_to_indices.setdefault(key, []).append(int(idx))
+
+    if bool(args.weight_target_topologies_by_posterior_frequency):
+        if bool(args.require_unique_target_topologies):
+            raise RuntimeError(
+                "Use either --require-unique-target-topologies or "
+                "--weight-target-topologies-by-posterior-frequency, not both."
+            )
+        exclude_key = None
+        if exclude_target is not None:
+            exclude_key = canonicalize_topology_newick(str(exclude_target).strip())
+        weighted_items = []
+        for topo_key, indices in sorted(
+            topology_to_indices.items(), key=lambda item: item[1][0]
+        ):
+            if exclude_key is not None and topo_key == exclude_key:
+                continue
+            weighted_items.append(
+                {
+                    "topology_key": str(topo_key),
+                    "posterior_index": int(indices[0]),
+                    "topology_count": int(len(indices)),
+                }
+            )
+        total_count = int(sum(item["topology_count"] for item in weighted_items))
+        if total_count <= 0:
+            raise RuntimeError("No posterior topology mass available for weighted allocation.")
+        base_alloc = [0 for _ in weighted_items]
+        if bool(args.ensure_all_topologies_represented):
+            if int(args.num_cases) < len(weighted_items):
+                raise RuntimeError(
+                    f"Requested {args.num_cases} cases but need at least "
+                    f"{len(weighted_items)} to cover every topology."
+                )
+            base_alloc = [1 for _ in weighted_items]
+        extra_cases = int(args.num_cases) - int(sum(base_alloc))
+        scaled_counts = [
+            (float(item["topology_count"]) / float(total_count)) * extra_cases
+            for item in weighted_items
+        ]
+        allocated = [base + int(math.floor(count)) for base, count in zip(base_alloc, scaled_counts)]
+        remaining = int(args.num_cases) - int(sum(allocated))
+        if remaining > 0:
+            remainder_order = sorted(
+                range(len(weighted_items)),
+                key=lambda idx: (
+                    scaled_counts[idx] - math.floor(scaled_counts[idx]),
+                    weighted_items[idx]["topology_count"],
+                ),
+                reverse=True,
+            )
+            for idx in remainder_order[:remaining]:
+                allocated[idx] += 1
+        target_schedule_entries = []
+        for item, alloc in zip(weighted_items, allocated):
+            if int(alloc) <= 0:
+                continue
+            prob = float(item["topology_count"]) / float(total_count)
+            for _ in range(int(alloc)):
+                target_schedule_entries.append(
+                    {
+                        "posterior_index": int(item["posterior_index"]),
+                        "topology_key": str(item["topology_key"]),
+                        "topology_count": int(item["topology_count"]),
+                        "topology_probability": prob,
+                    }
+                )
+        if len(target_schedule_entries) != int(args.num_cases):
+            raise RuntimeError(
+                f"Weighted allocation created {len(target_schedule_entries)} cases, "
+                f"expected {int(args.num_cases)}."
+            )
+        rng.shuffle(target_schedule_entries)
+    elif bool(args.require_unique_target_topologies):
         topology_to_indices = {}
         for idx, tree in enumerate(posterior_trees):
             key = canonicalize_topology_newick(str(tree).strip())
@@ -120,8 +242,26 @@ def main():
         case_idx = len(manifests)
         case_name = f"{args.bank_name}_case{case_idx:02d}"
         posterior_index = None
+        topology_metadata = {}
         if target_index_schedule is not None:
             posterior_index = int(target_index_schedule[case_idx])
+            topology_key = canonicalize_topology_newick(
+                str(posterior_trees[posterior_index]).strip()
+            )
+            topology_metadata = {
+                "topology_key": str(topology_key),
+                "topology_count": int(len(topology_to_indices[topology_key])),
+                "topology_probability": float(len(topology_to_indices[topology_key]))
+                / float(len(posterior_trees)),
+            }
+        elif target_schedule_entries is not None:
+            entry = target_schedule_entries[case_idx]
+            posterior_index = int(entry["posterior_index"])
+            topology_metadata = {
+                "topology_key": str(entry["topology_key"]),
+                "topology_count": int(entry["topology_count"]),
+                "topology_probability": float(entry["topology_probability"]),
+            }
         pair = _pick_pair(
             dataset,
             dataset_index=int(args.dataset_index),
@@ -133,9 +273,14 @@ def main():
         )
         pair_attempt += 1
         target_key = str(pair["target_tree"]).strip()
-        if target_key in seen_targets:
+        start_target_key = (str(pair["start_tree"]).strip(), target_key)
+        if start_target_key in seen_start_target_pairs:
             continue
-        seen_targets.add(target_key)
+        if target_schedule_entries is None and target_key in seen_targets:
+            continue
+        seen_start_target_pairs.add(start_target_key)
+        if target_schedule_entries is None:
+            seen_targets.add(target_key)
 
         anchor_payload = _build_anchor_payloads(
             pair["start_tree"],
@@ -144,7 +289,13 @@ def main():
             o0_count=int(args.o0_count),
             a1_count=int(args.a1_count),
             o2_count=int(args.o2_count),
+            full_path_count=(
+                None
+                if args.full_path_anchor_count is None
+                else int(args.full_path_anchor_count)
+            ),
         )
+        pair.update(topology_metadata)
         manifest, case_paths = _write_case_files(case_name, pair, anchor_payload)
         manifests.append(manifest)
         combined_anchor_samples.extend(anchor_payload["anchors"])
@@ -191,6 +342,14 @@ def main():
         "num_cases": int(args.num_cases),
         "dataset_index": int(args.dataset_index),
         "pair_seed": int(args.pair_seed),
+        "full_path_anchor_count": (
+            None
+            if args.full_path_anchor_count is None
+            else int(args.full_path_anchor_count)
+        ),
+        "weighted_by_topology_frequency": bool(
+            args.weight_target_topologies_by_posterior_frequency
+        ),
         "combined_anchors_json": str(combined_anchors_path),
         "config_yaml": str(config_path),
         "metrics_path": str(metrics_path),
