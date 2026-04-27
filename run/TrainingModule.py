@@ -2092,6 +2092,42 @@ def _build_start_topology_identity_batch(module, start_trees, *, device=None, dt
     return padded, pad_mask
 
 
+def _build_start_tree_graph_context(
+    module,
+    start_trees,
+    phyla_embeddings,
+    *,
+    device=None,
+    detach=None,
+):
+    if not start_trees:
+        return None
+    if device is None:
+        device = module.device
+    if detach is None:
+        detach = bool(
+            getattr(module.model, "first_hit_start_tree_graph_detach", False)
+        )
+    tokenized = module.model.tokenizer([str(tree) for tree in start_trees])
+    tokenized = _move_tokenized_batch_to_device(tokenized, device)
+    if detach:
+        with torch.no_grad():
+            start_tokens = module.model(
+                tokenized,
+                t=None,
+                phyla_embeddings=phyla_embeddings,
+                return_all_tokens=True,
+            )
+        return start_tokens[:, 0, :].detach()
+    start_tokens = module.model(
+        tokenized,
+        t=None,
+        phyla_embeddings=phyla_embeddings,
+        return_all_tokens=True,
+    )
+    return start_tokens[:, 0, :]
+
+
 def _pooled_probe_terminal_stats(x, *, device, dtype):
     if x is None or x.numel() == 0:
         return torch.zeros(4, device=device, dtype=dtype)
@@ -2328,6 +2364,68 @@ def _build_case_index_tensor_from_group_keys(
     return torch.tensor(indices, dtype=torch.long, device=device)
 
 
+def _cached_case_group_key_lookup(dataset_split):
+    if dataset_split is None:
+        return {}
+    cached = getattr(dataset_split, "_cached_case_group_key_by_start_tree", None)
+    if cached is not None:
+        return cached
+
+    lookup = {}
+    for item in getattr(dataset_split, "overfit_fixed_pair_start_tree_bank_items", []) or []:
+        tree = item.get("tree")
+        group_key = item.get("group_key")
+        if tree is None or group_key is None:
+            continue
+        tree_key = str(tree).strip()
+        if tree_key:
+            lookup.setdefault(tree_key, str(group_key))
+
+    setattr(dataset_split, "_cached_case_group_key_by_start_tree", lookup)
+    return lookup
+
+
+def _infer_case_group_keys_from_batch(module, batch):
+    if batch is None:
+        return None
+
+    start_trees = batch.get("start_trees")
+    if start_trees is None:
+        return None
+    if isinstance(start_trees, str):
+        start_trees = [start_trees]
+    else:
+        start_trees = list(start_trees)
+    if not start_trees:
+        return None
+
+    dataset_obj = getattr(module, "dataset", None)
+    dataset_splits = []
+    for split_name in ("dataset_train", "dataset_val"):
+        split = getattr(dataset_obj, split_name, None)
+        if split is not None and split not in dataset_splits:
+            dataset_splits.append(split)
+
+    if not dataset_splits:
+        return None
+
+    resolved = []
+    for start_tree in start_trees:
+        tree_key = None if start_tree is None else str(start_tree).strip()
+        group_key = None
+        if tree_key:
+            for dataset_split in dataset_splits:
+                lookup = _cached_case_group_key_lookup(dataset_split)
+                group_key = lookup.get(tree_key)
+                if group_key is not None:
+                    break
+        if group_key is None:
+            return None
+        resolved.append(str(group_key))
+
+    return resolved
+
+
 def _build_velocity_replay_batch(module, samples):
     if not samples:
         return None
@@ -2447,6 +2545,7 @@ def _build_velocity_replay_batch(module, samples):
             sample.get("start_tree", sample.get("newick_tree")) for sample in samples
         ],
         "target_trees": [sample["target_tree"] for sample in samples],
+        "bank_group_key": [sample.get("bank_group_key") for sample in samples],
         "batched_velocity": [sample["velocity"] for sample in samples],
         "velocity_next_boundary_trees": [
             sample.get("velocity_next_boundary_tree") for sample in samples
@@ -2498,6 +2597,7 @@ def _build_terminal_replay_batch(module, samples):
             sample.get("start_tree", sample.get("newick_tree")) for sample in samples
         ],
         "target_trees": [sample.get("target_tree") for sample in samples],
+        "bank_group_key": [sample.get("bank_group_key") for sample in samples],
         "_first_hit_case_indices": first_hit_case_index_tensor,
     }
 
@@ -2525,6 +2625,7 @@ def _build_autoregressive_replay_batch(module, samples):
         "tokenized_autoregressive_trees": tokenized,
         "newick_autoregressive_trees": newicks,
         "target_trees": [sample["target_tree"] for sample in samples],
+        "bank_group_key": [sample.get("bank_group_key") for sample in samples],
         "batched_autoregressive_time": torch.tensor(
             [float(sample["time"]) for sample in samples],
             dtype=torch.float32,
@@ -4731,7 +4832,10 @@ def _discrete_phase_rollout(
     if (
         rollout_start_topology_features is None
         and getattr(module.model, "first_hit_head_mode", "base")
-        == "start_topology_adapter_mlp"
+        in {
+            "start_topology_adapter_mlp",
+            "start_topology_raw_pool_concat_mlp",
+        }
     ):
         rollout_start_topology_features = _build_start_topology_feature_tensor(
             module,
@@ -4755,6 +4859,15 @@ def _discrete_phase_rollout(
             module,
             [start_tree],
             device=module.device,
+        )
+    rollout_start_tree_graph_context = None
+    if getattr(module.model, "first_hit_head_mode", "base") == "start_tree_graph_token_mlp":
+        rollout_start_tree_graph_context = _build_start_tree_graph_context(
+            module,
+            [start_tree],
+            phyla_embeddings,
+            device=module.device,
+            detach=getattr(module.model, "first_hit_start_tree_graph_detach", False),
         )
     phase = 0
     n_events = 0
@@ -4795,6 +4908,7 @@ def _discrete_phase_rollout(
                 first_hit_start_topology_features=rollout_start_topology_features,
                 first_hit_start_topology_embeddings=rollout_start_topology_embeddings,
                 first_hit_start_topology_pad_mask=rollout_start_topology_pad_mask,
+                first_hit_start_tree_graph_context=rollout_start_tree_graph_context,
             )
         aligned_term = _align_model_outputs_to_tree_context(
             module,
@@ -4897,6 +5011,7 @@ def _discrete_phase_rollout(
                 first_hit_start_topology_features=rollout_start_topology_features,
                 first_hit_start_topology_embeddings=rollout_start_topology_embeddings,
                 first_hit_start_topology_pad_mask=rollout_start_topology_pad_mask,
+                first_hit_start_tree_graph_context=rollout_start_tree_graph_context,
             )
 
         aligned = _align_model_outputs_to_tree_context(
@@ -7638,6 +7753,8 @@ class TrainingModule(LightningModule):
             return batch
         group_keys = batch.get("bank_group_key")
         if group_keys is None:
+            group_keys = _infer_case_group_keys_from_batch(self, batch)
+        if group_keys is None:
             return batch
         if isinstance(group_keys, str):
             group_keys = [group_keys]
@@ -7648,6 +7765,7 @@ class TrainingModule(LightningModule):
         if case_index_tensor is None:
             return batch
         updated_batch = dict(batch)
+        updated_batch["bank_group_key"] = list(group_keys)
         updated_batch["_first_hit_case_indices"] = case_index_tensor
         return updated_batch
 
@@ -7657,11 +7775,15 @@ class TrainingModule(LightningModule):
         mode = getattr(self.model, "first_hit_head_mode", "base")
         if mode not in {
             "start_topology_adapter_mlp",
+            "start_topology_raw_pool_concat_mlp",
             "start_topology_cross_attn_mlp",
         }:
             return batch
         if (
-            mode == "start_topology_adapter_mlp"
+            mode in {
+                "start_topology_adapter_mlp",
+                "start_topology_raw_pool_concat_mlp",
+            }
             and batch.get("_first_hit_start_topology_features") is not None
         ):
             return batch
@@ -7679,7 +7801,10 @@ class TrainingModule(LightningModule):
         if isinstance(start_trees, str):
             start_trees = [start_trees]
         updated_batch = dict(batch)
-        if mode == "start_topology_adapter_mlp":
+        if mode in {
+            "start_topology_adapter_mlp",
+            "start_topology_raw_pool_concat_mlp",
+        }:
             feature_tensor = _build_start_topology_feature_tensor(
                 self,
                 list(start_trees),
@@ -7700,9 +7825,38 @@ class TrainingModule(LightningModule):
             updated_batch["_first_hit_start_topology_pad_mask"] = pad_mask
         return updated_batch
 
+    def _attach_start_tree_graph_context_to_batch(self, batch):
+        if batch is None:
+            return batch
+        if getattr(self.model, "first_hit_head_mode", "base") != "start_tree_graph_token_mlp":
+            return batch
+        if batch.get("_first_hit_start_tree_graph_context") is not None:
+            return batch
+        start_trees = batch.get("start_trees")
+        if start_trees is None:
+            start_trees = batch.get("original_trees")
+        phyla_embeddings = batch.get("phyla_embeddings")
+        if start_trees is None:
+            return batch
+        if isinstance(start_trees, str):
+            start_trees = [start_trees]
+        graph_context = _build_start_tree_graph_context(
+            self,
+            list(start_trees),
+            phyla_embeddings,
+            device=self.device,
+            detach=getattr(self.model, "first_hit_start_tree_graph_detach", False),
+        )
+        if graph_context is None:
+            return batch
+        updated_batch = dict(batch)
+        updated_batch["_first_hit_start_tree_graph_context"] = graph_context
+        return updated_batch
+
     def _prepare_velocity_training_batch(self, batch):
         batch = self._attach_case_indices_to_batch(batch)
         batch = self._attach_start_topology_features_to_batch(batch)
+        batch = self._attach_start_tree_graph_context_to_batch(batch)
         if batch.get("_skip_training_augmentations", False):
             return batch, {"attempted": 0.0, "applied": 0.0}
         if (
@@ -7769,6 +7923,8 @@ class TrainingModule(LightningModule):
             and batch.get("_autoregressive_case_indices") is None
         ):
             group_keys = batch.get("bank_group_key")
+            if group_keys is None:
+                group_keys = _infer_case_group_keys_from_batch(self, batch)
             if group_keys is not None:
                 if isinstance(group_keys, str):
                     group_keys = [group_keys]
@@ -7778,6 +7934,7 @@ class TrainingModule(LightningModule):
                 )
                 if case_index_tensor is not None:
                     batch = dict(batch)
+                    batch["bank_group_key"] = list(group_keys)
                     batch["_autoregressive_case_indices"] = case_index_tensor
         if batch.get("_skip_training_augmentations", False):
             return batch, {
@@ -8136,6 +8293,9 @@ class TrainingModule(LightningModule):
         start_topology_pad_mask = sample_kwargs.get(
             "first_hit_start_topology_pad_mask"
         )
+        start_tree_graph_context = sample_kwargs.get(
+            "first_hit_start_tree_graph_context"
+        )
 
         rows = []
         for idx, (source_tree, next_boundary_tree, model_time) in enumerate(
@@ -8166,6 +8326,7 @@ class TrainingModule(LightningModule):
                     first_hit_start_topology_features=start_topology_features,
                     first_hit_start_topology_embeddings=start_topology_embeddings,
                     first_hit_start_topology_pad_mask=start_topology_pad_mask,
+                    first_hit_start_tree_graph_context=start_tree_graph_context,
                 )
 
             model_masks = [int(mask) for mask in edge_splits[0]]
@@ -8500,7 +8661,10 @@ class TrainingModule(LightningModule):
                 sample_kwargs["case_indices"] = [int(case_index)]
         if (
             getattr(self.model, "first_hit_head_mode", "base")
-            == "start_topology_adapter_mlp"
+            in {
+                "start_topology_adapter_mlp",
+                "start_topology_raw_pool_concat_mlp",
+            }
         ):
             sample_kwargs["first_hit_start_topology_features"] = (
                 _build_start_topology_feature_tensor(
@@ -8520,6 +8684,21 @@ class TrainingModule(LightningModule):
             )
             sample_kwargs["first_hit_start_topology_embeddings"] = embeddings
             sample_kwargs["first_hit_start_topology_pad_mask"] = pad_mask
+        if (
+            getattr(self.model, "first_hit_head_mode", "base")
+            == "start_tree_graph_token_mlp"
+        ):
+            sample_kwargs["first_hit_start_tree_graph_context"] = (
+                _build_start_tree_graph_context(
+                    self,
+                    [pair["start_tree"]],
+                    phyla_embeddings,
+                    device=self.device,
+                    detach=getattr(
+                        self.model, "first_hit_start_tree_graph_detach", False
+                    ),
+                )
+            )
         sample_kwargs.update(overrides)
         return sample_kwargs
 
@@ -9876,6 +10055,7 @@ class TrainingModule(LightningModule):
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
         first_hit_start_topology_pad_mask=None,
+        first_hit_start_tree_graph_context=None,
     ):
         batched_tokenized_trees = _move_tokenized_batch_to_device(
             batched_tokenized_trees,
@@ -9921,6 +10101,7 @@ class TrainingModule(LightningModule):
                 first_hit_start_topology_features=first_hit_start_topology_features,
                 first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
                 first_hit_start_topology_pad_mask=first_hit_start_topology_pad_mask,
+                first_hit_start_tree_graph_context=first_hit_start_tree_graph_context,
             )
             edge_features = None
             first_hit_logits = None
@@ -10017,6 +10198,7 @@ class TrainingModule(LightningModule):
             }
         batch = self._attach_case_indices_to_batch(batch)
         batch = self._attach_start_topology_features_to_batch(batch)
+        batch = self._attach_start_tree_graph_context_to_batch(batch)
 
         (
             v_pred,
@@ -10038,6 +10220,9 @@ class TrainingModule(LightningModule):
             ),
             first_hit_start_topology_pad_mask=batch.get(
                 "_first_hit_start_topology_pad_mask"
+            ),
+            first_hit_start_tree_graph_context=batch.get(
+                "_first_hit_start_tree_graph_context"
             ),
         )
 
@@ -10223,6 +10408,9 @@ class TrainingModule(LightningModule):
                 ),
                 first_hit_start_topology_pad_mask=batch.get(
                     "_first_hit_start_topology_pad_mask"
+                ),
+                first_hit_start_tree_graph_context=batch.get(
+                    "_first_hit_start_tree_graph_context"
                 ),
             )
 
@@ -12037,6 +12225,7 @@ class TrainingModule(LightningModule):
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
         first_hit_start_topology_pad_mask=None,
+        first_hit_start_tree_graph_context=None,
         split_multi_label_events: bool = False,
         max_allowed_polytomy_size: int = -1,
         oversize_polytomy_policy: str = "none",
@@ -12205,7 +12394,10 @@ class TrainingModule(LightningModule):
         if (
             start_topology_feature_tensor is None
             and getattr(self.model, "first_hit_head_mode", "base")
-            == "start_topology_adapter_mlp"
+            in {
+                "start_topology_adapter_mlp",
+                "start_topology_raw_pool_concat_mlp",
+            }
         ):
             start_topology_feature_tensor = _build_start_topology_feature_tensor(
                 self,
@@ -12229,6 +12421,19 @@ class TrainingModule(LightningModule):
                 self,
                 newick_starting_trees,
                 device=self.device,
+            )
+        start_tree_graph_context_tensor = first_hit_start_tree_graph_context
+        if (
+            start_tree_graph_context_tensor is None
+            and getattr(self.model, "first_hit_head_mode", "base")
+            == "start_tree_graph_token_mlp"
+        ):
+            start_tree_graph_context_tensor = _build_start_tree_graph_context(
+                self,
+                newick_starting_trees,
+                phyla_embeddings,
+                device=self.device,
+                detach=getattr(self.model, "first_hit_start_tree_graph_detach", False),
             )
 
         self.model.eval()
@@ -12522,6 +12727,7 @@ class TrainingModule(LightningModule):
                     first_hit_start_topology_features=start_topology_feature_tensor,
                     first_hit_start_topology_embeddings=start_topology_embeddings_tensor,
                     first_hit_start_topology_pad_mask=start_topology_pad_mask_tensor,
+                    first_hit_start_tree_graph_context=start_tree_graph_context_tensor,
                 )
 
             # ---- FIRST PASS: compute per-tree dt_hit, cache per-tree arrays ----

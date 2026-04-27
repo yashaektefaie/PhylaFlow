@@ -404,6 +404,7 @@ class TreeDataset(Dataset):
             else None
         )
         override_start_tree = None
+        override_start_tree_loaded_from_json = False
         override_start_tree_bank: List[Any] = []
         if overfit_fixed_pair_start_tree_newick:
             override_start_tree = str(overfit_fixed_pair_start_tree_newick)
@@ -416,6 +417,7 @@ class TreeDataset(Dataset):
                 or override_payload.get("start_tree")
                 or override_payload.get("tree")
             )
+            override_start_tree_loaded_from_json = True
             override_start_tree_bank.append(dict(override_payload))
         if overfit_fixed_pair_start_tree_json_paths:
             for raw_path in overfit_fixed_pair_start_tree_json_paths:
@@ -437,9 +439,13 @@ class TreeDataset(Dataset):
                 )
                 if override_tree:
                     override_start_tree_bank.append(dict(override_payload))
-        if override_start_tree is not None:
+        if (
+            override_start_tree is not None
+            and not override_start_tree_loaded_from_json
+        ):
             override_start_tree_bank.append(str(override_start_tree))
         override_target_tree = None
+        override_target_tree_loaded_from_json = False
         override_target_tree_bank: List[Any] = []
         if overfit_fixed_pair_target_tree_newick:
             override_target_tree = str(overfit_fixed_pair_target_tree_newick)
@@ -453,6 +459,7 @@ class TreeDataset(Dataset):
                 or override_payload.get("start_tree")
                 or override_payload.get("tree")
             )
+            override_target_tree_loaded_from_json = True
             override_target_tree_bank.append(dict(override_payload))
         if overfit_fixed_pair_target_tree_json_paths:
             for raw_path in overfit_fixed_pair_target_tree_json_paths:
@@ -476,7 +483,10 @@ class TreeDataset(Dataset):
                 )
                 if override_tree:
                     override_target_tree_bank.append(dict(override_payload))
-        if override_target_tree is not None:
+        if (
+            override_target_tree is not None
+            and not override_target_tree_loaded_from_json
+        ):
             override_target_tree_bank.append(str(override_target_tree))
         self.overfit_fixed_pair_start_tree_newick = override_start_tree
         self.overfit_fixed_pair_start_tree_newick_bank: List[str] = []

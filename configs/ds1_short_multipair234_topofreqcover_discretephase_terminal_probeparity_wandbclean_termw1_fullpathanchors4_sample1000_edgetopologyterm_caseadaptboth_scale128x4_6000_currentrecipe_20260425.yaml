@@ -1,11 +1,11 @@
 model:
   num_node_types: 3
   num_edge_types: 2
-  hidden_dim: 64
-  embed_dim: 64
+  hidden_dim: 128
+  embed_dim: 128
   output_dim: 1
-  n_layers: 2
-  n_heads: 4
+  n_layers: 4
+  n_heads: 8
   dropout: 0.0
   attention_dropout: 0.0
   activation_dropout: 0.0
@@ -16,21 +16,22 @@ model:
   layernorm_style: prenorm
   tokenizer_lap_dim: 8
   tokenizer_lap_dropout: 0.0
-  tokenizer_n_layers: 2
+  tokenizer_n_layers: 4
   phyla_dim: 16
   autoregressive_head_mode: structured_subset
   first_hit_head_use_phase_input: true
-  first_hit_head_phase_hidden_dim: 64
+  first_hit_head_phase_hidden_dim: 128
+  first_hit_head_hidden_dim: 128
   first_hit_head_mode: case_adapted_mlp
   first_hit_head_num_cases: 234
 trainer:
   record: true
   epochs: 200
-  checkpoint_dir: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/checkpoints/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421
+  checkpoint_dir: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/checkpoints/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_scale128x4_6000_currentrecipe_20260425
   phyla_checkpoint_path: null
   phyla_precomputed_embeddings_path: null
   lr: 0.005
-  steps_callback: 50
+  steps_callback: 1000
   val_callback_freq: 0
   limit_val_batches: 0
   velocity_loss_mode: plain
@@ -113,17 +114,23 @@ trainer:
   num_warmup_steps: 0
   sampling_predsim_overrun_use_at_sampling: false
   sampling_random_fixed_pair_bank_use_at_sampling: true
-  sample_metrics_trace_path: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/metrics/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421_metrics.jsonl
+  sample_metrics_trace_path: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/metrics/full_sanity_fixedpair_20260401/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_scale128x4_6000_currentrecipe_20260425_metrics.jsonl
   wandb_dir: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/wandb
   wandb_project: DSoverfit
   wandb_tags:
   - DS1
-  - weighted234
+  - batch1
+  - topofreqcover
+  - fullsupport
+  - 234case
   - terminalw1
   - fullpathanchors4
   - sample1000
   - edgetopologyterm
   - caseadaptboth
+  - scale128x4
+  - currentrecipe
+  - '20260425'
   sample_metrics_num_pairs: 234
   velocity_logtau_all_weight: 2.0
   velocity_first_hit_loss_tol: 0.0001
@@ -135,7 +142,7 @@ trainer:
   init_checkpoint_path: null
   velocity_probe_direct_set_target_negative_weight: 1.0
   velocity_probe_direct_set_nontarget_nonnegative_weight: 0.0
-  wandb_name: ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_6000_20260421
+  wandb_name: ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptboth_scale128x4_6000_currentrecipe_20260425
   wandb_group: DS1
   metric_log_exact_keys:
   - loss
@@ -186,8 +193,8 @@ data:
   overfit_full_path_control_use_discrete_phase_time: true
   overfit_full_path_control_extra_velocity_samples_json_path: /n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/DS_data/30272299/phylaflow_fixed_path_artifacts/DS1/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_20260418_velocity_anchors.json
   overfit_fixed_pair: true
-  overfit_fixed_pair_start_tree_json_path: null
-  overfit_fixed_pair_target_tree_json_path: null
+  overfit_fixed_pair_start_tree_json_path: /n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/DS_data/30272299/phylaflow_fixed_path_artifacts/DS1/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case00_start.json
+  overfit_fixed_pair_target_tree_json_path: /n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/DS_data/30272299/phylaflow_fixed_path_artifacts/DS1/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case00_target.json
   overfit_fixed_pair_start_tree_json_paths:
   - /n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/DS_data/30272299/phylaflow_fixed_path_artifacts/DS1/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case00_start.json
   - /n/holylfs06/LABS/mzitnik_lab/Users/yektefaie/DS_data/30272299/phylaflow_fixed_path_artifacts/DS1/ds1_short_multipair234_topofreqcover_discretephase_terminal_probeparity_wandbclean_6000_20260417_case01_start.json

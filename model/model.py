@@ -341,10 +341,12 @@ class TreeDenoiserTokenGT(nn.Module):
         first_hit_head_phase_hidden_dim=None,
         first_hit_head_mode="base",
         first_hit_head_hidden_dim=None,
+        first_hit_head_enable_refinement=False,
         first_hit_head_refinement_layers=1,
         first_hit_head_router_hidden_dim=None,
         first_hit_head_num_cases=None,
         first_hit_head_case_dim=16,
+        first_hit_start_tree_graph_detach=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -436,6 +438,9 @@ class TreeDenoiserTokenGT(nn.Module):
             if first_hit_head_hidden_dim is None
             else first_hit_head_hidden_dim
         )
+        self.first_hit_head_enable_refinement = bool(
+            first_hit_head_enable_refinement
+        ) or self.first_hit_head_mode == "edge_refined_mlp"
         self.first_hit_head_refinement_layers = max(1, int(first_hit_head_refinement_layers))
         self.first_hit_head_router_hidden_dim = int(
             embed_dim
@@ -448,6 +453,9 @@ class TreeDenoiserTokenGT(nn.Module):
             else int(first_hit_head_num_cases)
         )
         self.first_hit_head_case_dim = int(first_hit_head_case_dim)
+        self.first_hit_start_tree_graph_detach = bool(
+            first_hit_start_tree_graph_detach
+        )
         self.first_hit_phase_proj = None
         first_hit_head_input_dim = embed_dim
         if self.first_hit_head_use_phase_input:
@@ -478,6 +486,8 @@ class TreeDenoiserTokenGT(nn.Module):
         self.first_hit_topology_cross_value = None
         self.first_hit_edge_head_cross_attn = None
         self.first_hit_edge_head_raw_topology = None
+        self.first_hit_edge_head_start_topology_raw = None
+        self.first_hit_edge_head_start_tree_graph = None
         self.first_hit_edge_refinement = None
         self.first_hit_autoregressive_edge_encoder = None
         self.first_hit_autoregressive_query = None
@@ -485,7 +495,7 @@ class TreeDenoiserTokenGT(nn.Module):
         self.first_hit_autoregressive_update = None
         self.first_hit_autoregressive_stop = None
         self.first_hit_autoregressive_start = None
-        if self.first_hit_head_mode == "edge_refined_mlp":
+        if self.first_hit_head_enable_refinement:
             self.first_hit_edge_refinement = nn.ModuleList(
                 [
                     AutoregressiveGroupRefinementBlock(
@@ -563,6 +573,36 @@ class TreeDenoiserTokenGT(nn.Module):
             self.first_hit_edge_head_raw_topology = nn.Sequential(
                 nn.LayerNorm(raw_topology_input_dim),
                 nn.Linear(raw_topology_input_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, 1),
+            )
+        if self.first_hit_head_mode == "start_topology_raw_pool_concat_mlp":
+            start_topology_raw_input_dim = first_hit_head_input_dim + (3 * embed_dim)
+            self.first_hit_edge_head_start_topology_raw = nn.Sequential(
+                nn.LayerNorm(start_topology_raw_input_dim),
+                nn.Linear(
+                    start_topology_raw_input_dim,
+                    self.first_hit_head_hidden_dim,
+                ),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(
+                    self.first_hit_head_hidden_dim,
+                    self.first_hit_head_hidden_dim,
+                ),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.first_hit_head_hidden_dim, 1),
+            )
+        if self.first_hit_head_mode == "start_tree_graph_token_mlp":
+            start_tree_graph_input_dim = first_hit_head_input_dim + embed_dim
+            self.first_hit_edge_head_start_tree_graph = nn.Sequential(
+                nn.LayerNorm(start_tree_graph_input_dim),
+                nn.Linear(start_tree_graph_input_dim, self.first_hit_head_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(self.first_hit_head_hidden_dim, self.first_hit_head_hidden_dim),
@@ -1335,8 +1375,9 @@ class TreeDenoiserTokenGT(nn.Module):
         start_topology_features=None,
         start_topology_embeddings=None,
         start_topology_pad_mask=None,
+        start_tree_graph_context=None,
     ):
-        if self.first_hit_head_mode == "edge_refined_mlp":
+        if self.first_hit_edge_refinement is not None:
             padded_edges = self._refine_first_hit_edges(padded_edges, edge_pad_mask)
         first_hit_head_input = self._build_first_hit_head_input(
             padded_edges,
@@ -1427,6 +1468,57 @@ class TreeDenoiserTokenGT(nn.Module):
             )
             return self.first_hit_edge_head_adapted(
                 torch.cat([first_hit_head_input, topology_code], dim=-1)
+            )
+        if self.first_hit_head_mode == "start_topology_raw_pool_concat_mlp":
+            if start_topology_features is None:
+                raise ValueError(
+                    "start_topology_features are required for "
+                    "start_topology_raw_pool_concat_mlp"
+                )
+            start_topology_features = start_topology_features.to(
+                device=padded_edges.device,
+                dtype=padded_edges.dtype,
+            )
+            if (
+                start_topology_features.ndim != 2
+                or start_topology_features.shape[0] != padded_edges.shape[0]
+                or start_topology_features.shape[1] != 3 * self.embed_dim
+            ):
+                raise ValueError(
+                    "start_topology_features must have shape [batch, 3 * embed_dim] "
+                    "for start_topology_raw_pool_concat_mlp"
+                )
+            topology_summary = start_topology_features.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            return self.first_hit_edge_head_start_topology_raw(
+                torch.cat([first_hit_head_input, topology_summary], dim=-1)
+            )
+        if self.first_hit_head_mode == "start_tree_graph_token_mlp":
+            if start_tree_graph_context is None:
+                raise ValueError(
+                    "start_tree_graph_context is required for start_tree_graph_token_mlp"
+                )
+            start_tree_graph_context = start_tree_graph_context.to(
+                device=padded_edges.device,
+                dtype=padded_edges.dtype,
+            )
+            if (
+                start_tree_graph_context.ndim != 2
+                or start_tree_graph_context.shape[0] != padded_edges.shape[0]
+                or start_tree_graph_context.shape[1] != self.embed_dim
+            ):
+                raise ValueError(
+                    "start_tree_graph_context must have shape [batch, embed_dim] "
+                    "for start_tree_graph_token_mlp"
+                )
+            if self.first_hit_start_tree_graph_detach:
+                start_tree_graph_context = start_tree_graph_context.detach()
+            graph_code = start_tree_graph_context.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            return self.first_hit_edge_head_start_tree_graph(
+                torch.cat([first_hit_head_input, graph_code], dim=-1)
             )
         if self.first_hit_head_mode == "topology_adapter_mlp":
             if topology_identity_embeddings is None:
@@ -1659,6 +1751,7 @@ class TreeDenoiserTokenGT(nn.Module):
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
         first_hit_start_topology_pad_mask=None,
+        first_hit_start_tree_graph_context=None,
     ):
         B, _T, D = x.shape
         leaf_idx_list = list(leaf_idx) if isinstance(leaf_idx, (list, tuple)) else [leaf_idx]
@@ -1842,6 +1935,7 @@ class TreeDenoiserTokenGT(nn.Module):
                         start_topology_features=first_hit_start_topology_features,
                         start_topology_embeddings=first_hit_start_topology_embeddings,
                         start_topology_pad_mask=first_hit_start_topology_pad_mask,
+                        start_tree_graph_context=first_hit_start_tree_graph_context,
                     )
                 if return_boundary_vanish_logits:
                     boundary_vanish_logits = self.boundary_vanish_edge_head(
@@ -1896,6 +1990,7 @@ class TreeDenoiserTokenGT(nn.Module):
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
         first_hit_start_topology_pad_mask=None,
+        first_hit_start_tree_graph_context=None,
     ):
         x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
             self._prepare_encoder_inputs(
@@ -1930,6 +2025,7 @@ class TreeDenoiserTokenGT(nn.Module):
             first_hit_start_topology_features=first_hit_start_topology_features,
             first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
             first_hit_start_topology_pad_mask=first_hit_start_topology_pad_mask,
+            first_hit_start_tree_graph_context=first_hit_start_tree_graph_context,
         )
 
 
@@ -2024,6 +2120,10 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
         autoregressive_component_groups=None,
         autoregressive_case_indices=None,
         first_hit_case_indices=None,
+        first_hit_start_topology_features=None,
+        first_hit_start_topology_embeddings=None,
+        first_hit_start_topology_pad_mask=None,
+        first_hit_start_tree_graph_context=None,
     ):
         x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
             self._prepare_encoder_inputs(
@@ -2062,6 +2162,10 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
             autoregressive_component_groups=autoregressive_component_groups,
             autoregressive_case_indices=autoregressive_case_indices,
             first_hit_case_indices=first_hit_case_indices,
+            first_hit_start_topology_features=first_hit_start_topology_features,
+            first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
+            first_hit_start_topology_pad_mask=first_hit_start_topology_pad_mask,
+            first_hit_start_tree_graph_context=first_hit_start_tree_graph_context,
         )
 
 
@@ -2177,6 +2281,10 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
         autoregressive_component_groups=None,
         autoregressive_case_indices=None,
         first_hit_case_indices=None,
+        first_hit_start_topology_features=None,
+        first_hit_start_topology_embeddings=None,
+        first_hit_start_topology_pad_mask=None,
+        first_hit_start_tree_graph_context=None,
     ):
         x, padding_mask, leaf_mask, leaf_idx, edge_mask, edge_split_masks = (
             self._prepare_encoder_inputs(
@@ -2221,6 +2329,10 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
             autoregressive_component_groups=autoregressive_component_groups,
             autoregressive_case_indices=autoregressive_case_indices,
             first_hit_case_indices=first_hit_case_indices,
+            first_hit_start_topology_features=first_hit_start_topology_features,
+            first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
+            first_hit_start_topology_pad_mask=first_hit_start_topology_pad_mask,
+            first_hit_start_tree_graph_context=first_hit_start_tree_graph_context,
         )
 
 
@@ -2284,12 +2396,18 @@ def return_model(config):
         ),
         first_hit_head_mode=config["model"].get("first_hit_head_mode", "base"),
         first_hit_head_hidden_dim=config["model"].get("first_hit_head_hidden_dim"),
+        first_hit_head_enable_refinement=config["model"].get(
+            "first_hit_head_enable_refinement", False
+        ),
         first_hit_head_refinement_layers=config["model"].get("first_hit_head_refinement_layers", 1),
         first_hit_head_router_hidden_dim=config["model"].get(
             "first_hit_head_router_hidden_dim"
         ),
         first_hit_head_num_cases=config["model"].get("first_hit_head_num_cases"),
         first_hit_head_case_dim=config["model"].get("first_hit_head_case_dim", 16),
+        first_hit_start_tree_graph_detach=config["model"].get(
+            "first_hit_start_tree_graph_detach", False
+        ),
     )
     model_variant = str(config["model"].get("model_variant", "base"))
     if model_variant == "two_block_refine":

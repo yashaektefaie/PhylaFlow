@@ -408,6 +408,10 @@ def _init_wandb_run(config, default_project):
             ),
         },
     }
+    wandb_dir = trainer_cfg.get("wandb_dir")
+    if wandb_dir:
+        os.makedirs(wandb_dir, exist_ok=True)
+        wandb_kwargs["dir"] = wandb_dir
     wandb_kwargs = {k: v for k, v in wandb_kwargs.items() if v is not None}
     return wandb.init(**wandb_kwargs)
 

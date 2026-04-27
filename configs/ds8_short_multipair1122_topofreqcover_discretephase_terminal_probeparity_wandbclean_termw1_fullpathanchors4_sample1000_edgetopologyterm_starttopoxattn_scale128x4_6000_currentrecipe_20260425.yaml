@@ -1,11 +1,11 @@
 model:
   num_node_types: 3
   num_edge_types: 2
-  hidden_dim: 64
-  embed_dim: 64
+  hidden_dim: 128
+  embed_dim: 128
   output_dim: 1
-  n_layers: 2
-  n_heads: 4
+  n_layers: 4
+  n_heads: 8
   dropout: 0.0
   attention_dropout: 0.0
   activation_dropout: 0.0
@@ -16,17 +16,18 @@ model:
   layernorm_style: prenorm
   tokenizer_lap_dim: 8
   tokenizer_lap_dropout: 0.0
-  tokenizer_n_layers: 2
+  tokenizer_n_layers: 4
   phyla_dim: 16
   autoregressive_head_mode: structured_subset
   first_hit_head_use_phase_input: true
-  first_hit_head_phase_hidden_dim: 64
-  first_hit_head_mode: case_adapted_mlp
+  first_hit_head_phase_hidden_dim: 128
+  first_hit_head_hidden_dim: 128
+  first_hit_head_mode: start_topology_cross_attn_mlp
   first_hit_head_num_cases: 1122
 trainer:
   record: true
   epochs: 200
-  checkpoint_dir: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/checkpoints/full_sanity_fixedpair_20260401/ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425
+  checkpoint_dir: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/checkpoints/full_sanity_fixedpair_20260401/ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_starttopoxattn_scale128x4_6000_currentrecipe_20260425
   phyla_checkpoint_path: null
   phyla_precomputed_embeddings_path: null
   lr: 0.005
@@ -113,7 +114,7 @@ trainer:
   num_warmup_steps: 0
   sampling_predsim_overrun_use_at_sampling: false
   sampling_random_fixed_pair_bank_use_at_sampling: true
-  sample_metrics_trace_path: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/metrics/full_sanity_fixedpair_20260401/ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425_metrics.jsonl
+  sample_metrics_trace_path: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/metrics/full_sanity_fixedpair_20260401/ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_starttopoxattn_scale128x4_6000_currentrecipe_20260425_metrics.jsonl
   wandb_dir: /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/wandb
   wandb_project: DSoverfit
   wandb_tags:
@@ -126,7 +127,8 @@ trainer:
   - fullpathanchors4
   - sample1000
   - edgetopologyterm
-  - caseadaptfhonly
+  - starttopoxattn
+  - scale128x4
   - currentrecipe
   - '20260425'
   sample_metrics_num_pairs: 1122
@@ -140,7 +142,7 @@ trainer:
   init_checkpoint_path: null
   velocity_probe_direct_set_target_negative_weight: 1.0
   velocity_probe_direct_set_nontarget_nonnegative_weight: 0.0
-  wandb_name: ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_caseadaptfhonly_6000_currentrecipe_20260425
+  wandb_name: ds8_short_multipair1122_topofreqcover_discretephase_terminal_probeparity_wandbclean_termw1_fullpathanchors4_sample1000_edgetopologyterm_starttopoxattn_scale128x4_6000_currentrecipe_20260425
   wandb_group: DS8
   metric_log_exact_keys:
   - loss
