@@ -1,0 +1,25 @@
+{
+  "created_at_utc": "2026-04-28T17:43:31.297598+00:00",
+  "dataset": "10125_NT_AL",
+  "nexus_path": "/home/yektefai/phylaflow_datasets/nexus/10125_NT_AL.nex",
+  "checkpoint": "/home/yektefai/PhylaFlow/weights/11564369",
+  "device": "cpu",
+  "model_name": "phyla-beta",
+  "taxa": 161,
+  "sites": 2409,
+  "window_size": 64,
+  "stride": 64,
+  "total_windows": 38,
+  "benchmarked_windows": [
+    {
+      "window_index": 0,
+      "start": 0,
+      "end": 64,
+      "length": 64,
+      "seconds": 60.56328025832772,
+      "taxa": 161,
+      "taxa_x_sites": 10304,
+      "peak_cuda_memory_mb": 0.0
+    }
+  ]
+}
