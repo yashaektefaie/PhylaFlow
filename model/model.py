@@ -17,6 +17,21 @@ from utils.bhv_utils import (
 )
 
 
+def _load_frozen_start_case_embedding_table(path, *, name):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    table = payload.get("embeddings") if isinstance(payload, dict) else payload
+    if table is None:
+        raise ValueError(f"{name} artifact at {path} does not contain embeddings")
+    table = torch.as_tensor(table, dtype=torch.float32)
+    if table.ndim != 2:
+        raise ValueError(
+            f"{name} embeddings must have shape [num_cases, dim], got {tuple(table.shape)}"
+        )
+    if int(table.shape[0]) <= 0 or int(table.shape[1]) <= 0:
+        raise ValueError(f"{name} embeddings cannot be empty")
+    return table.contiguous()
+
+
 # TokenGT parameter initialization
 def init_params(module, n_layers):
     if isinstance(module, nn.Linear):
@@ -30,11 +45,18 @@ def init_params(module, n_layers):
 
 
 class PairwiseMergeHead(nn.Module):
-    def __init__(self, d_model: int, hidden: int = 256, dropout: float = 0.1):
+    def __init__(
+        self,
+        d_model: int,
+        hidden: int = 256,
+        dropout: float = 0.1,
+        context_dim: int = 0,
+    ):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
+        self.context_dim = int(context_dim)
 
-        in_dim = 4 * d_model  # [hi, hj, |hi-hj|, hi*hj]
+        in_dim = 4 * d_model + self.context_dim  # [hi, hj, |hi-hj|, hi*hj, ctx]
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
@@ -45,16 +67,27 @@ class PairwiseMergeHead(nn.Module):
             nn.Linear(hidden, 1),  # logit
         )
 
-    def forward(self, H: torch.Tensor) -> torch.Tensor:
+    def forward(self, H: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
         """
         H: [G, D]
         returns logits: [G, G] with -inf on diagonal (no self-merge)
         """
         H = self.norm(H)
         G, D = H.shape
+        if self.context_dim:
+            if context is None:
+                raise ValueError("context is required for context-aware pairwise head")
+            context = context.to(device=H.device, dtype=H.dtype)
+            if context.ndim != 1 or context.shape[0] != self.context_dim:
+                raise ValueError(
+                    f"context must have shape [{self.context_dim}] for pairwise head"
+                )
         hi = H.unsqueeze(1).expand(G, G, D)  # [G, G, D]
         hj = H.unsqueeze(0).expand(G, G, D)  # [G, G, D]
-        feats = torch.cat([hi, hj, (hi - hj).abs(), hi * hj], dim=-1)  # [G, G, 4D]
+        feat_parts = [hi, hj, (hi - hj).abs(), hi * hj]
+        if self.context_dim:
+            feat_parts.append(context.view(1, 1, -1).expand(G, G, -1))
+        feats = torch.cat(feat_parts, dim=-1)
         logits = self.mlp(feats).squeeze(-1)  # [G, G]
 
         # disallow i==j
@@ -71,11 +104,13 @@ class StructuredSubsetMergeHead(nn.Module):
         hidden: int = 256,
         dropout: float = 0.1,
         max_subset_size: int = 64,
+        context_dim: int = 0,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.max_subset_size = int(max_subset_size)
-        pair_in_dim = 4 * d_model
+        self.context_dim = int(context_dim)
+        pair_in_dim = 4 * d_model + self.context_dim
         self.pair_mlp = nn.Sequential(
             nn.Linear(pair_in_dim, hidden),
             nn.GELU(),
@@ -90,7 +125,7 @@ class StructuredSubsetMergeHead(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        member_in_dim = 4 * d_model
+        member_in_dim = 4 * d_model + self.context_dim
         self.member_mlp = nn.Sequential(
             nn.Linear(member_in_dim, hidden),
             nn.GELU(),
@@ -100,20 +135,21 @@ class StructuredSubsetMergeHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
+        global_in_dim = d_model + self.context_dim
         self.subset_size_head = nn.Sequential(
-            nn.Linear(d_model, hidden),
+            nn.Linear(global_in_dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, self.max_subset_size + 1),
         )
         self.stop_after_merge_head = nn.Sequential(
-            nn.Linear(d_model, hidden),
+            nn.Linear(global_in_dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
 
-    def forward(self, H: torch.Tensor) -> dict:
+    def forward(self, H: torch.Tensor, context: torch.Tensor | None = None) -> dict:
         """
         H: [G, D]
         Returns:
@@ -124,6 +160,14 @@ class StructuredSubsetMergeHead(nn.Module):
         """
         H = self.norm(H)
         G, D = H.shape
+        if self.context_dim:
+            if context is None:
+                raise ValueError("context is required for context-aware structured head")
+            context = context.to(device=H.device, dtype=H.dtype)
+            if context.ndim != 1 or context.shape[0] != self.context_dim:
+                raise ValueError(
+                    f"context must have shape [{self.context_dim}] for structured head"
+                )
         if G <= 1:
             empty_logits = H.new_empty((0,))
             return {
@@ -142,7 +186,10 @@ class StructuredSubsetMergeHead(nn.Module):
         left_idx, right_idx = pair_indices[0], pair_indices[1]
         hi = H[left_idx]
         hj = H[right_idx]
-        pair_feats = torch.cat([hi, hj, (hi - hj).abs(), hi * hj], dim=-1)
+        pair_feat_parts = [hi, hj, (hi - hj).abs(), hi * hj]
+        if self.context_dim:
+            pair_feat_parts.append(context.unsqueeze(0).expand(hi.size(0), -1))
+        pair_feats = torch.cat(pair_feat_parts, dim=-1)
         pair_hidden = self.pair_mlp(pair_feats)
         starter_pair_logits = self.pair_logit(pair_hidden).squeeze(-1)
 
@@ -153,20 +200,26 @@ class StructuredSubsetMergeHead(nn.Module):
 
         node_expand = H.unsqueeze(0).expand(pair_context.size(0), G, D)
         pair_expand = pair_context.unsqueeze(1).expand(pair_context.size(0), G, D)
-        member_feats = torch.cat(
-            [
-                node_expand,
-                pair_expand,
-                (node_expand - pair_expand).abs(),
-                node_expand * pair_expand,
-            ],
-            dim=-1,
-        )
+        member_feat_parts = [
+            node_expand,
+            pair_expand,
+            (node_expand - pair_expand).abs(),
+            node_expand * pair_expand,
+        ]
+        if self.context_dim:
+            member_feat_parts.append(
+                context.view(1, 1, -1).expand(pair_context.size(0), G, -1)
+            )
+        member_feats = torch.cat(member_feat_parts, dim=-1)
         member_logits = self.member_mlp(member_feats).squeeze(-1)
 
         pair_matrix = H.new_full((G, G), float("-inf"))
         pair_matrix[left_idx, right_idx] = starter_pair_logits
         pair_matrix[right_idx, left_idx] = starter_pair_logits
+
+        pooled = H.mean(dim=0)
+        if self.context_dim:
+            pooled = torch.cat([pooled, context], dim=-1)
 
         return {
             "starter_pair_logits": starter_pair_logits,
@@ -176,8 +229,8 @@ class StructuredSubsetMergeHead(nn.Module):
             ],
             "member_logits": member_logits,
             "logits": pair_matrix,
-            "subset_size_logits": self.subset_size_head(H.mean(dim=0)),
-            "stop_after_merge_logit": self.stop_after_merge_head(H.mean(dim=0)).squeeze(-1),
+            "subset_size_logits": self.subset_size_head(pooled),
+            "stop_after_merge_logit": self.stop_after_merge_head(pooled).squeeze(-1),
         }
 
 
@@ -337,6 +390,11 @@ class TreeDenoiserTokenGT(nn.Module):
         autoregressive_use_case_conditioning=False,
         autoregressive_num_cases=None,
         autoregressive_case_dim=16,
+        autoregressive_use_start_topology_conditioning=False,
+        autoregressive_start_topology_hidden_dim=None,
+        autoregressive_start_topology_conditioning_mode="additive",
+        autoregressive_start_topology_code_dim=64,
+        autoregressive_frozen_start_case_embedding_path=None,
         first_hit_head_use_phase_input=False,
         first_hit_head_phase_hidden_dim=None,
         first_hit_head_mode="base",
@@ -346,6 +404,7 @@ class TreeDenoiserTokenGT(nn.Module):
         first_hit_head_router_hidden_dim=None,
         first_hit_head_num_cases=None,
         first_hit_head_case_dim=16,
+        first_hit_frozen_start_case_embedding_path=None,
         first_hit_start_tree_graph_detach=False,
     ):
         super().__init__()
@@ -453,6 +512,9 @@ class TreeDenoiserTokenGT(nn.Module):
             else int(first_hit_head_num_cases)
         )
         self.first_hit_head_case_dim = int(first_hit_head_case_dim)
+        self.first_hit_frozen_start_case_embedding_path = (
+            first_hit_frozen_start_case_embedding_path
+        )
         self.first_hit_start_tree_graph_detach = bool(
             first_hit_start_tree_graph_detach
         )
@@ -484,6 +546,7 @@ class TreeDenoiserTokenGT(nn.Module):
         self.first_hit_topology_cross_query = None
         self.first_hit_topology_cross_key = None
         self.first_hit_topology_cross_value = None
+        self.first_hit_frozen_start_case_proj = None
         self.first_hit_edge_head_cross_attn = None
         self.first_hit_edge_head_raw_topology = None
         self.first_hit_edge_head_start_topology_raw = None
@@ -556,6 +619,7 @@ class TreeDenoiserTokenGT(nn.Module):
             )
         if self.first_hit_head_mode in {
             "case_adapted_mlp",
+            "frozen_start_case_mlp",
             "topology_adapter_mlp",
             "topology_attention_adapter_mlp",
             "start_topology_adapter_mlp",
@@ -652,6 +716,36 @@ class TreeDenoiserTokenGT(nn.Module):
             self.first_hit_case_embedding = nn.Embedding(
                 self.first_hit_head_num_cases,
                 self.first_hit_head_case_dim,
+            )
+        if self.first_hit_head_mode == "frozen_start_case_mlp":
+            if not self.first_hit_frozen_start_case_embedding_path:
+                raise ValueError(
+                    "first_hit_frozen_start_case_embedding_path must be set for "
+                    "frozen_start_case_mlp"
+                )
+            frozen_table = _load_frozen_start_case_embedding_table(
+                self.first_hit_frozen_start_case_embedding_path,
+                name="first_hit_frozen_start_case",
+            )
+            if (
+                self.first_hit_head_num_cases is not None
+                and int(frozen_table.shape[0]) != self.first_hit_head_num_cases
+            ):
+                raise ValueError(
+                    "first_hit_frozen_start_case num cases "
+                    f"{int(frozen_table.shape[0])} does not match "
+                    f"first_hit_head_num_cases={self.first_hit_head_num_cases}"
+                )
+            self.first_hit_head_num_cases = int(frozen_table.shape[0])
+            if int(frozen_table.shape[1]) != self.first_hit_head_case_dim:
+                self.first_hit_frozen_start_case_proj = nn.Sequential(
+                    nn.LayerNorm(int(frozen_table.shape[1])),
+                    nn.Linear(int(frozen_table.shape[1]), self.first_hit_head_case_dim),
+                )
+            self.register_buffer(
+                "first_hit_frozen_start_case_embedding",
+                frozen_table,
+                persistent=True,
             )
         if self.first_hit_head_mode == "topology_adapter_mlp":
             topology_context_input_dim = (3 * embed_dim)
@@ -769,12 +863,54 @@ class TreeDenoiserTokenGT(nn.Module):
         self.autoregressive_use_case_conditioning = bool(
             autoregressive_use_case_conditioning
         )
+        self.autoregressive_use_start_topology_conditioning = bool(
+            autoregressive_use_start_topology_conditioning
+        )
+        if (
+            self.autoregressive_use_case_conditioning
+            and self.autoregressive_use_start_topology_conditioning
+        ):
+            raise ValueError(
+                "Use either autoregressive case conditioning or start-topology "
+                "conditioning, not both."
+            )
         self.autoregressive_num_cases = (
             None if autoregressive_num_cases is None else int(autoregressive_num_cases)
         )
         self.autoregressive_case_dim = int(autoregressive_case_dim)
+        self.autoregressive_start_topology_hidden_dim = int(
+            embed_dim
+            if autoregressive_start_topology_hidden_dim is None
+            else autoregressive_start_topology_hidden_dim
+        )
+        self.autoregressive_start_topology_conditioning_mode = str(
+            autoregressive_start_topology_conditioning_mode
+        )
+        valid_start_topology_modes = {
+            "additive",
+            "head_concat",
+            "frozen_case_probe",
+            "frozen_case_probe_additive",
+        }
+        if (
+            self.autoregressive_start_topology_conditioning_mode
+            not in valid_start_topology_modes
+        ):
+            raise ValueError(
+                "autoregressive_start_topology_conditioning_mode must be one of "
+                f"{sorted(valid_start_topology_modes)}"
+            )
+        self.autoregressive_start_topology_code_dim = int(
+            autoregressive_start_topology_code_dim
+        )
+        self.autoregressive_frozen_start_case_embedding_path = (
+            autoregressive_frozen_start_case_embedding_path
+        )
         self.autoregressive_case_embedding = None
         self.autoregressive_case_proj = None
+        self.autoregressive_start_topology_adapter = None
+        self.autoregressive_start_topology_head_proj = None
+        self.autoregressive_frozen_start_case_proj = None
         if self.autoregressive_use_case_conditioning:
             if self.autoregressive_num_cases is None or self.autoregressive_num_cases <= 0:
                 raise ValueError(
@@ -788,6 +924,67 @@ class TreeDenoiserTokenGT(nn.Module):
             self.autoregressive_case_proj = nn.Sequential(
                 nn.LayerNorm(self.autoregressive_case_dim),
                 nn.Linear(self.autoregressive_case_dim, embed_dim),
+            )
+        if (
+            self.autoregressive_use_start_topology_conditioning
+            and self.autoregressive_start_topology_conditioning_mode == "additive"
+        ):
+            self.autoregressive_start_topology_adapter = nn.Sequential(
+                nn.LayerNorm(3 * embed_dim),
+                nn.Linear(
+                    3 * embed_dim,
+                    self.autoregressive_start_topology_hidden_dim,
+                ),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.autoregressive_start_topology_hidden_dim, embed_dim),
+            )
+        if (
+            self.autoregressive_use_start_topology_conditioning
+            and self.autoregressive_start_topology_conditioning_mode == "head_concat"
+        ):
+            if self.autoregressive_start_topology_code_dim <= 0:
+                raise ValueError(
+                    "autoregressive_start_topology_code_dim must be positive for "
+                    "head_concat conditioning"
+                )
+            self.autoregressive_start_topology_head_proj = nn.Linear(
+                3 * embed_dim,
+                self.autoregressive_start_topology_code_dim,
+            )
+        if (
+            self.autoregressive_use_start_topology_conditioning
+            and self.autoregressive_start_topology_conditioning_mode
+            in {"frozen_case_probe", "frozen_case_probe_additive"}
+        ):
+            if not self.autoregressive_frozen_start_case_embedding_path:
+                raise ValueError(
+                    "autoregressive_frozen_start_case_embedding_path must be set for "
+                    "frozen case-probe conditioning"
+                )
+            frozen_table = _load_frozen_start_case_embedding_table(
+                self.autoregressive_frozen_start_case_embedding_path,
+                name="autoregressive_frozen_start_case",
+            )
+            if int(frozen_table.shape[1]) != self.autoregressive_start_topology_code_dim:
+                raise ValueError(
+                    "autoregressive_frozen_start_case embedding dim "
+                    f"{int(frozen_table.shape[1])} does not match "
+                    "autoregressive_start_topology_code_dim="
+                    f"{self.autoregressive_start_topology_code_dim}"
+                )
+            if (
+                self.autoregressive_start_topology_conditioning_mode
+                == "frozen_case_probe_additive"
+            ):
+                self.autoregressive_frozen_start_case_proj = nn.Sequential(
+                    nn.LayerNorm(self.autoregressive_start_topology_code_dim),
+                    nn.Linear(self.autoregressive_start_topology_code_dim, embed_dim),
+                )
+            self.register_buffer(
+                "autoregressive_frozen_start_case_embedding",
+                frozen_table,
+                persistent=True,
             )
         self.autoregressive_group_refinement = nn.ModuleList(
             [
@@ -803,7 +1000,18 @@ class TreeDenoiserTokenGT(nn.Module):
         )
         if self.autoregressive_head_mode == "pairwise_threshold":
             self.pairwise_head = PairwiseMergeHead(
-                d_model=embed_dim, hidden=embed_dim, dropout=dropout
+                d_model=embed_dim,
+                hidden=embed_dim,
+                dropout=dropout,
+                context_dim=(
+                    self.autoregressive_start_topology_code_dim
+                    if (
+                        self.autoregressive_use_start_topology_conditioning
+                        and self.autoregressive_start_topology_conditioning_mode
+                        in {"head_concat", "frozen_case_probe"}
+                    )
+                    else 0
+                ),
             )
             self.structured_subset_head = None
         elif self.autoregressive_head_mode == "structured_subset":
@@ -813,6 +1021,15 @@ class TreeDenoiserTokenGT(nn.Module):
                 hidden=embed_dim,
                 dropout=dropout,
                 max_subset_size=self.autoregressive_max_subset_size,
+                context_dim=(
+                    self.autoregressive_start_topology_code_dim
+                    if (
+                        self.autoregressive_use_start_topology_conditioning
+                        and self.autoregressive_start_topology_conditioning_mode
+                        in {"head_concat", "frozen_case_probe"}
+                    )
+                    else 0
+                ),
             )
         else:
             raise ValueError(
@@ -1438,6 +1655,27 @@ class TreeDenoiserTokenGT(nn.Module):
             return self.first_hit_edge_head_adapted(
                 torch.cat([first_hit_head_input, case_features], dim=-1)
             )
+        if self.first_hit_head_mode == "frozen_start_case_mlp":
+            if case_indices is None:
+                raise ValueError("case_indices are required for frozen_start_case_mlp")
+            case_indices = case_indices.to(device=padded_edges.device, dtype=torch.long)
+            if case_indices.ndim != 1 or case_indices.shape[0] != padded_edges.shape[0]:
+                raise ValueError(
+                    "case_indices must have shape [batch] for frozen_start_case_mlp"
+                )
+            frozen_table = self.first_hit_frozen_start_case_embedding.to(
+                device=padded_edges.device,
+                dtype=padded_edges.dtype,
+            )
+            case_features = frozen_table.index_select(0, case_indices)
+            if self.first_hit_frozen_start_case_proj is not None:
+                case_features = self.first_hit_frozen_start_case_proj(case_features)
+            case_features = case_features.unsqueeze(1).expand(
+                -1, first_hit_head_input.shape[1], -1
+            )
+            return self.first_hit_edge_head_adapted(
+                torch.cat([first_hit_head_input, case_features], dim=-1)
+            )
         if self.first_hit_head_mode == "start_topology_adapter_mlp":
             if start_topology_features is None:
                 raise ValueError(
@@ -1747,6 +1985,7 @@ class TreeDenoiserTokenGT(nn.Module):
         autoregressive=False,
         autoregressive_component_groups=None,
         autoregressive_case_indices=None,
+        autoregressive_start_topology_features=None,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -1839,6 +2078,85 @@ class TreeDenoiserTokenGT(nn.Module):
                     self.autoregressive_case_embedding(autoregressive_case_indices)
                 )
 
+            autoregressive_start_topology_context = None
+            autoregressive_start_topology_head_context = None
+            if self.autoregressive_use_start_topology_conditioning:
+                if (
+                    self.autoregressive_start_topology_conditioning_mode
+                    in {"frozen_case_probe", "frozen_case_probe_additive"}
+                ):
+                    if autoregressive_case_indices is None:
+                        raise ValueError(
+                            "autoregressive_case_indices are required for "
+                            "frozen case-probe conditioning"
+                        )
+                    autoregressive_case_indices = autoregressive_case_indices.to(
+                        device=x.device,
+                        dtype=torch.long,
+                    )
+                    if (
+                        autoregressive_case_indices.ndim != 1
+                        or autoregressive_case_indices.shape[0] != B
+                    ):
+                        raise ValueError(
+                            "autoregressive_case_indices must have shape [batch] "
+                            "for frozen case-probe conditioning"
+                        )
+                    frozen_table = self.autoregressive_frozen_start_case_embedding.to(
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    frozen_context = frozen_table.index_select(
+                        0,
+                        autoregressive_case_indices,
+                    )
+                    if (
+                        self.autoregressive_start_topology_conditioning_mode
+                        == "frozen_case_probe_additive"
+                    ):
+                        autoregressive_start_topology_context = (
+                            self.autoregressive_frozen_start_case_proj(frozen_context)
+                        )
+                    else:
+                        autoregressive_start_topology_head_context = frozen_context
+                else:
+                    if autoregressive_start_topology_features is None:
+                        raise ValueError(
+                            "autoregressive_start_topology_features are required when "
+                            "autoregressive_use_start_topology_conditioning is enabled"
+                        )
+                    autoregressive_start_topology_features = (
+                        autoregressive_start_topology_features.to(
+                            device=x.device,
+                            dtype=x.dtype,
+                        )
+                    )
+                    if (
+                        autoregressive_start_topology_features.ndim != 2
+                        or autoregressive_start_topology_features.shape[0] != B
+                        or autoregressive_start_topology_features.shape[1]
+                        != 3 * self.embed_dim
+                    ):
+                        raise ValueError(
+                            "autoregressive_start_topology_features must have shape "
+                            "[batch, 3 * embed_dim]"
+                        )
+                    if (
+                        self.autoregressive_start_topology_conditioning_mode
+                        == "additive"
+                    ):
+                        autoregressive_start_topology_context = (
+                            self.autoregressive_start_topology_adapter(
+                                autoregressive_start_topology_features
+                            )
+                        )
+                    else:
+                        autoregressive_start_topology_head_context = (
+                            self.autoregressive_start_topology_head_proj(
+                                autoregressive_start_topology_features
+                            )
+                        )
+
             for b, groups in enumerate(batch_polytomy_index):
                 for num, group in enumerate(groups):
                     if group.size(0) <= 1:
@@ -1856,14 +2174,30 @@ class TreeDenoiserTokenGT(nn.Module):
                         group_embeddings = group_embeddings + autoregressive_case_context[
                             b
                         ].unsqueeze(0)
+                    if autoregressive_start_topology_context is not None:
+                        group_embeddings = (
+                            group_embeddings
+                            + autoregressive_start_topology_context[b].unsqueeze(0)
+                        )
                     for refinement_block in self.autoregressive_group_refinement:
                         group_embeddings = refinement_block(group_embeddings)
+                    group_head_context = (
+                        None
+                        if autoregressive_start_topology_head_context is None
+                        else autoregressive_start_topology_head_context[b]
+                    )
                     if self.autoregressive_head_mode == "structured_subset":
-                        head_outputs = self.structured_subset_head(group_embeddings)
+                        head_outputs = self.structured_subset_head(
+                            group_embeddings,
+                            context=group_head_context,
+                        )
                         logits = head_outputs["logits"]
                     else:
                         head_outputs = {}
-                        logits = self.pairwise_head(group_embeddings)
+                        logits = self.pairwise_head(
+                            group_embeddings,
+                            context=group_head_context,
+                        )
 
                     group_output = {
                         "batch_index": b,
@@ -1986,6 +2320,7 @@ class TreeDenoiserTokenGT(nn.Module):
         autoregressive=False,
         autoregressive_component_groups=None,
         autoregressive_case_indices=None,
+        autoregressive_start_topology_features=None,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -2021,6 +2356,7 @@ class TreeDenoiserTokenGT(nn.Module):
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
             autoregressive_case_indices=autoregressive_case_indices,
+            autoregressive_start_topology_features=autoregressive_start_topology_features,
             first_hit_case_indices=first_hit_case_indices,
             first_hit_start_topology_features=first_hit_start_topology_features,
             first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
@@ -2119,6 +2455,7 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
         autoregressive=False,
         autoregressive_component_groups=None,
         autoregressive_case_indices=None,
+        autoregressive_start_topology_features=None,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -2161,6 +2498,7 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
             autoregressive_case_indices=autoregressive_case_indices,
+            autoregressive_start_topology_features=autoregressive_start_topology_features,
             first_hit_case_indices=first_hit_case_indices,
             first_hit_start_topology_features=first_hit_start_topology_features,
             first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
@@ -2280,6 +2618,7 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
         autoregressive=False,
         autoregressive_component_groups=None,
         autoregressive_case_indices=None,
+        autoregressive_start_topology_features=None,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -2328,6 +2667,7 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
             autoregressive_case_indices=autoregressive_case_indices,
+            autoregressive_start_topology_features=autoregressive_start_topology_features,
             first_hit_case_indices=first_hit_case_indices,
             first_hit_start_topology_features=first_hit_start_topology_features,
             first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
@@ -2388,6 +2728,21 @@ def return_model(config):
         ),
         autoregressive_num_cases=config["model"].get("autoregressive_num_cases"),
         autoregressive_case_dim=config["model"].get("autoregressive_case_dim", 16),
+        autoregressive_use_start_topology_conditioning=config["model"].get(
+            "autoregressive_use_start_topology_conditioning", False
+        ),
+        autoregressive_start_topology_hidden_dim=config["model"].get(
+            "autoregressive_start_topology_hidden_dim"
+        ),
+        autoregressive_start_topology_conditioning_mode=config["model"].get(
+            "autoregressive_start_topology_conditioning_mode", "additive"
+        ),
+        autoregressive_start_topology_code_dim=config["model"].get(
+            "autoregressive_start_topology_code_dim", 64
+        ),
+        autoregressive_frozen_start_case_embedding_path=config["model"].get(
+            "autoregressive_frozen_start_case_embedding_path"
+        ),
         first_hit_head_use_phase_input=config["model"].get(
             "first_hit_head_use_phase_input", False
         ),
@@ -2405,6 +2760,9 @@ def return_model(config):
         ),
         first_hit_head_num_cases=config["model"].get("first_hit_head_num_cases"),
         first_hit_head_case_dim=config["model"].get("first_hit_head_case_dim", 16),
+        first_hit_frozen_start_case_embedding_path=config["model"].get(
+            "first_hit_frozen_start_case_embedding_path"
+        ),
         first_hit_start_tree_graph_detach=config["model"].get(
             "first_hit_start_tree_graph_detach", False
         ),

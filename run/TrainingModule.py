@@ -2624,6 +2624,7 @@ def _build_autoregressive_replay_batch(module, samples):
         "_skip_training_augmentations": True,
         "tokenized_autoregressive_trees": tokenized,
         "newick_autoregressive_trees": newicks,
+        "start_trees": [sample.get("start_tree", sample.get("newick")) for sample in samples],
         "target_trees": [sample["target_tree"] for sample in samples],
         "bank_group_key": [sample.get("bank_group_key") for sample in samples],
         "batched_autoregressive_time": torch.tensor(
@@ -4398,6 +4399,7 @@ def _predsim_overrun_rollout(
     target_tree: str,
     phyla_embeddings,
     case_index=None,
+    start_topology_features=None,
     *,
     T: float = 1.0,
     eps_len: float = 1e-8,
@@ -4417,6 +4419,27 @@ def _predsim_overrun_rollout(
         if case_index is None
         else torch.tensor([int(case_index)], dtype=torch.long, device=module.device)
     )
+    rollout_start_topology_features = start_topology_features
+    if (
+        rollout_start_topology_features is None
+        and (
+            getattr(module.model, "first_hit_head_mode", "base")
+            in {
+                "start_topology_adapter_mlp",
+                "start_topology_raw_pool_concat_mlp",
+            }
+            or getattr(
+                module.model,
+                "autoregressive_use_start_topology_conditioning",
+                False,
+            )
+        )
+    ):
+        rollout_start_topology_features = _build_start_topology_feature_tensor(
+            module,
+            [start_tree],
+            device=module.device,
+        )
     trace = []
     t = 0.0
     n_events = 0
@@ -4434,7 +4457,12 @@ def _predsim_overrun_rollout(
                 first_hit_logits,
                 boundary_vanish_logits,
                 edge_features,
-            ) = module.forward(tokenized, float(t), phyla_embeddings)
+            ) = module.forward(
+                tokenized,
+                float(t),
+                phyla_embeddings,
+                first_hit_start_topology_features=rollout_start_topology_features,
+            )
 
         aligned = _align_model_outputs_to_tree_context(
             module,
@@ -4747,6 +4775,7 @@ def _predsim_overrun_rollout(
                     autoregressive=True,
                     autoregressive_component_groups=component_groups,
                     autoregressive_case_indices=case_index_tensor,
+                    autoregressive_start_topology_features=rollout_start_topology_features,
                 )
             td_ar, n_ar, m_ar = _tree_to_model_split_lengths(module, current_newick)
             planned_merges = _plan_autoregressive_boundary_merges(
@@ -4831,11 +4860,18 @@ def _discrete_phase_rollout(
     rollout_start_topology_features = start_topology_features
     if (
         rollout_start_topology_features is None
-        and getattr(module.model, "first_hit_head_mode", "base")
-        in {
-            "start_topology_adapter_mlp",
-            "start_topology_raw_pool_concat_mlp",
-        }
+        and (
+            getattr(module.model, "first_hit_head_mode", "base")
+            in {
+                "start_topology_adapter_mlp",
+                "start_topology_raw_pool_concat_mlp",
+            }
+            or getattr(
+                module.model,
+                "autoregressive_use_start_topology_conditioning",
+                False,
+            )
+        )
     ):
         rollout_start_topology_features = _build_start_topology_feature_tensor(
             module,
@@ -5155,6 +5191,7 @@ def _discrete_phase_rollout(
                     autoregressive=True,
                     autoregressive_component_groups=component_groups,
                     autoregressive_case_indices=rollout_case_indices,
+                    autoregressive_start_topology_features=rollout_start_topology_features,
                 )
             td_ar, n_ar, m_ar = _tree_to_model_split_lengths(module, current_newick)
             planned_merges = _plan_autoregressive_boundary_merges(
@@ -7747,7 +7784,10 @@ class TrainingModule(LightningModule):
     def _attach_case_indices_to_batch(self, batch):
         if batch is None:
             return batch
-        if getattr(self.model, "first_hit_head_mode", "base") != "case_adapted_mlp":
+        if getattr(self.model, "first_hit_head_mode", "base") not in {
+            "case_adapted_mlp",
+            "frozen_start_case_mlp",
+        }:
             return batch
         if batch.get("_first_hit_case_indices") is not None:
             return batch
@@ -7773,25 +7813,46 @@ class TrainingModule(LightningModule):
         if batch is None:
             return batch
         mode = getattr(self.model, "first_hit_head_mode", "base")
-        if mode not in {
+        first_hit_summary_modes = {
             "start_topology_adapter_mlp",
             "start_topology_raw_pool_concat_mlp",
-            "start_topology_cross_attn_mlp",
-        }:
-            return batch
+        }
+        needs_first_hit_summary = mode in first_hit_summary_modes
+        needs_first_hit_cross_attn = mode == "start_topology_cross_attn_mlp"
+        autoregressive_start_topology_mode = getattr(
+            self.model,
+            "autoregressive_start_topology_conditioning_mode",
+            "additive",
+        )
+        needs_autoregressive_summary = bool(
+            getattr(self.model, "autoregressive_use_start_topology_conditioning", False)
+            and autoregressive_start_topology_mode
+            not in {"frozen_case_probe", "frozen_case_probe_additive"}
+        )
         if (
-            mode in {
-                "start_topology_adapter_mlp",
-                "start_topology_raw_pool_concat_mlp",
-            }
-            and batch.get("_first_hit_start_topology_features") is not None
+            not needs_first_hit_summary
+            and not needs_first_hit_cross_attn
+            and not needs_autoregressive_summary
         ):
             return batch
-        if (
-            mode == "start_topology_cross_attn_mlp"
-            and batch.get("_first_hit_start_topology_embeddings") is not None
-            and batch.get("_first_hit_start_topology_pad_mask") is not None
-        ):
+        summary_ready = (
+            (
+                not needs_first_hit_summary
+                or batch.get("_first_hit_start_topology_features") is not None
+            )
+            and (
+                not needs_autoregressive_summary
+                or batch.get("_autoregressive_start_topology_features") is not None
+            )
+        )
+        cross_ready = (
+            not needs_first_hit_cross_attn
+            or (
+                batch.get("_first_hit_start_topology_embeddings") is not None
+                and batch.get("_first_hit_start_topology_pad_mask") is not None
+            )
+        )
+        if summary_ready and cross_ready:
             return batch
         start_trees = batch.get("start_trees")
         if start_trees is None:
@@ -7801,24 +7862,31 @@ class TrainingModule(LightningModule):
         if isinstance(start_trees, str):
             start_trees = [start_trees]
         updated_batch = dict(batch)
-        if mode in {
-            "start_topology_adapter_mlp",
-            "start_topology_raw_pool_concat_mlp",
-        }:
-            feature_tensor = _build_start_topology_feature_tensor(
-                self,
-                list(start_trees),
-                device=self.device,
-            )
+        if needs_first_hit_summary or needs_autoregressive_summary:
+            feature_tensor = batch.get("_first_hit_start_topology_features")
+            if feature_tensor is None:
+                feature_tensor = batch.get("_autoregressive_start_topology_features")
+            if feature_tensor is None:
+                feature_tensor = _build_start_topology_feature_tensor(
+                    self,
+                    list(start_trees),
+                    device=self.device,
+                )
             if feature_tensor is None:
                 return batch
-            updated_batch["_first_hit_start_topology_features"] = feature_tensor
-        else:
-            embeddings, pad_mask = _build_start_topology_identity_batch(
-                self,
-                list(start_trees),
-                device=self.device,
-            )
+            if needs_first_hit_summary:
+                updated_batch["_first_hit_start_topology_features"] = feature_tensor
+            if needs_autoregressive_summary:
+                updated_batch["_autoregressive_start_topology_features"] = feature_tensor
+        if needs_first_hit_cross_attn:
+            embeddings = batch.get("_first_hit_start_topology_embeddings")
+            pad_mask = batch.get("_first_hit_start_topology_pad_mask")
+            if embeddings is None or pad_mask is None:
+                embeddings, pad_mask = _build_start_topology_identity_batch(
+                    self,
+                    list(start_trees),
+                    device=self.device,
+                )
             if embeddings is None or pad_mask is None:
                 return batch
             updated_batch["_first_hit_start_topology_embeddings"] = embeddings
@@ -7918,10 +7986,25 @@ class TrainingModule(LightningModule):
         return updated_batch, {"attempted": float(attempted), "applied": float(applied)}
 
     def _prepare_autoregressive_training_batch(self, batch):
-        if (
+        batch = self._attach_start_topology_features_to_batch(batch)
+        needs_autoregressive_case_indices = bool(
             getattr(self.model, "autoregressive_use_case_conditioning", False)
-            and batch.get("_autoregressive_case_indices") is None
-        ):
+        ) or (
+            bool(
+                getattr(
+                    self.model,
+                    "autoregressive_use_start_topology_conditioning",
+                    False,
+                )
+            )
+            and getattr(
+                self.model,
+                "autoregressive_start_topology_conditioning_mode",
+                "additive",
+            )
+            in {"frozen_case_probe", "frozen_case_probe_additive"}
+        )
+        if needs_autoregressive_case_indices and batch.get("_autoregressive_case_indices") is None:
             group_keys = batch.get("bank_group_key")
             if group_keys is None:
                 group_keys = _infer_case_group_keys_from_batch(self, batch)
@@ -8497,6 +8580,9 @@ class TrainingModule(LightningModule):
                     autoregressive=True,
                     autoregressive_component_groups=component_groups,
                     autoregressive_case_indices=case_indices,
+                    autoregressive_start_topology_features=sample_kwargs.get(
+                        "autoregressive_start_topology_features"
+                    ),
                 )
             existing_splits = {
                 int(mask)
@@ -8652,27 +8738,67 @@ class TrainingModule(LightningModule):
             "target_trees": [pair["target_tree"]],
             "split_multi_label_events": split_multi_label_events,
         }
+        needs_frozen_ar_case_probe = (
+            bool(
+                getattr(
+                    self.model,
+                    "autoregressive_use_start_topology_conditioning",
+                    False,
+                )
+            )
+            and getattr(
+                self.model,
+                "autoregressive_start_topology_conditioning_mode",
+                "additive",
+            )
+            in {"frozen_case_probe", "frozen_case_probe_additive"}
+        )
         if (
-            getattr(self.model, "first_hit_head_mode", "base") == "case_adapted_mlp"
+            getattr(self.model, "first_hit_head_mode", "base")
+            in {"case_adapted_mlp", "frozen_start_case_mlp"}
             or getattr(self.model, "autoregressive_use_case_conditioning", False)
+            or needs_frozen_ar_case_probe
         ):
             case_index = _extract_case_index_from_group_key(pair.get("bank_group_key"))
             if case_index is not None:
                 sample_kwargs["case_indices"] = [int(case_index)]
-        if (
+        needs_start_topology_summary = (
             getattr(self.model, "first_hit_head_mode", "base")
             in {
                 "start_topology_adapter_mlp",
                 "start_topology_raw_pool_concat_mlp",
             }
-        ):
-            sample_kwargs["first_hit_start_topology_features"] = (
-                _build_start_topology_feature_tensor(
-                    self,
-                    [pair["start_tree"]],
-                    device=self.device,
-                )
+            or getattr(
+                self.model,
+                "autoregressive_use_start_topology_conditioning",
+                False,
             )
+            and not needs_frozen_ar_case_probe
+        )
+        if needs_start_topology_summary:
+            start_topology_features = _build_start_topology_feature_tensor(
+                self,
+                [pair["start_tree"]],
+                device=self.device,
+            )
+            if (
+                getattr(self.model, "first_hit_head_mode", "base")
+                in {
+                    "start_topology_adapter_mlp",
+                    "start_topology_raw_pool_concat_mlp",
+                }
+            ):
+                sample_kwargs["first_hit_start_topology_features"] = (
+                    start_topology_features
+                )
+            if getattr(
+                self.model,
+                "autoregressive_use_start_topology_conditioning",
+                False,
+            ):
+                sample_kwargs["autoregressive_start_topology_features"] = (
+                    start_topology_features
+                )
         if (
             getattr(self.model, "first_hit_head_mode", "base")
             == "start_topology_cross_attn_mlp"
@@ -10051,6 +10177,7 @@ class TrainingModule(LightningModule):
         autoregressive=False,
         autoregressive_component_groups=None,
         autoregressive_case_indices=None,
+        autoregressive_start_topology_features=None,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -10173,6 +10300,20 @@ class TrainingModule(LightningModule):
             )
             if autoregressive_case_indices is not None and supports_case_indices:
                 model_kwargs["autoregressive_case_indices"] = autoregressive_case_indices
+            supports_start_topology_features = (
+                "autoregressive_start_topology_features" in model_signature.parameters
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in model_signature.parameters.values()
+                )
+            )
+            if (
+                autoregressive_start_topology_features is not None
+                and supports_start_topology_features
+            ):
+                model_kwargs["autoregressive_start_topology_features"] = (
+                    autoregressive_start_topology_features
+                )
 
             all_group_logits = self.model(
                 batched_tokenized_trees,
@@ -11797,6 +11938,9 @@ class TrainingModule(LightningModule):
                 autoregressive=True,
                 autoregressive_component_groups=autoregressive_component_groups,
                 autoregressive_case_indices=batch.get("_autoregressive_case_indices"),
+                autoregressive_start_topology_features=batch.get(
+                    "_autoregressive_start_topology_features"
+                ),
             )
 
             found = {}
@@ -12223,6 +12367,7 @@ class TrainingModule(LightningModule):
         return_trace: bool = False,
         target_trees: list[str] | None = None,
         first_hit_start_topology_features=None,
+        autoregressive_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
         first_hit_start_topology_pad_mask=None,
         first_hit_start_tree_graph_context=None,
@@ -12279,6 +12424,9 @@ class TrainingModule(LightningModule):
                 oracle_gate_first_hit_use_at_sampling=oracle_gate_first_hit_use_at_sampling,
                 oracle_boundary_vanish_use_at_sampling=oracle_boundary_vanish_use_at_sampling,
             )
+        shared_start_topology_features = first_hit_start_topology_features
+        if shared_start_topology_features is None:
+            shared_start_topology_features = autoregressive_start_topology_features
         if (
             self.sampling_discrete_phase_rollout_use_at_sampling
             and len(newick_starting_trees) == 1
@@ -12293,7 +12441,7 @@ class TrainingModule(LightningModule):
                 case_index=None
                 if case_indices is None
                 else int(torch.as_tensor(case_indices).reshape(-1)[0].item()),
-                start_topology_features=first_hit_start_topology_features,
+                start_topology_features=shared_start_topology_features,
                 start_topology_embeddings=first_hit_start_topology_embeddings,
                 start_topology_pad_mask=first_hit_start_topology_pad_mask,
                 dt_base=float(dt_base),
@@ -12338,6 +12486,7 @@ class TrainingModule(LightningModule):
                 case_index=None
                 if case_indices is None
                 else int(torch.as_tensor(case_indices).reshape(-1)[0].item()),
+                start_topology_features=shared_start_topology_features,
                 T=float(T),
                 eps_len=float(eps_len),
                 first_hit_tol=float(first_hit_tol),
@@ -12390,14 +12539,21 @@ class TrainingModule(LightningModule):
                 raise ValueError(
                     "case_indices must have one entry per starting tree in sample()."
                 )
-        start_topology_feature_tensor = first_hit_start_topology_features
+        start_topology_feature_tensor = shared_start_topology_features
         if (
             start_topology_feature_tensor is None
-            and getattr(self.model, "first_hit_head_mode", "base")
-            in {
-                "start_topology_adapter_mlp",
-                "start_topology_raw_pool_concat_mlp",
-            }
+            and (
+                getattr(self.model, "first_hit_head_mode", "base")
+                in {
+                    "start_topology_adapter_mlp",
+                    "start_topology_raw_pool_concat_mlp",
+                }
+                or getattr(
+                    self.model,
+                    "autoregressive_use_start_topology_conditioning",
+                    False,
+                )
+            )
         ):
             start_topology_feature_tensor = _build_start_topology_feature_tensor(
                 self,
@@ -13765,6 +13921,7 @@ class TrainingModule(LightningModule):
                                 autoregressive=True,
                                 autoregressive_component_groups=autoregressive_component_groups,
                                 autoregressive_case_indices=case_index_tensor,
+                                autoregressive_start_topology_features=start_topology_feature_tensor,
                             )
                         
                         planned_merges = _plan_autoregressive_boundary_merges(

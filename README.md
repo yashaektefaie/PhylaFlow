@@ -49,6 +49,25 @@ trainer:
   velocity_terminal_head_weight: 0.0
 ```
 
+Additional best-checkpoint exports:
+
+- DS5:
+  `gs://phyla/30272299/DS5/best_04_28/best_golden_tree_topology_kl_step009000.ckpt`
+  with config
+  `gs://phyla/30272299/DS5/best_04_28/config_ds5_arcase64_s192_lr3e3.yaml`.
+  This is from `configs/ds5_caseadapt_arcase64_scale192x5_lr3e3_anchors_20260428.yaml`
+  and reached golden tree-topology KL `1.4076410986449068`.
+- DS6:
+  `gs://phyla/30272299/DS6/best_04_28/best_golden_tree_topology_kl_step015000.ckpt`
+  with config
+  `gs://phyla/30272299/DS6/best_04_28/config_ds6_arcase64_s192_lr3e3.yaml`.
+  This is from `configs/ds6_caseadapt_arcase64_scale192x5_lr3e3_anchors_20260427.yaml`
+  and reached golden tree-topology KL `0.9475878479324212`.
+
+The bucket folders also contain the full metrics JSONL, the selected best metric
+row, a short `README.md`, and SHA256 sums.  Use `gcloud storage rsync -r` to
+update these folders in place.
+
 ### Experiment Branches
 
 The main DS1 experimental configs added here are:
@@ -84,3 +103,66 @@ The most useful DS1 result so far was AR case conditioning.  The `arcase64`
 branch improved the small-model DS1 topological tree KL, while the larger
 `128x4` branch with `lr: 0.002` gave the first credible scaling signal.  The
 first-hit structural replacements were mostly weaker than case adaptation.
+
+### Start-Tree Frozen Probe Experiments
+
+The frozen-probe branch tests whether a defensible start-tree-derived embedding
+can replace the trainable case-ID lookup.  Train the probe table for DS1 with:
+
+```bash
+python scripts/train_start_case_probe.py \
+  --config configs/ds1_arcase64_scale128x4_lr2e3_20260427.yaml \
+  --output /n/netscratch/mzitnik_lab/Lab/yektefaie/phylaflow/artifacts/start_case_probe/ds1_start_case_probe_emb64_20260428.pt \
+  --epochs 2000 \
+  --min-epochs 200 \
+  --lr 0.001 \
+  --hidden-dim 256 \
+  --embedding-dim 64
+```
+
+The saved artifact contains a frozen 64-d table produced from start-tree split
+masks and trained to classify DS1 case IDs.  The first DS1 artifact reached
+100% case-ID accuracy with off-diagonal cosine mean about `-0.004` and effective
+rank about `58.9/64`.
+
+That artifact is also exported to
+`gs://phyla/30272299/DS1/start_case_probe/ds1_start_case_probe_emb64_20260428.pt`
+with SHA256
+`c09521f6eee11dc0bfbab91bf0737fa12a27f41f041b4043261fabe00262325c`.
+On another cluster, copy it locally and update both
+`model.first_hit_frozen_start_case_embedding_path` and
+`model.autoregressive_frozen_start_case_embedding_path` in the frozen-probe
+configs to point to that local copy.
+
+Two DS1 runs are currently useful:
+
+- `configs/ds1_frozenprobe64_fh16_aradd_scale128x4_lr2e3_20260428.yaml` is the
+  clean comparison to the case-adapted recipe.  First-hit receives the frozen
+  64-d probe projected to the usual 16-d first-hit case code; AR receives the
+  frozen 64-d probe projected and added to the AR token embeddings, matching the
+  successful additive AR case-conditioning mechanism.
+- `configs/ds1_frozenprobe64_fh_ar_scale128x4_lr2e3_20260428.yaml` is the
+  head-concat reference.  It passes the frozen 64-d probe into the AR merge head
+  as context instead of adding it into AR tokens.  The stopped 4K run was weak
+  but is useful as an injection-mechanism control; resume it with
+  `configs/ds1_frozenprobe64_fh_ar_scale128x4_lr2e3_resume4k_20260428.yaml`.
+
+Example Slurm launch:
+
+```bash
+sbatch \
+  --job-name pf-ds1-frozenprobe-add \
+  --partition kempner_h100 \
+  --account kempner_mzitnik_lab \
+  --ntasks 1 \
+  --cpus-per-task 4 \
+  --mem 32G \
+  --time 07:00:00 \
+  --gres gpu:nvidia_h100_80gb_hbm3:1 \
+  slurm/run_ds_24h.sbatch \
+  configs/ds1_frozenprobe64_fh16_aradd_scale128x4_lr2e3_20260428.yaml
+```
+
+The original head-concat frozen-probe run was stopped at step 4000 with golden
+tree-topology KL `8.683634649440112`, so it should not be interpreted as a fair
+replacement for additive AR case conditioning.
