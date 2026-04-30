@@ -89,6 +89,17 @@ raw topology/split KL metrics:
    chain. This is useful because a good initialization can still show burn-in in
    cumulative KL.
 
+The same sample-metrics pass can now also write the generated trees to disk.
+This is intentionally attached to the eval that already ran the sampler, so it
+does not launch an extra checkpoint rollout. For each eval step it writes:
+
+- `stepXXXXXXXX_stepperXXXXXXXX_train_trees.jsonl` with start, target, sampled,
+  relaxed, likelihood, RF, and bank metadata.
+- `stepXXXXXXXX_stepperXXXXXXXX_train_sampled_trees.txt` as a plain MrBayes-
+  compatible generated-tree list.
+- `stepXXXXXXXX_stepperXXXXXXXX_train_relaxed_trees.txt` when branch relaxation
+  is enabled.
+
 These metrics are intentionally expensive but much closer to the downstream
 objective. The current conclusion is: do not demote raw Tree-KL/split-KL, but
 do not optimize solely for them either. The main score to watch now is whether
@@ -201,6 +212,8 @@ sample_metrics_mrbayes20k_num_starts: 64
 sample_metrics_mrbayes20k_ngen: 20000
 sample_metrics_mrbayes20k_samplefreq: 200
 sample_metrics_mrbayes20k_max_workers: 12
+sample_metrics_tree_dump_enabled: true
+sample_metrics_tree_dump_dir: /home/yektefai/PhylaFlow/metrics/full_sanity_fixedpair_20260401/<run_name>_generated_trees
 wandb_project: DS
 ```
 

@@ -5952,6 +5952,8 @@ class TrainingModule(LightningModule):
         sample_metrics_mrbayes20k_work_root: str = "/tmp/phylaflow_sample_metrics_mrbayes20k",
         sample_metrics_mrbayes20k_output_dir: str | None = None,
         sample_metrics_mrbayes20k_bin: str = "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
+        sample_metrics_tree_dump_enabled: bool = False,
+        sample_metrics_tree_dump_dir: str | None = None,
         metric_log_exact_keys=None,
         metric_log_prefixes=None,
         branch_relax_head_weight: float = 0.0,
@@ -7052,6 +7054,14 @@ class TrainingModule(LightningModule):
             else None
         )
         self.sample_metrics_mrbayes20k_bin = str(sample_metrics_mrbayes20k_bin)
+        self.sample_metrics_tree_dump_enabled = bool(
+            sample_metrics_tree_dump_enabled
+        )
+        self.sample_metrics_tree_dump_dir = (
+            os.path.abspath(str(sample_metrics_tree_dump_dir))
+            if sample_metrics_tree_dump_dir
+            else None
+        )
         self._sample_metrics_standalone_relaxer_cache = {}
         self._sample_metrics_likelihood_scorer_cache = {}
         self._sample_metrics_metric_encoder_cache = {}
@@ -8866,6 +8876,124 @@ class TrainingModule(LightningModule):
         with open(self.sample_metrics_trace_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
+    def _sample_metrics_tree_dump_output_dir(self):
+        if self.sample_metrics_tree_dump_dir:
+            return self.sample_metrics_tree_dump_dir
+        if self.sample_metrics_trace_path:
+            return os.path.join(
+                os.path.dirname(self.sample_metrics_trace_path),
+                "generated_trees",
+            )
+        return os.path.abspath("sample_metrics_generated_trees")
+
+    def _sample_metrics_can_write_artifacts(self):
+        trainer = getattr(self, "trainer", None)
+        if trainer is not None and not bool(getattr(trainer, "is_global_zero", True)):
+            return False
+        try:
+            return int(os.environ.get("RANK", "0")) == 0
+        except Exception:
+            return True
+
+    @staticmethod
+    def _sample_metrics_newick_line(tree):
+        tree = str(tree).strip()
+        return tree if tree.endswith(";") else tree + ";"
+
+    @staticmethod
+    def _sample_metrics_json_value(value):
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return float(value.detach().cpu().item())
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _write_sample_metrics_tree_dump(self, rows, relaxed_tree_rows=None, train=True):
+        if not self.sample_metrics_tree_dump_enabled:
+            return {}
+        if not rows or not self._sample_metrics_can_write_artifacts():
+            return {}
+
+        relaxed_by_index = {
+            int(row.get("sample_index", index)): dict(row)
+            for index, row in enumerate(relaxed_tree_rows or [])
+        }
+        split = "train" if train else "val"
+        step = int(self.global_step)
+        stepper = int(self.stepper)
+        stamp = f"step{step:08d}_stepper{stepper:08d}_{split}"
+        out_dir = self._sample_metrics_tree_dump_output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        jsonl_path = os.path.join(out_dir, f"{stamp}_trees.jsonl")
+        sampled_path = os.path.join(out_dir, f"{stamp}_sampled_trees.txt")
+        relaxed_path = os.path.join(out_dir, f"{stamp}_relaxed_trees.txt")
+
+        payloads = []
+        sampled_lines = []
+        relaxed_lines = []
+        base_payload = {
+            "global_step": step,
+            "stepper": stepper,
+            "timestamp": time.time(),
+            "split": split,
+        }
+        for index, row in enumerate(rows):
+            row = dict(row)
+            payload = dict(base_payload)
+            payload["index"] = int(index)
+            field_map = {
+                "_start_tree": "start_tree",
+                "_original_start_tree": "original_start_tree",
+                "_target_tree": "target_tree",
+                "_sampled_tree": "sampled_tree",
+                "_bank_group_key": "bank_group_key",
+                "_source_bank_index": "source_bank_index",
+                "_n_leaves": "n_leaves",
+            }
+            for private_key, public_key in field_map.items():
+                if private_key in row and row[private_key] is not None:
+                    payload[public_key] = self._sample_metrics_json_value(
+                        row[private_key]
+                    )
+            for key, value in row.items():
+                if str(key).startswith("_") or key in payload:
+                    continue
+                payload[key] = self._sample_metrics_json_value(value)
+            relaxed_row = relaxed_by_index.get(index)
+            if relaxed_row:
+                for key, value in relaxed_row.items():
+                    if key == "sample_index":
+                        continue
+                    payload[key] = self._sample_metrics_json_value(value)
+            sampled_tree = payload.get("sampled_tree")
+            if sampled_tree:
+                sampled_lines.append(self._sample_metrics_newick_line(sampled_tree))
+            relaxed_tree = payload.get("relaxed_tree")
+            if relaxed_tree:
+                relaxed_lines.append(self._sample_metrics_newick_line(relaxed_tree))
+            payloads.append(payload)
+
+        with open(jsonl_path, "w", encoding="utf-8") as handle:
+            for payload in payloads:
+                handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        with open(sampled_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(sampled_lines) + ("\n" if sampled_lines else ""))
+        if relaxed_lines:
+            with open(relaxed_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(relaxed_lines) + "\n")
+
+        metrics = {
+            "tree_dump_written": 1.0,
+            "tree_dump_count": float(len(payloads)),
+        }
+        if relaxed_lines:
+            metrics["tree_dump_relaxed_count"] = float(len(relaxed_lines))
+        return metrics
+
     def _get_harness_sampling_pair(self, train=True, frozen_start_bank=False):
         cache_key = "train" if train else "val"
 
@@ -10113,15 +10241,22 @@ class TrainingModule(LightningModule):
             ),
         }
 
-    def _sample_metrics_relaxed_downstream_metrics(self, sampled_trees, train=True):
+    def _sample_metrics_relaxed_downstream_metrics(
+        self,
+        sampled_trees,
+        train=True,
+        return_tree_rows=False,
+        run_mrbayes=True,
+    ):
         if not (
             self.sample_metrics_relaxed_likelihood_enabled
             or self.sample_metrics_mrbayes20k_enabled
         ):
-            return {}
+            return ({}, []) if return_tree_rows else {}
         if not sampled_trees:
-            return {}
+            return ({}, []) if return_tree_rows else {}
         relaxed_trees = []
+        relaxed_tree_rows = []
         likelihoods = []
         applied = 0
         scorer = (
@@ -10137,8 +10272,18 @@ class TrainingModule(LightningModule):
             )
             relaxed_trees.append(relaxed_tree)
             applied += int(bool(info.get("applied")))
+            relaxed_row = {
+                "sample_index": int(index),
+                "relaxed_tree": str(relaxed_tree),
+                "relax_applied": bool(info.get("applied")),
+                "relax_applied_edge_count": int(info.get("applied_edge_count", 0)),
+                "relax_max_abs_delta": float(info.get("max_abs_delta", 0.0)),
+            }
             if scorer is not None:
-                likelihoods.append(float(scorer.log_likelihood(str(relaxed_tree))))
+                likelihood = float(scorer.log_likelihood(str(relaxed_tree)))
+                likelihoods.append(likelihood)
+                relaxed_row["relaxed_log_likelihood"] = likelihood
+            relaxed_tree_rows.append(relaxed_row)
 
         metrics = {
             "relaxed_start_count": float(len(relaxed_trees)),
@@ -10148,7 +10293,12 @@ class TrainingModule(LightningModule):
             metrics["relaxed_log_likelihood_mean"] = float(
                 np.asarray(likelihoods, dtype=np.float64).mean()
             )
-        metrics.update(self._sample_metrics_run_mrbayes20k(relaxed_trees, train=train))
+        if run_mrbayes:
+            metrics.update(
+                self._sample_metrics_run_mrbayes20k(relaxed_trees, train=train)
+            )
+        if return_tree_rows:
+            return metrics, relaxed_tree_rows
         return metrics
 
     def _sample_compare_harness_once(self, pair, train=True):
@@ -10163,9 +10313,17 @@ class TrainingModule(LightningModule):
             "start_rf_norm": float(
                 calculate_norm_rf(pair["start_tree"], pair["target_tree"])
             ),
+            "_start_tree": str(pair["start_tree"]),
+            "_original_start_tree": (
+                str(pair["original_start_tree"])
+                if pair.get("original_start_tree") is not None
+                else None
+            ),
             "_sampled_tree": str(sampled_tree),
             "_target_tree": str(pair["target_tree"]),
             "_n_leaves": int(pair["n_leaves"]),
+            "_bank_group_key": pair.get("bank_group_key"),
+            "_source_bank_index": pair.get("source_bank_index"),
         }
         if likelihood_scorer is not None:
             metrics["branch_relax_after_log_likelihood"] = float(
@@ -10203,10 +10361,28 @@ class TrainingModule(LightningModule):
                     metrics[f"{key}_p90"] = scalar
             metrics.update(row)
             sampled_tree = row.get("_sampled_tree")
+            relaxed_tree_rows = []
             if sampled_tree:
-                metrics.update(
+                downstream_metrics, relaxed_tree_rows = (
                     self._sample_metrics_relaxed_downstream_metrics(
                         [sampled_tree],
+                        train=train,
+                        return_tree_rows=True,
+                        run_mrbayes=False,
+                    )
+                )
+                metrics.update(downstream_metrics)
+            metrics.update(
+                self._write_sample_metrics_tree_dump(
+                    [row],
+                    relaxed_tree_rows=relaxed_tree_rows,
+                    train=train,
+                )
+            )
+            if relaxed_tree_rows:
+                metrics.update(
+                    self._sample_metrics_run_mrbayes20k(
+                        [row["relaxed_tree"] for row in relaxed_tree_rows],
                         train=train,
                     )
                 )
@@ -10238,6 +10414,7 @@ class TrainingModule(LightningModule):
 
         sampled_trees = [row.get("_sampled_tree") for row in rows]
         target_trees = [row.get("_target_tree") for row in rows]
+        relaxed_tree_rows = []
         n_leaves_values = [
             int(row.get("_n_leaves"))
             for row in rows
@@ -10266,9 +10443,27 @@ class TrainingModule(LightningModule):
             metrics.update(
                 self._posterior_reference_metrics(sampled_trees, train=train)
             )
-            metrics.update(
+            downstream_metrics, relaxed_tree_rows = (
                 self._sample_metrics_relaxed_downstream_metrics(
                     sampled_trees,
+                    train=train,
+                    return_tree_rows=True,
+                    run_mrbayes=False,
+                )
+            )
+            metrics.update(downstream_metrics)
+
+        metrics.update(
+            self._write_sample_metrics_tree_dump(
+                rows,
+                relaxed_tree_rows=relaxed_tree_rows,
+                train=train,
+            )
+        )
+        if relaxed_tree_rows:
+            metrics.update(
+                self._sample_metrics_run_mrbayes20k(
+                    [row["relaxed_tree"] for row in relaxed_tree_rows],
                     train=train,
                 )
             )

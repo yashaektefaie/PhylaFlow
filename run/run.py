@@ -863,6 +863,12 @@ def init_worker(config_file, device_id):
             "sample_metrics_mrbayes20k_bin",
             "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
         ),
+        sample_metrics_tree_dump_enabled=config["trainer"].get(
+            "sample_metrics_tree_dump_enabled", False
+        ),
+        sample_metrics_tree_dump_dir=config["trainer"].get(
+            "sample_metrics_tree_dump_dir"
+        ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
         branch_relax_head_weight=config["trainer"].get("branch_relax_head_weight", 0.0),
@@ -1423,6 +1429,12 @@ def run_test():
         sample_metrics_mrbayes20k_bin=config["trainer"].get(
             "sample_metrics_mrbayes20k_bin",
             "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
+        ),
+        sample_metrics_tree_dump_enabled=config["trainer"].get(
+            "sample_metrics_tree_dump_enabled", False
+        ),
+        sample_metrics_tree_dump_dir=config["trainer"].get(
+            "sample_metrics_tree_dump_dir"
         ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
@@ -2072,6 +2084,12 @@ def run_overfit():
             "sample_metrics_mrbayes20k_bin",
             "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
         ),
+        sample_metrics_tree_dump_enabled=config["trainer"].get(
+            "sample_metrics_tree_dump_enabled", False
+        ),
+        sample_metrics_tree_dump_dir=config["trainer"].get(
+            "sample_metrics_tree_dump_dir"
+        ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
         branch_relax_head_weight=config["trainer"].get("branch_relax_head_weight", 0.0),
@@ -2686,6 +2704,12 @@ def main():
         sample_metrics_mrbayes20k_bin=config["trainer"].get(
             "sample_metrics_mrbayes20k_bin",
             "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
+        ),
+        sample_metrics_tree_dump_enabled=config["trainer"].get(
+            "sample_metrics_tree_dump_enabled", False
+        ),
+        sample_metrics_tree_dump_dir=config["trainer"].get(
+            "sample_metrics_tree_dump_dir"
         ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),

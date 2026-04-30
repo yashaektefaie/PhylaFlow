@@ -205,6 +205,9 @@ trainer:
   - sample_metrics/mrbayes20k_failed
   - sample_metrics/mrbayes20k_completed_runs
   - sample_metrics/mrbayes20k_failure_count
+  - sample_metrics/tree_dump_written
+  - sample_metrics/tree_dump_count
+  - sample_metrics/tree_dump_relaxed_count
   metric_log_prefixes: []
   sample_metrics_unseen_start_eval: true
   sample_metrics_unseen_start_seed: 20260430
@@ -224,6 +227,8 @@ trainer:
   sample_metrics_mrbayes20k_golden_root: /home/yektefai/30272299/golden_run_data_DS1-8/DS1
   sample_metrics_mrbayes20k_work_root: /tmp/phylaflow_ds1_nocond_sample_metrics_mrbayes20k
   sample_metrics_mrbayes20k_output_dir: /home/yektefai/PhylaFlow/metrics/full_sanity_fixedpair_20260401/ds1_1280bank_nocond_s128_lr2e3_unseeneval64_mrbayes20k_relfix_outputs
+  sample_metrics_tree_dump_enabled: true
+  sample_metrics_tree_dump_dir: /home/yektefai/PhylaFlow/metrics/full_sanity_fixedpair_20260401/ds1_1280bank_nocond_s128_lr2e3_unseeneval64_mrbayes20k_relfix_generated_trees
 data:
   nexus_root: unused
   mrbayes_root: unused
