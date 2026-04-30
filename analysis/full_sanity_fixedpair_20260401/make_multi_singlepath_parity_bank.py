@@ -116,6 +116,39 @@ def main():
             "topology at least one case before distributing remaining cases by frequency."
         ),
     )
+    parser.add_argument(
+        "--target-schedule-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "If set, reuse the source manifest's posterior_index/topology schedule "
+            "instead of computing a fresh target allocation."
+        ),
+    )
+    parser.add_argument(
+        "--target-schedule-multiplier",
+        type=int,
+        default=1,
+        help="Repeat each source manifest target schedule entry this many times.",
+    )
+    parser.add_argument(
+        "--target-schedule-offset",
+        type=int,
+        default=0,
+        help="Skip this many entries from the expanded target schedule.",
+    )
+    parser.add_argument(
+        "--target-schedule-limit",
+        type=int,
+        default=None,
+        help="Use at most this many entries from the expanded target schedule.",
+    )
+    parser.add_argument(
+        "--case-index-offset",
+        type=int,
+        default=0,
+        help="Offset emitted case indices and pair-attempt seeds by this amount.",
+    )
     args = parser.parse_args()
 
     template_config = yaml.safe_load(args.template_config.read_text())
@@ -135,7 +168,7 @@ def main():
     combined_anchor_samples = []
     start_paths = []
     target_paths = []
-    pair_attempt = 0
+    pair_attempt = int(args.case_index_offset)
     target_index_schedule = None
     target_schedule_entries = None
     posterior_trees = list(
@@ -146,7 +179,53 @@ def main():
         key = canonicalize_topology_newick(str(tree).strip())
         topology_to_indices.setdefault(key, []).append(int(idx))
 
-    if bool(args.weight_target_topologies_by_posterior_frequency):
+    if args.target_schedule_manifest is not None:
+        if bool(args.require_unique_target_topologies) or bool(
+            args.weight_target_topologies_by_posterior_frequency
+        ):
+            raise RuntimeError(
+                "Use either --target-schedule-manifest or target allocation flags, not both."
+            )
+        source_payload = json.loads(args.target_schedule_manifest.read_text())
+        source_cases = list(source_payload.get("cases") or [])
+        if not source_cases:
+            raise RuntimeError(
+                f"{args.target_schedule_manifest} does not contain any manifest cases."
+            )
+        target_schedule_entries = []
+        for source_case in source_cases:
+            if source_case.get("posterior_index") is None:
+                raise RuntimeError(
+                    f"{args.target_schedule_manifest} has a case without posterior_index."
+                )
+            entry = {
+                "posterior_index": int(source_case["posterior_index"]),
+                "topology_key": str(source_case.get("topology_key", "")),
+                "topology_count": int(source_case.get("topology_count", 0)),
+                "topology_probability": float(
+                    source_case.get("topology_probability", 0.0)
+                ),
+            }
+            for _ in range(int(args.target_schedule_multiplier)):
+                target_schedule_entries.append(dict(entry))
+        full_target_schedule_count = len(target_schedule_entries)
+        if int(args.target_schedule_offset) < 0:
+            raise RuntimeError("--target-schedule-offset must be nonnegative.")
+        start = int(args.target_schedule_offset)
+        stop = None
+        if args.target_schedule_limit is not None:
+            if int(args.target_schedule_limit) < 0:
+                raise RuntimeError("--target-schedule-limit must be nonnegative.")
+            stop = start + int(args.target_schedule_limit)
+        target_schedule_entries = target_schedule_entries[start:stop]
+        if len(target_schedule_entries) != int(args.num_cases):
+            raise RuntimeError(
+                f"Schedule manifest expansion created {len(target_schedule_entries)} cases, "
+                f"after slicing {full_target_schedule_count} full entries, but "
+                f"--num-cases is {int(args.num_cases)}."
+            )
+        rng.shuffle(target_schedule_entries)
+    elif bool(args.weight_target_topologies_by_posterior_frequency):
         if bool(args.require_unique_target_topologies):
             raise RuntimeError(
                 "Use either --require-unique-target-topologies or "
@@ -239,12 +318,13 @@ def main():
             )
 
     while len(manifests) < int(args.num_cases):
-        case_idx = len(manifests)
+        local_case_idx = len(manifests)
+        case_idx = int(args.case_index_offset) + local_case_idx
         case_name = f"{args.bank_name}_case{case_idx:02d}"
         posterior_index = None
         topology_metadata = {}
         if target_index_schedule is not None:
-            posterior_index = int(target_index_schedule[case_idx])
+            posterior_index = int(target_index_schedule[local_case_idx])
             topology_key = canonicalize_topology_newick(
                 str(posterior_trees[posterior_index]).strip()
             )
@@ -255,7 +335,7 @@ def main():
                 / float(len(posterior_trees)),
             }
         elif target_schedule_entries is not None:
-            entry = target_schedule_entries[case_idx]
+            entry = target_schedule_entries[local_case_idx]
             posterior_index = int(entry["posterior_index"])
             topology_metadata = {
                 "topology_key": str(entry["topology_key"]),
@@ -311,6 +391,15 @@ def main():
     combined_anchors_path.write_text(json.dumps(combined_anchor_samples, indent=2))
 
     config = json.loads(json.dumps(template_config))
+    model_cfg = config.get("model", {})
+    for key in [
+        "first_hit_head_num_cases",
+        "autoregressive_num_cases",
+        "velocity_terminal_head_num_cases",
+        "branch_relax_num_cases",
+    ]:
+        if key in model_cfg and model_cfg.get(key) is not None:
+            model_cfg[key] = int(args.num_cases)
     config["trainer"]["checkpoint_dir"] = (
         f"./checkpoints/full_sanity_fixedpair_20260401/{args.bank_name}"
     )
@@ -350,6 +439,12 @@ def main():
         "weighted_by_topology_frequency": bool(
             args.weight_target_topologies_by_posterior_frequency
         ),
+        "source_target_schedule_manifest": (
+            None
+            if args.target_schedule_manifest is None
+            else str(args.target_schedule_manifest)
+        ),
+        "target_schedule_multiplier": int(args.target_schedule_multiplier),
         "combined_anchors_json": str(combined_anchors_path),
         "config_yaml": str(config_path),
         "metrics_path": str(metrics_path),

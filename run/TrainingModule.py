@@ -4,6 +4,7 @@ import inspect
 import math
 import json
 import numbers
+import subprocess
 from collections import Counter
 import importlib.util
 import functools
@@ -67,6 +68,37 @@ from utils.utils import compute_merge_metrics
 from utils.utils import _velocity_diagnostics
 
 logger = logging.getLogger(__name__)
+
+
+class BranchRelaxHead(nn.Module):
+    def __init__(
+        self,
+        edge_dim: int,
+        num_cases: int,
+        *,
+        case_dim: int = 64,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+        self.case_embedding = nn.Embedding(max(1, int(num_cases)), int(case_dim))
+        self.net = nn.Sequential(
+            nn.LayerNorm(int(edge_dim) + int(case_dim) + 3),
+            nn.Linear(int(edge_dim) + int(case_dim) + 3, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), 1),
+        )
+
+    def forward(self, edge_features, numeric_features, case_indices):
+        case_indices = torch.clamp(
+            case_indices.to(device=edge_features.device, dtype=torch.long),
+            min=0,
+            max=self.case_embedding.num_embeddings - 1,
+        )
+        case_features = self.case_embedding(case_indices)
+        x = torch.cat([edge_features, numeric_features, case_features], dim=-1)
+        return self.net(x).squeeze(-1)
 
 try:
     from deepspeed.ops.adam import FusedAdam
@@ -3542,6 +3574,126 @@ def _tree_to_model_split_lengths(module, newick):
     return td, int(tree_obj.n_leaves), tree_obj.id_to_name
 
 
+def _ensure_newick_semicolon(newick):
+    stripped = str(newick).strip()
+    return stripped if stripped.endswith(";") else stripped + ";"
+
+
+def _read_branch_relax_tree_list(path):
+    trees = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            maybe_path = os.path.expanduser(line)
+            if os.path.exists(maybe_path):
+                with open(maybe_path, "r", encoding="utf-8") as tree_handle:
+                    trees.append(_ensure_newick_semicolon(tree_handle.read().strip()))
+            else:
+                trees.append(_ensure_newick_semicolon(line))
+    return trees
+
+
+def _branch_relax_raw_length_map(newick):
+    tree_obj = Tree(newick)
+    encoder = BHVEncoder()
+    split_masks, split_lengths = encoder.return_BHV_encoding(tree_obj)
+    return {
+        int(mask): float(length)
+        for mask, length in zip(split_masks, split_lengths)
+        if length is not None
+    }, int(tree_obj.n_leaves), tree_obj.id_to_name
+
+
+def _branch_relax_split_fraction(mask, n_leaves):
+    biological_bits = max(int(n_leaves) - 1, 0)
+    if biological_bits <= 0:
+        return 0.0, 0.0
+    k = int(mask).bit_count()
+    small = min(k, biological_bits - k)
+    return float(small) / float(max(biological_bits, 1)), 1.0 if small == 1 else 0.0
+
+
+def _build_branch_relax_samples_for_module(module, start_tree_list_path, target_tree_list_path):
+    start_trees = _read_branch_relax_tree_list(start_tree_list_path)
+    target_trees = _read_branch_relax_tree_list(target_tree_list_path)
+    if len(start_trees) != len(target_trees):
+        raise ValueError(
+            "branch relax start/target tree counts differ: "
+            f"{len(start_trees)} vs {len(target_trees)}"
+        )
+    samples = []
+    for case_index, (start_tree, target_tree) in enumerate(zip(start_trees, target_trees)):
+        start_lengths, n_leaves, _mapping = _tree_to_model_split_lengths(module, start_tree)
+        target_lengths, _target_n_leaves, _target_mapping = _branch_relax_raw_length_map(
+            target_tree
+        )
+        biological_bits = max(int(n_leaves) - 1, 0)
+        full_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
+        labels = {}
+        for mask, start_length in sorted(start_lengths.items()):
+            if full_mask and int(mask) == int(full_mask):
+                continue
+            target_length = target_lengths.get(int(mask))
+            if target_length is None and full_mask:
+                target_length = target_lengths.get(full_mask ^ int(mask))
+            if target_length is None:
+                continue
+            labels[int(mask)] = float(target_length) - float(start_length)
+        if labels:
+            samples.append(
+                {
+                    "case_index": int(case_index),
+                    "newick_tree": start_tree,
+                    "target_tree": target_tree,
+                    "num_leaves": int(n_leaves),
+                    "labels": labels,
+                }
+            )
+    if not samples:
+        raise ValueError("branch relax label bank is empty")
+    return samples
+
+
+def _branch_relax_entries_for_tree(module, newick, edge_split_masks, labels=None):
+    lengths, n_leaves, mapping = _tree_to_model_split_lengths(module, newick)
+    model_masks = [int(mask) for mask in edge_split_masks if int(mask) != 0]
+    mask_to_idx = {int(mask): idx for idx, mask in enumerate(model_masks)}
+    biological_bits = max(int(n_leaves) - 1, 0)
+    full_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
+    entries = []
+    for mask, length in sorted(lengths.items()):
+        if full_mask and int(mask) == int(full_mask):
+            continue
+        matched_mask = int(mask)
+        idx = mask_to_idx.get(matched_mask)
+        if idx is None and full_mask:
+            complement = full_mask ^ matched_mask
+            idx = mask_to_idx.get(complement)
+            if idx is not None:
+                matched_mask = complement
+        if idx is None:
+            continue
+        split_fraction, is_pendant = _branch_relax_split_fraction(matched_mask, n_leaves)
+        entry = {
+            "edge_index": int(idx),
+            "mask": int(matched_mask),
+            "source_mask": int(mask),
+            "length": float(length),
+            "numeric": [float(length), float(split_fraction), float(is_pendant)],
+        }
+        if labels is not None:
+            value = labels.get(int(mask))
+            if value is None and full_mask:
+                value = labels.get(full_mask ^ int(mask))
+            if value is None:
+                continue
+            entry["label"] = float(value)
+        entries.append(entry)
+    return entries, lengths, int(n_leaves), mapping
+
+
 def _align_model_outputs_to_tree_context(
     module,
     newick,
@@ -3657,6 +3809,305 @@ def _align_model_outputs_to_tree_context(
             for mask in masks
         },
     }
+
+
+def _final_orthant_relax_model_time(time_mode, phase_value, local_time):
+    mode = str(time_mode).lower()
+    if mode == "phase":
+        return float(phase_value)
+    if mode == "phase_local":
+        return float(phase_value) + float(local_time)
+    return float(local_time)
+
+
+def _relax_final_orthant_branch_lengths(
+    module,
+    current_newick,
+    target_tree,
+    phyla_embeddings,
+    case_index=None,
+    start_topology_features=None,
+    start_topology_embeddings=None,
+    start_topology_pad_mask=None,
+    start_tree_graph_context=None,
+    *,
+    phase_value: float = 0.0,
+    eps_len: float = 1e-8,
+):
+    steps = int(getattr(module, "sampling_final_orthant_relax_steps", 0))
+    total_time = float(
+        getattr(module, "sampling_final_orthant_relax_total_time", 1.0)
+    )
+    time_mode = str(
+        getattr(module, "sampling_final_orthant_relax_time_mode", "local")
+    ).lower()
+    edge_floor_cfg = getattr(module, "sampling_final_orthant_relax_edge_floor", None)
+    edge_floor = (
+        float(edge_floor_cfg)
+        if edge_floor_cfg is not None
+        else max(float(eps_len) * 10.0, 1e-8)
+    )
+    edge_floor = max(float(edge_floor), float(eps_len) * 10.0)
+
+    start_newick = current_newick
+    summary = {
+        "applied": False,
+        "head": "velocity",
+        "requested_steps": int(steps),
+        "applied_steps": 0,
+        "total_time": float(total_time),
+        "time_mode": time_mode,
+        "edge_floor": float(edge_floor),
+        "phase_value": float(phase_value),
+        "start_tree": start_newick,
+        "final_tree": current_newick,
+        "rf_to_target_before": None
+        if target_tree is None
+        else float(calculate_norm_rf(current_newick, target_tree)),
+        "rf_to_target_after": None,
+        "topology_rf_before_after": None,
+        "min_length_before": None,
+        "min_length_after": None,
+        "max_abs_delta": 0.0,
+        "stopped_reason": None,
+    }
+    states = []
+
+    if steps <= 0:
+        summary["stopped_reason"] = "no_steps_requested"
+        return current_newick, summary, states
+    if total_time <= 0.0:
+        summary["stopped_reason"] = "nonpositive_total_time"
+        return current_newick, summary, states
+
+    relax_case_indices = (
+        None
+        if case_index is None
+        else torch.tensor([int(case_index)], dtype=torch.long, device=module.device)
+    )
+
+    if (
+        bool(getattr(module, "branch_relax_head_use_at_sampling", False))
+        and getattr(module, "branch_relax_head", None) is not None
+    ):
+        td, n_leaves, mapping = _tree_to_model_split_lengths(module, current_newick)
+        if not td:
+            summary["stopped_reason"] = "no_active_splits"
+            return current_newick, summary, states
+        tokenized = module.model.tokenizer([current_newick])
+        with torch.inference_mode():
+            (
+                _velocity,
+                edge_splits,
+                _edge_split_mask,
+                _first_hit_logits,
+                _boundary_vanish_logits,
+                edge_features,
+            ) = module.forward(
+                tokenized,
+                float(phase_value),
+                phyla_embeddings,
+                first_hit_case_indices=relax_case_indices,
+                first_hit_start_topology_features=start_topology_features,
+                first_hit_start_topology_embeddings=start_topology_embeddings,
+                first_hit_start_topology_pad_mask=start_topology_pad_mask,
+                first_hit_start_tree_graph_context=start_tree_graph_context,
+            )
+        if edge_features is None:
+            summary["stopped_reason"] = "missing_edge_features"
+            return current_newick, summary, states
+        entries, lengths, n_leaves, mapping = _branch_relax_entries_for_tree(
+            module,
+            current_newick,
+            edge_splits[0],
+        )
+        if not entries:
+            summary["stopped_reason"] = "no_aligned_splits"
+            return current_newick, summary, states
+        features = torch.stack(
+            [edge_features[0, entry["edge_index"]] for entry in entries],
+            dim=0,
+        )
+        numeric = torch.tensor(
+            [entry["numeric"] for entry in entries],
+            dtype=torch.float32,
+            device=module.device,
+        )
+        case_tensor = torch.full(
+            (len(entries),),
+            0 if case_index is None else int(case_index),
+            dtype=torch.long,
+            device=module.device,
+        )
+        with torch.inference_mode():
+            deltas = (
+                module.branch_relax_head(features, numeric, case_tensor)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+        next_lengths_by_mask = {int(mask): float(length) for mask, length in lengths.items()}
+        before_lengths = np.asarray([entry["length"] for entry in entries], dtype=np.float64)
+        after_lengths = []
+        for entry, delta in zip(entries, deltas):
+            next_length = max(
+                float(entry["length"]) + float(total_time) * float(delta),
+                float(edge_floor),
+            )
+            next_lengths_by_mask[int(entry.get("source_mask", entry["mask"]))] = next_length
+            after_lengths.append(next_length)
+        td_next = {
+            int(mask): float(length)
+            for mask, length in next_lengths_by_mask.items()
+            if float(length) > eps_len
+        }
+        current_newick = build_tree_from_splits(
+            list(td_next.keys()),
+            td_next,
+            n_leaves,
+            root_leaf=n_leaves - 1,
+            mapping=mapping,
+        )[1]
+        after_arr = np.asarray(after_lengths, dtype=np.float64)
+        summary["head"] = "branch_relax"
+        summary["applied"] = True
+        summary["applied_steps"] = 1
+        summary["min_length_before"] = float(np.min(before_lengths))
+        summary["min_length_after"] = float(np.min(after_arr))
+        summary["max_abs_delta"] = float(np.max(np.abs(after_arr - before_lengths)))
+        summary["final_tree"] = current_newick
+        summary["rf_to_target_after"] = (
+            None
+            if target_tree is None
+            else float(calculate_norm_rf(current_newick, target_tree))
+        )
+        summary["topology_rf_before_after"] = float(
+            calculate_norm_rf(start_newick, current_newick)
+        )
+        summary["stopped_reason"] = "completed"
+        states.append(
+            {
+                "step": 0,
+                "local_time": 0.0,
+                "timepoint": float(phase_value),
+                "dt": float(total_time),
+                "num_splits": int(len(entries)),
+                "min_length": float(np.min(after_arr)),
+                "max_abs_delta": float(summary["max_abs_delta"]),
+                "rf_to_target": summary["rf_to_target_after"],
+            }
+        )
+        return current_newick, summary, states
+
+    step_dt = total_time / float(steps)
+
+    for step_idx in range(steps):
+        td, n_leaves, mapping = _tree_to_model_split_lengths(module, current_newick)
+        if not td:
+            summary["stopped_reason"] = "no_active_splits"
+            break
+
+        local_time = float(step_idx) * step_dt
+        model_time = _final_orthant_relax_model_time(
+            time_mode,
+            phase_value,
+            local_time,
+        )
+        tokenized = module.model.tokenizer([current_newick])
+        with torch.inference_mode():
+            (
+                velocity,
+                edge_splits,
+                _edge_split_mask,
+                first_hit_logits,
+                boundary_vanish_logits,
+                edge_features,
+            ) = module.forward(
+                tokenized,
+                float(model_time),
+                phyla_embeddings,
+                first_hit_case_indices=relax_case_indices,
+                first_hit_start_topology_features=start_topology_features,
+                first_hit_start_topology_embeddings=start_topology_embeddings,
+                first_hit_start_topology_pad_mask=start_topology_pad_mask,
+                first_hit_start_tree_graph_context=start_tree_graph_context,
+            )
+
+        aligned = _align_model_outputs_to_tree_context(
+            module,
+            current_newick,
+            n_leaves,
+            edge_splits[0],
+            velocity[0, :, 0],
+            first_hit_logits_tree=None
+            if first_hit_logits is None
+            else first_hit_logits[0, :, 0],
+            boundary_vanish_logits_tree=None
+            if boundary_vanish_logits is None
+            else boundary_vanish_logits[0, :, 0],
+            edge_features_tree=None if edge_features is None else edge_features[0],
+            eps_len=eps_len,
+        )
+
+        lengths = aligned["lengths"].detach().cpu().numpy().astype(np.float64)
+        velocities = aligned["velocities"].detach().cpu().numpy().astype(np.float64)
+        masks = [int(x) for x in aligned["aligned_model_masks"]]
+        if len(lengths) == 0:
+            summary["stopped_reason"] = "no_aligned_splits"
+            break
+        if summary["min_length_before"] is None:
+            summary["min_length_before"] = float(np.min(lengths))
+
+        next_lengths = np.maximum(lengths + step_dt * velocities, edge_floor)
+        max_abs_delta_step = float(np.max(np.abs(next_lengths - lengths)))
+        summary["max_abs_delta"] = max(
+            float(summary["max_abs_delta"]),
+            max_abs_delta_step,
+        )
+
+        td_next = {
+            int(mask): float(length)
+            for mask, length in zip(masks, next_lengths)
+            if float(length) > eps_len
+        }
+        current_newick = build_tree_from_splits(
+            list(td_next.keys()),
+            td_next,
+            n_leaves,
+            root_leaf=n_leaves - 1,
+            mapping=mapping,
+        )[1]
+        summary["applied"] = True
+        summary["applied_steps"] = int(step_idx + 1)
+        summary["min_length_after"] = float(np.min(next_lengths))
+        states.append(
+            {
+                "step": int(step_idx),
+                "local_time": float(local_time),
+                "timepoint": float(model_time),
+                "dt": float(step_dt),
+                "num_splits": int(len(next_lengths)),
+                "min_length": float(np.min(next_lengths)),
+                "max_abs_delta": max_abs_delta_step,
+                "rf_to_target": None
+                if target_tree is None
+                else float(calculate_norm_rf(current_newick, target_tree)),
+            }
+        )
+
+    summary["final_tree"] = current_newick
+    summary["rf_to_target_after"] = (
+        None
+        if target_tree is None
+        else float(calculate_norm_rf(current_newick, target_tree))
+    )
+    summary["topology_rf_before_after"] = float(
+        calculate_norm_rf(start_newick, current_newick)
+    )
+    if summary["stopped_reason"] is None:
+        summary["stopped_reason"] = "completed"
+    return current_newick, summary, states
 
 
 def _align_model_outputs_to_batch_tree_context(
@@ -4919,6 +5370,8 @@ def _discrete_phase_rollout(
         "silent_boundary_recoveries": 0.0,
         "stopped_for_terminal_head": False,
         "autoregressive_boundary_stop_count": 0.0,
+        "final_orthant_relax": [],
+        "final_orthant_relax_summary": None,
     }
 
     def _terminal_probability_for_state(state_newick, phase_value):
@@ -5324,6 +5777,25 @@ def _discrete_phase_rollout(
             continue
         break
 
+    if bool(getattr(module, "sampling_final_orthant_relax_use_at_sampling", False)):
+        current_newick, relax_summary, relax_states = (
+            _relax_final_orthant_branch_lengths(
+                module,
+                current_newick,
+                target_tree,
+                phyla_embeddings,
+                case_index=case_index,
+                start_topology_features=rollout_start_topology_features,
+                start_topology_embeddings=rollout_start_topology_embeddings,
+                start_topology_pad_mask=rollout_start_topology_pad_mask,
+                start_tree_graph_context=rollout_start_tree_graph_context,
+                phase_value=float(phase),
+                eps_len=eps_len,
+            )
+        )
+        trace["final_orthant_relax"] = relax_states
+        trace["final_orthant_relax_summary"] = relax_summary
+
     out = {
         "final_tree": current_newick,
         "final_rf": float(calculate_norm_rf(current_newick, target_tree)),
@@ -5377,6 +5849,7 @@ class TrainingModule(LightningModule):
         training_step_gradient_clip_val: float = 1.0,
         training_step_autoregressive_grad_ratio = None,
         training_step_separate_optimizer_steps: bool = False,
+        training_step_verbose_logging_enabled: bool = False,
         autoregressive_use_time: bool = False,
         autoregressive_target_mode: str = "scheduled",
         autoregressive_polytomy_choosing_weight: float = 1.0,
@@ -5445,15 +5918,52 @@ class TrainingModule(LightningModule):
         velocity_probe_direct_set_include_base_samples: bool = False,
         velocity_probe_direct_set_positive_reweight_power: float = 1.0,
         velocity_probe_direct_set_positive_reweight_max: float | None = None,
+        velocity_probe_direct_set_loss_weight: float = 1.0,
+        velocity_probe_direct_set_mse_weight: float = 0.0,
         training_step_probe_parity_joint_update: bool = False,
         skip_repeated_no_valid_boundary_use_at_sampling: bool = False,
         sampling_discrete_phase_rollout_use_at_sampling: bool = False,
         sampling_discrete_phase_exact_boundary_step_use_at_sampling: bool = False,
         sampling_discrete_phase_max_phases: int = 8,
+        sampling_final_orthant_relax_use_at_sampling: bool = False,
+        sampling_final_orthant_relax_steps: int = 0,
+        sampling_final_orthant_relax_total_time: float = 1.0,
+        sampling_final_orthant_relax_time_mode: str = "local",
+        sampling_final_orthant_relax_edge_floor: float | None = None,
         sample_metrics_trace_path: str | None = None,
         sample_metrics_num_pairs: int = 1,
+        sample_metrics_trace_topology_repeats_enabled: bool = False,
+        sample_metrics_unseen_start_eval: bool = False,
+        sample_metrics_unseen_start_seed: int = 20260430,
+        sample_metrics_unseen_start_metric_encoder_path: str | None = None,
+        sample_metrics_unseen_pair_selection_mode: str = "random_bank",
+        sample_metrics_unseen_start_max_duplicate_tries: int = 100,
+        sample_metrics_relaxed_likelihood_enabled: bool = False,
+        sample_metrics_branch_relaxer_checkpoint_path: str | None = None,
+        sample_metrics_mrbayes20k_enabled: bool = False,
+        sample_metrics_mrbayes20k_num_starts: int = 64,
+        sample_metrics_mrbayes20k_ngen: int = 20000,
+        sample_metrics_mrbayes20k_samplefreq: int = 200,
+        sample_metrics_mrbayes20k_printfreq: int = 5000,
+        sample_metrics_mrbayes20k_max_workers: int = 12,
+        sample_metrics_mrbayes20k_timeout_sec: int = 1800,
+        sample_metrics_mrbayes20k_dataset_pickle_path: str | None = None,
+        sample_metrics_mrbayes20k_golden_root: str | None = None,
+        sample_metrics_mrbayes20k_work_root: str = "/tmp/phylaflow_sample_metrics_mrbayes20k",
+        sample_metrics_mrbayes20k_output_dir: str | None = None,
+        sample_metrics_mrbayes20k_bin: str = "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
         metric_log_exact_keys=None,
         metric_log_prefixes=None,
+        branch_relax_head_weight: float = 0.0,
+        branch_relax_head_use_at_sampling: bool = False,
+        branch_relax_start_tree_list_path: str | None = None,
+        branch_relax_target_tree_list_path: str | None = None,
+        branch_relax_detach_trunk: bool = True,
+        branch_relax_batch_size: int = 1,
+        branch_relax_case_dim: int = 64,
+        branch_relax_hidden_dim: int = 256,
+        branch_relax_likelihood_dataset_id: str | None = None,
+        branch_relax_likelihood_metric_enabled: bool = False,
         rollout_replay_velocity_weight: float = 0.0,
         rollout_replay_autoregressive_weight: float = 0.0,
         rollout_replay_start_step: int = 0,
@@ -5491,7 +6001,7 @@ class TrainingModule(LightningModule):
         dynamic_start_bank_trace_path: str | None = None,
         dynamic_start_bank_artifact_dir: str | None = None,
         dynamic_start_bank_save_improved_checkpoint: bool = False,
-        sampling_disable_inner_logging: bool = False,
+        sampling_disable_inner_logging: bool = True,
         sampling_only_first_hit_collapse: bool = False,
         sampling_actual_event_boundary_use_at_sampling: bool = False,
         sampling_actual_event_boundary_include_predicted_first_hit: bool = False,
@@ -5945,6 +6455,9 @@ class TrainingModule(LightningModule):
         )
         self.training_step_separate_optimizer_steps = bool(
             training_step_separate_optimizer_steps
+        )
+        self.training_step_verbose_logging_enabled = bool(
+            training_step_verbose_logging_enabled
         )
         if training_step_autoregressive_grad_ratio is None:
             self.training_step_autoregressive_grad_ratio = None
@@ -6403,6 +6916,12 @@ class TrainingModule(LightningModule):
             if velocity_probe_direct_set_positive_reweight_max is None
             else float(velocity_probe_direct_set_positive_reweight_max)
         )
+        self.velocity_probe_direct_set_loss_weight = float(
+            velocity_probe_direct_set_loss_weight
+        )
+        self.velocity_probe_direct_set_mse_weight = float(
+            velocity_probe_direct_set_mse_weight
+        )
         self.training_step_probe_parity_joint_update = bool(
             training_step_probe_parity_joint_update
         )
@@ -6418,12 +6937,124 @@ class TrainingModule(LightningModule):
         self.sampling_discrete_phase_max_phases = int(
             sampling_discrete_phase_max_phases
         )
+        self.sampling_final_orthant_relax_use_at_sampling = bool(
+            sampling_final_orthant_relax_use_at_sampling
+        )
+        self.sampling_final_orthant_relax_steps = int(
+            sampling_final_orthant_relax_steps
+        )
+        self.sampling_final_orthant_relax_total_time = float(
+            sampling_final_orthant_relax_total_time
+        )
+        final_relax_time_mode = str(sampling_final_orthant_relax_time_mode).lower()
+        valid_final_relax_time_modes = {"local", "phase", "phase_local"}
+        if final_relax_time_mode not in valid_final_relax_time_modes:
+            raise ValueError(
+                "sampling_final_orthant_relax_time_mode must be one of "
+                f"{sorted(valid_final_relax_time_modes)}, got "
+                f"{sampling_final_orthant_relax_time_mode!r}."
+            )
+        self.sampling_final_orthant_relax_time_mode = final_relax_time_mode
+        self.sampling_final_orthant_relax_edge_floor = (
+            None
+            if sampling_final_orthant_relax_edge_floor is None
+            else float(sampling_final_orthant_relax_edge_floor)
+        )
+        if self.sampling_final_orthant_relax_steps < 0:
+            raise ValueError(
+                "sampling_final_orthant_relax_steps must be >= 0, "
+                f"got {sampling_final_orthant_relax_steps}."
+            )
+        if (
+            self.sampling_final_orthant_relax_use_at_sampling
+            and self.sampling_final_orthant_relax_steps > 0
+            and self.sampling_final_orthant_relax_total_time <= 0.0
+        ):
+            raise ValueError(
+                "sampling_final_orthant_relax_total_time must be > 0, "
+                f"got {sampling_final_orthant_relax_total_time}."
+            )
+        if (
+            self.sampling_final_orthant_relax_edge_floor is not None
+            and self.sampling_final_orthant_relax_edge_floor <= 0.0
+        ):
+            raise ValueError(
+                "sampling_final_orthant_relax_edge_floor must be > 0 when provided, "
+                f"got {sampling_final_orthant_relax_edge_floor}."
+            )
         self.sample_metrics_trace_path = (
             str(sample_metrics_trace_path).strip()
             if sample_metrics_trace_path
             else None
         )
         self.sample_metrics_num_pairs = max(1, int(sample_metrics_num_pairs))
+        self.sample_metrics_trace_topology_repeats_enabled = bool(
+            sample_metrics_trace_topology_repeats_enabled
+        )
+        self.sample_metrics_unseen_start_eval = bool(sample_metrics_unseen_start_eval)
+        self.sample_metrics_unseen_start_seed = int(sample_metrics_unseen_start_seed)
+        self.sample_metrics_unseen_start_metric_encoder_path = (
+            os.path.abspath(str(sample_metrics_unseen_start_metric_encoder_path))
+            if sample_metrics_unseen_start_metric_encoder_path
+            else None
+        )
+        self.sample_metrics_unseen_pair_selection_mode = str(
+            sample_metrics_unseen_pair_selection_mode
+        ).strip().lower()
+        self.sample_metrics_unseen_start_max_duplicate_tries = max(
+            1, int(sample_metrics_unseen_start_max_duplicate_tries)
+        )
+        self.sample_metrics_relaxed_likelihood_enabled = bool(
+            sample_metrics_relaxed_likelihood_enabled
+        )
+        self.sample_metrics_branch_relaxer_checkpoint_path = (
+            os.path.abspath(str(sample_metrics_branch_relaxer_checkpoint_path))
+            if sample_metrics_branch_relaxer_checkpoint_path
+            else None
+        )
+        self.sample_metrics_mrbayes20k_enabled = bool(
+            sample_metrics_mrbayes20k_enabled
+        )
+        self.sample_metrics_mrbayes20k_num_starts = max(
+            1, int(sample_metrics_mrbayes20k_num_starts)
+        )
+        self.sample_metrics_mrbayes20k_ngen = max(
+            1, int(sample_metrics_mrbayes20k_ngen)
+        )
+        self.sample_metrics_mrbayes20k_samplefreq = max(
+            1, int(sample_metrics_mrbayes20k_samplefreq)
+        )
+        self.sample_metrics_mrbayes20k_printfreq = max(
+            1, int(sample_metrics_mrbayes20k_printfreq)
+        )
+        self.sample_metrics_mrbayes20k_max_workers = max(
+            1, int(sample_metrics_mrbayes20k_max_workers)
+        )
+        self.sample_metrics_mrbayes20k_timeout_sec = max(
+            1, int(sample_metrics_mrbayes20k_timeout_sec)
+        )
+        self.sample_metrics_mrbayes20k_dataset_pickle_path = (
+            os.path.abspath(str(sample_metrics_mrbayes20k_dataset_pickle_path))
+            if sample_metrics_mrbayes20k_dataset_pickle_path
+            else None
+        )
+        self.sample_metrics_mrbayes20k_golden_root = (
+            os.path.abspath(str(sample_metrics_mrbayes20k_golden_root))
+            if sample_metrics_mrbayes20k_golden_root
+            else None
+        )
+        self.sample_metrics_mrbayes20k_work_root = os.path.abspath(
+            str(sample_metrics_mrbayes20k_work_root)
+        )
+        self.sample_metrics_mrbayes20k_output_dir = (
+            os.path.abspath(str(sample_metrics_mrbayes20k_output_dir))
+            if sample_metrics_mrbayes20k_output_dir
+            else None
+        )
+        self.sample_metrics_mrbayes20k_bin = str(sample_metrics_mrbayes20k_bin)
+        self._sample_metrics_standalone_relaxer_cache = {}
+        self._sample_metrics_likelihood_scorer_cache = {}
+        self._sample_metrics_metric_encoder_cache = {}
         self.metric_log_exact_keys = (
             {
                 str(key).strip()
@@ -6438,6 +7069,42 @@ class TrainingModule(LightningModule):
             for prefix in (metric_log_prefixes or [])
             if str(prefix).strip()
         )
+        self.branch_relax_head_weight = float(branch_relax_head_weight)
+        self.branch_relax_head_use_at_sampling = bool(branch_relax_head_use_at_sampling)
+        self.branch_relax_detach_trunk = bool(branch_relax_detach_trunk)
+        self.branch_relax_batch_size = max(1, int(branch_relax_batch_size))
+        self.branch_relax_likelihood_dataset_id = (
+            str(branch_relax_likelihood_dataset_id).strip()
+            if branch_relax_likelihood_dataset_id
+            else None
+        )
+        self.branch_relax_likelihood_metric_enabled = bool(
+            branch_relax_likelihood_metric_enabled
+        )
+        self._branch_relax_likelihood_scorer = None
+        self.branch_relax_samples = []
+        if branch_relax_start_tree_list_path and branch_relax_target_tree_list_path:
+            self.branch_relax_samples = _build_branch_relax_samples_for_module(
+                self,
+                str(branch_relax_start_tree_list_path),
+                str(branch_relax_target_tree_list_path),
+            )
+        branch_relax_num_cases = (
+            int(getattr(self.model, "first_hit_head_num_cases", 0) or 0)
+            or len(self.branch_relax_samples)
+            or 1
+        )
+        self.branch_relax_head = None
+        if (
+            self.branch_relax_head_weight > 0.0
+            or self.branch_relax_head_use_at_sampling
+        ):
+            self.branch_relax_head = BranchRelaxHead(
+                int(self.model.embed_dim),
+                int(branch_relax_num_cases),
+                case_dim=int(branch_relax_case_dim),
+                hidden_dim=int(branch_relax_hidden_dim),
+            )
         self.rollout_replay_velocity_weight = float(rollout_replay_velocity_weight)
         self.rollout_replay_autoregressive_weight = float(
             rollout_replay_autoregressive_weight
@@ -9081,12 +9748,416 @@ class TrainingModule(LightningModule):
             metrics.update(self._prefix_metric_block(golden_block, "golden"))
         return metrics
 
+    def _get_branch_relax_likelihood_scorer(self):
+        if not self.branch_relax_likelihood_metric_enabled:
+            return None
+        dataset_id = self.branch_relax_likelihood_dataset_id
+        if not dataset_id:
+            bundle = self._load_posterior_reference_bundle(train=True)
+            dataset_id = None if bundle is None else bundle.get("dataset_id")
+        if not dataset_id:
+            return None
+        if self._branch_relax_likelihood_scorer is None:
+            from analysis.full_sanity_fixedpair_20260401.multi_ds_branchwarm_cumulative_mh_experiment import (
+                GenericJCLikelihood,
+            )
+
+            self._branch_relax_likelihood_scorer = GenericJCLikelihood(
+                dataset_id=str(dataset_id)
+            )
+        return self._branch_relax_likelihood_scorer
+
+    def _sample_metrics_dataset_id(self, train=True):
+        dataset_id = self.branch_relax_likelihood_dataset_id
+        if dataset_id:
+            return str(dataset_id)
+        bundle = self._load_posterior_reference_bundle(train=train)
+        if bundle is not None and bundle.get("dataset_id"):
+            return str(bundle["dataset_id"])
+        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        posterior_ids = list(getattr(dataset_split, "posterior_dataset_ids", []) or [])
+        if len(posterior_ids) == 1:
+            return str(posterior_ids[0])
+        return None
+
+    def _get_sample_metrics_likelihood_scorer(self, train=True):
+        dataset_id = self._sample_metrics_dataset_id(train=train)
+        if not dataset_id:
+            return None
+        cache = getattr(self, "_sample_metrics_likelihood_scorer_cache", None)
+        if cache is None:
+            cache = {}
+            self._sample_metrics_likelihood_scorer_cache = cache
+        key = str(dataset_id).upper()
+        scorer = cache.get(key)
+        if scorer is None:
+            from analysis.full_sanity_fixedpair_20260401.multi_ds_branchwarm_cumulative_mh_experiment import (
+                GenericJCLikelihood,
+            )
+
+            scorer = GenericJCLikelihood(dataset_id=key)
+            cache[key] = scorer
+        return scorer
+
+    def _sample_metrics_standalone_relaxer_args(self, checkpoint):
+        from types import SimpleNamespace
+
+        raw_args = dict(checkpoint.get("args") or {})
+        return SimpleNamespace(
+            base_config=raw_args.get(
+                "base_config",
+                "/home/yektefai/PhylaFlow/configs/local_ds1_frozenprobe64_fh16_aradd_scale128x4_lr2e3_20260428.yaml",
+            ),
+            embed_dim=int(raw_args.get("embed_dim", 64)),
+            n_layers=int(raw_args.get("n_layers", 2)),
+            n_heads=int(raw_args.get("n_heads", 4)),
+            dropout=float(raw_args.get("dropout", 0.0)),
+            head_hidden_dim=int(raw_args.get("head_hidden_dim", 128)),
+            case_dim=int(raw_args.get("case_dim", 0)),
+            phyla_dim=int(raw_args.get("phyla_dim", 256)),
+            phyla_use_leaf_tokens=bool(raw_args.get("phyla_use_leaf_tokens", True)),
+            phyla_use_split_tokens=bool(raw_args.get("phyla_use_split_tokens", False)),
+            phyla_embedding_dir=raw_args.get(
+                "phyla_embedding_dir",
+                "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds_phyla_embeddings_20260428",
+            ),
+        )
+
+    def _get_sample_metrics_standalone_relaxer(self, train=True):
+        path = self.sample_metrics_branch_relaxer_checkpoint_path
+        if not path:
+            return None
+        dataset_id = self._sample_metrics_dataset_id(train=train)
+        if not dataset_id:
+            return None
+        device = self.device
+        cache = getattr(self, "_sample_metrics_standalone_relaxer_cache", None)
+        if cache is None:
+            cache = {}
+            self._sample_metrics_standalone_relaxer_cache = cache
+        cache_key = (str(path), str(device), str(dataset_id).upper())
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        from analysis.full_sanity_fixedpair_20260401.train_standalone_branch_relaxer_20260429 import (
+            BranchDeltaHead,
+            StandaloneRelaxer,
+            _load_phyla_embedding_bank,
+            _small_model_config,
+        )
+        from model.model import return_model
+
+        checkpoint = torch.load(str(path), map_location=device)
+        ckpt_args = self._sample_metrics_standalone_relaxer_args(checkpoint)
+        cfg = _small_model_config(ckpt_args.base_config, ckpt_args)
+        model = return_model(cfg).to(device)
+        head_state = checkpoint.get("head") or {}
+        case_weight = head_state.get("case_embedding.weight")
+        num_cases = (
+            int(case_weight.shape[0])
+            if torch.is_tensor(case_weight)
+            else max(1, int(self.sample_metrics_mrbayes20k_num_starts))
+        )
+        head = BranchDeltaHead(
+            int(model.embed_dim),
+            hidden_dim=int(ckpt_args.head_hidden_dim),
+            case_dim=int(ckpt_args.case_dim),
+            num_cases=int(num_cases),
+        ).to(device)
+        model.load_state_dict(checkpoint["model"])
+        head.load_state_dict(head_state)
+        relaxer = StandaloneRelaxer(model, head).to(device)
+        relaxer.eval()
+        phyla_bank = _load_phyla_embedding_bank(
+            [str(dataset_id).upper()],
+            ckpt_args.phyla_embedding_dir,
+            device,
+        )
+        cached = {
+            "relaxer": relaxer,
+            "phyla_bank": phyla_bank,
+            "dataset_id": str(dataset_id).upper(),
+        }
+        cache[cache_key] = cached
+        return cached
+
+    def _sample_metrics_source_mask_for_node(self, node, n_leaves):
+        root_leaf = int(n_leaves) - 1
+        biological_bits = max(int(n_leaves) - 1, 0)
+        full_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
+        raw_indices = []
+        for leaf in node.iter_leaves():
+            value = int(str(leaf.name))
+            raw_indices.append(value - 1 if 1 <= value <= int(n_leaves) else value)
+        indices = set(raw_indices)
+        if root_leaf in indices:
+            indices = set(range(int(n_leaves))) - indices
+        mask = 0
+        for index in indices:
+            if 0 <= int(index) < biological_bits:
+                mask |= 1 << int(index)
+        return int(mask if mask else full_mask)
+
+    def _sample_metrics_apply_standalone_relaxer(self, tree_newick, case_index, train=True):
+        bundle = self._get_sample_metrics_standalone_relaxer(train=train)
+        if bundle is None:
+            return str(tree_newick), {"applied": False}
+        relaxer = bundle["relaxer"]
+        device = self.device
+        dataset_id = str(bundle["dataset_id"]).upper()
+        newick = str(tree_newick).strip()
+        if not newick.endswith(";"):
+            newick += ";"
+        tokenized = _move_tokenized_batch_to_device(relaxer.model.tokenizer([newick]), device)
+        phyla_embeddings = None
+        phyla_bank = bundle.get("phyla_bank") or {}
+        if phyla_bank:
+            phyla_embeddings = phyla_bank[dataset_id]
+        with torch.inference_mode():
+            edge_outputs = relaxer.model(
+                tokenized,
+                torch.tensor([4.0], dtype=torch.float32, device=device),
+                phyla_embeddings=phyla_embeddings,
+                return_leafs_only=False,
+                return_edges_only=True,
+                return_edge_features=True,
+            )
+            _edge_values, _edge_pad_mask, edge_features = edge_outputs
+            edge_split_masks = tokenized[-1]
+            entries, _lengths, n_leaves, _mapping = _branch_relax_entries_for_tree(
+                relaxer,
+                newick,
+                edge_split_masks[0],
+                labels=None,
+            )
+            if not entries:
+                return newick, {"applied": False}
+            features = torch.stack(
+                [edge_features[0, entry["edge_index"]] for entry in entries],
+                dim=0,
+            )
+            numeric = torch.tensor(
+                [entry["numeric"] for entry in entries],
+                dtype=torch.float32,
+                device=device,
+            )
+            case_indices = torch.full(
+                (len(entries),),
+                int(case_index),
+                dtype=torch.long,
+                device=device,
+            )
+            deltas = relaxer.head(features, numeric, case_indices).detach().cpu().numpy()
+
+        delta_by_source_mask = {
+            int(entry.get("source_mask", entry["mask"])): float(delta)
+            for entry, delta in zip(entries, deltas)
+        }
+        tree = EteTree(newick, format=1, quoted_node_names=True)
+        applied = 0
+        max_abs_delta = 0.0
+        for node in tree.traverse("postorder"):
+            if node.is_root():
+                continue
+            try:
+                source_mask = self._sample_metrics_source_mask_for_node(
+                    node,
+                    int(n_leaves),
+                )
+            except Exception:
+                continue
+            delta = delta_by_source_mask.get(int(source_mask))
+            if delta is None:
+                continue
+            before = float(node.dist)
+            after = max(before + float(delta), 1e-8)
+            node.dist = after
+            applied += 1
+            max_abs_delta = max(max_abs_delta, abs(after - before))
+        return tree.write(format=1), {
+            "applied": bool(applied),
+            "applied_edge_count": int(applied),
+            "max_abs_delta": float(max_abs_delta),
+        }
+
+    def _sample_metrics_infer_mrbayes_paths(self, train=True):
+        dataset_id = self._sample_metrics_dataset_id(train=train)
+        if not dataset_id:
+            return None, None, None
+        dataset_id = str(dataset_id).upper()
+        dataset_pickle = self.sample_metrics_mrbayes20k_dataset_pickle_path
+        golden_root = self.sample_metrics_mrbayes20k_golden_root
+        bundle = self._load_posterior_reference_bundle(train=train)
+        if golden_root is None and bundle is not None and bundle.get("golden_root"):
+            golden_root = str(bundle["golden_root"])
+        if dataset_pickle is None and golden_root:
+            root = os.path.dirname(os.path.dirname(str(golden_root).rstrip("/")))
+            candidate = os.path.join(root, f"{dataset_id}.pickle")
+            if os.path.exists(candidate):
+                dataset_pickle = candidate
+        return dataset_id, dataset_pickle, golden_root
+
+    def _sample_metrics_mrbayes20k_output_dir(self):
+        if self.sample_metrics_mrbayes20k_output_dir:
+            return self.sample_metrics_mrbayes20k_output_dir
+        if self.sample_metrics_trace_path:
+            return os.path.join(
+                os.path.dirname(self.sample_metrics_trace_path),
+                "mrbayes20k_sample_metrics",
+            )
+        return "/tmp/phylaflow_sample_metrics_mrbayes20k_outputs"
+
+    def _sample_metrics_run_mrbayes20k(self, relaxed_trees, train=True):
+        if not self.sample_metrics_mrbayes20k_enabled:
+            return {}
+        dataset_id, dataset_pickle, golden_root = self._sample_metrics_infer_mrbayes_paths(
+            train=train
+        )
+        if not dataset_id or not dataset_pickle or not golden_root:
+            return {"mrbayes20k_failed": 1.0}
+        selected_trees = list(relaxed_trees)[
+            : min(len(relaxed_trees), int(self.sample_metrics_mrbayes20k_num_starts))
+        ]
+        if not selected_trees:
+            return {"mrbayes20k_failed": 1.0}
+
+        step = int(self.global_step)
+        stamp = f"pid{os.getpid()}_step{step:08d}_{int(time.time())}"
+        work_dir = os.path.join(self.sample_metrics_mrbayes20k_work_root, stamp)
+        output_dir = self._sample_metrics_mrbayes20k_output_dir()
+        os.makedirs(work_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+        start_list_path = os.path.join(output_dir, f"{stamp}_relaxed_starts.txt")
+        output_json = os.path.join(output_dir, f"{stamp}_mrbayes20k_curve.json")
+        log_path = os.path.join(output_dir, f"{stamp}_mrbayes20k.log")
+        with open(start_list_path, "w", encoding="utf-8") as handle:
+            for tree in selected_trees:
+                tree = str(tree).strip()
+                handle.write(tree if tree.endswith(";") else tree + ";")
+                handle.write("\n")
+
+        benchmark = (
+            "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/"
+            "benchmark_mrbayes_fixed_start_generic.py"
+        )
+        cmd = [
+            sys.executable,
+            benchmark,
+            "--dataset-id",
+            str(dataset_id),
+            "--dataset-pickle",
+            str(dataset_pickle),
+            "--golden-root",
+            str(golden_root),
+            "--label",
+            f"sample_metrics_mrbayes20k_step{step}",
+            "--num-runs",
+            str(len(selected_trees)),
+            "--ngen",
+            str(int(self.sample_metrics_mrbayes20k_ngen)),
+            "--samplefreq",
+            str(int(self.sample_metrics_mrbayes20k_samplefreq)),
+            "--printfreq",
+            str(int(self.sample_metrics_mrbayes20k_printfreq)),
+            "--max-workers",
+            str(int(self.sample_metrics_mrbayes20k_max_workers)),
+            "--curve-interval",
+            str(int(self.sample_metrics_mrbayes20k_ngen)),
+            "--mrbayes-bin",
+            str(self.sample_metrics_mrbayes20k_bin),
+            "--work-dir",
+            str(work_dir),
+            "--output",
+            str(output_json),
+            "--start-tree-list",
+            str(start_list_path),
+            "--threshold-check-selected-only",
+        ]
+        try:
+            with open(log_path, "w", encoding="utf-8") as log_file:
+                result = subprocess.run(
+                    cmd,
+                    cwd="/home/yektefai/PhylaFlow",
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                    timeout=int(self.sample_metrics_mrbayes20k_timeout_sec),
+                )
+        except Exception as exc:
+            return {
+                "mrbayes20k_failed": 1.0,
+                "mrbayes20k_error": str(exc),
+            }
+        if result.returncode != 0 or not os.path.exists(output_json):
+            return {
+                "mrbayes20k_failed": 1.0,
+                "mrbayes20k_returncode": float(result.returncode),
+            }
+        with open(output_json, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        final_block = payload.get("final_cumulative_by_generation") or {}
+        tail_block = payload.get("tail_half_samples") or {}
+        failures = payload.get("failures") or []
+        return {
+            "mrbayes20k_failed": 0.0,
+            "mrbayes20k_num_starts": float(len(selected_trees)),
+            "mrbayes20k_completed_runs": float(payload.get("completed_runs", 0)),
+            "mrbayes20k_failure_count": float(len(failures)),
+            "mrbayes20k_tree_kl": float(
+                final_block.get("kl_divergence_tree_topology", float("nan"))
+            ),
+            "mrbayes20k_tail_tree_kl": float(
+                tail_block.get("kl_divergence_tree_topology", float("nan"))
+            ),
+        }
+
+    def _sample_metrics_relaxed_downstream_metrics(self, sampled_trees, train=True):
+        if not (
+            self.sample_metrics_relaxed_likelihood_enabled
+            or self.sample_metrics_mrbayes20k_enabled
+        ):
+            return {}
+        if not sampled_trees:
+            return {}
+        relaxed_trees = []
+        likelihoods = []
+        applied = 0
+        scorer = (
+            self._get_sample_metrics_likelihood_scorer(train=train)
+            if self.sample_metrics_relaxed_likelihood_enabled
+            else None
+        )
+        for index, tree in enumerate(sampled_trees):
+            relaxed_tree, info = self._sample_metrics_apply_standalone_relaxer(
+                tree,
+                case_index=index,
+                train=train,
+            )
+            relaxed_trees.append(relaxed_tree)
+            applied += int(bool(info.get("applied")))
+            if scorer is not None:
+                likelihoods.append(float(scorer.log_likelihood(str(relaxed_tree))))
+
+        metrics = {
+            "relaxed_start_count": float(len(relaxed_trees)),
+            "relaxed_applied_count": float(applied),
+        }
+        if likelihoods:
+            metrics["relaxed_log_likelihood_mean"] = float(
+                np.asarray(likelihoods, dtype=np.float64).mean()
+            )
+        metrics.update(self._sample_metrics_run_mrbayes20k(relaxed_trees, train=train))
+        return metrics
+
     def _sample_compare_harness_once(self, pair, train=True):
         sampled_trees, _, _, _, _, trace = self.sample(
             [pair["start_tree"]],
             **self._build_harness_sample_kwargs(pair, train=train),
         )
         sampled_tree = sampled_trees[0]
+        likelihood_scorer = self._get_branch_relax_likelihood_scorer()
         metrics = {
             "rf_norm": float(calculate_norm_rf(sampled_tree, pair["target_tree"])),
             "start_rf_norm": float(
@@ -9096,7 +10167,12 @@ class TrainingModule(LightningModule):
             "_target_tree": str(pair["target_tree"]),
             "_n_leaves": int(pair["n_leaves"]),
         }
-        metrics.update(_summarize_trace_topology_repeats(trace))
+        if likelihood_scorer is not None:
+            metrics["branch_relax_after_log_likelihood"] = float(
+                likelihood_scorer.log_likelihood(str(sampled_tree))
+            )
+        if self.sample_metrics_trace_topology_repeats_enabled:
+            metrics.update(_summarize_trace_topology_repeats(trace))
         metrics["stopped_for_repeated_topology"] = float(
             1.0 if trace.get("stopped_for_repeated_topology", False) else 0.0
         )
@@ -9126,6 +10202,14 @@ class TrainingModule(LightningModule):
                     metrics[f"{key}_p10"] = scalar
                     metrics[f"{key}_p90"] = scalar
             metrics.update(row)
+            sampled_tree = row.get("_sampled_tree")
+            if sampled_tree:
+                metrics.update(
+                    self._sample_metrics_relaxed_downstream_metrics(
+                        [sampled_tree],
+                        train=train,
+                    )
+                )
             return metrics
 
         def _numeric_values(key):
@@ -9182,6 +10266,12 @@ class TrainingModule(LightningModule):
             metrics.update(
                 self._posterior_reference_metrics(sampled_trees, train=train)
             )
+            metrics.update(
+                self._sample_metrics_relaxed_downstream_metrics(
+                    sampled_trees,
+                    train=train,
+                )
+            )
 
         aggregate_keys = sorted(
             {
@@ -9200,6 +10290,339 @@ class TrainingModule(LightningModule):
             metrics[f"{key}_max"] = float(arr.max())
         return metrics
 
+    def _sample_metrics_bank_size(self, dataset_split):
+        selections = getattr(dataset_split, "_frozen_full_path_control_selections", None)
+        if selections:
+            return len(selections)
+        start_bank = getattr(dataset_split, "overfit_fixed_pair_start_tree_newick_bank", [])
+        target_bank = getattr(dataset_split, "overfit_fixed_pair_target_tree_newick_bank", [])
+        if target_bank:
+            return len(target_bank)
+        if start_bank:
+            return len(start_bank)
+        try:
+            return len(dataset_split)
+        except TypeError:
+            return 0
+
+    def _sample_metrics_select_bank_indices(self, total_count, num_pairs, train=True):
+        total_count = max(0, int(total_count))
+        if total_count <= 0:
+            return []
+        num_pairs = min(max(1, int(num_pairs)), total_count)
+        mode = str(
+            getattr(self, "sample_metrics_unseen_pair_selection_mode", "random_bank")
+        ).strip().lower()
+        if mode in {"first", "sequential"}:
+            return list(range(num_pairs))
+        seed = (
+            int(self.sample_metrics_unseen_start_seed)
+            + int(self.global_step) * 1009
+            + (0 if train else 17)
+        )
+        rng = random.Random(seed)
+        return rng.sample(range(total_count), k=num_pairs)
+
+    def _sample_metrics_build_bank_pair(self, dataset_split, pair_index):
+        fixed_pair = None
+        sampled = None
+        if hasattr(dataset_split, "get_overfit_fixed_pair"):
+            try:
+                fixed_pair = dataset_split.get_overfit_fixed_pair(int(pair_index))
+            except Exception:
+                fixed_pair = None
+        if fixed_pair is None:
+            sampled = dataset_split[int(pair_index)]
+            if hasattr(dataset_split, "get_overfit_fixed_pair"):
+                try:
+                    fixed_pair = dataset_split.get_overfit_fixed_pair(int(pair_index))
+                except Exception:
+                    fixed_pair = None
+
+        if fixed_pair is not None:
+            start_tree = fixed_pair.get("random_tree", fixed_pair.get("start_tree"))
+            target_tree = fixed_pair.get(
+                "effective_target_tree", fixed_pair.get("target_tree")
+            )
+            max_events_value = int(
+                len(fixed_pair.get("final_labels", []) or [])
+                or fixed_pair.get("fixed_pair_num_events", 1024)
+            )
+            name_mapping_value = fixed_pair.get("name_mapping")
+            bank_group_key_value = fixed_pair.get("bank_group_key")
+        else:
+            start_tree = sampled.get("start_tree")
+            target_tree = sampled.get("target_tree")
+            max_events_value = int(sampled.get("fixed_pair_num_events", 1024))
+            name_mapping_value = sampled.get("name_mapping")
+            bank_group_key_value = sampled.get("bank_group_key")
+
+        mapping = (
+            name_mapping_value
+            if name_mapping_value is not None
+            else (
+                dataset_split.return_nexus_number_to_name(0)
+                if hasattr(dataset_split, "return_nexus_number_to_name")
+                else None
+            )
+        )
+        return {
+            "start_tree": str(start_tree),
+            "target_tree": str(target_tree),
+            "bank_group_key": bank_group_key_value,
+            "n_leaves": len(EteTree(str(start_tree), format=1).get_leaves()),
+            "max_events": int(max_events_value),
+            "name_mapping": mapping,
+            "source_bank_index": int(pair_index),
+        }
+
+    def _sample_metrics_generate_unseen_start(self, dataset_split, target_tree, seen):
+        def _topology_key(tree):
+            try:
+                return canonicalize_topology_newick(str(tree))
+            except Exception:
+                return str(tree)
+
+        training_starts = {
+            _topology_key(tree)
+            for tree in getattr(
+                dataset_split, "overfit_fixed_pair_start_tree_newick_bank", []
+            )
+        }
+        candidate = None
+        for _attempt in range(self.sample_metrics_unseen_start_max_duplicate_tries):
+            candidate = str(dataset_split.sample_random_tree(str(target_tree)))
+            candidate_key = _topology_key(candidate)
+            if candidate_key not in seen and candidate_key not in training_starts:
+                seen.add(candidate_key)
+                return candidate
+        if candidate is None:
+            candidate = str(dataset_split.sample_random_tree(str(target_tree)))
+        seen.add(_topology_key(candidate))
+        return candidate
+
+    def _sample_metrics_unseen_bank_pairs(self, dataset_split, train=True):
+        num_pairs = max(1, int(getattr(self, "sample_metrics_num_pairs", 1)))
+        bank_size = self._sample_metrics_bank_size(dataset_split)
+        indices = self._sample_metrics_select_bank_indices(
+            bank_size,
+            num_pairs,
+            train=train,
+        )
+        random_state = random.getstate()
+        seed = (
+            int(self.sample_metrics_unseen_start_seed)
+            + int(self.global_step) * 9973
+            + (0 if train else 31)
+        )
+        pairs = []
+        seen_starts = set()
+        try:
+            random.seed(seed)
+            for eval_index, source_index in enumerate(indices):
+                pair = self._sample_metrics_build_bank_pair(dataset_split, source_index)
+                original_start_tree = pair["start_tree"]
+                unseen_start_tree = self._sample_metrics_generate_unseen_start(
+                    dataset_split,
+                    pair["target_tree"],
+                    seen_starts,
+                )
+                pair["original_start_tree"] = original_start_tree
+                pair["start_tree"] = unseen_start_tree
+                pair["bank_group_key"] = f"sample_metrics_unseen_case{eval_index:05d}"
+                pair["n_leaves"] = len(EteTree(unseen_start_tree, format=1).get_leaves())
+                pair["source_bank_index"] = int(source_index)
+                pairs.append(pair)
+        finally:
+            random.setstate(random_state)
+        return pairs
+
+    def _sample_metrics_model_uses_frozen_start_case_table(self):
+        return any(
+            hasattr(self.model, name)
+            for name in (
+                "first_hit_frozen_start_case_embedding",
+                "autoregressive_frozen_start_case_embedding",
+            )
+        )
+
+    def _sample_metrics_model_needs_case_indices(self):
+        needs_frozen_ar_case_probe = (
+            bool(
+                getattr(
+                    self.model,
+                    "autoregressive_use_start_topology_conditioning",
+                    False,
+                )
+            )
+            and getattr(
+                self.model,
+                "autoregressive_start_topology_conditioning_mode",
+                "additive",
+            )
+            in {"frozen_case_probe", "frozen_case_probe_additive"}
+        )
+        return (
+            getattr(self.model, "first_hit_head_mode", "base")
+            in {"case_adapted_mlp", "frozen_start_case_mlp"}
+            or getattr(self.model, "autoregressive_use_case_conditioning", False)
+            or needs_frozen_ar_case_probe
+        )
+
+    def _get_sample_metrics_metric_encoder(self):
+        path = self.sample_metrics_unseen_start_metric_encoder_path
+        if not path:
+            return None
+        cached = self._sample_metrics_metric_encoder_cache.get(path)
+        if cached is not None:
+            return cached
+
+        from scripts.pretrain_start_tree_metric_encoder import SplitSetEncoder
+
+        checkpoint = torch.load(path, map_location="cpu")
+        metadata = dict(checkpoint.get("metadata", {}))
+        max_bits = int(metadata.get("max_bits", 64))
+        hidden_dim = int(metadata.get("hidden_dim", 128))
+        embedding_dim = int(metadata.get("embedding_dim", 64))
+        encoder = SplitSetEncoder(
+            max_bits=max_bits,
+            hidden_dim=hidden_dim,
+            embedding_dim=embedding_dim,
+            dropout=0.0,
+        )
+        state_dict = checkpoint.get("encoder_state_dict")
+        if state_dict is None and checkpoint.get("model_state_dict") is not None:
+            state_dict = {
+                key[len("encoder.") :]: value
+                for key, value in checkpoint["model_state_dict"].items()
+                if str(key).startswith("encoder.")
+            }
+        if not state_dict:
+            raise ValueError(
+                "Metric encoder checkpoint must contain encoder_state_dict or "
+                f"an encoder.* model_state_dict: {path}"
+            )
+        encoder.load_state_dict(state_dict)
+        encoder.eval()
+        cached = {
+            "encoder": encoder,
+            "max_bits": max_bits,
+            "embedding_dim": embedding_dim,
+        }
+        self._sample_metrics_metric_encoder_cache[path] = cached
+        return cached
+
+    def _sample_metrics_encode_metric_starts(self, start_trees):
+        encoder_bundle = self._get_sample_metrics_metric_encoder()
+        if encoder_bundle is None:
+            return None, {}
+
+        from scripts.pretrain_start_tree_metric_encoder import (
+            build_tree_tensor_batch,
+            canonical_internal_splits,
+            embedding_stats,
+        )
+
+        split_sets = []
+        n_taxa = []
+        for tree in start_trees:
+            splits, inferred_n_taxa = canonical_internal_splits(str(tree))
+            split_sets.append(splits)
+            n_taxa.append(int(inferred_n_taxa))
+
+        device = torch.device("cpu")
+        encoder = encoder_bundle["encoder"].to(device)
+        split_bits, pad_mask, size_features = build_tree_tensor_batch(
+            split_sets,
+            n_taxa,
+            max_bits=int(encoder_bundle["max_bits"]),
+            device=device,
+        )
+        with torch.no_grad():
+            embeddings = encoder(split_bits, pad_mask, size_features)
+            embeddings = F.normalize(embeddings, dim=-1)
+        stats = embedding_stats(embeddings)
+        return embeddings.detach().cpu(), stats
+
+    def _sample_metrics_replace_frozen_start_case_tables(self, embeddings):
+        replacements = []
+        if embeddings is None:
+            return replacements
+        for name in (
+            "first_hit_frozen_start_case_embedding",
+            "autoregressive_frozen_start_case_embedding",
+        ):
+            if not hasattr(self.model, name):
+                continue
+            current = getattr(self.model, name)
+            replacements.append((name, current))
+            table = embeddings.to(device=current.device, dtype=current.dtype)
+            setattr(self.model, name, table)
+        return replacements
+
+    def _sample_metrics_restore_frozen_start_case_tables(self, replacements):
+        for name, value in reversed(replacements):
+            setattr(self.model, name, value)
+
+    def _sample_compare_harness_unseen_starts(self, train=True):
+        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        pairs = self._sample_metrics_unseen_bank_pairs(dataset_split, train=train)
+        if not pairs:
+            return {"num_pairs": 0, "unseen_start_eval": 1.0}
+
+        needs_case_indices = self._sample_metrics_model_needs_case_indices()
+        uses_frozen_tables = self._sample_metrics_model_uses_frozen_start_case_table()
+        if needs_case_indices and not uses_frozen_tables:
+            raise RuntimeError(
+                "Unseen-start eval does not support trainable case-ID conditioning; "
+                "use no conditioning or a frozen start-case table."
+            )
+
+        embeddings = None
+        embedding_stats_block = {}
+        if uses_frozen_tables:
+            embeddings, embedding_stats_block = self._sample_metrics_encode_metric_starts(
+                [pair["start_tree"] for pair in pairs]
+            )
+            if embeddings is None:
+                raise RuntimeError(
+                    "sample_metrics_unseen_start_metric_encoder_path is required "
+                    "when unseen-start eval is used with frozen case-table conditioning."
+                )
+
+        rows = []
+        replacements = self._sample_metrics_replace_frozen_start_case_tables(embeddings)
+        try:
+            for pair in pairs:
+                rows.append(self._sample_compare_harness_once(pair, train=train))
+        finally:
+            self._sample_metrics_restore_frozen_start_case_tables(replacements)
+
+        metrics = self._summarize_sample_compare_harness_rows(rows, train=train)
+        metrics.update(
+            {
+                "unseen_start_eval": 1.0,
+                "unseen_start_count": float(len(pairs)),
+                "unseen_start_unique_count": float(
+                    len({str(pair["start_tree"]) for pair in pairs})
+                ),
+                "unseen_start_unique_topology_count": float(
+                    len(
+                        {
+                            canonicalize_topology_newick(str(pair["start_tree"]))
+                            for pair in pairs
+                        }
+                    )
+                ),
+                "unseen_source_bank_unique_count": float(
+                    len({int(pair["source_bank_index"]) for pair in pairs})
+                ),
+            }
+        )
+        for key, value in embedding_stats_block.items():
+            metrics[f"unseen_start_embedding_{key}"] = float(value)
+        return metrics
+
     def sample_compare_harness(self, train=True):
         if self.use_historical_sampling_impl:
             return _call_historical_trainingmodule_method(
@@ -9207,6 +10630,8 @@ class TrainingModule(LightningModule):
                 self,
                 train=train,
             )
+        if getattr(self, "sample_metrics_unseen_start_eval", False):
+            return self._sample_compare_harness_unseen_starts(train=train)
         num_pairs = max(1, int(getattr(self, "sample_metrics_num_pairs", 1)))
         rows = []
         dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
@@ -9306,6 +10731,90 @@ class TrainingModule(LightningModule):
         if num_pairs == 1:
             metrics.update(self._evaluate_fixed_pair_path_metrics(train=train))
         return metrics
+
+    def _branch_relax_training_loss(self):
+        if (
+            self.branch_relax_head is None
+            or self.branch_relax_head_weight <= 0.0
+            or not self.branch_relax_samples
+        ):
+            return None, {}
+        batch_size = min(int(self.branch_relax_batch_size), len(self.branch_relax_samples))
+        samples = random.sample(self.branch_relax_samples, k=batch_size)
+        tokenized = _move_tokenized_batch_to_device(
+            self.model.tokenizer([sample["newick_tree"] for sample in samples]),
+            self.device,
+        )
+        case_indices = torch.tensor(
+            [int(sample["case_index"]) for sample in samples],
+            dtype=torch.long,
+            device=self.device,
+        )
+        (
+            _velocity,
+            edge_splits,
+            _edge_mask,
+            _first_hit_logits,
+            _boundary_vanish_logits,
+            edge_features,
+        ) = self.forward(
+            tokenized,
+            torch.tensor([4.0], dtype=torch.float32, device=self.device),
+            None,
+            first_hit_case_indices=case_indices,
+        )
+        if edge_features is None:
+            return None, {}
+        preds = []
+        labels = []
+        for batch_idx, sample in enumerate(samples):
+            entries, _lengths, _n_leaves, _mapping = _branch_relax_entries_for_tree(
+                self,
+                sample["newick_tree"],
+                edge_splits[batch_idx],
+                labels=sample["labels"],
+            )
+            if not entries:
+                continue
+            feature_block = torch.stack(
+                [edge_features[batch_idx, entry["edge_index"]] for entry in entries],
+                dim=0,
+            )
+            if self.branch_relax_detach_trunk:
+                feature_block = feature_block.detach()
+            numeric = torch.tensor(
+                [entry["numeric"] for entry in entries],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            case_block = torch.full(
+                (len(entries),),
+                int(sample["case_index"]),
+                dtype=torch.long,
+                device=self.device,
+            )
+            preds.append(self.branch_relax_head(feature_block, numeric, case_block))
+            labels.append(
+                torch.tensor(
+                    [float(entry["label"]) for entry in entries],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            )
+        if not preds:
+            return None, {}
+        pred = torch.cat(preds)
+        target = torch.cat(labels)
+        diff = pred - target
+        loss = diff.pow(2).mean()
+        logs = {
+            "train/branch_relax_loss_unscaled": loss.detach(),
+            "train/branch_relax_mae": diff.abs().mean().detach(),
+            "train/branch_relax_sign_acc": (
+                ((pred > 0.0) == (target > 0.0)).float().mean().detach()
+            ),
+        }
+        return loss, logs
 
     def _should_collect_rollout_replay(self):
         if (
@@ -9496,13 +11005,14 @@ class TrainingModule(LightningModule):
                     device=self.device,
                 ),
             }
-            repeat_summary = _summarize_trace_topology_repeats(trace)
-            for key, value in repeat_summary.items():
-                replay_logs[f"replay/{key}"] = torch.tensor(
-                    float(value),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
+            if self.sample_metrics_trace_topology_repeats_enabled:
+                repeat_summary = _summarize_trace_topology_repeats(trace)
+                for key, value in repeat_summary.items():
+                    replay_logs[f"replay/{key}"] = torch.tensor(
+                        float(value),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
             replay_logs.update(
                 self._maybe_update_dynamic_start_bank(
                     pair=pair,
@@ -9793,13 +11303,14 @@ class TrainingModule(LightningModule):
                 device=self.device,
             ),
         }
-        repeat_summary = _summarize_trace_topology_repeats(trace)
-        for key, value in repeat_summary.items():
-            replay_logs[f"replay/{key}"] = torch.tensor(
-                float(value),
-                dtype=torch.float32,
-                device=self.device,
-            )
+        if self.sample_metrics_trace_topology_repeats_enabled:
+            repeat_summary = _summarize_trace_topology_repeats(trace)
+            for key, value in repeat_summary.items():
+                replay_logs[f"replay/{key}"] = torch.tensor(
+                    float(value),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
         if first_wrong_velocity_replay is not None:
             replay_logs["replay/first_wrong_velocity_phase"] = torch.tensor(
                 float(first_wrong_velocity_replay.get("first_wrong_phase_idx", -1)),
@@ -10214,6 +11725,8 @@ class TrainingModule(LightningModule):
                 or self.velocity_terminal_head_use_at_sampling
                 or self.sampling_discrete_phase_rollout_use_at_sampling
                 or self.velocity_refiner_mode == "edge_token_attention_delta"
+                or self.branch_relax_head_weight > 0.0
+                or self.branch_relax_head_use_at_sampling
             )
             edge_outputs = self.model(
                 batched_tokenized_trees,
@@ -10566,6 +12079,13 @@ class TrainingModule(LightningModule):
             #         import pdb; pdb.set_trace()
             #         raise Exception("Training tokenized trees changed during training!")
 
+            direct_set_loss = None
+            direct_set_mse_weight = float(
+                getattr(self, "velocity_probe_direct_set_mse_weight", 0.0)
+            )
+            direct_set_loss_weight = float(
+                getattr(self, "velocity_probe_direct_set_loss_weight", 1.0)
+            )
             if bool(batch.get("_use_probe_parity_direct_set_loss", False)):
                 direct_losses = []
                 exact_flags = []
@@ -10860,7 +12380,9 @@ class TrainingModule(LightningModule):
                         float(logs["velocity/probe_direct_set_exact_rate"].detach().item()),
                         float(logs["velocity/probe_direct_set_mean_jaccard"].detach().item()),
                     )
-                return logs
+                if direct_set_mse_weight <= 0.0:
+                    return logs
+                direct_set_loss = loss
 
             velocity_labels = batch["batched_velocity"]
             num_leaves = batch["num_leaves"]
@@ -11761,13 +13283,37 @@ class TrainingModule(LightningModule):
                     "dt_rel_err_mean": 0.0,
                 }
                 n_contract = 0
+            mse_branch_loss = loss
+            mse_branch_regression_loss = regression_loss
+            mse_branch_auxiliary_loss = auxiliary_loss
+            if direct_set_loss is not None:
+                loss = (
+                    direct_set_loss_weight * direct_set_loss
+                    + direct_set_mse_weight * mse_branch_loss
+                )
+                regression_loss = direct_set_mse_weight * mse_branch_regression_loss
+                auxiliary_loss = loss - regression_loss
             # print("Wow congrats")
             logs.update(
                 {
                     "velocity/loss_plain_mse": plain_mse.detach(),
                     "velocity/loss_weighted_mse": weighted_mse.detach(),
+                    "velocity/mse_branch_loss_unscaled": mse_branch_loss.detach(),
+                    "velocity/mse_branch_regression_unscaled": mse_branch_regression_loss.detach(),
+                    "velocity/mse_branch_auxiliary_unscaled": mse_branch_auxiliary_loss.detach(),
                     "velocity/loss_regression_unscaled": regression_loss.detach(),
                     "velocity/loss_auxiliary_unscaled": auxiliary_loss.detach(),
+                    "velocity/probe_direct_set_loss": (
+                        torch.zeros((), device=v_pred.device, dtype=v_pred.dtype)
+                        if direct_set_loss is None
+                        else direct_set_loss.detach()
+                    ),
+                    "velocity/probe_direct_set_loss_weight": torch.tensor(
+                        direct_set_loss_weight, device=v_pred.device
+                    ),
+                    "velocity/probe_direct_set_mse_weight": torch.tensor(
+                        direct_set_mse_weight, device=v_pred.device
+                    ),
                     "velocity/first_hit_velocity_loss": first_hit_velocity_loss.detach(),
                     "velocity/logtau_all_loss_raw": logtau_all_loss_raw.detach(),
                     "velocity/logtau_all_loss": logtau_all_loss.detach(),
@@ -12190,7 +13736,8 @@ class TrainingModule(LightningModule):
                     chosen_polytomies_tensor,
                 ) 
 
-                logger.info(f"Polytomy choosing loss: {L_polytomy_choosing.item()}")
+                if self.training_step_verbose_logging_enabled:
+                    logger.info(f"Polytomy choosing loss: {L_polytomy_choosing.item()}")
                 if self.record:
                     self._wandb_log_filtered(
                         {
@@ -12208,9 +13755,10 @@ class TrainingModule(LightningModule):
             else:
                 anchor_param = next(self.model.parameters())
                 L_merging = anchor_param.sum() * 0.0
-                logger.info(
-                    "Autoregressive loss skipped because no candidate merge targets were available."
-                )
+                if self.training_step_verbose_logging_enabled:
+                    logger.info(
+                        "Autoregressive loss skipped because no candidate merge targets were available."
+                    )
                 logs["autoregressive_stats/no_candidate_merge_loss"] = torch.tensor(
                     1.0,
                     device=loss_device,
@@ -12220,7 +13768,8 @@ class TrainingModule(LightningModule):
                 L_polytomy_choosing,
                 self.autoregressive_polytomy_choosing_weight,
             )
-            logger.info(f"Autoregressive loss: {L_merging.item()}")
+            if self.training_step_verbose_logging_enabled:
+                logger.info(f"Autoregressive loss: {L_merging.item()}")
 
             aggregated_metrics = {}
             if len(total_metrics) > 0:
@@ -12229,8 +13778,9 @@ class TrainingModule(LightningModule):
                         m[key] for m in total_metrics
                     ) / len(total_metrics)
 
-                for key in aggregated_metrics:
-                    logger.info(f"{key}: {aggregated_metrics[key]}")
+                if self.training_step_verbose_logging_enabled:
+                    for key in aggregated_metrics:
+                        logger.info(f"{key}: {aggregated_metrics[key]}")
 
             if L_polytomy_choosing is not None:
                 logs["autoregressive_stats/polytomy_choosing_weight"] = torch.tensor(
@@ -12279,10 +13829,11 @@ class TrainingModule(LightningModule):
                 if alternative_target_counts
                 else 0.0
             )
-            logger.info(f"Average polytomy size: {avg_polytomy_size}")
-            logger.info(
-                f"Average alternative autoregressive targets: {avg_alternative_targets}"
-            )
+            if self.training_step_verbose_logging_enabled:
+                logger.info(f"Average polytomy size: {avg_polytomy_size}")
+                logger.info(
+                    f"Average alternative autoregressive targets: {avg_alternative_targets}"
+                )
             logs["autoregressive_stats/avg_candidate_targets"] = torch.tensor(
                 avg_alternative_targets,
                 device=loss_device,
@@ -13066,7 +14617,11 @@ class TrainingModule(LightningModule):
                     raise Exception("There are negative lengths that is not possible!")
 
                 # --- DEBUG: compare predicted vs true velocity at t=0 ---
-                if debug_real_tree is not None and n_steps == 1:
+                if (
+                    debug_real_tree is not None
+                    and n_steps == 1
+                    and not sampling_disable_inner_logging
+                ):
                     try:
                         _, true_velocity = return_sampled_tree_orthant_velocity(
                             newick_starting_trees[b_idx], debug_real_tree, 0.0
@@ -14081,14 +15636,14 @@ class TrainingModule(LightningModule):
                 break
 
             if n_steps % 100 == 0:
-                print(f"Step {n_steps}: dt={dt:.2e}, t={t:.2f}/{T}")
+                _sampling_log_info(f"Step {n_steps}: dt={dt:.2e}, t={t:.2f}/{T}")
 
         # print(f"Sampling finished in {n_steps} steps. Total events: {n_events}")
         avg_polytomy_size = np.mean(polytomy_sizes) if polytomy_sizes else 0.0
         # if num_topology_changes > 0:
         #     import pdb; pdb.set_trace()
     
-        logger.info(
+        _sampling_log_info(
             f"Sampling finished in {n_steps} steps. Total events: {n_events}, topology changes: {num_topology_changes}, "
             f"silent boundary recoveries: {num_silent_boundary_recoveries}, average polytomy size: {avg_polytomy_size:.2f}"
         )
@@ -14117,6 +15672,9 @@ class TrainingModule(LightningModule):
     def sample_compare(self, batch, train=True, num_samples=None, dt=0.02, save = True):
         if num_samples is None:
             num_samples = self.num_samples
+        sampling_disable_inner_logging = bool(
+            getattr(self, "sampling_disable_inner_logging", False)
+        )
         nexus_filepaths = batch["nexus_filepaths"]
         tree_paths = batch["tree_paths"]
         ids = batch["ids"]
@@ -14218,9 +15776,12 @@ class TrainingModule(LightningModule):
             start_time = time.time()
             sampled_tree, n_topology_changes_one, avg_max_logit, avg_polytomy_size, n_polytomies_resolved_one = self.sample(
                 [starting_tree], batch["phyla_embeddings"], num_samples=1, dt_base=dt,
-                debug_real_tree=real_trees[0],
+                debug_real_tree=(
+                    real_trees[0] if not sampling_disable_inner_logging else None
+                ),
             )
-            print(f"Sampling a single tree took {time.time() - start_time} seconds")
+            if not sampling_disable_inner_logging:
+                print(f"Sampling a single tree took {time.time() - start_time} seconds")
 
             avg_polytomy_sizes.append(avg_polytomy_size)
             num_polytomies_resolved.append(n_polytomies_resolved_one)
@@ -14286,14 +15847,17 @@ class TrainingModule(LightningModule):
             )
         )
         metrics.update(compare_branch_length_distributions(posterior_trees, sampled))
-        print(f"Num polytomies resolved in sampling: {num_polytomies} out of {num_samples}")
-        print("Average topology changes during sampling: ", np.mean(num_topology_changes))
-        print("Average max logits during sampling: ", np.mean(avg_max_logits))
+        if not sampling_disable_inner_logging:
+            print(f"Num polytomies resolved in sampling: {num_polytomies} out of {num_samples}")
+            print("Average topology changes during sampling: ", np.mean(num_topology_changes))
+            print("Average max logits during sampling: ", np.mean(avg_max_logits))
         overall_avg_polytomy_size = np.mean([s for s in avg_polytomy_sizes if s > 0]) if any(s > 0 for s in avg_polytomy_sizes) else 0.0
-        print(f"Average polytomy size during sampling: {overall_avg_polytomy_size:.2f}")
+        if not sampling_disable_inner_logging:
+            print(f"Average polytomy size during sampling: {overall_avg_polytomy_size:.2f}")
         
         avg_num_polytomies_resolved = np.mean(num_polytomies_resolved)
-        print(f"Average number of polytomies resolved during sampling: {avg_num_polytomies_resolved}")
+        if not sampling_disable_inner_logging:
+            print(f"Average number of polytomies resolved during sampling: {avg_num_polytomies_resolved}")
         if self.record:
             self._wandb_log_filtered(
                 {
@@ -14553,21 +16117,23 @@ class TrainingModule(LightningModule):
                     batch = self.dataset.collate_fn(
                         [sub_batch], preset_subtree_num=new_num_subtrees
                     )
-                    logging.info(
-                        f"Memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
-                    )
-                    logging.info(
-                        f"Memory reserved: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
-                    )
+                    if self.training_step_verbose_logging_enabled:
+                        logging.info(
+                            f"Memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
+                        )
+                        logging.info(
+                            f"Memory reserved: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
+                        )
 
                     gc.collect()
                 try:
-                    logging.info(
-                        f"Memory allocated before step: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
-                    )
-                    logging.info(
-                        f"Memory reserved before step: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
-                    )
+                    if self.training_step_verbose_logging_enabled:
+                        logging.info(
+                            f"Memory allocated before step: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
+                        )
+                        logging.info(
+                            f"Memory reserved before step: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
+                        )
                     replay_velocity_batch = None
                     replay_autoregressive_batch = None
                     replay_metric_logs = {}
@@ -14620,7 +16186,8 @@ class TrainingModule(LightningModule):
                             )
 
                     # --- HEAD 1: VELOCITY ---
-                    logging.info("DEBUG: Starting Velocity Head Training")
+                    if self.training_step_verbose_logging_enabled:
+                        logging.info("DEBUG: Starting Velocity Head Training")
                     logs_vel = self.step(
                         velocity_training_batch,
                         autoregressive=False,
@@ -14745,14 +16312,15 @@ class TrainingModule(LightningModule):
                         loss_vel_auxiliary_unscaled.detach()
                     )
                     loss_vel_scaled_detached = loss_vel.detach()
-                    logging.info(
-                        "Velocity head loss: total_raw=%.6f regression_raw=%.6f auxiliary_raw=%.6f scaled=%.6f weight=%.4f",
-                        float(loss_vel_unscaled_detached.item()),
-                        float(loss_vel_regression_unscaled_detached.item()),
-                        float(loss_vel_auxiliary_unscaled_detached.item()),
-                        float(loss_vel_scaled_detached.item()),
-                        float(self.training_step_velocity_weight),
-                    )
+                    if self.training_step_verbose_logging_enabled:
+                        logging.info(
+                            "Velocity head loss: total_raw=%.6f regression_raw=%.6f auxiliary_raw=%.6f scaled=%.6f weight=%.4f",
+                            float(loss_vel_unscaled_detached.item()),
+                            float(loss_vel_regression_unscaled_detached.item()),
+                            float(loss_vel_auxiliary_unscaled_detached.item()),
+                            float(loss_vel_scaled_detached.item()),
+                            float(self.training_step_velocity_weight),
+                        )
                     pre_ar_grads = None
                     velocity_grad_norm = None
                     if not probe_parity_joint:
@@ -14776,7 +16344,8 @@ class TrainingModule(LightningModule):
                                 pre_ar_grads[p] = g_prev
                                 vel_sq += float(torch.sum(g_prev * g_prev))
                             velocity_grad_norm = vel_sq ** 0.5
-                    logging.info("DEBUG: Finished Velocity Head Training")
+                    if self.training_step_verbose_logging_enabled:
+                        logging.info("DEBUG: Finished Velocity Head Training")
 
                     del logs_vel
                     if not probe_parity_joint:
@@ -14786,7 +16355,8 @@ class TrainingModule(LightningModule):
                             torch.cuda.empty_cache()
 
                     # --- HEAD 2: AUTOREGRESSIVE ---
-                    logging.info("DEBUG: Starting Autoregressive Head Training")
+                    if self.training_step_verbose_logging_enabled:
+                        logging.info("DEBUG: Starting Autoregressive Head Training")
                     logs = self.step(
                         autoregressive_training_batch,
                         eval=control_mode,
@@ -14867,19 +16437,35 @@ class TrainingModule(LightningModule):
                     )
                     logs.update(velocity_metric_logs)
                     logs.update(replay_metric_logs)
-                    logging.info(
-                        "Autoregressive head loss: raw=%.6f scaled=%.6f weight=%.4f",
-                        float(loss_unscaled.detach().item()),
-                        float(loss.detach().item()),
-                        float(self.training_step_autoregressive_weight),
+                    branch_relax_loss_unscaled, branch_relax_logs = (
+                        self._branch_relax_training_loss()
                     )
-
-                    logging.info(
-                        f"Memory allocated before backward: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
-                    )
-                    logging.info(
-                        f"Memory reserved before backward: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
-                    )
+                    if branch_relax_loss_unscaled is not None:
+                        branch_relax_loss = (
+                            branch_relax_loss_unscaled
+                            * self.branch_relax_head_weight
+                        )
+                        loss = loss + branch_relax_loss
+                        logs["train/branch_relax_loss_unscaled"] = (
+                            branch_relax_loss_unscaled.detach()
+                        )
+                        logs["train/branch_relax_loss_scaled"] = (
+                            branch_relax_loss.detach()
+                        )
+                        logs.update(branch_relax_logs)
+                    if self.training_step_verbose_logging_enabled:
+                        logging.info(
+                            "Autoregressive head loss: raw=%.6f scaled=%.6f weight=%.4f",
+                            float(loss_unscaled.detach().item()),
+                            float(loss.detach().item()),
+                            float(self.training_step_autoregressive_weight),
+                        )
+                        logging.info(
+                            f"Memory allocated before backward: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
+                        )
+                        logging.info(
+                            f"Memory reserved before backward: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
+                        )
 
                     if probe_parity_joint:
                         joint_loss = loss_vel + loss
@@ -14955,12 +16541,13 @@ class TrainingModule(LightningModule):
                     success = True
                     failed = False
 
-                    logging.info(
-                        f"Memory allocated after backward: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
-                    )
-                    logging.info(
-                        f"Memory reserved after backward: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
-                    )
+                    if self.training_step_verbose_logging_enabled:
+                        logging.info(
+                            f"Memory allocated after backward: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
+                        )
+                        logging.info(
+                            f"Memory reserved after backward: {torch.cuda.memory_reserved() / 1024 ** 2} MB"
+                        )
                     if probe_parity_joint:
                         del loss_vel_unscaled
                         del loss_vel
@@ -15072,7 +16659,8 @@ class TrainingModule(LightningModule):
                         {f"sample_metrics/{k}": v for k, v in metrics.items()},
                         step=self.stepper,
                     )
-                print(metrics)
+                if self.training_step_verbose_logging_enabled:
+                    print(metrics)
                 rf_norm = metrics.get("rf_norm")
                 stop_threshold = self.training_sampling_stop_rf_threshold
                 if stop_threshold is None and self.training_sampling_stop_on_zero_rf:
@@ -15129,15 +16717,16 @@ class TrainingModule(LightningModule):
         )
 
         # Print a warning if exploding
-        if max_grad > 1:
+        if self.training_step_verbose_logging_enabled and max_grad > 1:
             print(
                 f"[Warning] Gradient norm unusually high: max={max_grad:.2e}, mean={mean_grad:.2e}"
             )
 
         self._log_scalar_filtered("grad_norm_total", total)
-        print(
-            f"step {self.global_step:4d}  total_grad_norm = {total:.2f} mean is {mean_grad:.2f} max is {max_grad:.2f}"
-        )
+        if self.training_step_verbose_logging_enabled:
+            print(
+                f"step {self.global_step:4d}  total_grad_norm = {total:.2f} mean is {mean_grad:.2f} max is {max_grad:.2f}"
+            )
         if self.record:
             self._wandb_log_filtered(
                 {

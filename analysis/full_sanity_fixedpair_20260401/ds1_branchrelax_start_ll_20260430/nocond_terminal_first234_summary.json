@@ -1,0 +1,32 @@
+{
+  "after_log_likelihood": {
+    "max": -7189.178429059864,
+    "mean": -7499.00096202704,
+    "median": -7413.141842086602,
+    "min": -10107.582670408621,
+    "std": 318.87501362336707
+  },
+  "applied_count": 234,
+  "before_log_likelihood": {
+    "max": -9853.734308247964,
+    "mean": -9922.36469991158,
+    "median": -9861.244626042586,
+    "min": -10928.938230755288,
+    "std": 133.65426470628583
+  },
+  "checkpoint": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/standalone_branch_relaxer_ds1_ds8_phyla_leafonly_balanced_nocase_20260429/best.pt",
+  "dataset_id": "DS1",
+  "delta_log_likelihood": {
+    "max": 2679.0725661390707,
+    "mean": 2423.363737884542,
+    "median": 2473.6195504507277,
+    "min": 821.3555603466666,
+    "std": 212.16931888915622
+  },
+  "input_tree_list": "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds1_1280bank_nocond_step20000_mrbayes_all234_from_all256_20260430/nocond_terminal_first234_start_trees.txt",
+  "label": "nocond_terminal_first234",
+  "num_improved": 234,
+  "num_worse": 0,
+  "relax_scale": 1.0,
+  "tree_count": 234
+}

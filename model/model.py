@@ -395,6 +395,8 @@ class TreeDenoiserTokenGT(nn.Module):
         autoregressive_start_topology_conditioning_mode="additive",
         autoregressive_start_topology_code_dim=64,
         autoregressive_frozen_start_case_embedding_path=None,
+        autoregressive_frozen_start_case_adapter_mode="linear",
+        autoregressive_frozen_start_case_adapter_hidden_dim=None,
         first_hit_head_use_phase_input=False,
         first_hit_head_phase_hidden_dim=None,
         first_hit_head_mode="base",
@@ -405,6 +407,8 @@ class TreeDenoiserTokenGT(nn.Module):
         first_hit_head_num_cases=None,
         first_hit_head_case_dim=16,
         first_hit_frozen_start_case_embedding_path=None,
+        first_hit_frozen_start_case_adapter_mode="linear",
+        first_hit_frozen_start_case_adapter_hidden_dim=None,
         first_hit_start_tree_graph_detach=False,
     ):
         super().__init__()
@@ -514,6 +518,19 @@ class TreeDenoiserTokenGT(nn.Module):
         self.first_hit_head_case_dim = int(first_hit_head_case_dim)
         self.first_hit_frozen_start_case_embedding_path = (
             first_hit_frozen_start_case_embedding_path
+        )
+        self.first_hit_frozen_start_case_adapter_mode = str(
+            first_hit_frozen_start_case_adapter_mode
+        )
+        if self.first_hit_frozen_start_case_adapter_mode not in {"linear", "mlp2"}:
+            raise ValueError(
+                "first_hit_frozen_start_case_adapter_mode must be one of "
+                "['linear', 'mlp2']"
+            )
+        self.first_hit_frozen_start_case_adapter_hidden_dim = int(
+            self.first_hit_head_hidden_dim
+            if first_hit_frozen_start_case_adapter_hidden_dim is None
+            else first_hit_frozen_start_case_adapter_hidden_dim
         )
         self.first_hit_start_tree_graph_detach = bool(
             first_hit_start_tree_graph_detach
@@ -737,10 +754,25 @@ class TreeDenoiserTokenGT(nn.Module):
                     f"first_hit_head_num_cases={self.first_hit_head_num_cases}"
                 )
             self.first_hit_head_num_cases = int(frozen_table.shape[0])
-            if int(frozen_table.shape[1]) != self.first_hit_head_case_dim:
+            frozen_dim = int(frozen_table.shape[1])
+            if self.first_hit_frozen_start_case_adapter_mode == "mlp2":
                 self.first_hit_frozen_start_case_proj = nn.Sequential(
-                    nn.LayerNorm(int(frozen_table.shape[1])),
-                    nn.Linear(int(frozen_table.shape[1]), self.first_hit_head_case_dim),
+                    nn.LayerNorm(frozen_dim),
+                    nn.Linear(
+                        frozen_dim,
+                        self.first_hit_frozen_start_case_adapter_hidden_dim,
+                    ),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(
+                        self.first_hit_frozen_start_case_adapter_hidden_dim,
+                        self.first_hit_head_case_dim,
+                    ),
+                )
+            elif frozen_dim != self.first_hit_head_case_dim:
+                self.first_hit_frozen_start_case_proj = nn.Sequential(
+                    nn.LayerNorm(frozen_dim),
+                    nn.Linear(frozen_dim, self.first_hit_head_case_dim),
                 )
             self.register_buffer(
                 "first_hit_frozen_start_case_embedding",
@@ -906,6 +938,19 @@ class TreeDenoiserTokenGT(nn.Module):
         self.autoregressive_frozen_start_case_embedding_path = (
             autoregressive_frozen_start_case_embedding_path
         )
+        self.autoregressive_frozen_start_case_adapter_mode = str(
+            autoregressive_frozen_start_case_adapter_mode
+        )
+        if self.autoregressive_frozen_start_case_adapter_mode not in {"linear", "mlp2"}:
+            raise ValueError(
+                "autoregressive_frozen_start_case_adapter_mode must be one of "
+                "['linear', 'mlp2']"
+            )
+        self.autoregressive_frozen_start_case_adapter_hidden_dim = int(
+            2 * embed_dim
+            if autoregressive_frozen_start_case_adapter_hidden_dim is None
+            else autoregressive_frozen_start_case_adapter_hidden_dim
+        )
         self.autoregressive_case_embedding = None
         self.autoregressive_case_proj = None
         self.autoregressive_start_topology_adapter = None
@@ -977,10 +1022,25 @@ class TreeDenoiserTokenGT(nn.Module):
                 self.autoregressive_start_topology_conditioning_mode
                 == "frozen_case_probe_additive"
             ):
-                self.autoregressive_frozen_start_case_proj = nn.Sequential(
-                    nn.LayerNorm(self.autoregressive_start_topology_code_dim),
-                    nn.Linear(self.autoregressive_start_topology_code_dim, embed_dim),
-                )
+                if self.autoregressive_frozen_start_case_adapter_mode == "mlp2":
+                    self.autoregressive_frozen_start_case_proj = nn.Sequential(
+                        nn.LayerNorm(self.autoregressive_start_topology_code_dim),
+                        nn.Linear(
+                            self.autoregressive_start_topology_code_dim,
+                            self.autoregressive_frozen_start_case_adapter_hidden_dim,
+                        ),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(
+                            self.autoregressive_frozen_start_case_adapter_hidden_dim,
+                            embed_dim,
+                        ),
+                    )
+                else:
+                    self.autoregressive_frozen_start_case_proj = nn.Sequential(
+                        nn.LayerNorm(self.autoregressive_start_topology_code_dim),
+                        nn.Linear(self.autoregressive_start_topology_code_dim, embed_dim),
+                    )
             self.register_buffer(
                 "autoregressive_frozen_start_case_embedding",
                 frozen_table,
@@ -2743,6 +2803,12 @@ def return_model(config):
         autoregressive_frozen_start_case_embedding_path=config["model"].get(
             "autoregressive_frozen_start_case_embedding_path"
         ),
+        autoregressive_frozen_start_case_adapter_mode=config["model"].get(
+            "autoregressive_frozen_start_case_adapter_mode", "linear"
+        ),
+        autoregressive_frozen_start_case_adapter_hidden_dim=config["model"].get(
+            "autoregressive_frozen_start_case_adapter_hidden_dim"
+        ),
         first_hit_head_use_phase_input=config["model"].get(
             "first_hit_head_use_phase_input", False
         ),
@@ -2762,6 +2828,12 @@ def return_model(config):
         first_hit_head_case_dim=config["model"].get("first_hit_head_case_dim", 16),
         first_hit_frozen_start_case_embedding_path=config["model"].get(
             "first_hit_frozen_start_case_embedding_path"
+        ),
+        first_hit_frozen_start_case_adapter_mode=config["model"].get(
+            "first_hit_frozen_start_case_adapter_mode", "linear"
+        ),
+        first_hit_frozen_start_case_adapter_hidden_dim=config["model"].get(
+            "first_hit_frozen_start_case_adapter_hidden_dim"
         ),
         first_hit_start_tree_graph_detach=config["model"].get(
             "first_hit_start_tree_graph_detach", False

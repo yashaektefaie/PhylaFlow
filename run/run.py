@@ -355,6 +355,9 @@ def _init_wandb_run(config, default_project):
             "training_step_separate_optimizer_steps": trainer_cfg.get(
                 "training_step_separate_optimizer_steps"
             ),
+            "training_step_verbose_logging_enabled": trainer_cfg.get(
+                "training_step_verbose_logging_enabled"
+            ),
             "optimizer_name": trainer_cfg.get("optimizer_name"),
             "autoregressive_use_time": trainer_cfg.get("autoregressive_use_time"),
             "autoregressive_target_mode": trainer_cfg.get(
@@ -508,6 +511,9 @@ def init_worker(config_file, device_id):
         ),
         training_step_separate_optimizer_steps=config["trainer"].get(
             "training_step_separate_optimizer_steps", False
+        ),
+        training_step_verbose_logging_enabled=config["trainer"].get(
+            "training_step_verbose_logging_enabled", False
         ),
         autoregressive_use_time=config["trainer"].get(
             "autoregressive_use_time", False
@@ -697,6 +703,12 @@ def init_worker(config_file, device_id):
         velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
             "velocity_probe_direct_set_positive_reweight_max"
         ),
+        velocity_probe_direct_set_loss_weight=config["trainer"].get(
+            "velocity_probe_direct_set_loss_weight", 1.0
+        ),
+        velocity_probe_direct_set_mse_weight=config["trainer"].get(
+            "velocity_probe_direct_set_mse_weight", 0.0
+        ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
         ),
@@ -712,6 +724,21 @@ def init_worker(config_file, device_id):
         sampling_discrete_phase_max_phases=config["trainer"].get(
             "sampling_discrete_phase_max_phases", 8
         ),
+        sampling_final_orthant_relax_use_at_sampling=config["trainer"].get(
+            "sampling_final_orthant_relax_use_at_sampling", False
+        ),
+        sampling_final_orthant_relax_steps=config["trainer"].get(
+            "sampling_final_orthant_relax_steps", 0
+        ),
+        sampling_final_orthant_relax_total_time=config["trainer"].get(
+            "sampling_final_orthant_relax_total_time", 1.0
+        ),
+        sampling_final_orthant_relax_time_mode=config["trainer"].get(
+            "sampling_final_orthant_relax_time_mode", "local"
+        ),
+        sampling_final_orthant_relax_edge_floor=config["trainer"].get(
+            "sampling_final_orthant_relax_edge_floor"
+        ),
         training_sampling_mode=config["trainer"].get(
             "training_sampling_mode", "batch_compare"
         ),
@@ -725,7 +752,7 @@ def init_worker(config_file, device_id):
             "sampling_max_autoregressive_merges_per_boundary", -1
         ),
         sampling_disable_inner_logging=config["trainer"].get(
-            "sampling_disable_inner_logging", False
+            "sampling_disable_inner_logging", True
         ),
         sampling_only_first_hit_collapse=config["trainer"].get(
             "sampling_only_first_hit_collapse", False
@@ -774,8 +801,92 @@ def init_worker(config_file, device_id):
         ),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
+        sample_metrics_trace_topology_repeats_enabled=config["trainer"].get(
+            "sample_metrics_trace_topology_repeats_enabled", False
+        ),
+        sample_metrics_unseen_start_eval=config["trainer"].get(
+            "sample_metrics_unseen_start_eval", False
+        ),
+        sample_metrics_unseen_start_seed=config["trainer"].get(
+            "sample_metrics_unseen_start_seed", 20260430
+        ),
+        sample_metrics_unseen_start_metric_encoder_path=config["trainer"].get(
+            "sample_metrics_unseen_start_metric_encoder_path"
+        ),
+        sample_metrics_unseen_pair_selection_mode=config["trainer"].get(
+            "sample_metrics_unseen_pair_selection_mode", "random_bank"
+        ),
+        sample_metrics_unseen_start_max_duplicate_tries=config["trainer"].get(
+            "sample_metrics_unseen_start_max_duplicate_tries", 100
+        ),
+        sample_metrics_relaxed_likelihood_enabled=config["trainer"].get(
+            "sample_metrics_relaxed_likelihood_enabled", False
+        ),
+        sample_metrics_branch_relaxer_checkpoint_path=config["trainer"].get(
+            "sample_metrics_branch_relaxer_checkpoint_path"
+        ),
+        sample_metrics_mrbayes20k_enabled=config["trainer"].get(
+            "sample_metrics_mrbayes20k_enabled", False
+        ),
+        sample_metrics_mrbayes20k_num_starts=config["trainer"].get(
+            "sample_metrics_mrbayes20k_num_starts", 64
+        ),
+        sample_metrics_mrbayes20k_ngen=config["trainer"].get(
+            "sample_metrics_mrbayes20k_ngen", 20000
+        ),
+        sample_metrics_mrbayes20k_samplefreq=config["trainer"].get(
+            "sample_metrics_mrbayes20k_samplefreq", 200
+        ),
+        sample_metrics_mrbayes20k_printfreq=config["trainer"].get(
+            "sample_metrics_mrbayes20k_printfreq", 5000
+        ),
+        sample_metrics_mrbayes20k_max_workers=config["trainer"].get(
+            "sample_metrics_mrbayes20k_max_workers", 12
+        ),
+        sample_metrics_mrbayes20k_timeout_sec=config["trainer"].get(
+            "sample_metrics_mrbayes20k_timeout_sec", 1800
+        ),
+        sample_metrics_mrbayes20k_dataset_pickle_path=config["trainer"].get(
+            "sample_metrics_mrbayes20k_dataset_pickle_path"
+        ),
+        sample_metrics_mrbayes20k_golden_root=config["trainer"].get(
+            "sample_metrics_mrbayes20k_golden_root"
+        ),
+        sample_metrics_mrbayes20k_work_root=config["trainer"].get(
+            "sample_metrics_mrbayes20k_work_root",
+            "/tmp/phylaflow_sample_metrics_mrbayes20k",
+        ),
+        sample_metrics_mrbayes20k_output_dir=config["trainer"].get(
+            "sample_metrics_mrbayes20k_output_dir"
+        ),
+        sample_metrics_mrbayes20k_bin=config["trainer"].get(
+            "sample_metrics_mrbayes20k_bin",
+            "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
+        ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
+        branch_relax_head_weight=config["trainer"].get("branch_relax_head_weight", 0.0),
+        branch_relax_head_use_at_sampling=config["trainer"].get(
+            "branch_relax_head_use_at_sampling", False
+        ),
+        branch_relax_start_tree_list_path=config["trainer"].get(
+            "branch_relax_start_tree_list_path"
+        ),
+        branch_relax_target_tree_list_path=config["trainer"].get(
+            "branch_relax_target_tree_list_path"
+        ),
+        branch_relax_detach_trunk=config["trainer"].get(
+            "branch_relax_detach_trunk", True
+        ),
+        branch_relax_batch_size=config["trainer"].get("branch_relax_batch_size", 1),
+        branch_relax_case_dim=config["trainer"].get("branch_relax_case_dim", 64),
+        branch_relax_hidden_dim=config["trainer"].get("branch_relax_hidden_dim", 256),
+        branch_relax_likelihood_dataset_id=config["trainer"].get(
+            "branch_relax_likelihood_dataset_id"
+        ),
+        branch_relax_likelihood_metric_enabled=config["trainer"].get(
+            "branch_relax_likelihood_metric_enabled", False
+        ),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -977,6 +1088,9 @@ def run_test():
         training_step_separate_optimizer_steps=config["trainer"].get(
             "training_step_separate_optimizer_steps", False
         ),
+        training_step_verbose_logging_enabled=config["trainer"].get(
+            "training_step_verbose_logging_enabled", False
+        ),
         autoregressive_use_time=config["trainer"].get(
             "autoregressive_use_time", False
         ),
@@ -1150,6 +1264,12 @@ def run_test():
         velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
             "velocity_probe_direct_set_positive_reweight_max"
         ),
+        velocity_probe_direct_set_loss_weight=config["trainer"].get(
+            "velocity_probe_direct_set_loss_weight", 1.0
+        ),
+        velocity_probe_direct_set_mse_weight=config["trainer"].get(
+            "velocity_probe_direct_set_mse_weight", 0.0
+        ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
         ),
@@ -1165,6 +1285,21 @@ def run_test():
         sampling_discrete_phase_max_phases=config["trainer"].get(
             "sampling_discrete_phase_max_phases", 8
         ),
+        sampling_final_orthant_relax_use_at_sampling=config["trainer"].get(
+            "sampling_final_orthant_relax_use_at_sampling", False
+        ),
+        sampling_final_orthant_relax_steps=config["trainer"].get(
+            "sampling_final_orthant_relax_steps", 0
+        ),
+        sampling_final_orthant_relax_total_time=config["trainer"].get(
+            "sampling_final_orthant_relax_total_time", 1.0
+        ),
+        sampling_final_orthant_relax_time_mode=config["trainer"].get(
+            "sampling_final_orthant_relax_time_mode", "local"
+        ),
+        sampling_final_orthant_relax_edge_floor=config["trainer"].get(
+            "sampling_final_orthant_relax_edge_floor"
+        ),
         training_sampling_mode=config["trainer"].get(
             "training_sampling_mode", "batch_compare"
         ),
@@ -1178,7 +1313,7 @@ def run_test():
             "sampling_max_autoregressive_merges_per_boundary", -1
         ),
         sampling_disable_inner_logging=config["trainer"].get(
-            "sampling_disable_inner_logging", False
+            "sampling_disable_inner_logging", True
         ),
         sampling_only_first_hit_collapse=config["trainer"].get(
             "sampling_only_first_hit_collapse", False
@@ -1227,8 +1362,92 @@ def run_test():
         ),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
+        sample_metrics_trace_topology_repeats_enabled=config["trainer"].get(
+            "sample_metrics_trace_topology_repeats_enabled", False
+        ),
+        sample_metrics_unseen_start_eval=config["trainer"].get(
+            "sample_metrics_unseen_start_eval", False
+        ),
+        sample_metrics_unseen_start_seed=config["trainer"].get(
+            "sample_metrics_unseen_start_seed", 20260430
+        ),
+        sample_metrics_unseen_start_metric_encoder_path=config["trainer"].get(
+            "sample_metrics_unseen_start_metric_encoder_path"
+        ),
+        sample_metrics_unseen_pair_selection_mode=config["trainer"].get(
+            "sample_metrics_unseen_pair_selection_mode", "random_bank"
+        ),
+        sample_metrics_unseen_start_max_duplicate_tries=config["trainer"].get(
+            "sample_metrics_unseen_start_max_duplicate_tries", 100
+        ),
+        sample_metrics_relaxed_likelihood_enabled=config["trainer"].get(
+            "sample_metrics_relaxed_likelihood_enabled", False
+        ),
+        sample_metrics_branch_relaxer_checkpoint_path=config["trainer"].get(
+            "sample_metrics_branch_relaxer_checkpoint_path"
+        ),
+        sample_metrics_mrbayes20k_enabled=config["trainer"].get(
+            "sample_metrics_mrbayes20k_enabled", False
+        ),
+        sample_metrics_mrbayes20k_num_starts=config["trainer"].get(
+            "sample_metrics_mrbayes20k_num_starts", 64
+        ),
+        sample_metrics_mrbayes20k_ngen=config["trainer"].get(
+            "sample_metrics_mrbayes20k_ngen", 20000
+        ),
+        sample_metrics_mrbayes20k_samplefreq=config["trainer"].get(
+            "sample_metrics_mrbayes20k_samplefreq", 200
+        ),
+        sample_metrics_mrbayes20k_printfreq=config["trainer"].get(
+            "sample_metrics_mrbayes20k_printfreq", 5000
+        ),
+        sample_metrics_mrbayes20k_max_workers=config["trainer"].get(
+            "sample_metrics_mrbayes20k_max_workers", 12
+        ),
+        sample_metrics_mrbayes20k_timeout_sec=config["trainer"].get(
+            "sample_metrics_mrbayes20k_timeout_sec", 1800
+        ),
+        sample_metrics_mrbayes20k_dataset_pickle_path=config["trainer"].get(
+            "sample_metrics_mrbayes20k_dataset_pickle_path"
+        ),
+        sample_metrics_mrbayes20k_golden_root=config["trainer"].get(
+            "sample_metrics_mrbayes20k_golden_root"
+        ),
+        sample_metrics_mrbayes20k_work_root=config["trainer"].get(
+            "sample_metrics_mrbayes20k_work_root",
+            "/tmp/phylaflow_sample_metrics_mrbayes20k",
+        ),
+        sample_metrics_mrbayes20k_output_dir=config["trainer"].get(
+            "sample_metrics_mrbayes20k_output_dir"
+        ),
+        sample_metrics_mrbayes20k_bin=config["trainer"].get(
+            "sample_metrics_mrbayes20k_bin",
+            "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
+        ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
+        branch_relax_head_weight=config["trainer"].get("branch_relax_head_weight", 0.0),
+        branch_relax_head_use_at_sampling=config["trainer"].get(
+            "branch_relax_head_use_at_sampling", False
+        ),
+        branch_relax_start_tree_list_path=config["trainer"].get(
+            "branch_relax_start_tree_list_path"
+        ),
+        branch_relax_target_tree_list_path=config["trainer"].get(
+            "branch_relax_target_tree_list_path"
+        ),
+        branch_relax_detach_trunk=config["trainer"].get(
+            "branch_relax_detach_trunk", True
+        ),
+        branch_relax_batch_size=config["trainer"].get("branch_relax_batch_size", 1),
+        branch_relax_case_dim=config["trainer"].get("branch_relax_case_dim", 64),
+        branch_relax_hidden_dim=config["trainer"].get("branch_relax_hidden_dim", 256),
+        branch_relax_likelihood_dataset_id=config["trainer"].get(
+            "branch_relax_likelihood_dataset_id"
+        ),
+        branch_relax_likelihood_metric_enabled=config["trainer"].get(
+            "branch_relax_likelihood_metric_enabled", False
+        ),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -1510,6 +1729,9 @@ def run_overfit():
         training_step_separate_optimizer_steps=config["trainer"].get(
             "training_step_separate_optimizer_steps", False
         ),
+        training_step_verbose_logging_enabled=config["trainer"].get(
+            "training_step_verbose_logging_enabled", False
+        ),
         autoregressive_use_time=config["trainer"].get(
             "autoregressive_use_time", False
         ),
@@ -1683,6 +1905,12 @@ def run_overfit():
         velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
             "velocity_probe_direct_set_positive_reweight_max"
         ),
+        velocity_probe_direct_set_loss_weight=config["trainer"].get(
+            "velocity_probe_direct_set_loss_weight", 1.0
+        ),
+        velocity_probe_direct_set_mse_weight=config["trainer"].get(
+            "velocity_probe_direct_set_mse_weight", 0.0
+        ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
         ),
@@ -1697,6 +1925,21 @@ def run_overfit():
         ),
         sampling_discrete_phase_max_phases=config["trainer"].get(
             "sampling_discrete_phase_max_phases", 8
+        ),
+        sampling_final_orthant_relax_use_at_sampling=config["trainer"].get(
+            "sampling_final_orthant_relax_use_at_sampling", False
+        ),
+        sampling_final_orthant_relax_steps=config["trainer"].get(
+            "sampling_final_orthant_relax_steps", 0
+        ),
+        sampling_final_orthant_relax_total_time=config["trainer"].get(
+            "sampling_final_orthant_relax_total_time", 1.0
+        ),
+        sampling_final_orthant_relax_time_mode=config["trainer"].get(
+            "sampling_final_orthant_relax_time_mode", "local"
+        ),
+        sampling_final_orthant_relax_edge_floor=config["trainer"].get(
+            "sampling_final_orthant_relax_edge_floor"
         ),
         training_sampling_frequency=config["trainer"].get(
             "training_sampling_frequency", 200
@@ -1717,7 +1960,7 @@ def run_overfit():
             "sampling_max_autoregressive_merges_per_boundary", -1
         ),
         sampling_disable_inner_logging=config["trainer"].get(
-            "sampling_disable_inner_logging", False
+            "sampling_disable_inner_logging", True
         ),
         sampling_only_first_hit_collapse=config["trainer"].get(
             "sampling_only_first_hit_collapse", False
@@ -1767,8 +2010,92 @@ def run_overfit():
         dt=config["trainer"].get("dt", 0.1),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
+        sample_metrics_trace_topology_repeats_enabled=config["trainer"].get(
+            "sample_metrics_trace_topology_repeats_enabled", False
+        ),
+        sample_metrics_unseen_start_eval=config["trainer"].get(
+            "sample_metrics_unseen_start_eval", False
+        ),
+        sample_metrics_unseen_start_seed=config["trainer"].get(
+            "sample_metrics_unseen_start_seed", 20260430
+        ),
+        sample_metrics_unseen_start_metric_encoder_path=config["trainer"].get(
+            "sample_metrics_unseen_start_metric_encoder_path"
+        ),
+        sample_metrics_unseen_pair_selection_mode=config["trainer"].get(
+            "sample_metrics_unseen_pair_selection_mode", "random_bank"
+        ),
+        sample_metrics_unseen_start_max_duplicate_tries=config["trainer"].get(
+            "sample_metrics_unseen_start_max_duplicate_tries", 100
+        ),
+        sample_metrics_relaxed_likelihood_enabled=config["trainer"].get(
+            "sample_metrics_relaxed_likelihood_enabled", False
+        ),
+        sample_metrics_branch_relaxer_checkpoint_path=config["trainer"].get(
+            "sample_metrics_branch_relaxer_checkpoint_path"
+        ),
+        sample_metrics_mrbayes20k_enabled=config["trainer"].get(
+            "sample_metrics_mrbayes20k_enabled", False
+        ),
+        sample_metrics_mrbayes20k_num_starts=config["trainer"].get(
+            "sample_metrics_mrbayes20k_num_starts", 64
+        ),
+        sample_metrics_mrbayes20k_ngen=config["trainer"].get(
+            "sample_metrics_mrbayes20k_ngen", 20000
+        ),
+        sample_metrics_mrbayes20k_samplefreq=config["trainer"].get(
+            "sample_metrics_mrbayes20k_samplefreq", 200
+        ),
+        sample_metrics_mrbayes20k_printfreq=config["trainer"].get(
+            "sample_metrics_mrbayes20k_printfreq", 5000
+        ),
+        sample_metrics_mrbayes20k_max_workers=config["trainer"].get(
+            "sample_metrics_mrbayes20k_max_workers", 12
+        ),
+        sample_metrics_mrbayes20k_timeout_sec=config["trainer"].get(
+            "sample_metrics_mrbayes20k_timeout_sec", 1800
+        ),
+        sample_metrics_mrbayes20k_dataset_pickle_path=config["trainer"].get(
+            "sample_metrics_mrbayes20k_dataset_pickle_path"
+        ),
+        sample_metrics_mrbayes20k_golden_root=config["trainer"].get(
+            "sample_metrics_mrbayes20k_golden_root"
+        ),
+        sample_metrics_mrbayes20k_work_root=config["trainer"].get(
+            "sample_metrics_mrbayes20k_work_root",
+            "/tmp/phylaflow_sample_metrics_mrbayes20k",
+        ),
+        sample_metrics_mrbayes20k_output_dir=config["trainer"].get(
+            "sample_metrics_mrbayes20k_output_dir"
+        ),
+        sample_metrics_mrbayes20k_bin=config["trainer"].get(
+            "sample_metrics_mrbayes20k_bin",
+            "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
+        ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
+        branch_relax_head_weight=config["trainer"].get("branch_relax_head_weight", 0.0),
+        branch_relax_head_use_at_sampling=config["trainer"].get(
+            "branch_relax_head_use_at_sampling", False
+        ),
+        branch_relax_start_tree_list_path=config["trainer"].get(
+            "branch_relax_start_tree_list_path"
+        ),
+        branch_relax_target_tree_list_path=config["trainer"].get(
+            "branch_relax_target_tree_list_path"
+        ),
+        branch_relax_detach_trunk=config["trainer"].get(
+            "branch_relax_detach_trunk", True
+        ),
+        branch_relax_batch_size=config["trainer"].get("branch_relax_batch_size", 1),
+        branch_relax_case_dim=config["trainer"].get("branch_relax_case_dim", 64),
+        branch_relax_hidden_dim=config["trainer"].get("branch_relax_hidden_dim", 256),
+        branch_relax_likelihood_dataset_id=config["trainer"].get(
+            "branch_relax_likelihood_dataset_id"
+        ),
+        branch_relax_likelihood_metric_enabled=config["trainer"].get(
+            "branch_relax_likelihood_metric_enabled", False
+        ),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
@@ -1898,12 +2225,25 @@ def run_overfit():
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"Saving checkpoints to: {checkpoint_dir}")
 
-    save_callback = ModelCheckpoint(
-        dirpath=checkpoint_dir,
-        filename="overfit-{epoch:02d}",
-        every_n_epochs=50,
-        save_top_k=-1,
+    checkpoint_every_n_train_steps = int(
+        config["trainer"].get("steps_callback", 0) or 0
     )
+    if checkpoint_every_n_train_steps > 0:
+        save_callback = ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="overfit-{epoch:02d}-step={step:06d}",
+            every_n_train_steps=checkpoint_every_n_train_steps,
+            save_top_k=-1,
+            save_last=True,
+        )
+    else:
+        save_callback = ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="overfit-{epoch:02d}",
+            every_n_epochs=50,
+            save_top_k=-1,
+            save_last=True,
+        )
 
     trainer_args = {}
     if config["trainer"]["record"]:
@@ -2003,6 +2343,9 @@ def main():
         ),
         training_step_separate_optimizer_steps=config["trainer"].get(
             "training_step_separate_optimizer_steps", False
+        ),
+        training_step_verbose_logging_enabled=config["trainer"].get(
+            "training_step_verbose_logging_enabled", False
         ),
         autoregressive_use_time=config["trainer"].get(
             "autoregressive_use_time", False
@@ -2177,6 +2520,12 @@ def main():
         velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
             "velocity_probe_direct_set_positive_reweight_max"
         ),
+        velocity_probe_direct_set_loss_weight=config["trainer"].get(
+            "velocity_probe_direct_set_loss_weight", 1.0
+        ),
+        velocity_probe_direct_set_mse_weight=config["trainer"].get(
+            "velocity_probe_direct_set_mse_weight", 0.0
+        ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
         ),
@@ -2191,6 +2540,21 @@ def main():
         ),
         sampling_discrete_phase_max_phases=config["trainer"].get(
             "sampling_discrete_phase_max_phases", 8
+        ),
+        sampling_final_orthant_relax_use_at_sampling=config["trainer"].get(
+            "sampling_final_orthant_relax_use_at_sampling", False
+        ),
+        sampling_final_orthant_relax_steps=config["trainer"].get(
+            "sampling_final_orthant_relax_steps", 0
+        ),
+        sampling_final_orthant_relax_total_time=config["trainer"].get(
+            "sampling_final_orthant_relax_total_time", 1.0
+        ),
+        sampling_final_orthant_relax_time_mode=config["trainer"].get(
+            "sampling_final_orthant_relax_time_mode", "local"
+        ),
+        sampling_final_orthant_relax_edge_floor=config["trainer"].get(
+            "sampling_final_orthant_relax_edge_floor"
         ),
         training_sampling_frequency=config["trainer"].get(
             "training_sampling_frequency", 200
@@ -2211,7 +2575,7 @@ def main():
             "sampling_max_autoregressive_merges_per_boundary", -1
         ),
         sampling_disable_inner_logging=config["trainer"].get(
-            "sampling_disable_inner_logging", False
+            "sampling_disable_inner_logging", True
         ),
         sampling_only_first_hit_collapse=config["trainer"].get(
             "sampling_only_first_hit_collapse", False
@@ -2261,8 +2625,92 @@ def main():
         dt=config["trainer"].get("dt", 0.1),
         sample_metrics_trace_path=config["trainer"].get("sample_metrics_trace_path"),
         sample_metrics_num_pairs=config["trainer"].get("sample_metrics_num_pairs", 1),
+        sample_metrics_trace_topology_repeats_enabled=config["trainer"].get(
+            "sample_metrics_trace_topology_repeats_enabled", False
+        ),
+        sample_metrics_unseen_start_eval=config["trainer"].get(
+            "sample_metrics_unseen_start_eval", False
+        ),
+        sample_metrics_unseen_start_seed=config["trainer"].get(
+            "sample_metrics_unseen_start_seed", 20260430
+        ),
+        sample_metrics_unseen_start_metric_encoder_path=config["trainer"].get(
+            "sample_metrics_unseen_start_metric_encoder_path"
+        ),
+        sample_metrics_unseen_pair_selection_mode=config["trainer"].get(
+            "sample_metrics_unseen_pair_selection_mode", "random_bank"
+        ),
+        sample_metrics_unseen_start_max_duplicate_tries=config["trainer"].get(
+            "sample_metrics_unseen_start_max_duplicate_tries", 100
+        ),
+        sample_metrics_relaxed_likelihood_enabled=config["trainer"].get(
+            "sample_metrics_relaxed_likelihood_enabled", False
+        ),
+        sample_metrics_branch_relaxer_checkpoint_path=config["trainer"].get(
+            "sample_metrics_branch_relaxer_checkpoint_path"
+        ),
+        sample_metrics_mrbayes20k_enabled=config["trainer"].get(
+            "sample_metrics_mrbayes20k_enabled", False
+        ),
+        sample_metrics_mrbayes20k_num_starts=config["trainer"].get(
+            "sample_metrics_mrbayes20k_num_starts", 64
+        ),
+        sample_metrics_mrbayes20k_ngen=config["trainer"].get(
+            "sample_metrics_mrbayes20k_ngen", 20000
+        ),
+        sample_metrics_mrbayes20k_samplefreq=config["trainer"].get(
+            "sample_metrics_mrbayes20k_samplefreq", 200
+        ),
+        sample_metrics_mrbayes20k_printfreq=config["trainer"].get(
+            "sample_metrics_mrbayes20k_printfreq", 5000
+        ),
+        sample_metrics_mrbayes20k_max_workers=config["trainer"].get(
+            "sample_metrics_mrbayes20k_max_workers", 12
+        ),
+        sample_metrics_mrbayes20k_timeout_sec=config["trainer"].get(
+            "sample_metrics_mrbayes20k_timeout_sec", 1800
+        ),
+        sample_metrics_mrbayes20k_dataset_pickle_path=config["trainer"].get(
+            "sample_metrics_mrbayes20k_dataset_pickle_path"
+        ),
+        sample_metrics_mrbayes20k_golden_root=config["trainer"].get(
+            "sample_metrics_mrbayes20k_golden_root"
+        ),
+        sample_metrics_mrbayes20k_work_root=config["trainer"].get(
+            "sample_metrics_mrbayes20k_work_root",
+            "/tmp/phylaflow_sample_metrics_mrbayes20k",
+        ),
+        sample_metrics_mrbayes20k_output_dir=config["trainer"].get(
+            "sample_metrics_mrbayes20k_output_dir"
+        ),
+        sample_metrics_mrbayes20k_bin=config["trainer"].get(
+            "sample_metrics_mrbayes20k_bin",
+            "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
+        ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
+        branch_relax_head_weight=config["trainer"].get("branch_relax_head_weight", 0.0),
+        branch_relax_head_use_at_sampling=config["trainer"].get(
+            "branch_relax_head_use_at_sampling", False
+        ),
+        branch_relax_start_tree_list_path=config["trainer"].get(
+            "branch_relax_start_tree_list_path"
+        ),
+        branch_relax_target_tree_list_path=config["trainer"].get(
+            "branch_relax_target_tree_list_path"
+        ),
+        branch_relax_detach_trunk=config["trainer"].get(
+            "branch_relax_detach_trunk", True
+        ),
+        branch_relax_batch_size=config["trainer"].get("branch_relax_batch_size", 1),
+        branch_relax_case_dim=config["trainer"].get("branch_relax_case_dim", 64),
+        branch_relax_hidden_dim=config["trainer"].get("branch_relax_hidden_dim", 256),
+        branch_relax_likelihood_dataset_id=config["trainer"].get(
+            "branch_relax_likelihood_dataset_id"
+        ),
+        branch_relax_likelihood_metric_enabled=config["trainer"].get(
+            "branch_relax_likelihood_metric_enabled", False
+        ),
         rollout_replay_velocity_weight=config["trainer"].get(
             "rollout_replay_velocity_weight", 0.0
         ),
