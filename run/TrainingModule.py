@@ -2037,6 +2037,10 @@ def _structuralize_trees_with_cache(module, trees):
     return structural_trees
 
 
+def _tokenize_trees_with_structural_cache(module, trees):
+    return module.model.tokenizer(_structuralize_trees_with_cache(module, trees))
+
+
 def _build_start_topology_feature_tensor(module, start_trees, *, device=None, dtype=None):
     if not start_trees:
         return None
@@ -3550,7 +3554,7 @@ def _sample_trace_states_uniform(trace_states, max_count, time_key):
     return sampled
 
 
-def _tree_to_model_split_lengths(module, newick):
+def _tree_to_model_split_lengths(module, newick, tokenized=None):
     tree_obj = Tree(newick)
     encoder = BHVEncoder()
     split_masks, split_lengths = encoder.return_BHV_encoding(tree_obj)
@@ -3559,7 +3563,8 @@ def _tree_to_model_split_lengths(module, newick):
         for mask, length in zip(split_masks, split_lengths)
         if length is not None and float(length) > 1e-8
     }
-    tokenized = module.model.tokenizer([newick])
+    if tokenized is None:
+        tokenized = _tokenize_trees_with_structural_cache(module, [newick])
     model_masks = [int(mask) for mask in tokenized[-1][0] if int(mask) != 0]
     biological_bits = max(tree_obj.n_leaves - 1, 0)
     full_model_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
@@ -5302,6 +5307,8 @@ def _discrete_phase_rollout(
     max_steps: int = 1000,
     max_phases: int = 8,
     return_trace: bool = False,
+    trace_state_rf: bool = True,
+    explicit_autoregressive_component_groups: bool = True,
 ):
     current_newick = str(start_tree)
     rollout_case_indices = (
@@ -5375,13 +5382,22 @@ def _discrete_phase_rollout(
         "final_orthant_relax_summary": None,
     }
 
+    def _trace_rf_to_target(tree_newick):
+        if not trace_state_rf:
+            return None
+        return float(calculate_norm_rf(tree_newick, target_tree))
+
     def _terminal_probability_for_state(state_newick, phase_value):
         if not bool(getattr(module, "velocity_terminal_head_use_at_sampling", False)):
             return None
         if module.velocity_terminal_head is None:
             return None
-        _td_term, n_term, _ = _tree_to_model_split_lengths(module, state_newick)
-        tokenized_term = module.model.tokenizer([state_newick])
+        tokenized_term = _tokenize_trees_with_structural_cache(module, [state_newick])
+        _td_term, n_term, _ = _tree_to_model_split_lengths(
+            module,
+            state_newick,
+            tokenized=tokenized_term,
+        )
         with torch.inference_mode():
             (
                 v_term,
@@ -5472,7 +5488,7 @@ def _discrete_phase_rollout(
                 "target_tree": target_tree,
                 "timepoint": float(phase),
                 "phase_idx": int(phase),
-                "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                "rf_to_target": _trace_rf_to_target(current_newick),
                 "pred_terminal_prob": terminal_prob,
                 "position": "phase_start",
                 "stop_after_phase": bool(stop_after_current_phase),
@@ -5483,8 +5499,12 @@ def _discrete_phase_rollout(
         if stop_immediately_for_terminal:
             trace["stopped_for_terminal_head"] = True
             break
-        td, n_leaves, mapping = _tree_to_model_split_lengths(module, current_newick)
-        tokenized = module.model.tokenizer([current_newick])
+        tokenized = _tokenize_trees_with_structural_cache(module, [current_newick])
+        td, n_leaves, mapping = _tree_to_model_split_lengths(
+            module,
+            current_newick,
+            tokenized=tokenized,
+        )
         with torch.inference_mode():
             (
                 velocity,
@@ -5612,7 +5632,7 @@ def _discrete_phase_rollout(
                 "timepoint": float(phase),
                 "phase_idx": int(phase),
                 "num_leaves": int(n_leaves),
-                "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                "rf_to_target": _trace_rf_to_target(current_newick),
                 "predicted_masks": [
                     masks[i]
                     for i, on in enumerate(predicted_first_mask.tolist())
@@ -5629,10 +5649,15 @@ def _discrete_phase_rollout(
             has_polytomy_fast(current_newick, unrooted_ok=False)
             and n_events < effective_max_events
         ):
-            tokenized_trees = module.model.tokenizer([current_newick])
-            component_groups = [
-                get_structural_polytomy_groups_from_newick(current_newick)
-            ]
+            tokenized_trees = _tokenize_trees_with_structural_cache(
+                module,
+                [current_newick],
+            )
+            component_groups = None
+            if explicit_autoregressive_component_groups:
+                component_groups = [
+                    get_structural_polytomy_groups_from_newick(current_newick)
+                ]
             with torch.inference_mode():
                 logit_outputs = module.forward(
                     tokenized_trees,
@@ -5647,7 +5672,11 @@ def _discrete_phase_rollout(
                     autoregressive_case_indices=rollout_case_indices,
                     autoregressive_start_topology_features=rollout_start_topology_features,
                 )
-            td_ar, n_ar, m_ar = _tree_to_model_split_lengths(module, current_newick)
+            td_ar, n_ar, m_ar = _tree_to_model_split_lengths(
+                module,
+                current_newick,
+                tokenized=tokenized_trees,
+            )
             planned_merges = _plan_autoregressive_boundary_merges(
                 logit_outputs,
                 td_ar.keys(),
@@ -5662,7 +5691,7 @@ def _discrete_phase_rollout(
                         "target_tree": target_tree,
                         "time": float(phase),
                         "phase_idx": int(phase),
-                        "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                        "rf_to_target": _trace_rf_to_target(current_newick),
                         "planned_merge_count": 0,
                         "selected_result_split": None,
                     }
@@ -5721,7 +5750,7 @@ def _discrete_phase_rollout(
                     "target_tree": target_tree,
                     "time": float(phase),
                     "phase_idx": int(phase),
-                    "rf_to_target": float(calculate_norm_rf(current_newick, target_tree)),
+                    "rf_to_target": _trace_rf_to_target(current_newick),
                     "planned_merge_count": int(len(planned_merges)),
                     "selected_result_split": int(new_split),
                     "stop_after_merge_logit": stop_after_merge_logit_value,
@@ -5743,9 +5772,7 @@ def _discrete_phase_rollout(
                     "target_tree": target_tree,
                     "timepoint": float(phase),
                     "phase_idx": int(phase),
-                    "rf_to_target": float(
-                        calculate_norm_rf(current_newick, target_tree)
-                    ),
+                    "rf_to_target": _trace_rf_to_target(current_newick),
                     "pred_terminal_prob": post_ar_terminal_prob,
                     "position": "post_ar_merge",
                     "selected_result_split": int(new_split),
@@ -9531,6 +9558,16 @@ class TrainingModule(LightningModule):
                 self.sampling_max_autoregressive_merges_per_boundary
             ),
             "return_trace": True,
+            "trace_state_rf": bool(
+                getattr(self, "sample_metrics_trace_state_rf_enabled", False)
+            ),
+            "explicit_autoregressive_component_groups": bool(
+                getattr(
+                    self,
+                    "sample_metrics_explicit_autoregressive_component_groups_enabled",
+                    True,
+                )
+            ),
             "target_trees": [pair["target_tree"]],
             "split_multi_label_events": split_multi_label_events,
         }
@@ -10922,29 +10959,47 @@ class TrainingModule(LightningModule):
             "source_bank_index": int(pair_index),
         }
 
-    def _sample_metrics_generate_unseen_start(self, dataset_split, target_tree, seen):
-        def _topology_key(tree):
-            try:
-                return canonicalize_topology_newick(str(tree))
-            except Exception:
-                return str(tree)
+    def _sample_metrics_topology_key(self, tree):
+        try:
+            return canonicalize_topology_newick(str(tree))
+        except Exception:
+            return str(tree)
 
-        training_starts = {
-            _topology_key(tree)
-            for tree in getattr(
-                dataset_split, "overfit_fixed_pair_start_tree_newick_bank", []
+    def _sample_metrics_training_start_topology_keys(self, dataset_split):
+        bank = getattr(dataset_split, "overfit_fixed_pair_start_tree_newick_bank", [])
+        cache = getattr(self, "_sample_metrics_training_start_topology_key_cache", None)
+        if cache is None:
+            cache = {}
+            self._sample_metrics_training_start_topology_key_cache = cache
+        cache_key = (id(dataset_split), id(bank), len(bank))
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+        keys = {self._sample_metrics_topology_key(tree) for tree in bank}
+        cache[cache_key] = keys
+        return keys
+
+    def _sample_metrics_generate_unseen_start(
+        self,
+        dataset_split,
+        target_tree,
+        seen,
+        training_starts=None,
+    ):
+        if training_starts is None:
+            training_starts = self._sample_metrics_training_start_topology_keys(
+                dataset_split
             )
-        }
         candidate = None
         for _attempt in range(self.sample_metrics_unseen_start_max_duplicate_tries):
             candidate = str(dataset_split.sample_random_tree(str(target_tree)))
-            candidate_key = _topology_key(candidate)
+            candidate_key = self._sample_metrics_topology_key(candidate)
             if candidate_key not in seen and candidate_key not in training_starts:
                 seen.add(candidate_key)
                 return candidate
         if candidate is None:
             candidate = str(dataset_split.sample_random_tree(str(target_tree)))
-        seen.add(_topology_key(candidate))
+        seen.add(self._sample_metrics_topology_key(candidate))
         return candidate
 
     def _sample_metrics_unseen_bank_pairs(self, dataset_split, train=True):
@@ -10963,6 +11018,9 @@ class TrainingModule(LightningModule):
         )
         pairs = []
         seen_starts = set()
+        training_start_keys = self._sample_metrics_training_start_topology_keys(
+            dataset_split
+        )
         try:
             random.seed(seed)
             for eval_index, source_index in enumerate(indices):
@@ -10972,6 +11030,7 @@ class TrainingModule(LightningModule):
                     dataset_split,
                     pair["target_tree"],
                     seen_starts,
+                    training_start_keys,
                 )
                 pair["original_start_tree"] = original_start_tree
                 pair["start_tree"] = unseen_start_tree
@@ -14481,6 +14540,8 @@ class TrainingModule(LightningModule):
         oracle_first_hit_use_at_sampling: bool = False,
         oracle_gate_first_hit_use_at_sampling: bool = False,
         oracle_boundary_vanish_use_at_sampling: bool = False,
+        trace_state_rf: bool = True,
+        explicit_autoregressive_component_groups: bool = True,
     ):
         if self.use_historical_sampling_impl:
             return _call_historical_trainingmodule_method(
@@ -14520,6 +14581,10 @@ class TrainingModule(LightningModule):
                 oracle_first_hit_use_at_sampling=oracle_first_hit_use_at_sampling,
                 oracle_gate_first_hit_use_at_sampling=oracle_gate_first_hit_use_at_sampling,
                 oracle_boundary_vanish_use_at_sampling=oracle_boundary_vanish_use_at_sampling,
+                trace_state_rf=trace_state_rf,
+                explicit_autoregressive_component_groups=(
+                    explicit_autoregressive_component_groups
+                ),
             )
         shared_start_topology_features = first_hit_start_topology_features
         if shared_start_topology_features is None:
@@ -14550,6 +14615,10 @@ class TrainingModule(LightningModule):
                     getattr(self, "sampling_discrete_phase_max_phases", 8)
                 ),
                 return_trace=return_trace,
+                trace_state_rf=bool(trace_state_rf),
+                explicit_autoregressive_component_groups=bool(
+                    explicit_autoregressive_component_groups
+                ),
             )
             result = (
                 [out["final_tree"]],

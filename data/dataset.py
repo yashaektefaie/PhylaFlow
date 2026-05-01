@@ -513,6 +513,10 @@ class TreeDataset(Dataset):
         self._cached_overfit_pair_banks: Dict[int, List[Dict[str, Any]]] = {}
         self._cached_overfit_bank_pairs_by_key: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._cached_overfit_bank_selection_by_virtual_index: Dict[int, Dict[str, Any]] = {}
+        self._cached_full_path_control_samples_by_key: Dict[
+            Tuple[Any, ...],
+            Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]],
+        ] = {}
         self._frozen_full_path_control_selections: List[Dict[str, Any]] = []
         self._cached_posterior_trees_by_key: Dict[Tuple[Any, ...], List[str]] = {}
         self.random_tree = None
@@ -690,6 +694,7 @@ class TreeDataset(Dataset):
         self._cached_overfit_pair_banks.clear()
         self._cached_overfit_bank_pairs_by_key.clear()
         self._cached_overfit_bank_selection_by_virtual_index.clear()
+        self._cached_full_path_control_samples_by_key.clear()
         return list(self.overfit_fixed_pair_start_tree_newick_bank)
 
     def _normalize_target_tree_bank(self, target_tree_bank: List[Any]) -> List[Dict[str, Any]]:
@@ -714,6 +719,7 @@ class TreeDataset(Dataset):
         self._cached_overfit_pair_banks.clear()
         self._cached_overfit_bank_pairs_by_key.clear()
         self._cached_overfit_bank_selection_by_virtual_index.clear()
+        self._cached_full_path_control_samples_by_key.clear()
         return list(self.overfit_fixed_pair_target_tree_newick_bank)
 
     def _oracle_prefix_candidates(
@@ -825,6 +831,7 @@ class TreeDataset(Dataset):
         self._cached_overfit_pair_banks.clear()
         self._cached_overfit_bank_pairs_by_key.clear()
         self._cached_overfit_bank_selection_by_virtual_index.clear()
+        self._cached_full_path_control_samples_by_key.clear()
         for index, selection in enumerate(selections):
             self._cached_overfit_bank_selection_by_virtual_index[int(index)] = dict(
                 selection
@@ -966,6 +973,52 @@ class TreeDataset(Dataset):
 
         return samples
 
+    @staticmethod
+    def _clone_full_path_control_sample_groups(
+        groups: Tuple[
+            List[Dict[str, Any]],
+            List[Dict[str, Any]],
+            List[Dict[str, Any]],
+        ],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        cloned_groups: List[List[Dict[str, Any]]] = []
+        for samples in groups:
+            cloned_samples = []
+            for sample in samples:
+                cloned = dict(sample)
+                velocity = cloned.get("velocity")
+                if isinstance(velocity, dict):
+                    cloned["velocity"] = dict(velocity)
+                labels = cloned.get("labels")
+                if isinstance(labels, list):
+                    cloned["labels"] = [
+                        dict(label) if isinstance(label, dict) else label
+                        for label in labels
+                    ]
+                cloned_samples.append(cloned)
+            cloned_groups.append(cloned_samples)
+        return cloned_groups[0], cloned_groups[1], cloned_groups[2]
+
+    def _full_path_control_samples_cache_key(
+        self,
+        pair: Dict[str, Any],
+        start_tree: str,
+        target_tree: str,
+        boundary_paths: List[Dict[str, Any]],
+    ) -> Tuple[Any, ...]:
+        return (
+            start_tree,
+            target_tree,
+            pair.get("bank_group_key"),
+            len(boundary_paths),
+            self.overfit_velocity_explicit_boundary_label_scale_mode,
+            bool(self.overfit_full_path_control_use_discrete_phase_time),
+            self.overfit_full_path_control_terminal_label_mode,
+            bool(self.overfit_full_path_control_terminal_include_ar_states),
+            bool(self.overfit_full_path_control_terminal_include_target_one_split_off),
+            len(self.overfit_full_path_control_extra_velocity_samples),
+        )
+
     def _build_full_path_control_samples(
         self,
         pair: Dict[str, Any],
@@ -975,6 +1028,15 @@ class TreeDataset(Dataset):
         target_tree = str(pair["effective_target_tree"])
         boundary_paths = list(pair["boundary_paths"])
         pair_group_key = pair.get("bank_group_key")
+        cache_key = self._full_path_control_samples_cache_key(
+            pair,
+            start_tree,
+            target_tree,
+            boundary_paths,
+        )
+        cached = self._cached_full_path_control_samples_by_key.get(cache_key)
+        if cached is not None:
+            return self._clone_full_path_control_sample_groups(cached)
 
         def _attach_pair_group(sample: Dict[str, Any]) -> Dict[str, Any]:
             sample.setdefault("start_tree", start_tree)
@@ -1140,7 +1202,11 @@ class TreeDataset(Dataset):
                 relabeled_sample["bank_group_key"] = str(pair_group_key)
             velocity_samples.append(relabeled_sample)
 
-        return velocity_samples, autoregressive_samples, terminal_samples
+        result = (velocity_samples, autoregressive_samples, terminal_samples)
+        self._cached_full_path_control_samples_by_key[cache_key] = (
+            self._clone_full_path_control_sample_groups(result)
+        )
+        return self._clone_full_path_control_sample_groups(result)
 
     def _random_distribution_sequences(
         self,
