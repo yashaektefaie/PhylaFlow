@@ -3,6 +3,7 @@ import time
 import inspect
 import math
 import json
+import hashlib
 import numbers
 import subprocess
 from collections import Counter
@@ -9679,6 +9680,317 @@ class TrainingModule(LightningModule):
                 continue
         return counts
 
+    def _split_topology_counts(self, trees):
+        counts = Counter()
+        encoder = BHVEncoder()
+        for tree in trees:
+            try:
+                masks, _lengths = encoder.return_BHV_encoding(Tree(str(tree)))
+                counts.update(int(mask) for mask in masks)
+            except Exception:
+                continue
+        return counts
+
+    @staticmethod
+    def _json_counter(counter):
+        return {str(key): int(value) for key, value in Counter(counter).items()}
+
+    @staticmethod
+    def _counter_from_json(value, *, integer_keys=False):
+        counts = Counter()
+        if not isinstance(value, dict):
+            return counts
+        for key, count in value.items():
+            try:
+                parsed_key = int(key) if integer_keys else str(key)
+                counts[parsed_key] = int(count)
+            except Exception:
+                continue
+        return counts
+
+    def _posterior_reference_cache_dir(self):
+        if self.sample_metrics_trace_path:
+            base_dir = os.path.dirname(os.path.abspath(self.sample_metrics_trace_path))
+        elif self.sample_metrics_tree_dump_dir:
+            base_dir = os.path.dirname(os.path.abspath(self.sample_metrics_tree_dump_dir))
+        elif self.sample_metrics_mrbayes20k_output_dir:
+            base_dir = os.path.dirname(
+                os.path.abspath(self.sample_metrics_mrbayes20k_output_dir)
+            )
+        else:
+            base_dir = os.path.abspath("metrics")
+        return os.path.join(base_dir, "posterior_reference_cache")
+
+    def _posterior_reference_cache_path(
+        self,
+        posterior_root,
+        golden_root,
+        dataset_id,
+        trprobs_sample_count,
+    ):
+        payload = json.dumps(
+            {
+                "version": 1,
+                "posterior_root": str(posterior_root),
+                "golden_root": str(golden_root),
+                "dataset_id": str(dataset_id),
+                "trprobs_sample_count": int(trprobs_sample_count),
+            },
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        safe_dataset_id = "".join(
+            ch if ch.isalnum() or ch in {"-", "_"} else "_"
+            for ch in str(dataset_id)
+        )
+        return os.path.join(
+            self._posterior_reference_cache_dir(),
+            f"{safe_dataset_id}_posterior_reference_v1_{digest}.json",
+        )
+
+    def _posterior_reference_bundle_from_payload(self, payload):
+        if not isinstance(payload, dict) or int(payload.get("version", 0)) != 1:
+            return None
+        short_block = dict(payload.get("short") or {})
+        golden_block = dict(payload.get("golden") or {})
+        return {
+            "dataset_id": str(payload.get("dataset_id")),
+            "short_root": payload.get("short_root"),
+            "golden_root": payload.get("golden_root"),
+            "posterior_raw_to_lex": {
+                str(key): str(value)
+                for key, value in dict(
+                    payload.get("posterior_raw_to_lex") or {}
+                ).items()
+            },
+            "numeric_to_lex": {
+                str(key): str(value)
+                for key, value in dict(payload.get("numeric_to_lex") or {}).items()
+            },
+            "num_leaves": int(payload.get("num_leaves", 0)),
+            "short_counts": self._counter_from_json(
+                short_block.get("topology_counts")
+            ),
+            "golden_counts": self._counter_from_json(
+                golden_block.get("topology_counts")
+            ),
+            "short_split_counts": self._counter_from_json(
+                short_block.get("split_counts"),
+                integer_keys=True,
+            ),
+            "golden_split_counts": self._counter_from_json(
+                golden_block.get("split_counts"),
+                integer_keys=True,
+            ),
+            "short_tree_total": int(short_block.get("tree_total", 0)),
+            "golden_tree_total": int(golden_block.get("tree_total", 0)),
+            "short_split_total": int(short_block.get("split_total", 0)),
+            "golden_split_total": int(golden_block.get("split_total", 0)),
+            "cache_path": payload.get("cache_path"),
+        }
+
+    def _posterior_reference_bundle_to_payload(
+        self,
+        bundle,
+        *,
+        posterior_root,
+        golden_root,
+        dataset_id,
+        trprobs_sample_count,
+        cache_path,
+    ):
+        short_split_counts = Counter(bundle.get("short_split_counts") or {})
+        golden_split_counts = Counter(bundle.get("golden_split_counts") or {})
+        return {
+            "version": 1,
+            "dataset_id": str(dataset_id),
+            "short_root": str(posterior_root),
+            "golden_root": str(golden_root) if golden_root else None,
+            "trprobs_sample_count": int(trprobs_sample_count),
+            "num_leaves": int(bundle.get("num_leaves", 0)),
+            "posterior_raw_to_lex": dict(bundle.get("posterior_raw_to_lex") or {}),
+            "numeric_to_lex": dict(bundle.get("numeric_to_lex") or {}),
+            "short": {
+                "tree_total": int(bundle.get("short_tree_total", 0)),
+                "topology_counts": self._json_counter(
+                    bundle.get("short_counts") or {}
+                ),
+                "split_total": int(sum(short_split_counts.values())),
+                "split_counts": self._json_counter(short_split_counts),
+            },
+            "golden": {
+                "tree_total": int(bundle.get("golden_tree_total", 0)),
+                "topology_counts": self._json_counter(
+                    bundle.get("golden_counts") or {}
+                ),
+                "split_total": int(sum(golden_split_counts.values())),
+                "split_counts": self._json_counter(golden_split_counts),
+            },
+            "cache_path": str(cache_path),
+        }
+
+    @staticmethod
+    def _kl_from_topology_counts(
+        posterior_counts,
+        sampled_counts,
+        *,
+        alpha=1e-6,
+    ):
+        posterior_counts = Counter(posterior_counts or {})
+        sampled_counts = Counter(sampled_counts or {})
+        support = set(posterior_counts.keys()).union(sampled_counts.keys())
+        if not support:
+            return {
+                "kl_divergence_tree_topology": 0.0,
+                "n_unique_posterior_topologies": 0.0,
+                "n_unique_sampled_topologies": 0.0,
+                "n_shared_topologies": 0.0,
+                "posterior_topology_support_recall": 1.0,
+            }
+
+        posterior_total = float(sum(posterior_counts.values()))
+        sampled_total = float(sum(sampled_counts.values()))
+        zp = posterior_total + float(alpha) * len(support)
+        zq = sampled_total + float(alpha) * len(support)
+        kl = 0.0
+        for key in support:
+            p = (float(posterior_counts.get(key, 0.0)) + float(alpha)) / zp
+            q = (float(sampled_counts.get(key, 0.0)) + float(alpha)) / zq
+            kl += p * math.log(p / q)
+
+        shared = len(set(posterior_counts.keys()).intersection(sampled_counts.keys()))
+        unique_posterior = len(posterior_counts)
+        return {
+            "kl_divergence_tree_topology": float(kl),
+            "n_unique_posterior_topologies": float(unique_posterior),
+            "n_unique_sampled_topologies": float(len(sampled_counts)),
+            "n_shared_topologies": float(shared),
+            "posterior_topology_support_recall": (
+                float(shared) / float(unique_posterior)
+                if unique_posterior
+                else 1.0
+            ),
+        }
+
+    @staticmethod
+    def _kl_from_split_counts(
+        posterior_split_counts,
+        sampled_split_counts,
+        *,
+        alpha=1e-6,
+    ):
+        posterior_split_counts = Counter(posterior_split_counts or {})
+        sampled_split_counts = Counter(sampled_split_counts or {})
+        posterior_total = float(sum(posterior_split_counts.values()))
+        sampled_total = float(sum(sampled_split_counts.values()))
+        if posterior_total <= 0.0 or sampled_total <= 0.0:
+            return {"kl_divergence_topological": 0.0}
+        posterior_distribution = {
+            key: float(value) / posterior_total
+            for key, value in posterior_split_counts.items()
+        }
+        sampled_distribution = {
+            key: float(value) / sampled_total
+            for key, value in sampled_split_counts.items()
+        }
+        support = set(posterior_distribution.keys()).union(
+            sampled_distribution.keys()
+        )
+        if not support:
+            return {"kl_divergence_topological": 0.0}
+        zp = 1.0 + float(alpha) * len(support)
+        zq = 1.0 + float(alpha) * len(support)
+        kl = 0.0
+        for key in support:
+            p = (posterior_distribution.get(key, 0.0) + float(alpha)) / zp
+            q = (sampled_distribution.get(key, 0.0) + float(alpha)) / zq
+            kl += p * math.log(p / q)
+        return {"kl_divergence_topological": float(kl)}
+
+    @staticmethod
+    def _topk_recall_from_topology_counts(
+        posterior_counts,
+        sampled_counts,
+        top_ks=(1, 5, 10, 20, 50),
+    ):
+        posterior_counts = Counter(posterior_counts or {})
+        sampled_support = set(Counter(sampled_counts or {}).keys())
+        if not posterior_counts:
+            return {}
+        ranked = sorted(
+            posterior_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        posterior_total = float(sum(posterior_counts.values()))
+        metrics = {}
+        for raw_k in top_ks:
+            k = max(1, int(raw_k))
+            top_items = ranked[: min(k, len(ranked))]
+            if not top_items:
+                metrics[f"posterior_topology_recall_at_{k}"] = 1.0
+                metrics[f"posterior_topology_mass_recall_at_{k}"] = 1.0
+                continue
+            hits = [key for key, _ in top_items if key in sampled_support]
+            top_mass = sum(count for _, count in top_items)
+            hit_mass = sum(posterior_counts[key] for key in hits)
+            metrics[f"posterior_topology_recall_at_{k}"] = float(len(hits)) / float(
+                len(top_items)
+            )
+            metrics[f"posterior_topology_mass_recall_at_{k}"] = (
+                float(hit_mass) / float(top_mass) if top_mass > 0 else 1.0
+            )
+        metrics["posterior_topology_sample_support_size"] = float(len(sampled_support))
+        metrics["posterior_topology_posterior_support_size"] = float(
+            len(posterior_counts)
+        )
+        metrics["posterior_topology_total_mass"] = float(posterior_total)
+        return metrics
+
+    def _support_rate_from_topology_counts(self, sampled_counts, support_counts):
+        sampled_counts = Counter(sampled_counts or {})
+        if not sampled_counts:
+            return float("nan")
+        if not support_counts:
+            return 0.0
+        total = float(sum(sampled_counts.values()))
+        if total <= 0.0:
+            return float("nan")
+        support_keys = set(Counter(support_counts).keys())
+        hits = sum(
+            int(count)
+            for key, count in sampled_counts.items()
+            if key in support_keys
+        )
+        return float(hits) / total
+
+    def _sampled_topology_distribution_metrics_from_counts(
+        self,
+        counts,
+        reference_support_size=None,
+    ):
+        counts = Counter(counts or {})
+        total = float(sum(counts.values()))
+        if total <= 0:
+            return {
+                "sampled_topology_unique_count": 0.0,
+                "sampled_topology_mode_mass": float("nan"),
+                "sampled_topology_entropy": float("nan"),
+                "sampled_topology_entropy_normalized": float("nan"),
+            }
+        probs = [float(count) / total for count in counts.values()]
+        entropy = -sum(p * math.log(p) for p in probs if p > 0.0)
+        norm_base = int(reference_support_size or 0)
+        if norm_base <= 1:
+            entropy_normalized = 0.0
+        else:
+            entropy_normalized = float(entropy) / float(math.log(norm_base))
+        return {
+            "sampled_topology_unique_count": float(len(counts)),
+            "sampled_topology_mode_mass": float(max(probs)),
+            "sampled_topology_entropy": float(entropy),
+            "sampled_topology_entropy_normalized": float(entropy_normalized),
+        }
+
     def _support_rate(self, sampled_trees, support_counts):
         if not sampled_trees:
             return float("nan")
@@ -9750,6 +10062,30 @@ class TrainingModule(LightningModule):
         if cache_key in cache:
             return cache[cache_key]
 
+        cache_path = self._posterior_reference_cache_path(
+            posterior_root,
+            golden_root,
+            dataset_id,
+            trprobs_sample_count,
+        )
+        if os.path.exists(cache_path) and os.environ.get(
+            "PHYLAFLOW_POSTERIOR_REFERENCE_CACHE_DISABLE", "0"
+        ) != "1":
+            try:
+                with open(cache_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                bundle = self._posterior_reference_bundle_from_payload(payload)
+                if bundle is not None:
+                    bundle["cache_path"] = cache_path
+                    cache[cache_key] = bundle
+                    return bundle
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load posterior reference cache %s: %s",
+                    cache_path,
+                    exc,
+                )
+
         short_dataset = TreeDataset(
             nexus_root="unused",
             mrbayes_root="unused",
@@ -9789,14 +10125,40 @@ class TrainingModule(LightningModule):
             "dataset_id": str(dataset_id),
             "short_root": str(posterior_root),
             "golden_root": str(golden_root) if golden_root else None,
-            "short_lex": short_lex,
-            "golden_lex": golden_lex,
             "short_counts": self._canonical_tree_topology_counts(short_lex),
             "golden_counts": self._canonical_tree_topology_counts(golden_lex),
+            "short_split_counts": self._split_topology_counts(short_lex),
+            "golden_split_counts": self._split_topology_counts(golden_lex),
+            "short_tree_total": int(len(short_lex)),
+            "golden_tree_total": int(len(golden_lex)),
             "posterior_raw_to_lex": posterior_raw_to_lex,
             "numeric_to_lex": numeric_to_lex,
             "num_leaves": len(EteTree(short_lex[0] if short_lex else golden_lex[0], format=1).get_leaves()),
+            "cache_path": cache_path,
         }
+        bundle["short_split_total"] = int(sum(bundle["short_split_counts"].values()))
+        bundle["golden_split_total"] = int(sum(bundle["golden_split_counts"].values()))
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            payload = self._posterior_reference_bundle_to_payload(
+                bundle,
+                posterior_root=posterior_root,
+                golden_root=golden_root,
+                dataset_id=dataset_id,
+                trprobs_sample_count=trprobs_sample_count,
+                cache_path=cache_path,
+            )
+            tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_path, cache_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to write posterior reference cache %s: %s",
+                cache_path,
+                exc,
+            )
         cache[cache_key] = bundle
         return bundle
 
@@ -9822,57 +10184,46 @@ class TrainingModule(LightningModule):
         ]
 
         metrics = {}
-        short_ref = bundle.get("short_lex") or []
-        golden_ref = bundle.get("golden_lex") or []
-        support_size = len(bundle.get("short_counts") or {}) or len(bundle.get("golden_counts") or {})
+        sampled_counts = self._canonical_tree_topology_counts(remapped_sampled)
+        sampled_split_counts = self._split_topology_counts(remapped_sampled)
+        short_counts = Counter(bundle.get("short_counts") or {})
+        golden_counts = Counter(bundle.get("golden_counts") or {})
+        short_split_counts = Counter(bundle.get("short_split_counts") or {})
+        golden_split_counts = Counter(bundle.get("golden_split_counts") or {})
+        support_size = len(short_counts) or len(golden_counts)
         metrics.update(
-            self._sampled_topology_distribution_metrics(
-                remapped_sampled,
+            self._sampled_topology_distribution_metrics_from_counts(
+                sampled_counts,
                 reference_support_size=support_size,
             )
         )
-        metrics["short_support_rate"] = self._support_rate(
-            remapped_sampled, bundle.get("short_counts") or {}
+        metrics["short_support_rate"] = self._support_rate_from_topology_counts(
+            sampled_counts,
+            short_counts,
         )
-        if golden_ref:
-            metrics["golden_support_rate"] = self._support_rate(
-                remapped_sampled, bundle.get("golden_counts") or {}
+        if golden_counts:
+            metrics["golden_support_rate"] = self._support_rate_from_topology_counts(
+                sampled_counts,
+                golden_counts,
             )
 
-        num_leaves = int(bundle["num_leaves"])
-        if short_ref:
+        if short_counts:
             short_block = {}
+            short_block.update(self._kl_from_split_counts(short_split_counts, sampled_split_counts))
+            short_block.update(self._kl_from_topology_counts(short_counts, sampled_counts))
             short_block.update(
-                kl_divergence_topological_distributions(
-                    short_ref,
-                    remapped_sampled,
-                    num_leaves=num_leaves,
-                )
+                self._topk_recall_from_topology_counts(short_counts, sampled_counts)
             )
-            short_block.update(
-                kl_divergence_tree_topology_distributions(
-                    short_ref,
-                    remapped_sampled,
-                )
-            )
-            short_block.update(topk_posterior_tree_recall(short_ref, remapped_sampled))
             metrics.update(self._prefix_metric_block(short_block, "short"))
-        if golden_ref:
+        if golden_counts:
             golden_block = {}
             golden_block.update(
-                kl_divergence_topological_distributions(
-                    golden_ref,
-                    remapped_sampled,
-                    num_leaves=num_leaves,
-                )
+                self._kl_from_split_counts(golden_split_counts, sampled_split_counts)
             )
+            golden_block.update(self._kl_from_topology_counts(golden_counts, sampled_counts))
             golden_block.update(
-                kl_divergence_tree_topology_distributions(
-                    golden_ref,
-                    remapped_sampled,
-                )
+                self._topk_recall_from_topology_counts(golden_counts, sampled_counts)
             )
-            golden_block.update(topk_posterior_tree_recall(golden_ref, remapped_sampled))
             metrics.update(self._prefix_metric_block(golden_block, "golden"))
         return metrics
 
