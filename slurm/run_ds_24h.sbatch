@@ -80,13 +80,32 @@ fi
 mkdir -p \
   "$SCRATCH_ROOT/checkpoints/full_sanity_fixedpair_20260401" \
   "$SCRATCH_ROOT/metrics/full_sanity_fixedpair_20260401" \
+  "$SCRATCH_ROOT/tmp" \
   "$SCRATCH_ROOT/wandb" \
   "$SCRATCH_ROOT/wandb_cache" \
+  "$SCRATCH_ROOT/wandb_data" \
+  "$SCRATCH_ROOT/wandb_artifacts" \
+  "$SCRATCH_ROOT/wandb_config" \
+  "$SCRATCH_ROOT/cache" \
+  "$SCRATCH_ROOT/torch_home" \
+  "$SCRATCH_ROOT/torch_extensions" \
+  "$SCRATCH_ROOT/mpl_config" \
   "$SCRATCH_ROOT/triton/${SLURM_JOB_ID:-manual}"
 
+export TMPDIR="$SCRATCH_ROOT/tmp"
+export TMP="$TMPDIR"
+export TEMP="$TMPDIR"
 export WANDB_DIR="$SCRATCH_ROOT/wandb"
 export WANDB_CACHE_DIR="$SCRATCH_ROOT/wandb_cache"
+export WANDB_DATA_DIR="$SCRATCH_ROOT/wandb_data"
+export WANDB_ARTIFACT_DIR="$SCRATCH_ROOT/wandb_artifacts"
+export WANDB_CONFIG_DIR="$SCRATCH_ROOT/wandb_config"
+export XDG_CACHE_HOME="$SCRATCH_ROOT/cache"
+export TORCH_HOME="$SCRATCH_ROOT/torch_home"
+export TORCH_EXTENSIONS_DIR="$SCRATCH_ROOT/torch_extensions"
 export TRITON_CACHE_DIR="$SCRATCH_ROOT/triton/${SLURM_JOB_ID:-manual}"
+export MPLCONFIGDIR="$SCRATCH_ROOT/mpl_config"
+export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 
 if command -v module >/dev/null 2>&1; then
@@ -111,6 +130,7 @@ echo "Host: $(hostname)"
 echo "Target: $TARGET"
 echo "Config: $CONFIG_PATH"
 echo "SLURM job: ${SLURM_JOB_ID:-none}"
+echo "TMPDIR: $TMPDIR"
 echo "WANDB_DIR: $WANDB_DIR"
 echo "TRITON_CACHE_DIR: $TRITON_CACHE_DIR"
 echo "Conda env: $CONDA_ENV_NAME"

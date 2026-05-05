@@ -131,6 +131,53 @@ def _configure_torch_runtime():
         torch.backends.cudnn.allow_tf32 = True
 
 
+def _is_orthomam_config(config):
+    data_cfg = config.get("data", {}) or {}
+    trainer_cfg = config.get("trainer", {}) or {}
+    markers = [
+        data_cfg.get("topology_stream_index_jsonl_path"),
+        data_cfg.get("nexus_root"),
+        data_cfg.get("mrbayes_root"),
+        trainer_cfg.get("phyla_precomputed_embeddings_path"),
+    ]
+    if any("phylaflow_datasets" in str(value) for value in markers if value):
+        return True
+    ids = _coerce_config_ids(
+        data_cfg.get("posterior_dataset_ids", data_cfg.get("short_run_dataset_ids"))
+    )
+    ids.extend(
+        _coerce_config_ids(
+            data_cfg.get("posterior_dataset_id", data_cfg.get("short_run_dataset_id"))
+        )
+    )
+    return any("_NT_AL" in dataset_id.upper() for dataset_id in ids)
+
+
+def _is_ds_dataset_wandb_tag(tag):
+    value = str(tag).strip().lower()
+    if value == "project_ds":
+        return True
+    return len(value) > 2 and value.startswith("ds") and value[2].isdigit()
+
+
+def _normalized_wandb_tags(config, raw_tags):
+    tags = [str(tag) for tag in (raw_tags or []) if str(tag).strip()]
+    if not _is_orthomam_config(config):
+        return tags
+
+    normalized = []
+    seen = set()
+    for tag in ["orthomam", *tags]:
+        if _is_ds_dataset_wandb_tag(tag):
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(tag)
+    return normalized
+
+
 def _init_wandb_run(config, default_project):
     trainer_cfg = config.get("trainer", {})
     wandb_kwargs = {
@@ -139,7 +186,7 @@ def _init_wandb_run(config, default_project):
         "group": trainer_cfg.get("wandb_group"),
         "job_type": trainer_cfg.get("wandb_job_type"),
         "notes": trainer_cfg.get("wandb_notes"),
-        "tags": trainer_cfg.get("wandb_tags"),
+        "tags": _normalized_wandb_tags(config, trainer_cfg.get("wandb_tags")),
         "config": {
             "seed": trainer_cfg.get("seed"),
             "epochs": trainer_cfg.get("epochs"),
@@ -688,6 +735,9 @@ def init_worker(config_file, device_id):
         velocity_probe_direct_set_anchor_only=config["trainer"].get(
             "velocity_probe_direct_set_anchor_only", False
         ),
+        velocity_probe_direct_set_include_base_samples=config["trainer"].get(
+            "velocity_probe_direct_set_include_base_samples", False
+        ),
         velocity_probe_direct_set_target_negative_weight=config["trainer"].get(
             "velocity_probe_direct_set_target_negative_weight", 1.0
         ),
@@ -711,6 +761,9 @@ def init_worker(config_file, device_id):
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
+        ),
+        training_step_full_path_replay_initial_retry_attempt=config["trainer"].get(
+            "training_step_full_path_replay_initial_retry_attempt", 0
         ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
@@ -807,6 +860,9 @@ def init_worker(config_file, device_id):
         sample_metrics_unseen_start_eval=config["trainer"].get(
             "sample_metrics_unseen_start_eval", False
         ),
+        sample_metrics_zero_shot_random_start_eval=config["trainer"].get(
+            "sample_metrics_zero_shot_random_start_eval", False
+        ),
         sample_metrics_unseen_start_seed=config["trainer"].get(
             "sample_metrics_unseen_start_seed", 20260430
         ),
@@ -868,6 +924,12 @@ def init_worker(config_file, device_id):
         ),
         sample_metrics_tree_dump_dir=config["trainer"].get(
             "sample_metrics_tree_dump_dir"
+        ),
+        sample_metrics_checkpoint_enabled=config["trainer"].get(
+            "sample_metrics_checkpoint_enabled", True
+        ),
+        sample_metrics_checkpoint_dir=config["trainer"].get(
+            "sample_metrics_checkpoint_dir"
         ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
@@ -1255,6 +1317,9 @@ def run_test():
         velocity_probe_direct_set_anchor_only=config["trainer"].get(
             "velocity_probe_direct_set_anchor_only", False
         ),
+        velocity_probe_direct_set_include_base_samples=config["trainer"].get(
+            "velocity_probe_direct_set_include_base_samples", False
+        ),
         velocity_probe_direct_set_target_negative_weight=config["trainer"].get(
             "velocity_probe_direct_set_target_negative_weight", 1.0
         ),
@@ -1278,6 +1343,9 @@ def run_test():
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
+        ),
+        training_step_full_path_replay_initial_retry_attempt=config["trainer"].get(
+            "training_step_full_path_replay_initial_retry_attempt", 0
         ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
@@ -1374,6 +1442,9 @@ def run_test():
         sample_metrics_unseen_start_eval=config["trainer"].get(
             "sample_metrics_unseen_start_eval", False
         ),
+        sample_metrics_zero_shot_random_start_eval=config["trainer"].get(
+            "sample_metrics_zero_shot_random_start_eval", False
+        ),
         sample_metrics_unseen_start_seed=config["trainer"].get(
             "sample_metrics_unseen_start_seed", 20260430
         ),
@@ -1435,6 +1506,12 @@ def run_test():
         ),
         sample_metrics_tree_dump_dir=config["trainer"].get(
             "sample_metrics_tree_dump_dir"
+        ),
+        sample_metrics_checkpoint_enabled=config["trainer"].get(
+            "sample_metrics_checkpoint_enabled", True
+        ),
+        sample_metrics_checkpoint_dir=config["trainer"].get(
+            "sample_metrics_checkpoint_dir"
         ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
@@ -1902,6 +1979,9 @@ def run_overfit():
         velocity_probe_direct_set_anchor_only=config["trainer"].get(
             "velocity_probe_direct_set_anchor_only", False
         ),
+        velocity_probe_direct_set_include_base_samples=config["trainer"].get(
+            "velocity_probe_direct_set_include_base_samples", False
+        ),
         velocity_probe_direct_set_target_negative_weight=config["trainer"].get(
             "velocity_probe_direct_set_target_negative_weight", 1.0
         ),
@@ -1925,6 +2005,9 @@ def run_overfit():
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
+        ),
+        training_step_full_path_replay_initial_retry_attempt=config["trainer"].get(
+            "training_step_full_path_replay_initial_retry_attempt", 0
         ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
@@ -2028,6 +2111,9 @@ def run_overfit():
         sample_metrics_unseen_start_eval=config["trainer"].get(
             "sample_metrics_unseen_start_eval", False
         ),
+        sample_metrics_zero_shot_random_start_eval=config["trainer"].get(
+            "sample_metrics_zero_shot_random_start_eval", False
+        ),
         sample_metrics_unseen_start_seed=config["trainer"].get(
             "sample_metrics_unseen_start_seed", 20260430
         ),
@@ -2089,6 +2175,12 @@ def run_overfit():
         ),
         sample_metrics_tree_dump_dir=config["trainer"].get(
             "sample_metrics_tree_dump_dir"
+        ),
+        sample_metrics_checkpoint_enabled=config["trainer"].get(
+            "sample_metrics_checkpoint_enabled", True
+        ),
+        sample_metrics_checkpoint_dir=config["trainer"].get(
+            "sample_metrics_checkpoint_dir"
         ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),
@@ -2523,6 +2615,9 @@ def main():
         velocity_probe_direct_set_anchor_only=config["trainer"].get(
             "velocity_probe_direct_set_anchor_only", False
         ),
+        velocity_probe_direct_set_include_base_samples=config["trainer"].get(
+            "velocity_probe_direct_set_include_base_samples", False
+        ),
         velocity_probe_direct_set_target_negative_weight=config["trainer"].get(
             "velocity_probe_direct_set_target_negative_weight", 1.0
         ),
@@ -2546,6 +2641,9 @@ def main():
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
+        ),
+        training_step_full_path_replay_initial_retry_attempt=config["trainer"].get(
+            "training_step_full_path_replay_initial_retry_attempt", 0
         ),
         skip_repeated_no_valid_boundary_use_at_sampling=config["trainer"].get(
             "skip_repeated_no_valid_boundary_use_at_sampling", False
@@ -2649,6 +2747,9 @@ def main():
         sample_metrics_unseen_start_eval=config["trainer"].get(
             "sample_metrics_unseen_start_eval", False
         ),
+        sample_metrics_zero_shot_random_start_eval=config["trainer"].get(
+            "sample_metrics_zero_shot_random_start_eval", False
+        ),
         sample_metrics_unseen_start_seed=config["trainer"].get(
             "sample_metrics_unseen_start_seed", 20260430
         ),
@@ -2710,6 +2811,12 @@ def main():
         ),
         sample_metrics_tree_dump_dir=config["trainer"].get(
             "sample_metrics_tree_dump_dir"
+        ),
+        sample_metrics_checkpoint_enabled=config["trainer"].get(
+            "sample_metrics_checkpoint_enabled", True
+        ),
+        sample_metrics_checkpoint_dir=config["trainer"].get(
+            "sample_metrics_checkpoint_dir"
         ),
         metric_log_exact_keys=config["trainer"].get("metric_log_exact_keys"),
         metric_log_prefixes=config["trainer"].get("metric_log_prefixes"),

@@ -6,7 +6,8 @@ import json
 import hashlib
 import numbers
 import subprocess
-from collections import Counter
+import re
+from collections import Counter, OrderedDict
 import importlib.util
 import functools
 import operator
@@ -2041,6 +2042,36 @@ def _tokenize_trees_with_structural_cache(module, trees):
     return module.model.tokenizer(_structuralize_trees_with_cache(module, trees))
 
 
+def _pair_oracle_velocity_label_map_cache(module):
+    cache = getattr(module, "_pair_oracle_velocity_label_map_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        module._pair_oracle_velocity_label_map_cache = cache
+    return cache
+
+
+def _pair_oracle_velocity_label_map_with_cache(module, start_tree, target_tree):
+    if not start_tree or not target_tree:
+        return {}, 0
+
+    key = (str(start_tree), str(target_tree))
+    cache = _pair_oracle_velocity_label_map_cache(module)
+    cached = cache.get(key)
+    if cached is not None:
+        cache.move_to_end(key)
+        return cached
+
+    value = _build_pair_oracle_orthant_velocity_label_map(
+        str(start_tree),
+        str(target_tree),
+    )
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > 4096:
+        cache.popitem(last=False)
+    return value
+
+
 def _build_start_topology_feature_tensor(module, start_trees, *, device=None, dtype=None):
     if not start_trees:
         return None
@@ -2500,7 +2531,8 @@ def _build_velocity_replay_batch(module, samples):
                 start_sample = all_samples[0]
             target_tree = None if start_sample is None else start_sample.get("target_tree")
             if start_sample is not None and target_tree is not None:
-                canonical_map, _ = _build_pair_oracle_orthant_velocity_label_map(
+                canonical_map, _ = _pair_oracle_velocity_label_map_with_cache(
+                    module,
                     str(start_sample["newick_tree"]),
                     str(target_tree),
                 )
@@ -2565,6 +2597,18 @@ def _build_velocity_replay_batch(module, samples):
             [sample.get("bank_group_key") for sample in samples],
             device=module.device,
         )
+    dataset_ids = [
+        str(sample.get("dataset_id")).upper()
+        if sample.get("dataset_id") is not None
+        else None
+        for sample in samples
+    ]
+    ids = [
+        sample.get("id") or dataset_id or str(idx)
+        for idx, (sample, dataset_id) in enumerate(zip(samples, dataset_ids))
+    ]
+    mappings = [sample.get("num_to_name") for sample in samples]
+    num_leaves = [int(sample["num_leaves"]) for sample in samples]
     return {
         "_is_replay_batch": True,
         "_skip_training_augmentations": True,
@@ -2587,7 +2631,10 @@ def _build_velocity_replay_batch(module, samples):
         "velocity_next_boundary_trees": [
             sample.get("velocity_next_boundary_tree") for sample in samples
         ],
-        "num_leaves": [int(sample["num_leaves"]) for sample in samples],
+        "num_leaves": num_leaves,
+        "ids": ids,
+        "dataset_ids": dataset_ids,
+        "mappings": mappings,
         "_probe_direct_set_targets": probe_direct_set_targets,
         "_probe_direct_set_sample_mask": probe_direct_set_mask,
         "_first_hit_case_indices": first_hit_case_index_tensor,
@@ -2611,6 +2658,21 @@ def _build_terminal_replay_batch(module, samples):
             [sample.get("bank_group_key") for sample in samples],
             device=module.device,
         )
+    dataset_ids = [
+        str(sample.get("dataset_id")).upper()
+        if sample.get("dataset_id") is not None
+        else None
+        for sample in samples
+    ]
+    ids = [
+        sample.get("id") or dataset_id or str(idx)
+        for idx, (sample, dataset_id) in enumerate(zip(samples, dataset_ids))
+    ]
+    mappings = [sample.get("num_to_name") for sample in samples]
+    num_leaves = [
+        int(sample.get("num_leaves", Tree(sample["newick_tree"]).n_leaves))
+        for sample in samples
+    ]
     return {
         "_is_replay_batch": True,
         "_skip_training_augmentations": True,
@@ -2635,6 +2697,10 @@ def _build_terminal_replay_batch(module, samples):
         ],
         "target_trees": [sample.get("target_tree") for sample in samples],
         "bank_group_key": [sample.get("bank_group_key") for sample in samples],
+        "num_leaves": num_leaves,
+        "ids": ids,
+        "dataset_ids": dataset_ids,
+        "mappings": mappings,
         "_first_hit_case_indices": first_hit_case_index_tensor,
     }
 
@@ -2656,6 +2722,21 @@ def _build_autoregressive_replay_batch(module, samples):
             [sample.get("bank_group_key") for sample in samples],
             device=module.device,
         )
+    dataset_ids = [
+        str(sample.get("dataset_id")).upper()
+        if sample.get("dataset_id") is not None
+        else None
+        for sample in samples
+    ]
+    ids = [
+        sample.get("id") or dataset_id or str(idx)
+        for idx, (sample, dataset_id) in enumerate(zip(samples, dataset_ids))
+    ]
+    mappings = [sample.get("num_to_name") for sample in samples]
+    num_leaves = [
+        int(sample.get("num_leaves", Tree(sample["newick"]).n_leaves))
+        for sample in samples
+    ]
     return {
         "_is_replay_batch": True,
         "_skip_training_augmentations": True,
@@ -2679,8 +2760,73 @@ def _build_autoregressive_replay_batch(module, samples):
             device=module.device,
         ),
         "phyla_embeddings": None,
+        "num_leaves": num_leaves,
+        "ids": ids,
+        "dataset_ids": dataset_ids,
+        "mappings": mappings,
         "_autoregressive_case_indices": autoregressive_case_index_tensor,
     }
+
+
+_FULL_PATH_REPLAY_SAMPLE_KEYS = (
+    "full_path_velocity_samples",
+    "full_path_autoregressive_samples",
+    "full_path_terminal_samples",
+)
+
+
+def _clone_full_path_replay_retry_base(batch):
+    if not isinstance(batch, dict):
+        return batch
+    cloned = dict(batch)
+    for key in _FULL_PATH_REPLAY_SAMPLE_KEYS:
+        if key in cloned:
+            cloned[key] = list(cloned.get(key) or [])
+    return cloned
+
+
+def _stable_replay_retry_rng(stepper, retry_attempt, key):
+    payload = f"{int(stepper)}:{int(retry_attempt)}:{str(key)}"
+    seed = int(hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16], 16)
+    return random.Random(seed)
+
+
+def _sample_replay_items_for_retry(items, keep_count, rng):
+    items = list(items or [])
+    if keep_count >= len(items):
+        return items
+    if keep_count <= 0:
+        return []
+    kept_indices = sorted(rng.sample(range(len(items)), int(keep_count)))
+    return [items[idx] for idx in kept_indices]
+
+
+def _subsample_full_path_replay_for_oom_retry(batch, *, stepper, retry_attempt):
+    if not isinstance(batch, dict) or not batch.get("_full_path_control_mode", False):
+        return batch, False, {}
+
+    retry_attempt = max(1, int(retry_attempt))
+    denominator = 2 ** retry_attempt
+    reduced = dict(batch)
+    counts = {}
+    changed = False
+    for key in _FULL_PATH_REPLAY_SAMPLE_KEYS:
+        samples = list(batch.get(key) or [])
+        original_count = len(samples)
+        if original_count <= 1:
+            keep_count = original_count
+            reduced_samples = samples
+        else:
+            keep_count = max(1, original_count // denominator)
+            rng = _stable_replay_retry_rng(stepper, retry_attempt, key)
+            reduced_samples = _sample_replay_items_for_retry(samples, keep_count, rng)
+        reduced[key] = reduced_samples
+        counts[key] = (original_count, len(reduced_samples))
+        changed = changed or len(reduced_samples) < original_count
+
+    reduced["_full_path_replay_subsample_retry_attempt"] = retry_attempt
+    reduced["_full_path_replay_subsample_counts"] = counts
+    return reduced, changed, counts
 def _make_replay_anchor_state(newick_tree, timepoint, target_tree, num_leaves):
     return {
         "newick_tree": str(newick_tree),
@@ -5949,6 +6095,7 @@ class TrainingModule(LightningModule):
         velocity_probe_direct_set_loss_weight: float = 1.0,
         velocity_probe_direct_set_mse_weight: float = 0.0,
         training_step_probe_parity_joint_update: bool = False,
+        training_step_full_path_replay_initial_retry_attempt: int = 0,
         skip_repeated_no_valid_boundary_use_at_sampling: bool = False,
         sampling_discrete_phase_rollout_use_at_sampling: bool = False,
         sampling_discrete_phase_exact_boundary_step_use_at_sampling: bool = False,
@@ -5962,6 +6109,7 @@ class TrainingModule(LightningModule):
         sample_metrics_num_pairs: int = 1,
         sample_metrics_trace_topology_repeats_enabled: bool = False,
         sample_metrics_unseen_start_eval: bool = False,
+        sample_metrics_zero_shot_random_start_eval: bool = False,
         sample_metrics_unseen_start_seed: int = 20260430,
         sample_metrics_unseen_start_metric_encoder_path: str | None = None,
         sample_metrics_unseen_pair_selection_mode: str = "random_bank",
@@ -5982,6 +6130,8 @@ class TrainingModule(LightningModule):
         sample_metrics_mrbayes20k_bin: str = "/opt/conda/envs/phylaflow-mrbayes/bin/mb",
         sample_metrics_tree_dump_enabled: bool = False,
         sample_metrics_tree_dump_dir: str | None = None,
+        sample_metrics_checkpoint_enabled: bool = True,
+        sample_metrics_checkpoint_dir: str | None = None,
         metric_log_exact_keys=None,
         metric_log_prefixes=None,
         branch_relax_head_weight: float = 0.0,
@@ -6126,6 +6276,51 @@ class TrainingModule(LightningModule):
         self.phyla_precomputed_embeddings_path = phyla_precomputed_embeddings_path
         self.phyla_model = None
         self.phyla_precomputed_name_to_embedding = None
+        self.phyla_precomputed_dataset_name_to_embedding = {}
+        self.phyla_precomputed_dataset_id_to_tensor = {}
+        self.phyla_precomputed_dataset_id_allowlist = (
+            self._infer_precomputed_phyla_dataset_ids()
+        )
+
+        phyla_config_path = "configs/sample_eval_config.yaml"
+
+        if self.phyla_checkpoint_path is not None:
+            original_argv = sys.argv
+            sys.argv = ["script", phyla_config_path]
+            try:
+                if not os.path.exists(phyla_config_path):
+                    logging.warning(
+                        f"Phyla configuration file not found at {phyla_config_path}"
+                    )
+
+                load_config, Config, load_model, _ = _load_phyla_runtime()
+                config = load_config(Config)
+                config.trainer.checkpoint_path = self.phyla_checkpoint_path
+                config.eval.device = "cuda" if torch.cuda.is_available() else "cpu"
+                loaded = load_model(config=config, random_model=False)
+                self.phyla_model = loaded["model"]
+                self.phyla_model.eval()
+                if verbose:
+                    logging.info("Phyla model loaded successfully.")
+            except Exception as e:
+                logging.warning(f"Failed to load Phyla model: {e}")
+            finally:
+                sys.argv = original_argv
+
+        if self.phyla_precomputed_embeddings_path is not None:
+            try:
+                self._load_precomputed_phyla_embeddings(
+                    self.phyla_precomputed_embeddings_path
+                )
+                logging.info(
+                    "Loaded precomputed Phyla embeddings from %s",
+                    self.phyla_precomputed_embeddings_path,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load precomputed Phyla embeddings from "
+                    f"{self.phyla_precomputed_embeddings_path}: {e}"
+                ) from e
         self.stepper = 1
 
         if self.optimizer_name not in {"adam", "adamw"}:
@@ -6955,6 +7150,9 @@ class TrainingModule(LightningModule):
         self.training_step_probe_parity_joint_update = bool(
             training_step_probe_parity_joint_update
         )
+        self.training_step_full_path_replay_initial_retry_attempt = max(
+            0, int(training_step_full_path_replay_initial_retry_attempt or 0)
+        )
         self.skip_repeated_no_valid_boundary_use_at_sampling = bool(
             skip_repeated_no_valid_boundary_use_at_sampling
         )
@@ -7022,6 +7220,9 @@ class TrainingModule(LightningModule):
             sample_metrics_trace_topology_repeats_enabled
         )
         self.sample_metrics_unseen_start_eval = bool(sample_metrics_unseen_start_eval)
+        self.sample_metrics_zero_shot_random_start_eval = bool(
+            sample_metrics_zero_shot_random_start_eval
+        )
         self.sample_metrics_unseen_start_seed = int(sample_metrics_unseen_start_seed)
         self.sample_metrics_unseen_start_metric_encoder_path = (
             os.path.abspath(str(sample_metrics_unseen_start_metric_encoder_path))
@@ -7090,6 +7291,15 @@ class TrainingModule(LightningModule):
             if sample_metrics_tree_dump_dir
             else None
         )
+        self.sample_metrics_checkpoint_enabled = bool(
+            sample_metrics_checkpoint_enabled
+        )
+        self.sample_metrics_checkpoint_dir = (
+            os.path.abspath(str(sample_metrics_checkpoint_dir))
+            if sample_metrics_checkpoint_dir
+            else None
+        )
+        self._sample_metrics_checkpoint_steps = set()
         self._sample_metrics_standalone_relaxer_cache = {}
         self._sample_metrics_likelihood_scorer_cache = {}
         self._sample_metrics_metric_encoder_cache = {}
@@ -8252,47 +8462,6 @@ class TrainingModule(LightningModule):
         )
         return self.velocity_terminal_head(terminal_input).reshape(())
 
-        phyla_config_path = "configs/sample_eval_config.yaml"
-
-        if self.phyla_checkpoint_path is not None:
-            original_argv = sys.argv
-            sys.argv = ["script", phyla_config_path]
-            try:
-                if not os.path.exists(phyla_config_path):
-                    logging.warning(
-                        f"Phyla configuration file not found at {phyla_config_path}"
-                    )
-
-                load_config, Config, load_model, _ = _load_phyla_runtime()
-                config = load_config(Config)
-                config.trainer.checkpoint_path = self.phyla_checkpoint_path
-                config.eval.device = "cuda" if torch.cuda.is_available() else "cpu"
-                loaded = load_model(config=config, random_model=False)
-                self.phyla_model = loaded["model"]
-                self.phyla_model.eval()
-                if verbose:
-                    logging.info("Phyla model loaded successfully.")
-            except Exception as e:
-                logging.warning(f"Failed to load Phyla model: {e}")
-            finally:
-                sys.argv = original_argv
-
-        if self.phyla_precomputed_embeddings_path is not None:
-            try:
-                self._load_precomputed_phyla_embeddings(
-                    self.phyla_precomputed_embeddings_path
-                )
-                if verbose:
-                    logging.info(
-                        "Loaded precomputed Phyla embeddings from %s",
-                        self.phyla_precomputed_embeddings_path,
-                    )
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to load precomputed Phyla embeddings from "
-                    f"{self.phyla_precomputed_embeddings_path}: {e}"
-                ) from e
-
     def _effective_autoregressive_time_value(self, time_value):
         if not self.autoregressive_use_time:
             return 0.0
@@ -8904,6 +9073,62 @@ class TrainingModule(LightningModule):
         with open(self.sample_metrics_trace_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
+    def _sample_metrics_checkpoint_output_dir(self):
+        if self.sample_metrics_checkpoint_dir:
+            return self.sample_metrics_checkpoint_dir
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is not None:
+            checkpoint_callback = getattr(trainer, "checkpoint_callback", None)
+            checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+            if checkpoint_dir:
+                return str(checkpoint_dir)
+            for callback in getattr(trainer, "callbacks", []) or []:
+                checkpoint_dir = getattr(callback, "dirpath", None)
+                if checkpoint_dir:
+                    return str(checkpoint_dir)
+
+        if self.sample_metrics_trace_path:
+            return os.path.join(
+                os.path.dirname(os.path.abspath(self.sample_metrics_trace_path)),
+                "sample_metrics_checkpoints",
+            )
+        return os.path.abspath("sample_metrics_checkpoints")
+
+    def _save_sample_metrics_checkpoint(self):
+        if not self.sample_metrics_checkpoint_enabled:
+            return
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is None or not hasattr(trainer, "save_checkpoint"):
+            return
+        if not getattr(trainer, "is_global_zero", True):
+            return
+
+        step = int(self.global_step)
+        if step <= 0 or step in self._sample_metrics_checkpoint_steps:
+            return
+
+        out_dir = self._sample_metrics_checkpoint_output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        step_fragment = f"step={step:06d}"
+        for name in os.listdir(out_dir):
+            if name.endswith(".ckpt") and step_fragment in name:
+                self._sample_metrics_checkpoint_steps.add(step)
+                return
+
+        ckpt_path = os.path.join(
+            out_dir,
+            f"sample-metrics-epoch={int(self.current_epoch)}-step={step:06d}.ckpt",
+        )
+        trainer.save_checkpoint(ckpt_path)
+        self._sample_metrics_checkpoint_steps.add(step)
+        logging.info(
+            "Saved sample-metrics checkpoint at global_step=%s to %s",
+            step,
+            ckpt_path,
+        )
+
     def _sample_metrics_tree_dump_output_dir(self):
         if self.sample_metrics_tree_dump_dir:
             return self.sample_metrics_tree_dump_dir
@@ -8954,6 +9179,11 @@ class TrainingModule(LightningModule):
         step = int(self.global_step)
         stepper = int(self.stepper)
         stamp = f"step{step:08d}_stepper{stepper:08d}_{split}"
+        label = getattr(self, "_sample_metrics_tree_dump_label", None)
+        if label:
+            safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(label)).strip("_")
+            if safe_label:
+                stamp = f"{stamp}_{safe_label}"
         out_dir = self._sample_metrics_tree_dump_output_dir()
         os.makedirs(out_dir, exist_ok=True)
         jsonl_path = os.path.join(out_dir, f"{stamp}_trees.jsonl")
@@ -8969,6 +9199,8 @@ class TrainingModule(LightningModule):
             "timestamp": time.time(),
             "split": split,
         }
+        if label:
+            base_payload["eval_label"] = str(label)
         for index, row in enumerate(rows):
             row = dict(row)
             payload = dict(base_payload)
@@ -9025,7 +9257,7 @@ class TrainingModule(LightningModule):
     def _get_harness_sampling_pair(self, train=True, frozen_start_bank=False):
         cache_key = "train" if train else "val"
 
-        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        dataset_split = self._sample_metrics_dataset_split(train=train)
         use_random_fixed_pair_bank = (
             bool(train)
             and self.sampling_random_fixed_pair_bank_use_at_sampling
@@ -9048,6 +9280,7 @@ class TrainingModule(LightningModule):
                     "start_tree": start_tree,
                     "target_tree": target_tree,
                     "bank_group_key": sampled_pair.get("bank_group_key"),
+                    "dataset_id": sampled_pair.get("dataset_id"),
                     "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                     "max_events": int(len(sampled_pair.get("final_labels", []))),
                     "name_mapping": (
@@ -9061,10 +9294,12 @@ class TrainingModule(LightningModule):
             start_tree = sampled.get("start_tree")
             target_tree = sampled.get("target_tree")
             if start_tree and target_tree:
+                bank_group_key_value = sampled.get("bank_group_key")
                 return {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
                     "bank_group_key": bank_group_key_value,
+                    "dataset_id": sampled.get("dataset_id"),
                     "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                     "max_events": int(sampled.get("fixed_pair_num_events", 1024)),
                     "name_mapping": (
@@ -9096,6 +9331,7 @@ class TrainingModule(LightningModule):
             pair = {
                 "start_tree": start_tree,
                 "target_tree": target_tree,
+                "dataset_id": fixed_pair.get("dataset_id"),
                 "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                 "max_events": int(max_events),
                 "name_mapping": name_mapping,
@@ -9157,7 +9393,7 @@ class TrainingModule(LightningModule):
     def _get_fixed_pair_sampling_details(self, train=True):
         if not hasattr(self, "dataset") or self.dataset is None:
             return None
-        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        dataset_split = self._sample_metrics_dataset_split(train=train)
         if dataset_split is None or not getattr(dataset_split, "overfit_fixed_pair", False):
             return None
         pair = dataset_split.get_overfit_fixed_pair(0)
@@ -9512,6 +9748,7 @@ class TrainingModule(LightningModule):
             mapping=pair.get("name_mapping"),
             num_leaf=pair.get("n_leaves"),
             device=self.device,
+            dataset_id=pair.get("dataset_id"),
         )
         dataset_obj = getattr(self, "dataset", None)
         dataset_split = None
@@ -10075,8 +10312,21 @@ class TrainingModule(LightningModule):
     def _prefix_metric_block(self, metrics, prefix):
         return {f"{prefix}_{key}": value for key, value in metrics.items()}
 
+    def _sample_metrics_dataset_split(self, train=True):
+        if self.dataset is None:
+            return None
+        override_name = (
+            "sample_metrics_dataset_train" if train else "sample_metrics_dataset_val"
+        )
+        override_split = getattr(self.dataset, override_name, None)
+        if override_split is not None:
+            return override_split
+        return self.dataset.dataset_train if train else self.dataset.dataset_val
+
     def _load_posterior_reference_bundle(self, train=True):
-        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        dataset_split = self._sample_metrics_dataset_split(train=train)
+        if dataset_split is None:
+            return None
         posterior_root = getattr(dataset_split, "posterior_trprobs_root", None)
         posterior_ids = list(getattr(dataset_split, "posterior_dataset_ids", []) or [])
         if not posterior_root or len(posterior_ids) != 1:
@@ -10123,24 +10373,41 @@ class TrainingModule(LightningModule):
                     exc,
                 )
 
-        short_dataset = TreeDataset(
-            nexus_root="unused",
-            mrbayes_root="unused",
-            posterior_trprobs_root=str(posterior_root),
-            posterior_dataset_id=str(dataset_id),
-            trprobs_sample_count_per_file=int(trprobs_sample_count),
-        )
-        short_raw = list(short_dataset.return_posterior_trees(str(dataset_id)))
-        golden_raw = []
-        if golden_root and os.path.isdir(str(golden_root)):
-            golden_dataset = TreeDataset(
+        try:
+            short_dataset = TreeDataset(
                 nexus_root="unused",
                 mrbayes_root="unused",
-                posterior_trprobs_root=str(golden_root),
+                posterior_trprobs_root=str(posterior_root),
                 posterior_dataset_id=str(dataset_id),
                 trprobs_sample_count_per_file=int(trprobs_sample_count),
             )
-            golden_raw = list(golden_dataset.return_posterior_trees(str(dataset_id)))
+            short_raw = list(short_dataset.return_posterior_trees(str(dataset_id)))
+        except Exception as exc:
+            logger.warning(
+                "Skipping posterior reference metrics for %s: %s",
+                dataset_id,
+                exc,
+            )
+            cache[cache_key] = None
+            return None
+        golden_raw = []
+        if golden_root and os.path.isdir(str(golden_root)):
+            try:
+                golden_dataset = TreeDataset(
+                    nexus_root="unused",
+                    mrbayes_root="unused",
+                    posterior_trprobs_root=str(golden_root),
+                    posterior_dataset_id=str(dataset_id),
+                    trprobs_sample_count_per_file=int(trprobs_sample_count),
+                )
+                golden_raw = list(golden_dataset.return_posterior_trees(str(dataset_id)))
+            except Exception as exc:
+                logger.warning(
+                    "Skipping golden posterior reference metrics for %s: %s",
+                    dataset_id,
+                    exc,
+                )
+                golden_raw = []
 
         reference_tree = short_raw[0] if short_raw else (golden_raw[0] if golden_raw else None)
         if reference_tree is None:
@@ -10290,7 +10557,9 @@ class TrainingModule(LightningModule):
         bundle = self._load_posterior_reference_bundle(train=train)
         if bundle is not None and bundle.get("dataset_id"):
             return str(bundle["dataset_id"])
-        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        dataset_split = self._sample_metrics_dataset_split(train=train)
+        if dataset_split is None:
+            return None
         posterior_ids = list(getattr(dataset_split, "posterior_dataset_ids", []) or [])
         if len(posterior_ids) == 1:
             return str(posterior_ids[0])
@@ -10319,10 +10588,38 @@ class TrainingModule(LightningModule):
         from types import SimpleNamespace
 
         raw_args = dict(checkpoint.get("args") or {})
+        repo_root = os.getcwd()
+
+        def _localize_repo_path(value):
+            if value is None:
+                return value
+            value = str(value)
+            old_root = "/home/yektefai/PhylaFlow"
+            if value == old_root:
+                return repo_root
+            if value.startswith(old_root + os.sep):
+                return os.path.join(repo_root, value[len(old_root) + 1 :])
+            return value
+
+        def _localize_base_config(value):
+            value = _localize_repo_path(value)
+            if value and not os.path.exists(value):
+                directory, filename = os.path.split(value)
+                if filename.startswith("local_"):
+                    alternate = os.path.join(directory, filename[len("local_") :])
+                    if os.path.exists(alternate):
+                        return alternate
+            return value
+
         return SimpleNamespace(
-            base_config=raw_args.get(
-                "base_config",
-                "/home/yektefai/PhylaFlow/configs/local_ds1_frozenprobe64_fh16_aradd_scale128x4_lr2e3_20260428.yaml",
+            base_config=_localize_base_config(
+                raw_args.get(
+                    "base_config",
+                    os.path.join(
+                        repo_root,
+                        "configs/local_ds1_frozenprobe64_fh16_aradd_scale128x4_lr2e3_20260428.yaml",
+                    ),
+                )
             ),
             embed_dim=int(raw_args.get("embed_dim", 64)),
             n_layers=int(raw_args.get("n_layers", 2)),
@@ -10333,9 +10630,14 @@ class TrainingModule(LightningModule):
             phyla_dim=int(raw_args.get("phyla_dim", 256)),
             phyla_use_leaf_tokens=bool(raw_args.get("phyla_use_leaf_tokens", True)),
             phyla_use_split_tokens=bool(raw_args.get("phyla_use_split_tokens", False)),
-            phyla_embedding_dir=raw_args.get(
-                "phyla_embedding_dir",
-                "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/ds_phyla_embeddings_20260428",
+            phyla_embedding_dir=_localize_repo_path(
+                raw_args.get(
+                    "phyla_embedding_dir",
+                    os.path.join(
+                        repo_root,
+                        "analysis/full_sanity_fixedpair_20260401/ds_phyla_embeddings_20260428",
+                    ),
+                )
             ),
         )
 
@@ -10553,9 +10855,11 @@ class TrainingModule(LightningModule):
                 handle.write(tree if tree.endswith(";") else tree + ";")
                 handle.write("\n")
 
-        benchmark = (
-            "/home/yektefai/PhylaFlow/analysis/full_sanity_fixedpair_20260401/"
-            "benchmark_mrbayes_fixed_start_generic.py"
+        repo_root = os.getcwd()
+        benchmark = os.path.join(
+            repo_root,
+            "analysis/full_sanity_fixedpair_20260401/"
+            "benchmark_mrbayes_fixed_start_generic.py",
         )
         cmd = [
             sys.executable,
@@ -10594,7 +10898,7 @@ class TrainingModule(LightningModule):
             with open(log_path, "w", encoding="utf-8") as log_file:
                 result = subprocess.run(
                     cmd,
-                    cwd="/home/yektefai/PhylaFlow",
+                    cwd=repo_root,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -10933,12 +11237,14 @@ class TrainingModule(LightningModule):
             )
             name_mapping_value = fixed_pair.get("name_mapping")
             bank_group_key_value = fixed_pair.get("bank_group_key")
+            dataset_id_value = fixed_pair.get("dataset_id")
         else:
             start_tree = sampled.get("start_tree")
             target_tree = sampled.get("target_tree")
             max_events_value = int(sampled.get("fixed_pair_num_events", 1024))
             name_mapping_value = sampled.get("name_mapping")
             bank_group_key_value = sampled.get("bank_group_key")
+            dataset_id_value = sampled.get("dataset_id")
 
         mapping = (
             name_mapping_value
@@ -10953,6 +11259,7 @@ class TrainingModule(LightningModule):
             "start_tree": str(start_tree),
             "target_tree": str(target_tree),
             "bank_group_key": bank_group_key_value,
+            "dataset_id": dataset_id_value,
             "n_leaves": len(EteTree(str(start_tree), format=1).get_leaves()),
             "max_events": int(max_events_value),
             "name_mapping": mapping,
@@ -10967,14 +11274,45 @@ class TrainingModule(LightningModule):
 
     def _sample_metrics_training_start_topology_keys(self, dataset_split):
         bank = getattr(dataset_split, "overfit_fixed_pair_start_tree_newick_bank", [])
+        topology_stream_index_path = getattr(
+            dataset_split,
+            "topology_stream_index_jsonl_path",
+            None,
+        )
         cache = getattr(self, "_sample_metrics_training_start_topology_key_cache", None)
         if cache is None:
             cache = {}
             self._sample_metrics_training_start_topology_key_cache = cache
-        cache_key = (id(dataset_split), id(bank), len(bank))
+        try:
+            dataset_len = len(dataset_split)
+        except TypeError:
+            dataset_len = 0
+        cache_key = (
+            id(dataset_split),
+            str(topology_stream_index_path) if topology_stream_index_path else None,
+            int(dataset_len),
+            id(bank),
+            len(bank),
+        )
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
+        if topology_stream_index_path:
+            keys = set()
+            random_state = random.getstate()
+            try:
+                for index in range(int(dataset_len)):
+                    try:
+                        sample = dataset_split[index]
+                    except Exception:
+                        continue
+                    start_tree = sample.get("start_tree") if isinstance(sample, dict) else None
+                    if start_tree:
+                        keys.add(self._sample_metrics_topology_key(start_tree))
+            finally:
+                random.setstate(random_state)
+            cache[cache_key] = keys
+            return keys
         keys = {self._sample_metrics_topology_key(tree) for tree in bank}
         cache[cache_key] = keys
         return keys
@@ -11170,7 +11508,7 @@ class TrainingModule(LightningModule):
             setattr(self.model, name, value)
 
     def _sample_compare_harness_unseen_starts(self, train=True):
-        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        dataset_split = self._sample_metrics_dataset_split(train=train)
         pairs = self._sample_metrics_unseen_bank_pairs(dataset_split, train=train)
         if not pairs:
             return {"num_pairs": 0, "unseen_start_eval": 1.0}
@@ -11228,6 +11566,50 @@ class TrainingModule(LightningModule):
             metrics[f"unseen_start_embedding_{key}"] = float(value)
         return metrics
 
+    def _sample_metrics_should_iterate_dataset_indices(self, dataset_split):
+        return bool(
+            dataset_split is not None
+            and getattr(dataset_split, "topology_stream_index_jsonl_path", None)
+        )
+
+    def _sample_metrics_dataset_index_pairs(self, dataset_split, train=True):
+        num_pairs = max(1, int(getattr(self, "sample_metrics_num_pairs", 1)))
+        bank_size = self._sample_metrics_bank_size(dataset_split)
+        indices = self._sample_metrics_select_bank_indices(
+            bank_size,
+            num_pairs,
+            train=train,
+        )
+        return [
+            self._sample_metrics_build_bank_pair(dataset_split, source_index)
+            for source_index in indices
+        ]
+
+    def _add_zero_shot_random_start_metrics(self, metrics, train=True):
+        if not getattr(self, "sample_metrics_zero_shot_random_start_eval", False):
+            return metrics
+        previous_label = getattr(self, "_sample_metrics_tree_dump_label", None)
+        self._sample_metrics_tree_dump_label = "zero_shot_random_start"
+        try:
+            zero_shot_metrics = self._sample_compare_harness_unseen_starts(
+                train=train
+            )
+        finally:
+            if previous_label is None:
+                try:
+                    delattr(self, "_sample_metrics_tree_dump_label")
+                except AttributeError:
+                    pass
+            else:
+                self._sample_metrics_tree_dump_label = previous_label
+        metrics.update(
+            {
+                f"zero_shot_random_start/{key}": value
+                for key, value in zero_shot_metrics.items()
+            }
+        )
+        return metrics
+
     def sample_compare_harness(self, train=True):
         if self.use_historical_sampling_impl:
             return _call_historical_trainingmodule_method(
@@ -11239,7 +11621,15 @@ class TrainingModule(LightningModule):
             return self._sample_compare_harness_unseen_starts(train=train)
         num_pairs = max(1, int(getattr(self, "sample_metrics_num_pairs", 1)))
         rows = []
-        dataset_split = self.dataset.dataset_train if train else self.dataset.dataset_val
+        dataset_split = self._sample_metrics_dataset_split(train=train)
+        if self._sample_metrics_should_iterate_dataset_indices(dataset_split):
+            for pair in self._sample_metrics_dataset_index_pairs(
+                dataset_split,
+                train=train,
+            ):
+                rows.append(self._sample_compare_harness_once(pair, train=train))
+            metrics = self._summarize_sample_compare_harness_rows(rows, train=train)
+            return self._add_zero_shot_random_start_metrics(metrics, train=train)
         if getattr(dataset_split, "overfit_fixed_pair", False) and int(num_pairs) == 1:
             fixed_pair = self._get_fixed_pair_sampling_details(train=train)
             if fixed_pair is not None:
@@ -11249,6 +11639,7 @@ class TrainingModule(LightningModule):
                         "effective_target_tree", fixed_pair.get("target_tree")
                     ),
                     "bank_group_key": fixed_pair.get("bank_group_key"),
+                    "dataset_id": fixed_pair.get("dataset_id"),
                     "n_leaves": len(
                         EteTree(
                             fixed_pair.get("random_tree", fixed_pair.get("start_tree")),
@@ -11272,7 +11663,7 @@ class TrainingModule(LightningModule):
                 rows.append(self._sample_compare_harness_once(pair, train=train))
                 metrics = self._summarize_sample_compare_harness_rows(rows, train=train)
                 metrics.update(self._evaluate_fixed_pair_path_metrics(train=train))
-                return metrics
+                return self._add_zero_shot_random_start_metrics(metrics, train=train)
         if (
             getattr(dataset_split, "overfit_full_path_control_mode", False)
             and getattr(dataset_split, "_frozen_full_path_control_selections", None)
@@ -11301,16 +11692,19 @@ class TrainingModule(LightningModule):
                     )
                     name_mapping_value = fixed_pair.get("name_mapping")
                     bank_group_key_value = fixed_pair.get("bank_group_key")
+                    dataset_id_value = fixed_pair.get("dataset_id")
                 else:
                     start_tree = sampled.get("start_tree")
                     target_tree = sampled.get("target_tree")
                     max_events_value = int(sampled.get("fixed_pair_num_events", 1024))
                     name_mapping_value = None
                     bank_group_key_value = sampled.get("bank_group_key")
+                    dataset_id_value = sampled.get("dataset_id")
                 pair = {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
                     "bank_group_key": bank_group_key_value,
+                    "dataset_id": dataset_id_value,
                     "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                     "max_events": max_events_value,
                     "name_mapping": (
@@ -11335,7 +11729,7 @@ class TrainingModule(LightningModule):
         metrics = self._summarize_sample_compare_harness_rows(rows, train=train)
         if num_pairs == 1:
             metrics.update(self._evaluate_fixed_pair_path_metrics(train=train))
-        return metrics
+        return self._add_zero_shot_random_start_metrics(metrics, train=train)
 
     def _branch_relax_training_loss(self):
         if (
@@ -12166,7 +12560,98 @@ class TrainingModule(LightningModule):
 
         return embeddings
 
-    def _load_precomputed_phyla_embeddings(self, path):
+    def _infer_precomputed_phyla_dataset_ids(self):
+        dataset_ids = set()
+        data_module = getattr(self, "dataset", None)
+        candidates = []
+        for attr in (
+            "dataset_train",
+            "dataset_val",
+            "dataset_test",
+            "dataset_predict",
+            "sample_metrics_dataset_train",
+            "sample_metrics_dataset_val",
+        ):
+            dataset_obj = getattr(data_module, attr, None)
+            if dataset_obj is not None:
+                candidates.append(dataset_obj)
+        if data_module is not None and not candidates:
+            candidates.append(data_module)
+
+        for dataset_obj in candidates:
+            for meta in getattr(dataset_obj, "_index", []) or []:
+                raw_id = meta.get("dataset_id")
+                if raw_id is None:
+                    raw_id = meta.get("id")
+                if raw_id is not None:
+                    dataset_ids.add(str(raw_id).upper())
+            for raw_id in getattr(dataset_obj, "posterior_dataset_ids", []) or []:
+                if raw_id is not None:
+                    dataset_ids.add(str(raw_id).upper())
+
+        return dataset_ids or None
+
+    def _iter_precomputed_phyla_embedding_paths(self, path):
+        raw_path = str(path)
+        parts = [
+            part
+            for part in raw_path.split(os.pathsep)
+            if part.strip()
+        ]
+        if len(parts) > 1 and not os.path.exists(raw_path):
+            for part in parts:
+                yield from self._iter_precomputed_phyla_embedding_paths(part)
+            return
+
+        if os.path.isdir(raw_path):
+            dataset_ids = getattr(
+                self,
+                "phyla_precomputed_dataset_id_allowlist",
+                None,
+            )
+            suffixes = (
+                "_phyla_beta_embeddings.pt",
+                "_phyla_beta_sitechunk_w256_s256_embeddings.pt",
+            )
+            if dataset_ids:
+                for dataset_id in sorted(dataset_ids):
+                    for suffix in suffixes:
+                        candidate = os.path.join(raw_path, f"{dataset_id}{suffix}")
+                        if os.path.exists(candidate):
+                            yield candidate
+                return
+
+            candidates = []
+            for filename in os.listdir(raw_path):
+                if filename.endswith(suffixes):
+                    candidates.append(os.path.join(raw_path, filename))
+            for candidate in sorted(candidates):
+                yield candidate
+            return
+
+        yield raw_path
+
+    def _register_precomputed_phyla_embeddings(
+        self,
+        sequence_names,
+        tensor,
+        *,
+        dataset_id=None,
+    ):
+        mapping = {
+            str(name): tensor[idx].clone()
+            for idx, name in enumerate(sequence_names)
+        }
+        if self.phyla_precomputed_name_to_embedding is None:
+            self.phyla_precomputed_name_to_embedding = {}
+        if dataset_id is None:
+            self.phyla_precomputed_name_to_embedding.update(mapping)
+            return
+        dataset_key = str(dataset_id).upper()
+        self.phyla_precomputed_dataset_name_to_embedding[dataset_key] = mapping
+        self.phyla_precomputed_dataset_id_to_tensor[dataset_key] = tensor.clone()
+
+    def _load_single_precomputed_phyla_embeddings(self, path):
         payload = torch.load(path, map_location="cpu")
         if not isinstance(payload, dict):
             raise ValueError(
@@ -12212,10 +12697,40 @@ class TrainingModule(LightningModule):
                 f"model phyla_dim {expected_dim}."
             )
 
-        self.phyla_precomputed_name_to_embedding = {
-            str(name): tensor[idx].clone()
-            for idx, name in enumerate(sequence_names)
-        }
+        dataset_id = payload.get("dataset_id")
+        self._register_precomputed_phyla_embeddings(
+            sequence_names,
+            tensor,
+            dataset_id=dataset_id,
+        )
+
+    def _load_precomputed_phyla_embeddings(self, path):
+        loaded = 0
+        for embedding_path in self._iter_precomputed_phyla_embedding_paths(path):
+            if not os.path.exists(str(embedding_path)):
+                raise FileNotFoundError(str(embedding_path))
+            self._load_single_precomputed_phyla_embeddings(embedding_path)
+            loaded += 1
+        if loaded == 0:
+            raise FileNotFoundError(f"No phyla embedding files found under {path!r}")
+        dataset_count = len(
+            getattr(self, "phyla_precomputed_dataset_name_to_embedding", {}) or {}
+        )
+        allowlist = getattr(self, "phyla_precomputed_dataset_id_allowlist", None)
+        if allowlist:
+            logging.info(
+                "Loaded %d precomputed Phyla embedding file(s) for %d dataset bank(s) "
+                "using a %d-ID dataset filter.",
+                loaded,
+                dataset_count,
+                len(allowlist),
+            )
+        else:
+            logging.info(
+                "Loaded %d precomputed Phyla embedding file(s) for %d dataset bank(s).",
+                loaded,
+                dataset_count,
+            )
 
     def _ordered_leaf_names_from_mapping(self, mapping, num_leaf=None):
         if mapping is None:
@@ -12246,8 +12761,18 @@ class TrainingModule(LightningModule):
                 names.append(name)
         return names
 
-    def _lookup_precomputed_phyla_embeddings(self, names, device=None):
-        precomputed = getattr(self, "phyla_precomputed_name_to_embedding", None)
+    def _lookup_precomputed_phyla_embeddings(self, names, device=None, dataset_id=None):
+        if not names:
+            return None
+        precomputed = None
+        if dataset_id is not None:
+            precomputed = getattr(
+                self,
+                "phyla_precomputed_dataset_name_to_embedding",
+                {},
+            ).get(str(dataset_id).upper())
+        if not precomputed:
+            precomputed = getattr(self, "phyla_precomputed_name_to_embedding", None)
         if not precomputed:
             return None
         missing = [
@@ -12256,7 +12781,37 @@ class TrainingModule(LightningModule):
             if str(name) not in precomputed
         ]
         if missing:
-            return None
+            dataset_key = None if dataset_id is None else str(dataset_id).upper()
+            tensor = getattr(
+                self,
+                "phyla_precomputed_dataset_id_to_tensor",
+                {},
+            ).get(dataset_key)
+            if tensor is None:
+                return None
+            try:
+                numeric_names = [int(str(name)) for name in names]
+            except (TypeError, ValueError):
+                return None
+            if not numeric_names:
+                return None
+            min_idx = min(numeric_names)
+            max_idx = max(numeric_names)
+            if min_idx >= 1 and max_idx <= tensor.size(0):
+                embeddings = torch.stack(
+                    [tensor[idx - 1] for idx in numeric_names],
+                    dim=0,
+                )
+            elif min_idx >= 0 and max_idx < tensor.size(0):
+                embeddings = torch.stack(
+                    [tensor[idx] for idx in numeric_names],
+                    dim=0,
+                )
+            else:
+                return None
+            if device is not None:
+                embeddings = embeddings.to(device)
+            return embeddings
         embeddings = torch.stack(
             [
                 precomputed[str(name)]
@@ -12274,13 +12829,18 @@ class TrainingModule(LightningModule):
         mapping=None,
         num_leaf=None,
         device=None,
+        dataset_id=None,
     ):
         names = self._ordered_leaf_names_from_mapping(mapping, num_leaf=num_leaf)
         if names is None and newick_tree is not None:
             names = self._ordered_leaf_names_from_newick(newick_tree)
         if not names:
             return None
-        embeddings = self._lookup_precomputed_phyla_embeddings(names, device=device)
+        embeddings = self._lookup_precomputed_phyla_embeddings(
+            names,
+            device=device,
+            dataset_id=dataset_id,
+        )
         if embeddings is None:
             return None
         return embeddings.unsqueeze(0)
@@ -12600,8 +13160,10 @@ class TrainingModule(LightningModule):
             phyla_embeddings_list = []
             missing_precomputed = False
             for i in range(len(batch["ids"])):
-                mapping = batch["mappings"][i]
-                num_leaf = batch["num_leaves"][i]
+                mapping = batch.get("mappings", [None] * len(batch["ids"]))[i]
+                num_leaf = batch.get("num_leaves", [None] * len(batch["ids"]))[i]
+                dataset_ids = batch.get("dataset_ids") or [None] * len(batch["ids"])
+                dataset_id = dataset_ids[i]
                 ordered_names = self._ordered_leaf_names_from_mapping(
                     mapping,
                     num_leaf=num_leaf,
@@ -12609,6 +13171,7 @@ class TrainingModule(LightningModule):
                 embeddings = self._lookup_precomputed_phyla_embeddings(
                     ordered_names or [],
                     device=self.device,
+                    dataset_id=dataset_id,
                 )
                 if embeddings is None:
                     missing_precomputed = True
@@ -12621,8 +13184,11 @@ class TrainingModule(LightningModule):
             elif self.phyla_model is not None and missing_precomputed:
                 phyla_embeddings_list = []
                 for i in range(len(batch["ids"])):
-                    mapping = batch["mappings"][i]
-                    num_leaf = batch["num_leaves"][i]
+                    mapping = batch.get("mappings", [None] * len(batch["ids"]))[i]
+                    num_leaf = batch.get("num_leaves", [0] * len(batch["ids"]))[i]
+                    if mapping is None:
+                        phyla_embeddings_list = []
+                        break
                     seqs = []
                     names = []
                     for idx in range(num_leaf):
@@ -16503,6 +17069,30 @@ class TrainingModule(LightningModule):
         
         opt = self.optimizers()
         opt.zero_grad()
+        full_path_retry_base_batch = _clone_full_path_replay_retry_base(batch)
+        initial_replay_retry_attempt = int(
+            getattr(self, "training_step_full_path_replay_initial_retry_attempt", 0)
+        )
+        if initial_replay_retry_attempt > 0:
+            (
+                initial_capped_batch,
+                initial_replay_reduced,
+                initial_replay_counts,
+            ) = _subsample_full_path_replay_for_oom_retry(
+                full_path_retry_base_batch,
+                stepper=self.stepper,
+                retry_attempt=initial_replay_retry_attempt,
+            )
+            if initial_replay_reduced:
+                logging.info(
+                    "Initial full-path replay cap %s: %s",
+                    initial_replay_retry_attempt,
+                    initial_replay_counts,
+                )
+                batch = initial_capped_batch
+                full_path_retry_base_batch = _clone_full_path_replay_retry_base(
+                    initial_capped_batch
+                )
 
         if self.deepspeed:
 
@@ -16516,7 +17106,8 @@ class TrainingModule(LightningModule):
                 error_tensor = torch.zeros(1).cuda()
                 if num > 1:
                     self.logger_.log(
-                        f"Batch is too large decreasing max tree size by a factor of 2 and num sequences",
+                        "Batch is too large; subsampling full-path replay items "
+                        "instead of pruning leaves",
                         level=logging.INFO,
                     )
                     if "loss" in locals():
@@ -16529,49 +17120,25 @@ class TrainingModule(LightningModule):
 
                     torch.cuda.empty_cache()
                     torch.distributed.barrier()
-                    index, sub_tree_size, num_subtrees = self.dataset.chosen_tree
-
-                    if sub_tree_size <= 5:
-                        self.logger_.log(
-                            f"We have reached the minimum tree size", level=logging.INFO
+                    retry_attempt = max(1, int(num) - 1)
+                    batch, replay_reduced, replay_counts = (
+                        _subsample_full_path_replay_for_oom_retry(
+                            full_path_retry_base_batch,
+                            stepper=self.stepper,
+                            retry_attempt=retry_attempt,
                         )
-                        num_subtrees = 5
-                        sub_tree_size = 5
-                    elif num_subtrees > 100:
+                    )
+                    self.logger_.log(
+                        f"Full-path replay retry {retry_attempt}: "
+                        f"{replay_counts if replay_counts else 'no replay samples to reduce'}",
+                        level=logging.INFO,
+                    )
+                    if not replay_reduced:
                         self.logger_.log(
-                            f"Number of subtrees way too big {torch.distributed.get_rank()}",
+                            "No full-path replay items were reduced on OOM retry; "
+                            "retrying without leaf pruning.",
                             level=logging.INFO,
                         )
-                        num_subtrees = 50
-                    else:
-                        num_subtrees = int(num_subtrees // 2)
-                        sub_tree_size = int(sub_tree_size // 2)
-
-                        if sub_tree_size < 5:
-                            sub_tree_size = 5
-                        if num_subtrees < 1:
-                            num_subtrees = 1
-
-                    sub_batch = self.dataset.__getitem__(
-                        index, preset_subtree_size=sub_tree_size
-                    )
-                    batch = self.dataset.collate_fn(
-                        [sub_batch], preset_subtree_num=num_subtrees
-                    )
-
-                    # TODO: Run without adaptive batch size speedup
-                    # TODO: Run with adaptive batch size speedup
-                    if num <= 2:
-                        new_max_aa = (
-                            num_subtrees
-                            * sub_tree_size
-                            * self.dataset.return_max_length(self.dataset.name_to_seq)
-                        )
-                        self.logger_.log(
-                            f"Updating the adaptive batch size sampler with this new information of the max aa of {new_max_aa}",
-                            level=logging.INFO,
-                        )
-                        self.dataset.size_detector.update_max_aa(new_max_aa)
 
                     torch.distributed.barrier()
                     self.logger_.log(
@@ -16697,41 +17264,30 @@ class TrainingModule(LightningModule):
                 opt.zero_grad()
                 if num > 0:
                     logging.info(
-                        "Batch is too large decreasing max tree and number of subtrees by a factor of 1.2"
+                        "Batch is too large; subsampling full-path replay items "
+                        "instead of pruning leaves"
                     )
-                    index, sub_tree_size, num_subtrees = self.dataset.chosen_tree
-                    new_sub_tree_size = sub_tree_size
-                    new_num_subtrees = int(num_subtrees // 1.2)
-
-                    if new_num_subtrees == 0:
-                        new_num_subtrees = 1
-                        new_sub_tree_size = int(sub_tree_size // 1.2)
-
-                    if new_sub_tree_size < 5:
-                        new_sub_tree_size = 5
-                        new_num_subtrees = 1
-
-                    if num <= 2:
-                        new_max_aa = (
-                            new_num_subtrees
-                            * new_sub_tree_size
-                            * self.dataset.return_max_length(self.dataset.name_to_seq)
-                        )
-                        logging.info(
-                            f"Updating the adaptive batch size sampler with this new information of the max aa of {new_max_aa}"
-                        )
-                        self.dataset.size_detector.update_max_aa(new_max_aa)
-
                     if num > 10:
                         logging.info("We are spiraling, moving on")
                         return torch.tensor(0)
 
-                    sub_batch = self.dataset.__getitem__(
-                        index, preset_subtree_size=new_sub_tree_size
+                    batch, replay_reduced, replay_counts = (
+                        _subsample_full_path_replay_for_oom_retry(
+                            full_path_retry_base_batch,
+                            stepper=self.stepper,
+                            retry_attempt=num,
+                        )
                     )
-                    batch = self.dataset.collate_fn(
-                        [sub_batch], preset_subtree_num=new_num_subtrees
+                    logging.info(
+                        "Full-path replay retry %s: %s",
+                        num,
+                        replay_counts if replay_counts else "no replay samples to reduce",
                     )
+                    if not replay_reduced:
+                        logging.info(
+                            "No full-path replay items were reduced on OOM retry; "
+                            "retrying without leaf pruning."
+                        )
                     if self.training_step_verbose_logging_enabled:
                         logging.info(
                             f"Memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2} MB"
@@ -17268,6 +17824,7 @@ class TrainingModule(LightningModule):
                         logger=True,
                     )
                 self._append_sample_metrics_trace(metrics)
+                self._save_sample_metrics_checkpoint()
                 self._advance_training_sampling_schedule()
                 if self.record:
                     self._wandb_log_filtered(
