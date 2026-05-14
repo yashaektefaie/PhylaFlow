@@ -106,7 +106,7 @@ trainer:
   rollout_replay_full_continuation_chain: false
   rollout_replay_velocity_use_pair_oracle_orthant_labels: false
   training_sampling_start: 500
-  training_sampling_frequency: 500
+  training_sampling_frequency: 1000
   training_sampling_mode: harness_sanity
   training_sampling_dt_base: 0.02
   sampling_fixed_dt_base: 0.01
@@ -147,7 +147,7 @@ trainer:
   - generalization
   - project_DS
   - '20260430'
-  sample_metrics_num_pairs: 64
+  sample_metrics_num_pairs: 234
   velocity_logtau_all_weight: 0.0
   velocity_first_hit_loss_tol: 0.0001
   velocity_logtau_first_over_weight: 0.0

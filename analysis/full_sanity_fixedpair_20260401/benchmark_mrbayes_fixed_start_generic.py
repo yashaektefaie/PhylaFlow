@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from ete3 import Tree as EteTree
 
-ROOT = Path("/home/yektefai/PhylaFlow")
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

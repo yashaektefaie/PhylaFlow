@@ -379,9 +379,12 @@ class TreeDenoiserTokenGT(nn.Module):
         tokenizer_branch_length_num_buckets=64,
         tokenizer_branch_length_log_min=-8.0,
         tokenizer_branch_length_log_max=1.0,
+        tokenizer_raw_graph_cache_vectorized=False,
         phyla_dim=256,
         phyla_use_leaf_tokens=True,
         phyla_use_split_tokens=True,
+        phyla_leaf_adapter_layers=1,
+        phyla_leaf_adapter_hidden_dim=None,
         phyla_leaf_scale=1.0,
         phyla_split_scale=1.0,
         phyla_use_global_context=False,
@@ -429,6 +432,7 @@ class TreeDenoiserTokenGT(nn.Module):
             branch_length_num_buckets=tokenizer_branch_length_num_buckets,
             branch_length_log_min=tokenizer_branch_length_log_min,
             branch_length_log_max=tokenizer_branch_length_log_max,
+            raw_graph_cache_vectorized=tokenizer_raw_graph_cache_vectorized,
             # concat_features=True,  # Use concatenation of features
         )
         # [graph] token and [null] token
@@ -440,7 +444,25 @@ class TreeDenoiserTokenGT(nn.Module):
         # self.embed_proj = nn.Linear(embed_dim, embed_dim)
 
         # Phyla projection
-        self.phyla_proj = nn.Linear(phyla_dim, embed_dim)
+        self.phyla_dim = int(phyla_dim)
+        self.phyla_leaf_adapter_layers = max(1, int(phyla_leaf_adapter_layers))
+        self.phyla_leaf_adapter_hidden_dim = int(
+            phyla_leaf_adapter_hidden_dim or embed_dim
+        )
+        if self.phyla_leaf_adapter_layers <= 1:
+            self.phyla_proj = nn.Linear(phyla_dim, embed_dim)
+        else:
+            phyla_leaf_layers = [nn.LayerNorm(phyla_dim)]
+            in_dim = phyla_dim
+            for _ in range(self.phyla_leaf_adapter_layers - 1):
+                phyla_leaf_layers.append(
+                    nn.Linear(in_dim, self.phyla_leaf_adapter_hidden_dim)
+                )
+                phyla_leaf_layers.append(nn.GELU())
+                phyla_leaf_layers.append(nn.Dropout(dropout))
+                in_dim = self.phyla_leaf_adapter_hidden_dim
+            phyla_leaf_layers.append(nn.Linear(in_dim, embed_dim))
+            self.phyla_proj = nn.Sequential(*phyla_leaf_layers)
         self.phyla_split_proj = nn.Sequential(
             nn.Linear(2 * phyla_dim, embed_dim),
             nn.GELU(),
@@ -3075,9 +3097,18 @@ def return_model(config):
         tokenizer_branch_length_log_max=config["model"].get(
             "tokenizer_branch_length_log_max", 1.0
         ),
+        tokenizer_raw_graph_cache_vectorized=config["model"].get(
+            "tokenizer_raw_graph_cache_vectorized", False
+        ),
         phyla_dim=config["model"]["phyla_dim"],
         phyla_use_leaf_tokens=config["model"].get("phyla_use_leaf_tokens", True),
         phyla_use_split_tokens=config["model"].get("phyla_use_split_tokens", True),
+        phyla_leaf_adapter_layers=config["model"].get(
+            "phyla_leaf_adapter_layers", 1
+        ),
+        phyla_leaf_adapter_hidden_dim=config["model"].get(
+            "phyla_leaf_adapter_hidden_dim", None
+        ),
         phyla_leaf_scale=config["model"].get("phyla_leaf_scale", 1.0),
         phyla_split_scale=config["model"].get("phyla_split_scale", 1.0),
         phyla_use_global_context=config["model"].get(

@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import json
 import math
+import os
 import pickle
 import random
 import subprocess
@@ -16,9 +17,9 @@ from typing import Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 from ete3 import Tree as EteTree
 
-ROOT = Path("/home/yektefai/PhylaFlow")
+ROOT = Path(__file__).resolve().parents[2]
 ANALYSIS_DIR = ROOT / "analysis/full_sanity_fixedpair_20260401"
-DATA_ROOT = Path("/home/yektefai/30272299")
+DATA_ROOT = Path(os.environ.get("PHYLAFLOW_30272299_ROOT", "/ewsc/yektefai/30272299"))
 GOLDEN_ROOT = DATA_ROOT / "golden_run_data_DS1-8"
 SOURCE_DIR = ANALYSIS_DIR / "ds2_ds3_ds4_ds6_ds7_ds8_checkpoint_samples_20260426"
 SPLIT_DIVERSE_DIR = ANALYSIS_DIR / "splitkl_diverse_mrbayes_100k_20260427"
@@ -36,20 +37,73 @@ from analysis.full_sanity_fixedpair_20260401.benchmark_mrbayes_fixed_start_gener
     _sanitize_start_tree,
     _tree_distribution_metrics_from_counts,
 )
-from analysis.full_sanity_fixedpair_20260401.split_guided_likelihood_mh_experiment import (  # noqa: E402
-    IUPAC_MASKS,
-    _mixture_proposal_log_probs,
-)
-from analysis.full_sanity_fixedpair_20260401.split_guided_local_search_experiment import (  # noqa: E402
-    _leaf_sort_key,
-    _nni_neighbors,
-    _strip_internal_names,
-)
-from analysis.full_sanity_fixedpair_20260401.split_guided_proxy_mh_experiment import (  # noqa: E402
-    _choose_from_log_probs,
-    _split_log_weights,
-    _tree_split_set,
-)
+try:
+    from analysis.full_sanity_fixedpair_20260401.split_guided_likelihood_mh_experiment import (  # noqa: E402
+        IUPAC_MASKS,
+        _mixture_proposal_log_probs,
+    )
+except ModuleNotFoundError:
+    IUPAC_MASKS = {
+        "A": np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        "C": np.asarray([0.0, 1.0, 0.0, 0.0], dtype=np.float64),
+        "G": np.asarray([0.0, 0.0, 1.0, 0.0], dtype=np.float64),
+        "T": np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+        "U": np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+        "?": np.asarray([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+        "-": np.asarray([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+        "N": np.asarray([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+    }
+
+    def _mixture_proposal_log_probs(*_args, **_kwargs):
+        raise RuntimeError(
+            "split_guided_likelihood_mh_experiment.py is unavailable; "
+            "mixture proposal MH is not available in this checkout"
+        )
+try:
+    from analysis.full_sanity_fixedpair_20260401.split_guided_local_search_experiment import (  # noqa: E402
+        _leaf_sort_key,
+        _nni_neighbors,
+        _strip_internal_names,
+    )
+except ModuleNotFoundError:
+    def _leaf_sort_key(value):
+        try:
+            return (0, int(value))
+        except Exception:
+            return (1, str(value))
+
+    def _nni_neighbors(*_args, **_kwargs):
+        raise RuntimeError(
+            "split_guided_local_search_experiment.py is unavailable in this checkout"
+        )
+
+    def _strip_internal_names(tree):
+        for node in tree.traverse():
+            if not node.is_leaf():
+                node.name = ""
+        return tree
+
+try:
+    from analysis.full_sanity_fixedpair_20260401.split_guided_proxy_mh_experiment import (  # noqa: E402
+        _choose_from_log_probs,
+        _split_log_weights,
+        _tree_split_set,
+    )
+except ModuleNotFoundError:
+    def _choose_from_log_probs(*_args, **_kwargs):
+        raise RuntimeError(
+            "split_guided_proxy_mh_experiment.py is unavailable in this checkout"
+        )
+
+    def _split_log_weights(*_args, **_kwargs):
+        raise RuntimeError(
+            "split_guided_proxy_mh_experiment.py is unavailable in this checkout"
+        )
+
+    def _tree_split_set(*_args, **_kwargs):
+        raise RuntimeError(
+            "split_guided_proxy_mh_experiment.py is unavailable in this checkout"
+        )
 from analysis.full_sanity_fixedpair_20260401.split_guided_start_experiment import (  # noqa: E402
     _ensure_semicolon,
     _split_counts,

@@ -22,8 +22,9 @@ import math
 import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import pytorch_lightning as pl
 from utils.bhv_utils import (
     BHVEncoder,
@@ -33,7 +34,7 @@ from utils.bhv_utils import (
     return_tree_boundary_merge_paths,
 )
 import random
-from model.treeTokenizer import TreeFeatureTokenizer
+from model.treeTokenizer import TreeFeatureTokenizer, _worker_newick_parser
 from utils.random_tree import Tree
 from ete3 import Tree as EteTree
 from utils.utils import get_possible_ids, remove_bit
@@ -309,6 +310,75 @@ def _numeric_name_sort_key(name: Any) -> Tuple[int, Any]:
         return (1, name)
 
 
+def _canonicalize_ete_child_order(tree: EteTree) -> None:
+    for node in tree.traverse("postorder"):
+        if node.is_leaf():
+            node.add_feature("sort_val", _numeric_name_sort_key(node.name))
+        else:
+            child_values = [
+                getattr(child, "sort_val", (1, ""))
+                for child in node.children
+            ]
+            node.add_feature(
+                "sort_val",
+                min(child_values) if child_values else (1, ""),
+            )
+    tree.sort_descendants(attr="sort_val")
+
+
+def _normalize_topology_stream_tree_pair(
+    start_obj: EteTree,
+    target_obj: EteTree,
+) -> Tuple[str, str, List[str], Dict[str, str]]:
+    """Put topology-stream start/target trees in the dataset leaf space.
+
+    The BHV wrapper adds a dummy root at the serialized Newick root, so two
+    equivalent unrooted trees can become different supervised problems if their
+    Newick roots differ after pruning.  Normalize both trees to the same sorted
+    leaf order, rename leaves to 0..N-1, and root them on leaf 0 before label
+    generation.
+    """
+    original_leaf_order = [
+        str(leaf.name)
+        for leaf in sorted(
+            target_obj.get_leaves(),
+            key=lambda leaf: _numeric_name_sort_key(leaf.name),
+        )
+    ]
+    start_leaf_names = {str(leaf.name) for leaf in start_obj.get_leaves()}
+    target_leaf_names = {str(leaf.name) for leaf in target_obj.get_leaves()}
+    expected_leaf_names = set(original_leaf_order)
+    if start_leaf_names != expected_leaf_names or target_leaf_names != expected_leaf_names:
+        raise ValueError(
+            "Topology-stream start/target leaf sets differ after pruning. "
+            f"start_only={sorted(start_leaf_names - expected_leaf_names)[:5]}, "
+            f"target_only={sorted(target_leaf_names - start_leaf_names)[:5]}"
+        )
+
+    leaf_to_index = {
+        original_name: str(idx)
+        for idx, original_name in enumerate(original_leaf_order)
+    }
+
+    def _rewrite(tree: EteTree) -> str:
+        for leaf in tree.get_leaves():
+            leaf.name = leaf_to_index[str(leaf.name)]
+        if len(original_leaf_order) > 2:
+            leaves_by_name = {str(leaf.name): leaf for leaf in tree.get_leaves()}
+            outgroup = leaves_by_name.get("0")
+            if outgroup is not None:
+                tree.set_outgroup(outgroup)
+        _canonicalize_ete_child_order(tree)
+        return tree.write(format=1)
+
+    return (
+        _rewrite(start_obj),
+        _rewrite(target_obj),
+        original_leaf_order,
+        leaf_to_index,
+    )
+
+
 def _coerce_id_list(raw_ids: Optional[Any]) -> List[str]:
     if raw_ids is None:
         return []
@@ -397,6 +467,7 @@ class TreeDataset(Dataset):
         overfit_full_path_control_extra_velocity_samples_json_path: Optional[str] = None,
         overfit_full_path_control_extra_velocity_samples_json_paths: Optional[List[str]] = None,
         overfit_full_path_control_extra_velocity_samples_json_paths_by_dataset_id: Optional[Any] = None,
+        full_path_preparse_structural_trees: bool = False,
         overfit_oracle_prefix_start_prob: float = 0.0,
         overfit_oracle_prefix_max_fraction: float = 0.5,
         overfit_fixed_pair_group_by_json_metadata: bool = False,
@@ -405,7 +476,14 @@ class TreeDataset(Dataset):
         overfit_fixed_pair_cache_virtual_index_selection: bool = False,
         topology_stream_index_jsonl_path: Optional[str] = None,
         topology_stream_index_max_cases: int = 0,
+        topology_stream_index_min_num_leaves: int = 0,
         topology_stream_index_max_num_leaves: int = 0,
+        topology_stream_subset_num_leaves: int = 0,
+        posterior_subset_num_leaves: int = 0,
+        posterior_subset_max_input_tokens: int = 0,
+        sample_metrics_iterate_dataset_indices: bool = False,
+        topology_stream_use_real_sequences: bool = False,
+        topology_stream_max_input_tokens: int = 0,
         posterior_trprobs_root: Optional[str] = None,
         posterior_dataset_id: Optional[Any] = None,
         posterior_dataset_ids: Optional[Any] = None,
@@ -431,9 +509,35 @@ class TreeDataset(Dataset):
             0,
             int(topology_stream_index_max_cases or 0),
         )
+        self.topology_stream_index_min_num_leaves = max(
+            0,
+            int(topology_stream_index_min_num_leaves or 0),
+        )
         self.topology_stream_index_max_num_leaves = max(
             0,
             int(topology_stream_index_max_num_leaves or 0),
+        )
+        self.topology_stream_subset_num_leaves = max(
+            0,
+            int(topology_stream_subset_num_leaves or 0),
+        )
+        self.posterior_subset_num_leaves = max(
+            0,
+            int(posterior_subset_num_leaves or 0),
+        )
+        self.posterior_subset_max_input_tokens = max(
+            0,
+            int(posterior_subset_max_input_tokens or 0),
+        )
+        self.sample_metrics_iterate_dataset_indices = bool(
+            sample_metrics_iterate_dataset_indices
+        )
+        self.topology_stream_use_real_sequences = bool(
+            topology_stream_use_real_sequences
+        )
+        self.topology_stream_max_input_tokens = max(
+            0,
+            int(topology_stream_max_input_tokens or 0),
         )
         posterior_ids = _coerce_id_list(posterior_dataset_ids)
         if not posterior_ids:
@@ -442,7 +546,10 @@ class TreeDataset(Dataset):
         self.use_random_sequence_distribution = bool(
             use_random_sequence_distribution
             or self.posterior_trprobs_root
-            or self.topology_stream_index_jsonl_path
+            or (
+                self.topology_stream_index_jsonl_path
+                and not self.topology_stream_use_real_sequences
+            )
         )
         self.random_distribution_sequence_length = max(
             1, int(random_distribution_sequence_length)
@@ -493,6 +600,9 @@ class TreeDataset(Dataset):
         )
         self.overfit_full_path_control_terminal_include_target_one_split_off = bool(
             overfit_full_path_control_terminal_include_target_one_split_off
+        )
+        self.full_path_preparse_structural_trees = bool(
+            full_path_preparse_structural_trees
         )
         self.overfit_full_path_control_extra_velocity_samples = (
             _load_full_path_control_extra_velocity_samples(
@@ -657,6 +767,20 @@ class TreeDataset(Dataset):
         ] = {}
         self._frozen_full_path_control_selections: List[Dict[str, Any]] = []
         self._cached_posterior_trees_by_key: Dict[Tuple[Any, ...], List[str]] = {}
+        self._cached_sequences_by_nexus_path: Dict[
+            str,
+            Tuple[Dict[str, str], List[str]],
+        ] = {}
+        self._cached_topology_stream_sequences_by_dataset_id: Dict[
+            str,
+            Tuple[Dict[str, str], List[str]],
+        ] = {}
+        self._cached_topology_stream_pair_by_key: Dict[
+            Tuple[str, str, str],
+            Dict[str, Any],
+        ] = {}
+        self.same_dataset_batch_size = 0
+        self.same_dataset_batch_seed = 0
         self.random_tree = None
         self.sanity_check = sanity_check
         self.random_sanity_check = random_sanity_check
@@ -666,6 +790,8 @@ class TreeDataset(Dataset):
 
         # Build index immediately; optionally preload
         self.build_index()
+        self._filter_index_by_available_tree_paths()
+        self._filter_index_by_posterior_subset_token_limit()
         self.set_overfit_fixed_pair_start_tree_bank(override_start_tree_bank)
         self.set_overfit_fixed_pair_target_tree_bank(override_target_tree_bank)
         if (
@@ -1172,6 +1298,45 @@ class TreeDataset(Dataset):
         return cloned_groups[0], cloned_groups[1], cloned_groups[2]
 
     @staticmethod
+    def _attach_structural_newick(sample: Dict[str, Any], newick_key: str, out_key: str) -> None:
+        if sample.get(out_key) is not None:
+            return
+        newick = sample.get(newick_key)
+        if newick in {None, ""}:
+            return
+        sample[out_key] = _worker_newick_parser(str(newick))
+
+    @classmethod
+    def _attach_structural_fields_to_full_path_samples(
+        cls,
+        groups: Tuple[
+            List[Dict[str, Any]],
+            List[Dict[str, Any]],
+            List[Dict[str, Any]],
+        ],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        velocity_samples, autoregressive_samples, terminal_samples = groups
+        for sample in velocity_samples:
+            cls._attach_structural_newick(
+                sample,
+                "newick_tree",
+                "newick_tree_structural",
+            )
+        for sample in terminal_samples:
+            cls._attach_structural_newick(
+                sample,
+                "newick_tree",
+                "newick_tree_structural",
+            )
+        for sample in autoregressive_samples:
+            cls._attach_structural_newick(
+                sample,
+                "newick",
+                "newick_structural",
+            )
+        return groups
+
+    @staticmethod
     def _attach_batch_metadata_to_full_path_samples(
         groups: Tuple[
             List[Dict[str, Any]],
@@ -1183,6 +1348,8 @@ class TreeDataset(Dataset):
         sample_id: str,
         num_to_name: Dict[str, str],
         seq_ordering_map: Dict[str, Any],
+        selected_sequences: Optional[List[str]] = None,
+        selected_sequence_names: Optional[List[str]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         for samples in groups:
             for sample in samples:
@@ -1190,6 +1357,13 @@ class TreeDataset(Dataset):
                 sample.setdefault("id", sample_id)
                 sample.setdefault("num_to_name", num_to_name)
                 sample.setdefault("seq_ordering_map", seq_ordering_map)
+                if selected_sequences is not None:
+                    sample.setdefault("selected_sequences", list(selected_sequences))
+                if selected_sequence_names is not None:
+                    sample.setdefault(
+                        "selected_sequence_names",
+                        list(selected_sequence_names),
+                    )
         return groups
 
     def _full_path_control_samples_cache_key(
@@ -1408,6 +1582,8 @@ class TreeDataset(Dataset):
             velocity_samples.append(relabeled_sample)
 
         result = (velocity_samples, autoregressive_samples, terminal_samples)
+        if self.full_path_preparse_structural_trees:
+            result = self._attach_structural_fields_to_full_path_samples(result)
         self._cached_full_path_control_samples_by_key[cache_key] = (
             self._clone_full_path_control_sample_groups(result)
         )
@@ -1484,7 +1660,168 @@ class TreeDataset(Dataset):
                 self._random_distribution_sequences(str(meta["id"]), taxa_order),
                 taxa_order,
             )
-        return self.parse_nexus(meta["nexus_path"])
+        nexus_path = str(meta["nexus_path"])
+        cached = self._cached_sequences_by_nexus_path.get(nexus_path)
+        if cached is None:
+            seqs, taxa_order = self.parse_nexus(nexus_path)
+            cached = (dict(seqs), list(taxa_order))
+            self._cached_sequences_by_nexus_path[nexus_path] = cached
+        return dict(cached[0]), list(cached[1])
+
+    def _filter_index_by_posterior_subset_token_limit(self) -> None:
+        subset_size = int(getattr(self, "posterior_subset_num_leaves", 0) or 0)
+        max_tokens = int(getattr(self, "posterior_subset_max_input_tokens", 0) or 0)
+        if subset_size <= 0 or max_tokens <= 0 or not self._index:
+            return
+
+        filtered_index: List[Dict[str, Any]] = []
+        dropped_ids: List[str] = []
+        for meta in self._index:
+            if meta.get("topology_stream_pair") or meta.get("random_distribution"):
+                filtered_index.append(meta)
+                continue
+            try:
+                seqs, taxa_order = self._sequences_for_meta(meta)
+            except Exception:
+                filtered_index.append(meta)
+                continue
+            stripped_lengths = sorted(
+                len(self._strip_live_phyla_input_sequence(seqs.get(str(name), "")))
+                for name in taxa_order
+                if str(name) in seqs
+            )
+            if len(stripped_lengths) < subset_size:
+                filtered_index.append(meta)
+                continue
+            shortest_tokens = int(sum(stripped_lengths[:subset_size]) + subset_size)
+            if shortest_tokens <= max_tokens:
+                filtered_index.append(meta)
+            else:
+                dropped_ids.append(str(meta.get("id", "")))
+
+        if not dropped_ids:
+            return
+        self._index = filtered_index
+        self._ids = [str(meta["id"]) for meta in self._index]
+        self._id_to_idx = {id_: i for i, id_ in enumerate(self._ids)}
+        print(
+            "Filtered "
+            f"{len(dropped_ids)} posterior-subset datasets whose shortest "
+            f"{subset_size} raw sequences exceed {max_tokens} live-Phyla tokens "
+            f"({len(self._index)} remain)."
+        )
+
+    def _filter_index_by_available_tree_paths(self) -> None:
+        if (
+            self.topology_stream_index_jsonl_path
+            or self.posterior_trprobs_root
+            or not self._index
+        ):
+            return
+        filtered_index = [
+            meta for meta in self._index if meta.get("tree_paths")
+        ]
+        dropped_count = len(self._index) - len(filtered_index)
+        if dropped_count <= 0:
+            return
+        self._index = filtered_index
+        self._ids = [str(meta["id"]) for meta in self._index]
+        self._id_to_idx = {id_: i for i, id_ in enumerate(self._ids)}
+        print(
+            f"Filtered {dropped_count} posterior datasets with no tree paths "
+            f"({len(self._index)} remain)."
+        )
+
+    @staticmethod
+    def _strip_live_phyla_input_sequence(sequence: str) -> str:
+        return str(sequence or "").replace("-", "").replace(".", "")
+
+    def _topology_stream_nexus_path(self, dataset_id: str) -> str:
+        dataset_id = str(dataset_id).upper()
+        root = Path(str(self.nexus_root))
+        candidates = [
+            root / f"{dataset_id}.nex",
+            root / f"{dataset_id}.nexus",
+            root / f"{dataset_id.lower()}.nex",
+            root / f"{dataset_id.lower()}.nexus",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        raise FileNotFoundError(
+            f"No NEXUS alignment found for topology-stream dataset {dataset_id} "
+            f"under {root}"
+        )
+
+    def _topology_stream_sequences_for_dataset(
+        self,
+        dataset_id: str,
+        nexus_path: Optional[str] = None,
+    ) -> Tuple[Dict[str, str], List[str]]:
+        dataset_id = str(dataset_id).upper()
+        cached = self._cached_topology_stream_sequences_by_dataset_id.get(dataset_id)
+        if cached is not None:
+            return cached
+        path = nexus_path or self._topology_stream_nexus_path(dataset_id)
+        parsed = self.parse_nexus(path)
+        self._cached_topology_stream_sequences_by_dataset_id[dataset_id] = parsed
+        return parsed
+
+    def _resolve_sequence_for_leaf_label(
+        self,
+        leaf_label: str,
+        seqs: Dict[str, str],
+        source_taxa_order: List[str],
+    ) -> Tuple[str, str]:
+        label = str(leaf_label)
+        if label in seqs:
+            return label, seqs[label]
+        try:
+            idx = int(label)
+        except ValueError:
+            idx = None
+        if idx is not None:
+            if 1 <= idx <= len(source_taxa_order):
+                name = str(source_taxa_order[idx - 1])
+                return name, seqs.get(name, "")
+            if 0 <= idx < len(source_taxa_order):
+                name = str(source_taxa_order[idx])
+                return name, seqs.get(name, "")
+        return label, seqs.get(label, "")
+
+    def _selected_sequences_from_leaf_labels(
+        self,
+        leaf_labels: List[str],
+        seqs: Dict[str, str],
+        source_taxa_order: List[str],
+    ) -> Tuple[Dict[str, str], List[str], List[str]]:
+        new_seqs: Dict[str, str] = {}
+        selected_names: List[str] = []
+        selected_sequences: List[str] = []
+        for idx, leaf_label in enumerate(leaf_labels):
+            sequence_name, sequence = self._resolve_sequence_for_leaf_label(
+                str(leaf_label),
+                seqs,
+                source_taxa_order,
+            )
+            clean_sequence = self._strip_live_phyla_input_sequence(sequence)
+            new_seqs[str(idx)] = clean_sequence
+            selected_names.append(str(sequence_name))
+            selected_sequences.append(clean_sequence)
+        return new_seqs, selected_names, selected_sequences
+
+    def _topology_stream_input_tokens_for_labels(
+        self,
+        leaf_labels: List[str],
+        seqs: Dict[str, str],
+        source_taxa_order: List[str],
+    ) -> int:
+        _new_seqs, _names, selected_sequences = self._selected_sequences_from_leaf_labels(
+            leaf_labels,
+            seqs,
+            source_taxa_order,
+        )
+        return int(sum(len(sequence) for sequence in selected_sequences) + len(selected_sequences))
 
     def sample_random_tree_with_base(
         self,
@@ -1566,9 +1903,27 @@ class TreeDataset(Dataset):
         self, index: int, preset_subtree_size: Optional[int] = None
     ) -> Dict[str, Any]:  # Required for torch Dataset
         requested_index = int(index)
-        if self.overfit_virtual_epoch_size is not None and len(self._index) > 0:
+        same_dataset_batch_size = int(getattr(self, "same_dataset_batch_size", 0) or 0)
+        if same_dataset_batch_size > 1 and len(self._index) > 0:
+            group_code = requested_index // same_dataset_batch_size
+            index = group_code % len(self._index)
+            group_id = group_code // len(self._index)
+            shared_subset_seed = (
+                f"{getattr(self, 'same_dataset_batch_seed', 0)}:"
+                f"{group_id}:{index}"
+            )
+        elif self.overfit_virtual_epoch_size is not None and len(self._index) > 0:
             index = requested_index % len(self._index)
+            shared_subset_seed = None
+        else:
+            shared_subset_seed = None
         meta = self._index[index]
+        if (
+            preset_subtree_size is None
+            and self.posterior_subset_num_leaves > 0
+            and not meta.get("topology_stream_pair")
+        ):
+            preset_subtree_size = int(self.posterior_subset_num_leaves)
         if self.validation:
             return {
                 "id": meta["id"],
@@ -1579,6 +1934,9 @@ class TreeDataset(Dataset):
             }
 
         seqs, taxa_order = self._sequences_for_meta(meta)
+        source_taxa_order = list(taxa_order)
+        selected_sequence_names = None
+        selected_sequences = None
 
         # Update name_to_seq cache (dumb update for now)
         self.name_to_seq = seqs
@@ -1596,11 +1954,68 @@ class TreeDataset(Dataset):
                 target_obj.get_leaves(),
                 key=lambda leaf: _numeric_name_sort_key(leaf.name),
             )
-            if preset_subtree_size is not None and len(leaves) > preset_subtree_size:
-                keep_count = max(2, int(preset_subtree_size))
-                keep_names = set(
-                    random.sample([str(leaf.name) for leaf in leaves], keep_count)
-                )
+            effective_subtree_size = preset_subtree_size
+            if (
+                effective_subtree_size is None
+                and self.topology_stream_subset_num_leaves > 0
+            ):
+                effective_subtree_size = int(self.topology_stream_subset_num_leaves)
+            if (
+                effective_subtree_size is not None
+                and len(leaves) > effective_subtree_size
+            ):
+                keep_count = max(2, int(effective_subtree_size))
+                candidate_leaf_names = [str(leaf.name) for leaf in leaves]
+                keep_names = set(random.sample(candidate_leaf_names, keep_count))
+                if (
+                    self.topology_stream_use_real_sequences
+                    and self.topology_stream_max_input_tokens > 0
+                ):
+                    best_keep_names = keep_names
+                    best_tokens = None
+                    for _attempt in range(32):
+                        candidate = set(
+                            random.sample(candidate_leaf_names, keep_count)
+                        )
+                        candidate_tokens = self._topology_stream_input_tokens_for_labels(
+                            sorted(candidate, key=_numeric_name_sort_key),
+                            seqs,
+                            source_taxa_order,
+                        )
+                        if best_tokens is None or candidate_tokens < best_tokens:
+                            best_keep_names = candidate
+                            best_tokens = candidate_tokens
+                        if candidate_tokens <= self.topology_stream_max_input_tokens:
+                            keep_names = candidate
+                            break
+                    else:
+                        lengths = []
+                        for leaf_name in candidate_leaf_names:
+                            _sequence_name, sequence = self._resolve_sequence_for_leaf_label(
+                                leaf_name,
+                                seqs,
+                                source_taxa_order,
+                            )
+                            lengths.append(
+                                (
+                                    len(self._strip_live_phyla_input_sequence(sequence)),
+                                    leaf_name,
+                                )
+                            )
+                        shortest = [
+                            name
+                            for _length, name in sorted(lengths)[:keep_count]
+                        ]
+                        shortest_tokens = self._topology_stream_input_tokens_for_labels(
+                            sorted(shortest, key=_numeric_name_sort_key),
+                            seqs,
+                            source_taxa_order,
+                        )
+                        keep_names = (
+                            set(shortest)
+                            if shortest_tokens <= self.topology_stream_max_input_tokens
+                            else best_keep_names
+                        )
                 start_leaf_names = {str(leaf.name) for leaf in start_obj.get_leaves()}
                 missing_start_leaves = sorted(keep_names - start_leaf_names)
                 if missing_start_leaves:
@@ -1611,25 +2026,58 @@ class TreeDataset(Dataset):
                 ordered_keep_names = sorted(keep_names, key=_numeric_name_sort_key)
                 start_obj.prune(ordered_keep_names, preserve_branch_length=True)
                 target_obj.prune(ordered_keep_names, preserve_branch_length=True)
-                start_tree_newick = start_obj.write(format=1)
-                target_tree_newick = target_obj.write(format=1)
-                target_obj = EteTree(target_tree_newick, format=1)
-                leaves = sorted(
-                    target_obj.get_leaves(),
-                    key=lambda leaf: _numeric_name_sort_key(leaf.name),
-                )
                 topology_stream_pruned = True
-            taxa_order = [str(leaf.name) for leaf in leaves]
-            new_seqs = self._random_distribution_sequences(str(meta["id"]), taxa_order)
+
+            (
+                start_tree_newick,
+                target_tree_newick,
+                original_topology_leaf_order,
+                topology_leaf_to_index,
+            ) = _normalize_topology_stream_tree_pair(start_obj, target_obj)
+            leaves = [
+                str(idx)
+                for idx in range(len(original_topology_leaf_order))
+            ]
+            taxa_order = list(leaves)
+            if self.topology_stream_use_real_sequences:
+                (
+                    new_seqs,
+                    selected_sequence_names,
+                    selected_sequences,
+                ) = self._selected_sequences_from_leaf_labels(
+                    original_topology_leaf_order,
+                    seqs,
+                    source_taxa_order,
+                )
+                input_tokens = int(
+                    sum(len(sequence) for sequence in selected_sequences)
+                    + len(selected_sequences)
+                )
+                if (
+                    self.topology_stream_max_input_tokens > 0
+                    and input_tokens > self.topology_stream_max_input_tokens
+                ):
+                    raise ValueError(
+                        f"Topology-stream item {meta['id']} has {input_tokens} live "
+                        "Phyla input tokens after pruning, exceeding "
+                        f"topology_stream_max_input_tokens="
+                        f"{self.topology_stream_max_input_tokens}."
+                    )
+            else:
+                new_seqs = self._random_distribution_sequences(str(meta["id"]), taxa_order)
+                selected_sequence_names = list(taxa_order)
+                selected_sequences = [
+                    new_seqs[str(idx)] for idx in range(len(taxa_order))
+                ]
             original_names_map = {
                 str(idx): str(name)
-                for idx, name in enumerate(taxa_order)
+                for idx, name in enumerate(original_topology_leaf_order)
             }
             seq_ordering_map = {
                 str(name): str(idx)
-                for idx, name in enumerate(taxa_order)
+                for name, idx in topology_leaf_to_index.items()
             }
-            current_size = len(leaves)
+            current_size = len(taxa_order)
             self.chosen_tree = (index, current_size, 1)
             real_tree_newick = target_tree_newick
             real_tree_original_label_newick = target_tree_newick
@@ -1646,9 +2094,10 @@ class TreeDataset(Dataset):
                 "dataset_id": str(meta.get("dataset_id", meta["id"])).upper(),
             }
             if not topology_stream_pruned:
-                topology_stream_extra_velocity_samples = list(
-                    stream_pair.get("extra_velocity_samples") or []
-                )
+                # Extra velocity samples were serialized in the source leaf/root
+                # convention.  After canonicalizing labels and root placement,
+                # reusing their old split masks would mix coordinate systems.
+                topology_stream_extra_velocity_samples = []
             forced_bank_selection = None
         else:
             # Attempt to parse translation block from the first tree file
@@ -1721,7 +2170,88 @@ class TreeDataset(Dataset):
             # Pruning logic for adaptive batching
 
             if preset_subtree_size is not None and len(leaves) > preset_subtree_size:
-                kept_leaves = random.sample(leaves, preset_subtree_size)
+                keep_count = max(2, int(preset_subtree_size))
+                candidate_leaf_names = sorted(
+                    [str(leaf.name) for leaf in leaves],
+                    key=_numeric_name_sort_key,
+                )
+                leaves_by_name = {str(leaf.name): leaf for leaf in leaves}
+
+                def _posterior_subset_input_tokens(leaf_names: List[str]) -> int:
+                    total = len(leaf_names)
+                    for leaf_name in leaf_names:
+                        taxon_name = translate_map.get(str(leaf_name))
+                        if taxon_name is not None:
+                            sequence = seqs.get(taxon_name, "")
+                        else:
+                            _sequence_name, sequence = self._resolve_sequence_for_leaf_label(
+                                str(leaf_name),
+                                seqs,
+                                source_taxa_order,
+                            )
+                        total += len(self._strip_live_phyla_input_sequence(sequence))
+                    return int(total)
+
+                def _sample_keep_names(rng) -> set[str]:
+                    return set(rng.sample(candidate_leaf_names, keep_count))
+
+                if shared_subset_seed is not None:
+                    subset_rng = random.Random(
+                        f"{shared_subset_seed}:posterior_subset"
+                    )
+                    keep_names = _sample_keep_names(subset_rng)
+                else:
+                    subset_rng = random
+                    keep_names = _sample_keep_names(subset_rng)
+                if self.posterior_subset_max_input_tokens > 0:
+                    best_keep_names = set(keep_names)
+                    best_tokens = _posterior_subset_input_tokens(
+                        sorted(best_keep_names, key=_numeric_name_sort_key)
+                    )
+                    if best_tokens > self.posterior_subset_max_input_tokens:
+                        for _attempt in range(64):
+                            candidate = _sample_keep_names(subset_rng)
+                            candidate_tokens = _posterior_subset_input_tokens(
+                                sorted(candidate, key=_numeric_name_sort_key)
+                            )
+                            if candidate_tokens < best_tokens:
+                                best_keep_names = set(candidate)
+                                best_tokens = candidate_tokens
+                            if candidate_tokens <= self.posterior_subset_max_input_tokens:
+                                keep_names = set(candidate)
+                                break
+                        else:
+                            lengths = []
+                            for leaf_name in candidate_leaf_names:
+                                taxon_name = translate_map.get(str(leaf_name))
+                                if taxon_name is not None:
+                                    sequence = seqs.get(taxon_name, "")
+                                else:
+                                    _sequence_name, sequence = self._resolve_sequence_for_leaf_label(
+                                        str(leaf_name),
+                                        seqs,
+                                        source_taxa_order,
+                                    )
+                                lengths.append(
+                                    (
+                                        len(self._strip_live_phyla_input_sequence(sequence)),
+                                        str(leaf_name),
+                                    )
+                                )
+                            shortest = [
+                                name
+                                for _length, name in sorted(lengths)[:keep_count]
+                            ]
+                            shortest_tokens = _posterior_subset_input_tokens(shortest)
+                            keep_names = (
+                                set(shortest)
+                                if shortest_tokens <= self.posterior_subset_max_input_tokens
+                                else best_keep_names
+                            )
+                kept_leaves = [
+                    leaves_by_name[name]
+                    for name in sorted(keep_names, key=_numeric_name_sort_key)
+                ]
                 t.prune(kept_leaves, preserve_branch_length=True)
                 # real_tree_newick = t.write(format=1) # Don't write yet, wait for re-indexing
                 # Update leaves for size tracking
@@ -2067,6 +2597,17 @@ class TreeDataset(Dataset):
         boundary_paths = pair["boundary_paths"]
         final_labels = pair["final_labels"]
         sample_dataset_id = str(pair.get("dataset_id", meta["id"])).upper()
+        if selected_sequences is None or selected_sequence_names is None:
+            selected_sequences = [
+                new_seqs.get(str(idx), "") for idx in range(int(current_size))
+            ]
+            selected_sequence_names = [
+                str(original_names_map.get(str(idx), idx))
+                for idx in range(int(current_size))
+            ]
+        pair["name_mapping"] = original_names_map
+        pair["selected_sequences"] = list(selected_sequences)
+        pair["selected_sequence_names"] = list(selected_sequence_names)
 
         if len(final_labels) == 0:
             velocity_next_boundary_tree = (
@@ -2100,6 +2641,8 @@ class TreeDataset(Dataset):
                 "autoregressive_newick_time": 0.0,
                 "num_to_name": original_names_map,
                 "seq_ordering_map": seq_ordering_map,
+                "selected_sequences": list(selected_sequences),
+                "selected_sequence_names": list(selected_sequence_names),
                 "dataset_id": sample_dataset_id,
             }
             if "bank_group_key" in pair:
@@ -2117,6 +2660,8 @@ class TreeDataset(Dataset):
                     sample_id=meta["id"],
                     num_to_name=original_names_map,
                     seq_ordering_map=seq_ordering_map,
+                    selected_sequences=selected_sequences,
+                    selected_sequence_names=selected_sequence_names,
                 )
                 (
                     sample["full_path_velocity_samples"],
@@ -2264,6 +2809,8 @@ class TreeDataset(Dataset):
                 "autoregressive_newick_time": autoregressive_time,
                 "num_to_name": original_names_map,
                 "seq_ordering_map": seq_ordering_map,
+                "selected_sequences": list(selected_sequences),
+                "selected_sequence_names": list(selected_sequence_names),
                 "dataset_id": sample_dataset_id,
             }
             if "bank_group_key" in pair:
@@ -2281,6 +2828,8 @@ class TreeDataset(Dataset):
         sample = dict(step_samples[0])
         sample["num_to_name"] = original_names_map
         sample["dataset_id"] = sample_dataset_id
+        sample["selected_sequences"] = list(selected_sequences)
+        sample["selected_sequence_names"] = list(selected_sequence_names)
         if "bank_group_key" in pair:
             sample["bank_group_key"] = pair["bank_group_key"]
         if "oracle_prefix_start_tree" in pair:
@@ -2299,6 +2848,8 @@ class TreeDataset(Dataset):
                 sample_id=meta["id"],
                 num_to_name=original_names_map,
                 seq_ordering_map=seq_ordering_map,
+                selected_sequences=selected_sequences,
+                selected_sequence_names=selected_sequence_names,
             )
             (
                 sample["full_path_velocity_samples"],
@@ -2793,6 +3344,11 @@ class TreeDataset(Dataset):
                         f"Topology-stream index row {line_number} is missing num_leaves."
                     )
                 if (
+                    self.topology_stream_index_min_num_leaves
+                    and num_leaves < self.topology_stream_index_min_num_leaves
+                ):
+                    continue
+                if (
                     self.topology_stream_index_max_num_leaves
                     and num_leaves > self.topology_stream_index_max_num_leaves
                 ):
@@ -2803,13 +3359,55 @@ class TreeDataset(Dataset):
                     start_path
                 )
                 item_id = f"realstream_case{case_index:06d}"
+                if self.topology_stream_use_real_sequences:
+                    nexus_path = self._topology_stream_nexus_path(dataset_id)
+                    if self.topology_stream_max_input_tokens > 0:
+                        seqs, source_taxa_order = (
+                            self._topology_stream_sequences_for_dataset(
+                                dataset_id,
+                                nexus_path,
+                            )
+                        )
+                        target_payload = json.loads(Path(target_path).read_text())
+                        target_tree = EteTree(
+                            _tree_from_json_payload(
+                                target_payload,
+                                role="target",
+                            ),
+                            format=1,
+                        )
+                        leaf_labels = [
+                            str(leaf.name)
+                            for leaf in sorted(
+                                target_tree.get_leaves(),
+                                key=lambda leaf: _numeric_name_sort_key(leaf.name),
+                            )
+                        ]
+                        if (
+                            self.topology_stream_subset_num_leaves > 0
+                            and len(leaf_labels) > self.topology_stream_subset_num_leaves
+                        ):
+                            leaf_labels = leaf_labels[
+                                : int(self.topology_stream_subset_num_leaves)
+                            ]
+                        input_tokens = self._topology_stream_input_tokens_for_labels(
+                            leaf_labels,
+                            seqs,
+                            source_taxa_order,
+                        )
+                        if input_tokens > self.topology_stream_max_input_tokens:
+                            continue
+                    random_distribution = False
+                else:
+                    nexus_path = f"random_distribution://{dataset_id}/{item_id}"
+                    random_distribution = True
                 ids.append(item_id)
                 index.append(
                     {
                         "id": item_id,
-                        "nexus_path": f"random_distribution://{dataset_id}/{item_id}",
+                        "nexus_path": nexus_path,
                         "tree_paths": [],
-                        "random_distribution": True,
+                        "random_distribution": random_distribution,
                         "num_leaves": int(num_leaves),
                         "topology_stream_pair": True,
                         "case_index": case_index,
@@ -2828,6 +3426,15 @@ class TreeDataset(Dataset):
         self._id_to_idx = {id_: i for i, id_ in enumerate(self._ids)}
 
     def _load_topology_stream_pair_for_meta(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        cache_key = (
+            str(meta.get("start_path", "")),
+            str(meta.get("target_path", "")),
+            str(meta.get("anchors_path", "")),
+        )
+        cached = self._cached_topology_stream_pair_by_key.get(cache_key)
+        if cached is not None:
+            return cached
+
         start_payload = json.loads(Path(meta["start_path"]).read_text())
         target_payload = json.loads(Path(meta["target_path"]).read_text())
         start_tree = _tree_from_json_payload(start_payload, role="start")
@@ -2838,11 +3445,13 @@ class TreeDataset(Dataset):
             extra_velocity_samples = _load_full_path_control_extra_velocity_samples(
                 str(anchors_path)
             )
-        return {
+        loaded = {
             "start_tree": start_tree,
             "target_tree": target_tree,
             "extra_velocity_samples": extra_velocity_samples,
         }
+        self._cached_topology_stream_pair_by_key[cache_key] = loaded
+        return loaded
 
     def _available_trprobs_dataset_ids(self) -> List[str]:
         root = Path(self.posterior_trprobs_root)
@@ -2932,6 +3541,51 @@ class TreeDataset(Dataset):
         self._id_to_idx = {id_: i for i, id_ in enumerate(self._ids)}
 
 
+class SameDatasetBatchSampler(Sampler[List[int]]):
+    """Yield batches whose items share one alignment/subset context."""
+
+    def __init__(
+        self,
+        dataset: TreeDataset,
+        batch_size: int,
+        *,
+        num_batches: Optional[int] = None,
+        seed: Optional[int] = None,
+        shuffle: bool = True,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = max(1, int(batch_size))
+        self.dataset_size = len(getattr(dataset, "_index", []))
+        default_num_batches = len(dataset)
+        self.num_batches = max(
+            0,
+            int(num_batches) if num_batches is not None else int(default_num_batches),
+        )
+        self.seed = seed
+        self.shuffle = bool(shuffle)
+        self._iteration = 0
+
+    def __iter__(self):
+        if self.dataset_size <= 0 or self.num_batches <= 0:
+            return
+        seed = 0 if self.seed is None else int(self.seed)
+        rng = random.Random(f"{seed}:{self._iteration}")
+        self._iteration += 1
+        for group_id in range(self.num_batches):
+            if self.shuffle:
+                dataset_index = rng.randrange(self.dataset_size)
+            else:
+                dataset_index = group_id % self.dataset_size
+            group_code = group_id * self.dataset_size + dataset_index
+            yield [
+                group_code * self.batch_size + path_slot
+                for path_slot in range(self.batch_size)
+            ]
+
+    def __len__(self) -> int:
+        return int(self.num_batches)
+
+
 class PhylaDataModule(pl.LightningDataModule):
     """PyTorch Lightning DataModule for managing TreeDataset splits.
 
@@ -2956,6 +3610,34 @@ class PhylaDataModule(pl.LightningDataModule):
         self.loader_seed = config["data"].get(
             "loader_seed",
             config.get("trainer", {}).get("seed"),
+        )
+        self.same_dataset_batch = bool(
+            config["data"].get("same_dataset_batch", False)
+        )
+        self.same_dataset_batches_per_epoch = config["data"].get(
+            "same_dataset_batches_per_epoch"
+        )
+        self.full_path_precompute_tokenizer_raw_graphs = bool(
+            config["data"].get(
+                "full_path_precompute_tokenizer_raw_graphs",
+                config["data"].get("full_path_precompute_tokenizer_graph_cache", False),
+            )
+        )
+        self.full_path_use_terminal_samples = (
+            float(config.get("trainer", {}).get("velocity_terminal_head_weight", 0.0))
+            > 0.0
+        )
+        self.full_path_joint_tokenizer_batch = bool(
+            config.get("trainer", {}).get(
+                "training_step_joint_tokenize_velocity_ar",
+                False,
+            )
+        )
+        self.velocity_probe_direct_set_anchor_only = bool(
+            config.get("trainer", {}).get(
+                "velocity_probe_direct_set_anchor_only",
+                False,
+            )
         )
 
         self.train_ids = train_ids
@@ -2985,6 +3667,8 @@ class PhylaDataModule(pl.LightningDataModule):
             else:
                 self.train_ids = filtered_train_ids or list(configured_posterior_ids)
                 self.test_ids = filtered_test_ids or list(configured_posterior_ids)
+        if config["data"].get("train_from_test_ids", False):
+            self.train_ids = list(self.test_ids)
         posterior_trprobs_root = config["data"].get(
             "posterior_trprobs_root",
             config["data"].get("short_run_root"),
@@ -3026,8 +3710,30 @@ class PhylaDataModule(pl.LightningDataModule):
             "topology_stream_index_max_cases": config["data"].get(
                 "topology_stream_index_max_cases", 0
             ),
+            "topology_stream_index_min_num_leaves": config["data"].get(
+                "topology_stream_index_min_num_leaves", 0
+            ),
             "topology_stream_index_max_num_leaves": config["data"].get(
                 "topology_stream_index_max_num_leaves", 0
+            ),
+            "topology_stream_subset_num_leaves": config["data"].get(
+                "topology_stream_subset_num_leaves", 0
+            ),
+            "posterior_subset_num_leaves": config["data"].get(
+                "posterior_subset_num_leaves", 0
+            ),
+            "posterior_subset_max_input_tokens": config["data"].get(
+                "posterior_subset_max_input_tokens",
+                config.get("trainer", {}).get("live_phyla_max_input_tokens", 0),
+            ),
+            "sample_metrics_iterate_dataset_indices": config["data"].get(
+                "sample_metrics_iterate_dataset_indices", False
+            ),
+            "topology_stream_use_real_sequences": config["data"].get(
+                "topology_stream_use_real_sequences", False
+            ),
+            "topology_stream_max_input_tokens": config["data"].get(
+                "topology_stream_max_input_tokens", 0
             ),
         }
         topology_stream_val_dataset_kwargs = dict(topology_stream_dataset_kwargs)
@@ -3115,6 +3821,9 @@ class PhylaDataModule(pl.LightningDataModule):
             overfit_full_path_control_extra_velocity_samples_json_paths_by_dataset_id=config["data"].get(
                 "overfit_full_path_control_extra_velocity_samples_json_paths_by_dataset_id"
             ),
+            full_path_preparse_structural_trees=config["data"].get(
+                "full_path_preparse_structural_trees", False
+            ),
             overfit_oracle_prefix_start_prob=config["data"].get(
                 "overfit_oracle_prefix_start_prob",
                 config["data"].get(
@@ -3148,6 +3857,9 @@ class PhylaDataModule(pl.LightningDataModule):
             **topology_stream_dataset_kwargs,
             **trprobs_dataset_kwargs,
         )
+        if self.same_dataset_batch:
+            self.dataset_train.same_dataset_batch_size = int(self.batch_size)
+            self.dataset_train.same_dataset_batch_seed = int(self.loader_seed or 0)
         self.dataset_val = TreeDataset(
             self.nexus_dir, self.mrbayes_dir, filter_ids=self.test_ids, validation=True, sanity_check=config["data"].get("sanity_check", False), random_sanity_check=config["data"].get("random_sanity_check", False),
             overfit_velocity_zero=config["data"].get("overfit_velocity_zero", False),
@@ -3227,6 +3939,9 @@ class PhylaDataModule(pl.LightningDataModule):
             overfit_full_path_control_extra_velocity_samples_json_paths_by_dataset_id=config["data"].get(
                 "overfit_full_path_control_extra_velocity_samples_json_paths_by_dataset_id"
             ),
+            full_path_preparse_structural_trees=config["data"].get(
+                "full_path_preparse_structural_trees", False
+            ),
             overfit_oracle_prefix_start_prob=config["data"].get(
                 "overfit_oracle_prefix_start_prob",
                 config["data"].get(
@@ -3302,6 +4017,25 @@ class PhylaDataModule(pl.LightningDataModule):
             config["model"]["num_node_types"],
             config["model"]["num_edge_types"],
             config["model"]["hidden_dim"],
+            n_layers=config["model"].get("tokenizer_n_layers", 6),
+            lap_dim=config["model"].get("tokenizer_lap_dim", 16),
+            lap_dropout=config["model"].get("tokenizer_lap_dropout", 0.2),
+            branch_length_mode=config["model"].get(
+                "tokenizer_branch_length_mode",
+                "linear",
+            ),
+            branch_length_num_buckets=config["model"].get(
+                "tokenizer_branch_length_num_buckets",
+                64,
+            ),
+            branch_length_log_min=config["model"].get(
+                "tokenizer_branch_length_log_min",
+                -8.0,
+            ),
+            branch_length_log_max=config["model"].get(
+                "tokenizer_branch_length_log_max",
+                1.0,
+            ),
         )
         self._collate_structural_tree_cache: Dict[str, Any] = {}
         self._collate_bhv_tree_cache: Dict[
@@ -3340,6 +4074,20 @@ class PhylaDataModule(pl.LightningDataModule):
         if self.loader_seed is not None:
             generator = torch.Generator()
             generator.manual_seed(int(self.loader_seed))
+        if self.same_dataset_batch:
+            return DataLoader(
+                self.dataset_train,
+                batch_sampler=SameDatasetBatchSampler(
+                    self.dataset_train,
+                    self.batch_size,
+                    num_batches=self.same_dataset_batches_per_epoch,
+                    seed=self.loader_seed,
+                    shuffle=True,
+                ),
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                collate_fn=self.collate_fn,
+            )
         return DataLoader(
             self.dataset_train,
             batch_size=self.batch_size,
@@ -3388,6 +4136,259 @@ class PhylaDataModule(pl.LightningDataModule):
             self._collate_structural_tree_cache[key] = cached
         return cached
 
+    def _collate_tokenizer_raw_graph(self, tree_newick, structural_tree=None):
+        if structural_tree is None:
+            structural_tree = _worker_newick_parser(str(tree_newick))
+        raw_graph = self.tree_tokenizer.compute_raw_graph_cache([structural_tree])[0]
+        return {
+            key: value.detach().cpu().numpy()
+            if torch.is_tensor(value)
+            else value
+            for key, value in raw_graph.items()
+        }
+
+    def _select_velocity_samples_for_joint_tokenizer(self, samples):
+        samples = list(samples or [])
+        if self.velocity_probe_direct_set_anchor_only:
+            anchor_samples = [
+                sample for sample in samples if sample.get("anchor_family")
+            ]
+            if anchor_samples:
+                return anchor_samples
+        return samples
+
+    def _pack_tokenizer_raw_graph_batch(self, raw_graphs, task_types=None):
+        raw_graphs = [raw_graph for raw_graph in raw_graphs if raw_graph is not None]
+        if not raw_graphs:
+            return None
+
+        def _array(raw_graph, key, dtype=None):
+            value = raw_graph[key]
+            if torch.is_tensor(value):
+                value = value.detach().cpu().numpy()
+            value = np.asarray(value)
+            if dtype is not None:
+                value = value.astype(dtype, copy=False)
+            return value
+
+        batch_size = len(raw_graphs)
+        task_types = (
+            [0] * batch_size
+            if task_types is None
+            else [int(task_type) for task_type in task_types]
+        )
+        node_counts = np.asarray(
+            [int(raw_graph["node_num"]) for raw_graph in raw_graphs],
+            dtype=np.int64,
+        )
+        edge_counts = np.asarray(
+            [int(raw_graph["edge_num"]) for raw_graph in raw_graphs],
+            dtype=np.int64,
+        )
+        token_counts = node_counts + edge_counts
+        max_tokens = int(token_counts.max()) if token_counts.size else 0
+        token_offsets = np.zeros((batch_size + 1,), dtype=np.int64)
+        np.cumsum(token_counts, out=token_offsets[1:])
+        node_offsets = np.zeros((batch_size + 1,), dtype=np.int64)
+        np.cumsum(node_counts, out=node_offsets[1:])
+        edge_offsets = np.zeros((batch_size + 1,), dtype=np.int64)
+        np.cumsum(edge_counts, out=edge_offsets[1:])
+        total_tokens = int(token_offsets[-1])
+        total_nodes = int(node_offsets[-1])
+        total_edges = int(edge_offsets[-1])
+
+        node_data = (
+            np.concatenate(
+                [_array(raw_graph, "node_data", np.int64) for raw_graph in raw_graphs],
+                axis=0,
+            )
+            if total_nodes > 0
+            else np.zeros((0,), dtype=np.int64)
+        )
+        sin_embed_node = (
+            np.concatenate(
+                [
+                    _array(raw_graph, "sin_embed_node", np.float32)
+                    for raw_graph in raw_graphs
+                ],
+                axis=0,
+            )
+            if total_nodes > 0
+            else np.zeros((0, 0), dtype=np.float32)
+        )
+        lap_pe = (
+            np.concatenate(
+                [_array(raw_graph, "lap_pe", np.float32) for raw_graph in raw_graphs],
+                axis=0,
+            )
+            if total_nodes > 0
+            else np.zeros((0, 0), dtype=np.float32)
+        )
+        edge_data = (
+            np.concatenate(
+                [_array(raw_graph, "edge_data", np.int64) for raw_graph in raw_graphs],
+                axis=0,
+            )
+            if total_edges > 0
+            else np.zeros((0,), dtype=np.int64)
+        )
+        branch_lengths = (
+            np.concatenate(
+                [
+                    _array(raw_graph, "branch_lengths", np.float32)
+                    for raw_graph in raw_graphs
+                ],
+                axis=0,
+            )
+            if total_edges > 0
+            else np.zeros((0,), dtype=np.float32)
+        )
+        sin_embed_edge = (
+            np.concatenate(
+                [
+                    _array(raw_graph, "sin_embed_edge", np.float32)
+                    for raw_graph in raw_graphs
+                ],
+                axis=0,
+            )
+            if total_edges > 0
+            else np.zeros((0, 0), dtype=np.float32)
+        )
+
+        padding_mask = np.ones((batch_size, max_tokens), dtype=np.bool_)
+        padded_indices = np.zeros((batch_size, max_tokens, 2), dtype=np.int64)
+        padded_leaf_masks = np.zeros((batch_size, max_tokens), dtype=np.bool_)
+        padded_edge_masks = np.zeros((batch_size, max_tokens), dtype=np.bool_)
+        flat_lap_indices = np.zeros((total_tokens, 2), dtype=np.int64)
+        flat_type_ids = np.zeros((total_tokens,), dtype=np.int64)
+        flat_batch_indices = np.zeros((total_tokens,), dtype=np.int64)
+        flat_token_positions = np.zeros((total_tokens,), dtype=np.int64)
+        node_token_positions = np.zeros((total_nodes,), dtype=np.int64)
+        edge_token_positions = np.zeros((total_edges,), dtype=np.int64)
+        leaf_indices = []
+        edge_split_masks = []
+
+        for batch_idx, raw_graph in enumerate(raw_graphs):
+            node_count = int(node_counts[batch_idx])
+            edge_count = int(edge_counts[batch_idx])
+            token_count = int(token_counts[batch_idx])
+            token_start = int(token_offsets[batch_idx])
+            token_end = int(token_offsets[batch_idx + 1])
+            node_start = int(node_offsets[batch_idx])
+            node_end = int(node_offsets[batch_idx + 1])
+            edge_start = int(edge_offsets[batch_idx])
+            edge_end = int(edge_offsets[batch_idx + 1])
+
+            local_indices = _array(raw_graph, "full_padded_index", np.int64)
+            leaf_mask = _array(raw_graph, "leaf_mask", np.bool_)
+            lap_offset = node_start
+            padding_mask[batch_idx, :token_count] = False
+            padded_indices[batch_idx, :token_count] = local_indices
+            padded_leaf_masks[batch_idx, :token_count] = leaf_mask
+            padded_edge_masks[batch_idx, node_count:token_count] = True
+            flat_lap_indices[token_start:token_end] = local_indices + lap_offset
+            flat_type_ids[token_start + node_count:token_end] = 1
+            flat_batch_indices[token_start:token_end] = batch_idx
+            flat_token_positions[token_start:token_end] = np.arange(
+                token_count,
+                dtype=np.int64,
+            )
+            if node_count > 0:
+                node_token_positions[node_start:node_end] = np.arange(
+                    token_start,
+                    token_start + node_count,
+                    dtype=np.int64,
+                )
+            if edge_count > 0:
+                edge_token_positions[edge_start:edge_end] = np.arange(
+                    token_start + node_count,
+                    token_end,
+                    dtype=np.int64,
+                )
+            leaf_indices.append(_array(raw_graph, "leaf_idx", np.int64))
+            edge_split_masks.append(
+                [int(mask) for mask in raw_graph.get("edge_split_masks", [])]
+            )
+
+        return {
+            "_tree_tokenizer_raw_graph_batch_cache": True,
+            "batch_size": int(batch_size),
+            "task_types": np.asarray(task_types, dtype=np.int64),
+            "node_counts": node_counts,
+            "edge_counts": edge_counts,
+            "token_counts": token_counts,
+            "max_tokens": int(max_tokens),
+            "node_data": node_data,
+            "edge_data": edge_data,
+            "branch_lengths": branch_lengths,
+            "lap_pe": lap_pe,
+            "sin_embed_node": sin_embed_node,
+            "sin_embed_edge": sin_embed_edge,
+            "padding_mask": padding_mask,
+            "padded_indices": padded_indices,
+            "padded_leaf_masks": padded_leaf_masks,
+            "padded_edge_masks": padded_edge_masks,
+            "flat_lap_indices": flat_lap_indices,
+            "flat_type_ids": flat_type_ids,
+            "flat_batch_indices": flat_batch_indices,
+            "flat_token_positions": flat_token_positions,
+            "node_token_positions": node_token_positions,
+            "edge_token_positions": edge_token_positions,
+            "leaf_idx": leaf_indices,
+            "edge_split_masks": edge_split_masks,
+        }
+
+    def _attach_tokenizer_raw_graph_to_sample(
+        self,
+        sample,
+        *,
+        newick_key,
+        structural_key,
+        out_key,
+    ):
+        if sample.get(out_key) is not None:
+            return
+        newick = sample.get(newick_key)
+        if newick in {None, ""}:
+            return
+        structural_tree = sample.get(structural_key)
+        if structural_tree is None:
+            structural_tree = self._collate_structural_tree(newick)
+            sample[structural_key] = structural_tree
+        sample[out_key] = self._collate_tokenizer_raw_graph(
+            newick,
+            structural_tree=structural_tree,
+        )
+
+    def _attach_tokenizer_raw_graph_to_full_path_samples(
+        self,
+        velocity_samples,
+        autoregressive_samples,
+        terminal_samples,
+    ):
+        for sample in velocity_samples:
+            self._attach_tokenizer_raw_graph_to_sample(
+                sample,
+                newick_key="newick_tree",
+                structural_key="newick_tree_structural",
+                out_key="newick_tree_tokenizer_raw_graph",
+            )
+        if self.full_path_use_terminal_samples:
+            for sample in terminal_samples:
+                self._attach_tokenizer_raw_graph_to_sample(
+                    sample,
+                    newick_key="newick_tree",
+                    structural_key="newick_tree_structural",
+                    out_key="newick_tree_tokenizer_raw_graph",
+                )
+        for sample in autoregressive_samples:
+            self._attach_tokenizer_raw_graph_to_sample(
+                sample,
+                newick_key="newick",
+                structural_key="newick_structural",
+                out_key="newick_tokenizer_raw_graph",
+            )
+
     def _collate_bhv_tree_entry(self, tree_newick):
         key = str(tree_newick)
         cached = self._collate_bhv_tree_cache.get(key)
@@ -3411,6 +4412,7 @@ class PhylaDataModule(pl.LightningDataModule):
         full_path_velocity_samples = []
         full_path_autoregressive_samples = []
         full_path_terminal_samples = []
+        full_path_joint_tokenizer_raw_graph_batch = None
         full_path_control_mode = False
         for item in batch:
             if item is None:
@@ -3423,9 +4425,51 @@ class PhylaDataModule(pl.LightningDataModule):
                 full_path_autoregressive_samples.extend(
                     item.get("full_path_autoregressive_samples") or []
                 )
-                full_path_terminal_samples.extend(
-                    item.get("full_path_terminal_samples") or []
+                if self.full_path_use_terminal_samples:
+                    full_path_terminal_samples.extend(
+                        item.get("full_path_terminal_samples") or []
+                    )
+        if (
+            full_path_control_mode
+            and self.full_path_precompute_tokenizer_raw_graphs
+        ):
+            self._attach_tokenizer_raw_graph_to_full_path_samples(
+                full_path_velocity_samples,
+                full_path_autoregressive_samples,
+                full_path_terminal_samples,
+            )
+            if self.full_path_joint_tokenizer_batch:
+                selected_velocity_samples = (
+                    self._select_velocity_samples_for_joint_tokenizer(
+                        full_path_velocity_samples
+                    )
                 )
+                joint_raw_graphs = [
+                    sample.get("newick_tree_tokenizer_raw_graph")
+                    for sample in selected_velocity_samples
+                ] + [
+                    sample.get("newick_tokenizer_raw_graph")
+                    for sample in full_path_autoregressive_samples
+                ]
+                if joint_raw_graphs and all(
+                    raw_graph is not None for raw_graph in joint_raw_graphs
+                ):
+                    full_path_joint_tokenizer_raw_graph_batch = (
+                        self._pack_tokenizer_raw_graph_batch(
+                            joint_raw_graphs,
+                            task_types=(
+                                [0] * len(selected_velocity_samples)
+                                + [1] * len(full_path_autoregressive_samples)
+                            ),
+                        )
+                    )
+                    if full_path_joint_tokenizer_raw_graph_batch is not None:
+                        full_path_joint_tokenizer_raw_graph_batch[
+                            "velocity_count"
+                        ] = int(len(selected_velocity_samples))
+                        full_path_joint_tokenizer_raw_graph_batch[
+                            "autoregressive_count"
+                        ] = int(len(full_path_autoregressive_samples))
 
         if self.use_historical_collate:
             flat_batch = []
@@ -3520,6 +4564,12 @@ class PhylaDataModule(pl.LightningDataModule):
                 "ids": ids,
                 "dataset_ids": dataset_ids,
                 "mappings": mappings,
+                "selected_sequences": [
+                    item.get("selected_sequences") for item in batch
+                ],
+                "selected_sequence_names": [
+                    item.get("selected_sequence_names") for item in batch
+                ],
                 "bank_group_key": [
                     item.get("bank_group_key") for item in batch
                 ],
@@ -3534,6 +4584,10 @@ class PhylaDataModule(pl.LightningDataModule):
                 to_run["full_path_terminal_samples"] = list(
                     full_path_terminal_samples
                 )
+                if full_path_joint_tokenizer_raw_graph_batch is not None:
+                    to_run["full_path_joint_tokenizer_raw_graph_batch"] = (
+                        full_path_joint_tokenizer_raw_graph_batch
+                    )
                 to_run["_full_path_control_mode"] = True
             return to_run
 
@@ -3696,6 +4750,12 @@ class PhylaDataModule(pl.LightningDataModule):
             "dataset_ids": dataset_ids,
             "mappings": mappings,
             "sequence_ordering_maps": [item["seq_ordering_map"] for item in batch],
+            "selected_sequences": [
+                item.get("selected_sequences") for item in batch
+            ],
+            "selected_sequence_names": [
+                item.get("selected_sequence_names") for item in batch
+            ],
             "bank_group_key": [item.get("bank_group_key") for item in batch],
         }
         if full_path_control_mode:
@@ -3706,6 +4766,10 @@ class PhylaDataModule(pl.LightningDataModule):
             to_run["full_path_terminal_samples"] = list(
                 full_path_terminal_samples
             )
+            if full_path_joint_tokenizer_raw_graph_batch is not None:
+                to_run["full_path_joint_tokenizer_raw_graph_batch"] = (
+                    full_path_joint_tokenizer_raw_graph_batch
+                )
             to_run["_full_path_control_mode"] = True
         return to_run
 

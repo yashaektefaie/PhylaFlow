@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,12 +79,36 @@ def _summary(values: list[float]) -> dict[str, float]:
 
 def _checkpoint_args(checkpoint: dict) -> SimpleNamespace:
     raw_args = dict(checkpoint.get("args") or {})
+
+    def _localize_repo_path(value):
+        if value is None:
+            return value
+        value = str(value)
+        old_root = "/home/yektefai/PhylaFlow"
+        if value == old_root:
+            return str(REPO_ROOT)
+        if value.startswith(old_root + os.sep):
+            return str(REPO_ROOT / value[len(old_root) + 1 :])
+        return value
+
+    def _localize_base_config(value):
+        value = _localize_repo_path(value)
+        if value and not os.path.exists(value):
+            directory, filename = os.path.split(value)
+            if filename.startswith("local_"):
+                alternate = os.path.join(directory, filename[len("local_") :])
+                if os.path.exists(alternate):
+                    return alternate
+        return value
+
     return SimpleNamespace(
-        base_config=raw_args.get(
-            "base_config",
-            str(
-                REPO_ROOT
-                / "configs/local_ds1_frozenprobe64_fh16_aradd_scale128x4_lr2e3_20260428.yaml"
+        base_config=_localize_base_config(
+            raw_args.get(
+                "base_config",
+                str(
+                    REPO_ROOT
+                    / "configs/local_ds1_frozenprobe64_fh16_aradd_scale128x4_lr2e3_20260428.yaml"
+                ),
             ),
         ),
         embed_dim=int(raw_args.get("embed_dim", 64)),
@@ -95,9 +120,11 @@ def _checkpoint_args(checkpoint: dict) -> SimpleNamespace:
         phyla_dim=int(raw_args.get("phyla_dim", 256)),
         phyla_use_leaf_tokens=bool(raw_args.get("phyla_use_leaf_tokens", True)),
         phyla_use_split_tokens=bool(raw_args.get("phyla_use_split_tokens", False)),
-        phyla_embedding_dir=raw_args.get(
-            "phyla_embedding_dir",
-            str(REPO_ROOT / "analysis/full_sanity_fixedpair_20260401/ds_phyla_embeddings_20260428"),
+        phyla_embedding_dir=_localize_repo_path(
+            raw_args.get(
+                "phyla_embedding_dir",
+                str(REPO_ROOT / "analysis/full_sanity_fixedpair_20260401/ds_phyla_embeddings_20260428"),
+            )
         ),
     )
 

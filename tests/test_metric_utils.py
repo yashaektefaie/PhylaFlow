@@ -1,6 +1,9 @@
+import math
 import unittest
 
 from utils.metric_utils import (
+    calculate_norm_rf,
+    align_numeric_leaf_labels_to_reference,
     kl_divergence_topological_distributions,
     kl_divergence_tree_topology_distributions,
     topk_posterior_tree_recall,
@@ -9,6 +12,7 @@ from utils.metric_utils import (
     compare_likelihood_distributions,
     compare_branch_length_distributions
 )
+from utils.bhv_movie import build_tree_from_splits
 from utils.random_tree import Tree
 from data.dataset import TreeDataset
 import random
@@ -21,6 +25,50 @@ class TestMetricUtils(unittest.TestCase):
         self.tree_b = str(Tree(num_leaves=50, random=True))
         self.tree_c = str(Tree(num_leaves=50, random=True))    
         self.num_leaves = 50
+
+    def test_rf_mismatched_leaf_sets_is_nan(self):
+        rf = calculate_norm_rf(
+            "((0:1,1:1):1,(2:1,3:1):1);",
+            "((10:1,11:1):1,(12:1,13:1):1);",
+        )
+
+        self.assertTrue(math.isnan(rf))
+
+    def test_align_numeric_leaf_labels_to_reference(self):
+        sampled = "((0:1,1:1):1,(2:1,(3:1,4:1):1):1);"
+        reference = "((37:1,44:1):1,(62:1,(69:1,74:1):1):1);"
+        remapped, changed = align_numeric_leaf_labels_to_reference(
+            sampled,
+            reference,
+            target_tree=reference,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(calculate_norm_rf(remapped, reference), 0.0)
+
+    def test_build_tree_from_splits_preserves_mapping_for_star_tree(self):
+        mapping = {
+            0: "37",
+            1: "44",
+            2: "62",
+            3: "69",
+            4: "74",
+            5: "ROOT_DUMMY",
+        }
+        split_set = [1 << idx for idx in range(5)]
+        length_map = {mask: 0.1 for mask in split_set}
+
+        _graph, newick = build_tree_from_splits(
+            split_set,
+            length_map,
+            n_leaves=6,
+            root_leaf=5,
+            mapping=mapping,
+        )
+
+        self.assertIn("37", newick)
+        self.assertIn("74", newick)
+        self.assertNotIn("ROOT_DUMMY", newick)
 
     def test_kl_divergence_matches_identity(self):
         posterior = [self.tree_a, self.tree_a, self.tree_b]

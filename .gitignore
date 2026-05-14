@@ -5,3 +5,7 @@ checkpoints/
 logs/
 samples/
 wandb/
+artifacts/
+metrics/
+weights/
+analysis/full_sanity_fixedpair_20260401/ds_phyla_embeddings_20260428/

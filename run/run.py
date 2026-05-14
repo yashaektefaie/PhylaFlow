@@ -539,6 +539,19 @@ def init_worker(config_file, device_id):
         phyla_precomputed_embeddings_path=config["trainer"].get(
             "phyla_precomputed_embeddings_path"
         ),
+        live_phyla_checkpoint_path=config["trainer"].get(
+            "live_phyla_checkpoint_path"
+        ),
+        live_phyla_unfreeze=config["trainer"].get("live_phyla_unfreeze", True),
+        live_phyla_lr=config["trainer"].get("live_phyla_lr"),
+        live_phyla_input_mode=config["trainer"].get(
+            "live_phyla_input_mode",
+            "raw-full",
+        ),
+        live_phyla_max_input_tokens=config["trainer"].get(
+            "live_phyla_max_input_tokens",
+            0,
+        ),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -552,6 +565,16 @@ def init_worker(config_file, device_id):
         ),
         training_step_gradient_clip_val=config["trainer"].get(
             "training_step_gradient_clip_val", 1.0
+        ),
+        grad_norm_log_frequency=config["trainer"].get("grad_norm_log_frequency", 1),
+        training_step_profile_frequency=config["trainer"].get(
+            "training_step_profile_frequency", 0
+        ),
+        training_step_profile_warmup_steps=config["trainer"].get(
+            "training_step_profile_warmup_steps", 0
+        ),
+        training_step_profile_sync_cuda=config["trainer"].get(
+            "training_step_profile_sync_cuda", True
         ),
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
@@ -753,6 +776,9 @@ def init_worker(config_file, device_id):
         velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
             "velocity_probe_direct_set_positive_reweight_max"
         ),
+        velocity_probe_direct_set_bce_weight=config["trainer"].get(
+            "velocity_probe_direct_set_bce_weight", 1.0
+        ),
         velocity_probe_direct_set_loss_weight=config["trainer"].get(
             "velocity_probe_direct_set_loss_weight", 1.0
         ),
@@ -761,6 +787,9 @@ def init_worker(config_file, device_id):
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
+        ),
+        training_step_joint_tokenize_velocity_ar=config["trainer"].get(
+            "training_step_joint_tokenize_velocity_ar", False
         ),
         training_step_full_path_replay_initial_retry_attempt=config["trainer"].get(
             "training_step_full_path_replay_initial_retry_attempt", 0
@@ -1136,6 +1165,19 @@ def run_test():
         phyla_precomputed_embeddings_path=config["trainer"].get(
             "phyla_precomputed_embeddings_path"
         ),
+        live_phyla_checkpoint_path=config["trainer"].get(
+            "live_phyla_checkpoint_path"
+        ),
+        live_phyla_unfreeze=config["trainer"].get("live_phyla_unfreeze", True),
+        live_phyla_lr=config["trainer"].get("live_phyla_lr"),
+        live_phyla_input_mode=config["trainer"].get(
+            "live_phyla_input_mode",
+            "raw-full",
+        ),
+        live_phyla_max_input_tokens=config["trainer"].get(
+            "live_phyla_max_input_tokens",
+            0,
+        ),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -1149,6 +1191,16 @@ def run_test():
         ),
         training_step_gradient_clip_val=config["trainer"].get(
             "training_step_gradient_clip_val", 1.0
+        ),
+        grad_norm_log_frequency=config["trainer"].get("grad_norm_log_frequency", 1),
+        training_step_profile_frequency=config["trainer"].get(
+            "training_step_profile_frequency", 0
+        ),
+        training_step_profile_warmup_steps=config["trainer"].get(
+            "training_step_profile_warmup_steps", 0
+        ),
+        training_step_profile_sync_cuda=config["trainer"].get(
+            "training_step_profile_sync_cuda", True
         ),
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
@@ -1335,6 +1387,9 @@ def run_test():
         velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
             "velocity_probe_direct_set_positive_reweight_max"
         ),
+        velocity_probe_direct_set_bce_weight=config["trainer"].get(
+            "velocity_probe_direct_set_bce_weight", 1.0
+        ),
         velocity_probe_direct_set_loss_weight=config["trainer"].get(
             "velocity_probe_direct_set_loss_weight", 1.0
         ),
@@ -1343,6 +1398,9 @@ def run_test():
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
+        ),
+        training_step_joint_tokenize_velocity_ar=config["trainer"].get(
+            "training_step_joint_tokenize_velocity_ar", False
         ),
         training_step_full_path_replay_initial_retry_attempt=config["trainer"].get(
             "training_step_full_path_replay_initial_retry_attempt", 0
@@ -1798,6 +1856,19 @@ def run_overfit():
         phyla_precomputed_embeddings_path=config["trainer"].get(
             "phyla_precomputed_embeddings_path"
         ),
+        live_phyla_checkpoint_path=config["trainer"].get(
+            "live_phyla_checkpoint_path"
+        ),
+        live_phyla_unfreeze=config["trainer"].get("live_phyla_unfreeze", True),
+        live_phyla_lr=config["trainer"].get("live_phyla_lr"),
+        live_phyla_input_mode=config["trainer"].get(
+            "live_phyla_input_mode",
+            "raw-full",
+        ),
+        live_phyla_max_input_tokens=config["trainer"].get(
+            "live_phyla_max_input_tokens",
+            0,
+        ),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -1811,6 +1882,16 @@ def run_overfit():
         ),
         training_step_gradient_clip_val=config["trainer"].get(
             "training_step_gradient_clip_val", 1.0
+        ),
+        grad_norm_log_frequency=config["trainer"].get("grad_norm_log_frequency", 1),
+        training_step_profile_frequency=config["trainer"].get(
+            "training_step_profile_frequency", 0
+        ),
+        training_step_profile_warmup_steps=config["trainer"].get(
+            "training_step_profile_warmup_steps", 0
+        ),
+        training_step_profile_sync_cuda=config["trainer"].get(
+            "training_step_profile_sync_cuda", True
         ),
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
@@ -1997,6 +2078,9 @@ def run_overfit():
         velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
             "velocity_probe_direct_set_positive_reweight_max"
         ),
+        velocity_probe_direct_set_bce_weight=config["trainer"].get(
+            "velocity_probe_direct_set_bce_weight", 1.0
+        ),
         velocity_probe_direct_set_loss_weight=config["trainer"].get(
             "velocity_probe_direct_set_loss_weight", 1.0
         ),
@@ -2005,6 +2089,9 @@ def run_overfit():
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
+        ),
+        training_step_joint_tokenize_velocity_ar=config["trainer"].get(
+            "training_step_joint_tokenize_velocity_ar", False
         ),
         training_step_full_path_replay_initial_retry_attempt=config["trainer"].get(
             "training_step_full_path_replay_initial_retry_attempt", 0
@@ -2361,6 +2448,9 @@ def run_overfit():
     else:
         trainer_args["logger"] = False
 
+    if config["trainer"].get("default_root_dir"):
+        trainer_args["default_root_dir"] = config["trainer"]["default_root_dir"]
+
     trainer_args["max_epochs"] = config["trainer"]["epochs"]
     trainer_args["callbacks"] = [save_callback]
 
@@ -2434,6 +2524,19 @@ def main():
         phyla_precomputed_embeddings_path=config["trainer"].get(
             "phyla_precomputed_embeddings_path"
         ),
+        live_phyla_checkpoint_path=config["trainer"].get(
+            "live_phyla_checkpoint_path"
+        ),
+        live_phyla_unfreeze=config["trainer"].get("live_phyla_unfreeze", True),
+        live_phyla_lr=config["trainer"].get("live_phyla_lr"),
+        live_phyla_input_mode=config["trainer"].get(
+            "live_phyla_input_mode",
+            "raw-full",
+        ),
+        live_phyla_max_input_tokens=config["trainer"].get(
+            "live_phyla_max_input_tokens",
+            0,
+        ),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -2447,6 +2550,16 @@ def main():
         ),
         training_step_gradient_clip_val=config["trainer"].get(
             "training_step_gradient_clip_val", 1.0
+        ),
+        grad_norm_log_frequency=config["trainer"].get("grad_norm_log_frequency", 1),
+        training_step_profile_frequency=config["trainer"].get(
+            "training_step_profile_frequency", 0
+        ),
+        training_step_profile_warmup_steps=config["trainer"].get(
+            "training_step_profile_warmup_steps", 0
+        ),
+        training_step_profile_sync_cuda=config["trainer"].get(
+            "training_step_profile_sync_cuda", True
         ),
         training_step_autoregressive_grad_ratio=config["trainer"].get(
             "training_step_autoregressive_grad_ratio"
@@ -2633,6 +2746,9 @@ def main():
         velocity_probe_direct_set_positive_reweight_max=config["trainer"].get(
             "velocity_probe_direct_set_positive_reweight_max"
         ),
+        velocity_probe_direct_set_bce_weight=config["trainer"].get(
+            "velocity_probe_direct_set_bce_weight", 1.0
+        ),
         velocity_probe_direct_set_loss_weight=config["trainer"].get(
             "velocity_probe_direct_set_loss_weight", 1.0
         ),
@@ -2641,6 +2757,9 @@ def main():
         ),
         training_step_probe_parity_joint_update=config["trainer"].get(
             "training_step_probe_parity_joint_update", False
+        ),
+        training_step_joint_tokenize_velocity_ar=config["trainer"].get(
+            "training_step_joint_tokenize_velocity_ar", False
         ),
         training_step_full_path_replay_initial_retry_attempt=config["trainer"].get(
             "training_step_full_path_replay_initial_retry_attempt", 0
@@ -2986,6 +3105,11 @@ def main():
         _init_wandb_run(config, default_project="phylaflow")
     else:
         trainer_args["logger"] = False
+    if config["trainer"].get("disable_lightning_logger", False):
+        trainer_args["logger"] = False
+
+    if config["trainer"].get("default_root_dir"):
+        trainer_args["default_root_dir"] = config["trainer"]["default_root_dir"]
 
     trainer_args["max_epochs"] = config["trainer"]["epochs"]
     trainer_args["callbacks"] = [

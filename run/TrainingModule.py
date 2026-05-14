@@ -7,6 +7,8 @@ import hashlib
 import numbers
 import subprocess
 import re
+import contextlib
+import types
 from collections import Counter, OrderedDict
 import importlib.util
 import functools
@@ -60,6 +62,7 @@ compare_likelihood_distributions,
 compare_branch_length_distributions,
 calculate_norm_rf,
 canonicalize_topology_newick,
+align_numeric_leaf_labels_to_reference,
 )
 from data.dataset import PhylaDataModule, TreeDataset
 from model.model import TreeDenoiserTokenGT
@@ -117,6 +120,60 @@ def _load_phyla_runtime():
     )
 
     return load_config, Config, load_model, _encode_sequences_openfold_style
+
+
+def _install_skbio_stub_for_live_phyla() -> None:
+    if "skbio" in sys.modules:
+        return
+    skbio = types.ModuleType("skbio")
+    skbio_tree = types.ModuleType("skbio.tree")
+
+    class _UnusedDistanceMatrix:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("scikit-bio is not required for live Phyla embeddings")
+
+    def _unused_nj(*args, **kwargs):
+        raise ImportError("scikit-bio is not required for live Phyla embeddings")
+
+    skbio.DistanceMatrix = _UnusedDistanceMatrix
+    skbio_tree.nj = _unused_nj
+    sys.modules["skbio"] = skbio
+    sys.modules["skbio.tree"] = skbio_tree
+
+
+def _load_live_phyla_beta_state_dict(checkpoint_path, map_location="cpu"):
+    payload = torch.load(checkpoint_path, map_location=map_location)
+    state_dict = (
+        payload["state_dict"]
+        if isinstance(payload, dict) and "state_dict" in payload
+        else payload
+    )
+    normalized = {}
+    for key, value in state_dict.items():
+        key = str(key)
+        for prefix in ("model_name.", "_forward_module.model.", "model."):
+            if key.startswith(prefix):
+                key = key[len(prefix) :]
+        normalized[key] = value
+    return normalized
+
+
+def _load_live_phyla_beta_model(checkpoint_path, device="cpu"):
+    _install_skbio_stub_for_live_phyla()
+    from phyla.model.model import Config, Phyla
+
+    cfg = Config()
+    cfg.model.model_name = "phyla-beta"
+    if str(device).startswith("cpu"):
+        cfg.model.fused_add_norm = False
+    model = Phyla(cfg, name="phyla-beta", device=device)
+    model.load_state_dict(
+        _load_live_phyla_beta_state_dict(checkpoint_path, map_location="cpu"),
+        strict=True,
+    )
+    model.to(device)
+    model.device = torch.device(device)
+    return model
 
 
 _HISTORICAL_STEP_MODULE = None
@@ -2038,6 +2095,97 @@ def _structuralize_trees_with_cache(module, trees):
     return structural_trees
 
 
+def _structural_trees_from_samples(module, samples, newick_key, structural_key):
+    structural_trees = []
+    fallback_positions = []
+    fallback_newicks = []
+    for idx, sample in enumerate(samples):
+        structural = sample.get(structural_key)
+        if structural is None:
+            fallback_positions.append(idx)
+            fallback_newicks.append(sample[newick_key])
+            structural_trees.append(None)
+        else:
+            structural_trees.append(structural)
+    if fallback_newicks:
+        parsed = _structuralize_trees_with_cache(module, fallback_newicks)
+        for idx, structural in zip(fallback_positions, parsed):
+            structural_trees[idx] = structural
+    return structural_trees
+
+
+def _tokenize_samples_with_optional_raw_graphs(
+    module,
+    samples,
+    newick_key,
+    structural_key,
+    raw_graph_key,
+):
+    raw_graphs = [sample.get(raw_graph_key) for sample in samples]
+    if raw_graphs and all(raw_graph is not None for raw_graph in raw_graphs):
+        tokenizer = module.model.tokenizer
+        if hasattr(tokenizer, "forward_raw_graph_cache"):
+            return tokenizer.forward_raw_graph_cache(raw_graphs)
+    return module.model.tokenizer(
+        _structural_trees_from_samples(
+            module,
+            samples,
+            newick_key,
+            structural_key,
+        )
+    )
+
+
+def _tokenized_batch_size_from_tokenizer_output(tokenized_trees):
+    if tokenized_trees is None or not tokenized_trees:
+        return 0
+    return int(tokenized_trees[0].shape[0])
+
+
+def _slice_tokenized_tree_batch(tokenized_trees, start, end):
+    start = int(start)
+    end = int(end)
+    if tokenized_trees is None:
+        return None
+    return (
+        tokenized_trees[0][start:end],
+        tokenized_trees[1][start:end],
+        tokenized_trees[2][start:end],
+        tokenized_trees[3][start:end],
+        list(tokenized_trees[4][start:end]),
+        tokenized_trees[5][start:end],
+        list(tokenized_trees[6][start:end]),
+    )
+
+
+def _tokenize_mixed_samples_with_optional_raw_graphs(module, specs):
+    specs = list(specs or [])
+    if not specs:
+        return None
+    raw_graphs = [sample.get(raw_key) for sample, _newick, _struct, raw_key in specs]
+    if raw_graphs and all(raw_graph is not None for raw_graph in raw_graphs):
+        tokenizer = module.model.tokenizer
+        if hasattr(tokenizer, "forward_raw_graph_cache"):
+            return tokenizer.forward_raw_graph_cache(raw_graphs)
+
+    structural_trees = []
+    fallback_positions = []
+    fallback_newicks = []
+    for idx, (sample, newick_key, structural_key, _raw_key) in enumerate(specs):
+        structural = sample.get(structural_key)
+        if structural is None:
+            fallback_positions.append(idx)
+            fallback_newicks.append(sample[newick_key])
+            structural_trees.append(None)
+        else:
+            structural_trees.append(structural)
+    if fallback_newicks:
+        parsed = _structuralize_trees_with_cache(module, fallback_newicks)
+        for idx, structural in zip(fallback_positions, parsed):
+            structural_trees[idx] = structural
+    return module.model.tokenizer(structural_trees)
+
+
 def _tokenize_trees_with_structural_cache(module, trees):
     return module.model.tokenizer(_structuralize_trees_with_cache(module, trees))
 
@@ -2432,6 +2580,116 @@ def _build_case_index_tensor_from_group_keys(
     return torch.tensor(indices, dtype=torch.long, device=device)
 
 
+def _selected_sequence_fields_from_samples(samples):
+    selected_sequences = [sample.get("selected_sequences") for sample in samples]
+    selected_sequence_names = [
+        sample.get("selected_sequence_names") for sample in samples
+    ]
+    if not any(value is not None for value in selected_sequences):
+        selected_sequences = None
+    if not any(value is not None for value in selected_sequence_names):
+        selected_sequence_names = None
+    return selected_sequences, selected_sequence_names
+
+
+def _normalize_selected_sequence_cases(selected_sequences, selected_sequence_names=None):
+    if selected_sequences is None:
+        return [], []
+    if isinstance(selected_sequences, tuple):
+        selected_sequences = list(selected_sequences)
+    if isinstance(selected_sequences, str):
+        selected_sequences = [[selected_sequences]]
+    elif selected_sequences and all(
+        isinstance(item, str) for item in selected_sequences
+    ):
+        selected_sequences = [selected_sequences]
+    else:
+        selected_sequences = list(selected_sequences)
+
+    if selected_sequence_names is None:
+        selected_sequence_names = [None] * len(selected_sequences)
+    else:
+        if isinstance(selected_sequence_names, tuple):
+            selected_sequence_names = list(selected_sequence_names)
+        if isinstance(selected_sequence_names, str):
+            selected_sequence_names = [[selected_sequence_names]]
+        elif selected_sequence_names and all(
+            isinstance(item, str) for item in selected_sequence_names
+        ):
+            selected_sequence_names = [selected_sequence_names]
+        else:
+            selected_sequence_names = list(selected_sequence_names)
+        if len(selected_sequence_names) != len(selected_sequences):
+            selected_sequence_names = [None] * len(selected_sequences)
+
+    return selected_sequences, selected_sequence_names
+
+
+def _canonical_selected_sequence_key(sequences, names=None):
+    if sequences is None:
+        return None
+    sequence_tuple = tuple(str(sequence) for sequence in list(sequences))
+    if not sequence_tuple:
+        return None
+    if names is None:
+        name_tuple = ()
+    else:
+        name_tuple = tuple(str(name) for name in list(names))
+        if len(name_tuple) != len(sequence_tuple):
+            name_tuple = ()
+    return name_tuple, sequence_tuple
+
+
+def _common_selected_sequence_fields(selected_sequences, selected_sequence_names=None):
+    selected_sequences, selected_sequence_names = _normalize_selected_sequence_cases(
+        selected_sequences,
+        selected_sequence_names,
+    )
+    if not selected_sequences:
+        return None, None, None
+
+    common_key = None
+    common_sequences = None
+    common_names = None
+    for sequences, names in zip(selected_sequences, selected_sequence_names):
+        if sequences is None:
+            return None, None, None
+        sequence_list = list(sequences)
+        name_list = None if names is None else list(names)
+        key = _canonical_selected_sequence_key(sequence_list, name_list)
+        if key is None:
+            return None, None, None
+        if common_key is None:
+            common_key = key
+            common_sequences = sequence_list
+            common_names = name_list
+        elif key != common_key:
+            return None, None, None
+
+    return common_sequences, common_names, common_key
+
+
+def _selected_sequence_case_specs(selected_sequences, selected_sequence_names=None):
+    selected_sequences, selected_sequence_names = _normalize_selected_sequence_cases(
+        selected_sequences,
+        selected_sequence_names,
+    )
+    if not selected_sequences:
+        return None
+
+    specs = []
+    for sequences, names in zip(selected_sequences, selected_sequence_names):
+        if sequences is None:
+            return None
+        sequence_list = list(sequences)
+        name_list = None if names is None else list(names)
+        key = _canonical_selected_sequence_key(sequence_list, name_list)
+        if key is None:
+            return None
+        specs.append((key, sequence_list, name_list))
+    return specs
+
+
 def _cached_case_group_key_lookup(dataset_split):
     if dataset_split is None:
         return {}
@@ -2494,25 +2752,36 @@ def _infer_case_group_keys_from_batch(module, batch):
     return resolved
 
 
-def _build_velocity_replay_batch(module, samples):
-    if not samples:
-        return None
-
+def _select_velocity_replay_samples(module, samples):
     all_samples = list(samples)
     filtered_samples = list(all_samples)
     if bool(getattr(module, "velocity_probe_direct_set_anchor_only", False)):
         anchor_samples = [sample for sample in filtered_samples if sample.get("anchor_family")]
         if anchor_samples:
             filtered_samples = anchor_samples
-    samples = filtered_samples
+    return all_samples, filtered_samples
+
+
+def _build_velocity_replay_batch(module, samples, tokenized_override=None):
+    if not samples:
+        return None
+
+    all_samples, samples = _select_velocity_replay_samples(module, samples)
+    if not samples:
+        return None
 
     newicks = [sample["newick_tree"] for sample in samples]
-    structural_trees = _structuralize_trees_with_cache(module, newicks)
-    with torch.no_grad():
-        tokenized = _move_tokenized_batch_to_device(
-            module.model.tokenizer(structural_trees),
-            module.device,
+    if tokenized_override is None:
+        tokenized = _tokenize_samples_with_optional_raw_graphs(
+            module,
+            samples,
+            "newick_tree",
+            "newick_tree_structural",
+            "newick_tree_tokenizer_raw_graph",
         )
+    else:
+        tokenized = tokenized_override
+    tokenized = _move_tokenized_batch_to_device(tokenized, module.device)
     canonical_targets_by_topology = {}
     canonical_targets_by_state = {}
     if bool(getattr(module, "velocity_probe_direct_set_loss", False)):
@@ -2609,6 +2878,9 @@ def _build_velocity_replay_batch(module, samples):
     ]
     mappings = [sample.get("num_to_name") for sample in samples]
     num_leaves = [int(sample["num_leaves"]) for sample in samples]
+    selected_sequences, selected_sequence_names = _selected_sequence_fields_from_samples(
+        samples
+    )
     return {
         "_is_replay_batch": True,
         "_skip_training_augmentations": True,
@@ -2635,6 +2907,8 @@ def _build_velocity_replay_batch(module, samples):
         "ids": ids,
         "dataset_ids": dataset_ids,
         "mappings": mappings,
+        "selected_sequences": selected_sequences,
+        "selected_sequence_names": selected_sequence_names,
         "_probe_direct_set_targets": probe_direct_set_targets,
         "_probe_direct_set_sample_mask": probe_direct_set_mask,
         "_first_hit_case_indices": first_hit_case_index_tensor,
@@ -2646,12 +2920,16 @@ def _build_terminal_replay_batch(module, samples):
         return None
 
     newicks = [sample["newick_tree"] for sample in samples]
-    structural_trees = _structuralize_trees_with_cache(module, newicks)
-    with torch.no_grad():
-        tokenized = _move_tokenized_batch_to_device(
-            module.model.tokenizer(structural_trees),
-            module.device,
-        )
+    tokenized = _move_tokenized_batch_to_device(
+        _tokenize_samples_with_optional_raw_graphs(
+            module,
+            samples,
+            "newick_tree",
+            "newick_tree_structural",
+            "newick_tree_tokenizer_raw_graph",
+        ),
+        module.device,
+    )
     first_hit_case_index_tensor = None
     if getattr(module.model, "first_hit_head_mode", "base") == "case_adapted_mlp":
         first_hit_case_index_tensor = _build_case_index_tensor_from_group_keys(
@@ -2673,6 +2951,9 @@ def _build_terminal_replay_batch(module, samples):
         int(sample.get("num_leaves", Tree(sample["newick_tree"]).n_leaves))
         for sample in samples
     ]
+    selected_sequences, selected_sequence_names = _selected_sequence_fields_from_samples(
+        samples
+    )
     return {
         "_is_replay_batch": True,
         "_skip_training_augmentations": True,
@@ -2701,21 +2982,28 @@ def _build_terminal_replay_batch(module, samples):
         "ids": ids,
         "dataset_ids": dataset_ids,
         "mappings": mappings,
+        "selected_sequences": selected_sequences,
+        "selected_sequence_names": selected_sequence_names,
         "_first_hit_case_indices": first_hit_case_index_tensor,
     }
 
 
-def _build_autoregressive_replay_batch(module, samples):
+def _build_autoregressive_replay_batch(module, samples, tokenized_override=None):
     if not samples:
         return None
 
     newicks = [sample["newick"] for sample in samples]
-    structural_trees = _structuralize_trees_with_cache(module, newicks)
-    with torch.no_grad():
-        tokenized = _move_tokenized_batch_to_device(
-            module.model.tokenizer(structural_trees),
-            module.device,
+    if tokenized_override is None:
+        tokenized = _tokenize_samples_with_optional_raw_graphs(
+            module,
+            samples,
+            "newick",
+            "newick_structural",
+            "newick_tokenizer_raw_graph",
         )
+    else:
+        tokenized = tokenized_override
+    tokenized = _move_tokenized_batch_to_device(tokenized, module.device)
     autoregressive_case_index_tensor = None
     if getattr(module.model, "autoregressive_use_case_conditioning", False):
         autoregressive_case_index_tensor = _build_case_index_tensor_from_group_keys(
@@ -2737,6 +3025,9 @@ def _build_autoregressive_replay_batch(module, samples):
         int(sample.get("num_leaves", Tree(sample["newick"]).n_leaves))
         for sample in samples
     ]
+    selected_sequences, selected_sequence_names = _selected_sequence_fields_from_samples(
+        samples
+    )
     return {
         "_is_replay_batch": True,
         "_skip_training_augmentations": True,
@@ -2764,8 +3055,118 @@ def _build_autoregressive_replay_batch(module, samples):
         "ids": ids,
         "dataset_ids": dataset_ids,
         "mappings": mappings,
+        "selected_sequences": selected_sequences,
+        "selected_sequence_names": selected_sequence_names,
         "_autoregressive_case_indices": autoregressive_case_index_tensor,
     }
+
+
+def _build_velocity_autoregressive_replay_batches(
+    module,
+    velocity_samples,
+    autoregressive_samples,
+    joint_raw_graph_batch=None,
+):
+    velocity_samples = list(velocity_samples or [])
+    autoregressive_samples = list(autoregressive_samples or [])
+    _velocity_all_samples, selected_velocity_samples = _select_velocity_replay_samples(
+        module,
+        velocity_samples,
+    )
+    combined_tokenized = None
+    if (
+        isinstance(joint_raw_graph_batch, dict)
+        and bool(
+            joint_raw_graph_batch.get(
+                "_tree_tokenizer_raw_graph_batch_cache",
+                False,
+            )
+        )
+        and int(joint_raw_graph_batch.get("velocity_count", -1))
+        == len(selected_velocity_samples)
+        and int(joint_raw_graph_batch.get("autoregressive_count", -1))
+        == len(autoregressive_samples)
+    ):
+        tokenizer = module.model.tokenizer
+        if hasattr(tokenizer, "forward_raw_graph_cache"):
+            combined_tokenized = tokenizer.forward_raw_graph_cache(
+                joint_raw_graph_batch
+            )
+    if combined_tokenized is None:
+        specs = []
+        if selected_velocity_samples:
+            specs.extend(
+                (
+                    sample,
+                    "newick_tree",
+                    "newick_tree_structural",
+                    "newick_tree_tokenizer_raw_graph",
+                )
+                for sample in selected_velocity_samples
+            )
+        if autoregressive_samples:
+            specs.extend(
+                (
+                    sample,
+                    "newick",
+                    "newick_structural",
+                    "newick_tokenizer_raw_graph",
+                )
+                for sample in autoregressive_samples
+            )
+        combined_tokenized = _tokenize_mixed_samples_with_optional_raw_graphs(
+            module,
+            specs,
+        )
+    if combined_tokenized is None:
+        return (
+            _build_velocity_replay_batch(module, velocity_samples),
+            _build_autoregressive_replay_batch(module, autoregressive_samples),
+        )
+    combined_tokenized = _move_tokenized_batch_to_device(
+        combined_tokenized,
+        module.device,
+    )
+    velocity_count = len(selected_velocity_samples)
+    autoregressive_count = len(autoregressive_samples)
+    if _tokenized_batch_size_from_tokenizer_output(combined_tokenized) != (
+        velocity_count + autoregressive_count
+    ):
+        return (
+            _build_velocity_replay_batch(module, velocity_samples),
+            _build_autoregressive_replay_batch(module, autoregressive_samples),
+        )
+
+    velocity_tokenized = (
+        _slice_tokenized_tree_batch(combined_tokenized, 0, velocity_count)
+        if velocity_count > 0
+        else None
+    )
+    autoregressive_tokenized = (
+        _slice_tokenized_tree_batch(
+            combined_tokenized,
+            velocity_count,
+            velocity_count + autoregressive_count,
+        )
+        if autoregressive_count > 0
+        else None
+    )
+    velocity_batch = _build_velocity_replay_batch(
+        module,
+        velocity_samples,
+        tokenized_override=velocity_tokenized,
+    )
+    autoregressive_batch = _build_autoregressive_replay_batch(
+        module,
+        autoregressive_samples,
+        tokenized_override=autoregressive_tokenized,
+    )
+    if velocity_batch is not None and autoregressive_batch is not None:
+        for batch in (velocity_batch, autoregressive_batch):
+            batch["_joint_tokenized_trees"] = combined_tokenized
+            batch["_joint_velocity_batch_size"] = int(velocity_count)
+            batch["_joint_autoregressive_batch_size"] = int(autoregressive_count)
+    return velocity_batch, autoregressive_batch
 
 
 _FULL_PATH_REPLAY_SAMPLE_KEYS = (
@@ -5420,6 +5821,13 @@ def _predsim_overrun_rollout(
                 break
             merges_this_boundary += 1
 
+    current_newick, final_tree_label_remapped = (
+        align_numeric_leaf_labels_to_reference(
+            current_newick,
+            start_tree,
+            target_tree=target_tree,
+        )
+    )
     best_rf = (
         min(float(item["rf"]) for item in trace)
         if trace
@@ -5432,6 +5840,7 @@ def _predsim_overrun_rollout(
         "num_trace_states": int(len(trace)),
         "num_velocity_states": int(sum(1 for x in trace if x["phase"] == "velocity")),
         "num_ar_states": int(sum(1 for x in trace if x["phase"] == "autoregressive")),
+        "final_tree_label_remapped": bool(final_tree_label_remapped),
         "trace": trace,
     }
 
@@ -5970,11 +6379,19 @@ def _discrete_phase_rollout(
         trace["final_orthant_relax"] = relax_states
         trace["final_orthant_relax_summary"] = relax_summary
 
+    current_newick, final_tree_label_remapped = (
+        align_numeric_leaf_labels_to_reference(
+            current_newick,
+            start_tree,
+            target_tree=target_tree,
+        )
+    )
     out = {
         "final_tree": current_newick,
         "final_rf": float(calculate_norm_rf(current_newick, target_tree)),
         "num_velocity_states": int(len(trace["velocity"])),
         "num_ar_states": int(len(trace["autoregressive"])),
+        "final_tree_label_remapped": bool(final_tree_label_remapped),
         "trace": trace,
     }
     if return_trace:
@@ -6015,12 +6432,21 @@ class TrainingModule(LightningModule):
         verbose: bool = False,
         phyla_checkpoint_path=None,
         phyla_precomputed_embeddings_path: str | None = None,
+        live_phyla_checkpoint_path: str | None = None,
+        live_phyla_unfreeze: bool = True,
+        live_phyla_lr: float | None = None,
+        live_phyla_input_mode: str = "raw-full",
+        live_phyla_max_input_tokens: int = 0,
         velocity_loss_mode: str = "weighted",
         velocity_loss_plain_weight: float = 0.5,
         velocity_sign_eps: float = 1e-3,
         training_step_velocity_weight: float = 1.0,
         training_step_autoregressive_weight: float = 1.0,
         training_step_gradient_clip_val: float = 1.0,
+        grad_norm_log_frequency: int = 1,
+        training_step_profile_frequency: int = 0,
+        training_step_profile_warmup_steps: int = 0,
+        training_step_profile_sync_cuda: bool = True,
         training_step_autoregressive_grad_ratio = None,
         training_step_separate_optimizer_steps: bool = False,
         training_step_verbose_logging_enabled: bool = False,
@@ -6092,9 +6518,11 @@ class TrainingModule(LightningModule):
         velocity_probe_direct_set_include_base_samples: bool = False,
         velocity_probe_direct_set_positive_reweight_power: float = 1.0,
         velocity_probe_direct_set_positive_reweight_max: float | None = None,
+        velocity_probe_direct_set_bce_weight: float = 1.0,
         velocity_probe_direct_set_loss_weight: float = 1.0,
         velocity_probe_direct_set_mse_weight: float = 0.0,
         training_step_probe_parity_joint_update: bool = False,
+        training_step_joint_tokenize_velocity_ar: bool = False,
         training_step_full_path_replay_initial_retry_attempt: int = 0,
         skip_repeated_no_valid_boundary_use_at_sampling: bool = False,
         sampling_discrete_phase_rollout_use_at_sampling: bool = False,
@@ -6254,6 +6682,14 @@ class TrainingModule(LightningModule):
         self.num_samples = num_samples
         self.dt = dt
         self.training_step_gradient_clip_val = float(training_step_gradient_clip_val)
+        self.grad_norm_log_frequency = int(grad_norm_log_frequency or 0)
+        self.training_step_profile_frequency = int(
+            training_step_profile_frequency or 0
+        )
+        self.training_step_profile_warmup_steps = int(
+            training_step_profile_warmup_steps or 0
+        )
+        self.training_step_profile_sync_cuda = bool(training_step_profile_sync_cuda)
         self.train_tokenized_trees = None
         self.train_batched_time = None
         self.train_tree = None
@@ -6275,6 +6711,18 @@ class TrainingModule(LightningModule):
         self.phyla_checkpoint_path = phyla_checkpoint_path
         self.phyla_precomputed_embeddings_path = phyla_precomputed_embeddings_path
         self.phyla_model = None
+        self.live_phyla_checkpoint_path = live_phyla_checkpoint_path
+        self.live_phyla_unfreeze = bool(live_phyla_unfreeze)
+        self.live_phyla_lr = (
+            None if live_phyla_lr is None else float(live_phyla_lr)
+        )
+        self.live_phyla_input_mode = str(live_phyla_input_mode or "raw-full")
+        self.live_phyla_max_input_tokens = max(
+            0,
+            int(live_phyla_max_input_tokens or 0),
+        )
+        self.live_phyla_model = None
+        self._live_phyla_device = None
         self.phyla_precomputed_name_to_embedding = None
         self.phyla_precomputed_dataset_name_to_embedding = {}
         self.phyla_precomputed_dataset_id_to_tensor = {}
@@ -6306,6 +6754,31 @@ class TrainingModule(LightningModule):
                 logging.warning(f"Failed to load Phyla model: {e}")
             finally:
                 sys.argv = original_argv
+
+        if self.live_phyla_checkpoint_path is not None:
+            live_device = "cuda" if torch.cuda.is_available() else "cpu"
+            try:
+                self.live_phyla_model = _load_live_phyla_beta_model(
+                    self.live_phyla_checkpoint_path,
+                    device=live_device,
+                )
+                self._live_phyla_device = str(torch.device(live_device))
+                for param in self.live_phyla_model.parameters():
+                    param.requires_grad_(self.live_phyla_unfreeze)
+                if self.live_phyla_unfreeze:
+                    self.live_phyla_model.train()
+                else:
+                    self.live_phyla_model.eval()
+                logging.info(
+                    "Loaded live Phyla-beta checkpoint from %s (unfreeze=%s)",
+                    self.live_phyla_checkpoint_path,
+                    self.live_phyla_unfreeze,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load live Phyla-beta checkpoint from "
+                    f"{self.live_phyla_checkpoint_path}: {e}"
+                ) from e
 
         if self.phyla_precomputed_embeddings_path is not None:
             try:
@@ -6957,7 +7430,6 @@ class TrainingModule(LightningModule):
         if (
             float(velocity_terminal_head_weight) > 0.0
             or bool(velocity_terminal_head_use_at_sampling)
-            or bool(sampling_discrete_phase_rollout_use_at_sampling)
         ):
             terminal_input_mode = (
                 "probe"
@@ -7141,6 +7613,9 @@ class TrainingModule(LightningModule):
             if velocity_probe_direct_set_positive_reweight_max is None
             else float(velocity_probe_direct_set_positive_reweight_max)
         )
+        self.velocity_probe_direct_set_bce_weight = float(
+            velocity_probe_direct_set_bce_weight
+        )
         self.velocity_probe_direct_set_loss_weight = float(
             velocity_probe_direct_set_loss_weight
         )
@@ -7149,6 +7624,9 @@ class TrainingModule(LightningModule):
         )
         self.training_step_probe_parity_joint_update = bool(
             training_step_probe_parity_joint_update
+        )
+        self.training_step_joint_tokenize_velocity_ar = bool(
+            training_step_joint_tokenize_velocity_ar
         )
         self.training_step_full_path_replay_initial_retry_attempt = max(
             0, int(training_step_full_path_replay_initial_retry_attempt or 0)
@@ -9288,6 +9766,10 @@ class TrainingModule(LightningModule):
                         if hasattr(dataset_split, "return_nexus_number_to_name")
                         else None
                     ),
+                    "selected_sequences": sampled_pair.get("selected_sequences"),
+                    "selected_sequence_names": sampled_pair.get(
+                        "selected_sequence_names"
+                    ),
                 }
 
             sampled = dataset_split[0]
@@ -9306,6 +9788,10 @@ class TrainingModule(LightningModule):
                         dataset_split.return_nexus_number_to_name(0)
                         if hasattr(dataset_split, "return_nexus_number_to_name")
                         else None
+                    ),
+                    "selected_sequences": sampled.get("selected_sequences"),
+                    "selected_sequence_names": sampled.get(
+                        "selected_sequence_names"
                     ),
                 }
 
@@ -9335,6 +9821,10 @@ class TrainingModule(LightningModule):
                 "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                 "max_events": int(max_events),
                 "name_mapping": name_mapping,
+                "selected_sequences": fixed_pair.get("selected_sequences"),
+                "selected_sequence_names": fixed_pair.get(
+                    "selected_sequence_names"
+                ),
             }
             self._cached_harness_sampling_pairs[cache_key] = pair
             return pair
@@ -9421,6 +9911,8 @@ class TrainingModule(LightningModule):
             "bank_group_key": fixed_pair.get("bank_group_key"),
             "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
             "name_mapping": fixed_pair.get("name_mapping"),
+            "selected_sequences": fixed_pair.get("selected_sequences"),
+            "selected_sequence_names": fixed_pair.get("selected_sequence_names"),
             "max_events": len(fixed_pair.get("final_labels", []) or []),
         }
         sample_kwargs = self._build_harness_sample_kwargs(pair, train=True)
@@ -9615,6 +10107,8 @@ class TrainingModule(LightningModule):
             "bank_group_key": fixed_pair.get("bank_group_key"),
             "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
             "name_mapping": fixed_pair.get("name_mapping"),
+            "selected_sequences": fixed_pair.get("selected_sequences"),
+            "selected_sequence_names": fixed_pair.get("selected_sequence_names"),
             "max_events": len(final_labels),
         }
         sample_kwargs = self._build_harness_sample_kwargs(pair, train=True)
@@ -9679,6 +10173,8 @@ class TrainingModule(LightningModule):
             "bank_group_key": fixed_pair.get("bank_group_key"),
             "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
             "name_mapping": fixed_pair.get("name_mapping"),
+            "selected_sequences": fixed_pair.get("selected_sequences"),
+            "selected_sequence_names": fixed_pair.get("selected_sequence_names"),
             "max_events": len(fixed_pair.get("final_labels", []) or []),
         }
         sample_kwargs = self._build_harness_sample_kwargs(pair, train=train)
@@ -9743,13 +10239,17 @@ class TrainingModule(LightningModule):
                 rollout_kind=rollout_kind,
                 **overrides,
             )
-        phyla_embeddings = self._resolve_precomputed_phyla_embeddings_for_tree(
-            pair["start_tree"],
-            mapping=pair.get("name_mapping"),
-            num_leaf=pair.get("n_leaves"),
-            device=self.device,
-            dataset_id=pair.get("dataset_id"),
-        )
+        phyla_embeddings = None
+        if self.live_phyla_model is not None:
+            phyla_embeddings = self._compute_live_phyla_embeddings_for_pair(pair)
+        if phyla_embeddings is None:
+            phyla_embeddings = self._resolve_precomputed_phyla_embeddings_for_tree(
+                pair["start_tree"],
+                mapping=pair.get("name_mapping"),
+                num_leaf=pair.get("n_leaves"),
+                device=self.device,
+                dataset_id=pair.get("dataset_id"),
+            )
         dataset_obj = getattr(self, "dataset", None)
         dataset_split = None
         if dataset_obj is not None:
@@ -10998,12 +11498,21 @@ class TrainingModule(LightningModule):
             [pair["start_tree"]],
             **self._build_harness_sample_kwargs(pair, train=train),
         )
-        sampled_tree = sampled_trees[0]
+        sampled_tree, sampled_tree_label_remapped = (
+            align_numeric_leaf_labels_to_reference(
+                sampled_trees[0],
+                pair["start_tree"],
+                target_tree=pair["target_tree"],
+            )
+        )
         likelihood_scorer = self._get_branch_relax_likelihood_scorer()
         metrics = {
             "rf_norm": float(calculate_norm_rf(sampled_tree, pair["target_tree"])),
             "start_rf_norm": float(
                 calculate_norm_rf(pair["start_tree"], pair["target_tree"])
+            ),
+            "sampled_tree_label_remapped": float(
+                1.0 if sampled_tree_label_remapped else 0.0
             ),
             "_start_tree": str(pair["start_tree"]),
             "_original_start_tree": (
@@ -11238,6 +11747,8 @@ class TrainingModule(LightningModule):
             name_mapping_value = fixed_pair.get("name_mapping")
             bank_group_key_value = fixed_pair.get("bank_group_key")
             dataset_id_value = fixed_pair.get("dataset_id")
+            selected_sequences_value = fixed_pair.get("selected_sequences")
+            selected_sequence_names_value = fixed_pair.get("selected_sequence_names")
         else:
             start_tree = sampled.get("start_tree")
             target_tree = sampled.get("target_tree")
@@ -11245,16 +11756,21 @@ class TrainingModule(LightningModule):
             name_mapping_value = sampled.get("name_mapping")
             bank_group_key_value = sampled.get("bank_group_key")
             dataset_id_value = sampled.get("dataset_id")
+            selected_sequences_value = sampled.get("selected_sequences")
+            selected_sequence_names_value = sampled.get("selected_sequence_names")
 
-        mapping = (
-            name_mapping_value
-            if name_mapping_value is not None
-            else (
+        topology_stream_index_path = getattr(
+            dataset_split,
+            "topology_stream_index_jsonl_path",
+            None,
+        )
+        mapping = name_mapping_value
+        if mapping is None and not topology_stream_index_path:
+            mapping = (
                 dataset_split.return_nexus_number_to_name(0)
                 if hasattr(dataset_split, "return_nexus_number_to_name")
                 else None
             )
-        )
         return {
             "start_tree": str(start_tree),
             "target_tree": str(target_tree),
@@ -11263,6 +11779,8 @@ class TrainingModule(LightningModule):
             "n_leaves": len(EteTree(str(start_tree), format=1).get_leaves()),
             "max_events": int(max_events_value),
             "name_mapping": mapping,
+            "selected_sequences": selected_sequences_value,
+            "selected_sequence_names": selected_sequence_names_value,
             "source_bank_index": int(pair_index),
         }
 
@@ -11569,7 +12087,10 @@ class TrainingModule(LightningModule):
     def _sample_metrics_should_iterate_dataset_indices(self, dataset_split):
         return bool(
             dataset_split is not None
-            and getattr(dataset_split, "topology_stream_index_jsonl_path", None)
+            and (
+                getattr(dataset_split, "topology_stream_index_jsonl_path", None)
+                or getattr(dataset_split, "sample_metrics_iterate_dataset_indices", False)
+            )
         )
 
     def _sample_metrics_dataset_index_pairs(self, dataset_split, train=True):
@@ -12560,6 +13081,191 @@ class TrainingModule(LightningModule):
 
         return embeddings
 
+    @staticmethod
+    def _strip_live_phyla_sequence(sequence):
+        return str(sequence or "").replace("-", "").replace(".", "")
+
+    def _ensure_live_phyla_device(self):
+        if self.live_phyla_model is None:
+            raise ValueError("Live Phyla model not loaded.")
+        target = torch.device(self.device)
+        if self._live_phyla_device != str(target):
+            self.live_phyla_model.to(target)
+            self.live_phyla_model.device = target
+            self._live_phyla_device = str(target)
+        return target
+
+    def _compute_live_phyla_embeddings_case(
+        self,
+        sequences,
+        names=None,
+        *,
+        grad: bool = True,
+    ):
+        if self.live_phyla_model is None:
+            raise ValueError("Live Phyla model not loaded.")
+        if sequences is None:
+            return None
+        sequences = [self._strip_live_phyla_sequence(sequence) for sequence in sequences]
+        if names is None:
+            names = [str(idx) for idx in range(len(sequences))]
+        names = [str(name) for name in names]
+        if len(names) != len(sequences):
+            names = [str(idx) for idx in range(len(sequences))]
+        input_tokens = int(sum(len(sequence) for sequence in sequences) + len(sequences))
+        if (
+            self.live_phyla_max_input_tokens > 0
+            and input_tokens > self.live_phyla_max_input_tokens
+        ):
+            raise RuntimeError(
+                f"Live Phyla input has {input_tokens} tokens, exceeding "
+                f"live_phyla_max_input_tokens={self.live_phyla_max_input_tokens}."
+            )
+        device = self._ensure_live_phyla_device()
+        use_grad = bool(grad and self.live_phyla_unfreeze)
+        previous_training = self.live_phyla_model.training
+        if use_grad:
+            self.live_phyla_model.train()
+            context = contextlib.nullcontext()
+        else:
+            self.live_phyla_model.eval()
+            context = torch.no_grad()
+        with context:
+            encoded, cls_mask, seq_mask, _ = self.live_phyla_model.encode(
+                sequences,
+                names,
+            )
+            embeddings = self.live_phyla_model(
+                encoded.to(device),
+                seq_mask.to(device),
+                cls_mask.to(device),
+            )
+        if previous_training:
+            self.live_phyla_model.train()
+        else:
+            self.live_phyla_model.eval()
+        if embeddings.dim() == 3 and embeddings.size(0) == 1:
+            embeddings = embeddings.squeeze(0)
+        return embeddings
+
+    def _attach_shared_live_phyla_embeddings_for_batches(
+        self,
+        batches,
+        *,
+        grad: bool = True,
+    ):
+        if self.live_phyla_model is None:
+            return False
+
+        attach_specs = []
+        unique_cases = {}
+        for batch in batches:
+            if not isinstance(batch, dict):
+                continue
+            if batch.get("phyla_embeddings") is not None:
+                continue
+            if batch.get("selected_sequences") is None:
+                continue
+            specs = _selected_sequence_case_specs(
+                batch.get("selected_sequences"),
+                batch.get("selected_sequence_names"),
+            )
+            if specs is None:
+                return False
+            for key, sequences, names in specs:
+                unique_cases.setdefault(key, (sequences, names))
+            attach_specs.append((batch, specs))
+
+        if len(attach_specs) < 2 or not unique_cases:
+            return False
+
+        embeddings_by_key = {}
+        for key, (sequences, names) in unique_cases.items():
+            embeddings = self._compute_live_phyla_embeddings_case(
+                sequences,
+                names,
+                grad=grad,
+            )
+            if embeddings is None:
+                return False
+            embeddings_by_key[key] = embeddings
+
+        all_specs = [
+            specs
+            for _batch, specs in attach_specs
+        ]
+        if (
+            len(unique_cases) == 1
+            and all(
+                specs
+                and all(spec[0] == next(iter(unique_cases)) for spec in specs)
+                for specs in all_specs
+            )
+        ):
+            shared_embeddings = embeddings_by_key[next(iter(unique_cases))]
+            for batch, _specs in attach_specs:
+                batch["phyla_embeddings"] = shared_embeddings
+            return True
+
+        for batch, specs in attach_specs:
+            batch["phyla_embeddings"] = [
+                embeddings_by_key[key]
+                for key, _sequences, _names in specs
+            ]
+        return True
+
+    def _compute_live_phyla_embeddings_for_batch(self, batch, *, grad: bool = True):
+        selected_sequences = batch.get("selected_sequences")
+        if selected_sequences is None:
+            return None
+        selected_names = batch.get("selected_sequence_names")
+        if isinstance(selected_sequences, tuple):
+            selected_sequences = list(selected_sequences)
+        if selected_sequences and all(
+            isinstance(item, str) for item in selected_sequences
+        ):
+            selected_sequences = [selected_sequences]
+        if selected_names is None:
+            selected_names = [None] * len(selected_sequences)
+        elif isinstance(selected_names, tuple):
+            selected_names = list(selected_names)
+        if selected_names and all(isinstance(item, str) for item in selected_names):
+            selected_names = [selected_names]
+        embeddings = []
+        local_cache = {}
+        for sequences, names in zip(selected_sequences, selected_names):
+            if sequences is None:
+                return None
+            sequence_list = list(sequences)
+            name_list = None if names is None else list(names)
+            cache_key = (
+                tuple(str(name) for name in (name_list or [])),
+                tuple(str(sequence) for sequence in sequence_list),
+                bool(grad),
+            )
+            if cache_key not in local_cache:
+                local_cache[cache_key] = self._compute_live_phyla_embeddings_case(
+                    sequence_list,
+                    name_list,
+                    grad=grad,
+                )
+            embeddings.append(local_cache[cache_key])
+        return embeddings
+
+    def _compute_live_phyla_embeddings_for_pair(self, pair):
+        sequences = pair.get("selected_sequences")
+        if sequences is None:
+            return None
+        names = pair.get("selected_sequence_names")
+        embeddings = self._compute_live_phyla_embeddings_case(
+            list(sequences),
+            None if names is None else list(names),
+            grad=False,
+        )
+        if embeddings is None:
+            return None
+        return embeddings.unsqueeze(0)
+
     def _infer_precomputed_phyla_dataset_ids(self):
         dataset_ids = set()
         data_module = getattr(self, "dataset", None)
@@ -12690,7 +13396,18 @@ class TrainingModule(LightningModule):
                 f"embedding rows {tensor.size(0)}."
             )
 
-        expected_dim = int(self.model.phyla_proj.in_features)
+        expected_dim = getattr(self.model, "phyla_dim", None)
+        if expected_dim is None:
+            phyla_proj = getattr(self.model, "phyla_proj", None)
+            expected_dim = getattr(phyla_proj, "in_features", None)
+            if expected_dim is None and phyla_proj is not None:
+                for module in phyla_proj.modules():
+                    if isinstance(module, nn.Linear):
+                        expected_dim = module.in_features
+                        break
+        if expected_dim is None:
+            raise ValueError("Could not infer model Phyla embedding dimension.")
+        expected_dim = int(expected_dim)
         if tensor.size(1) != expected_dim:
             raise ValueError(
                 f"Precomputed embedding dim {tensor.size(1)} does not match "
@@ -13000,6 +13717,485 @@ class TrainingModule(LightningModule):
             )
             return all_group_logits
 
+    def _velocity_decode_flags(self):
+        return_first_hit_logits = (
+            self.velocity_first_hit_head_weight > 0.0
+            or self.velocity_first_hit_head_use_at_sampling
+        )
+        return_boundary_vanish_logits = (
+            self.velocity_boundary_vanish_head_weight > 0.0
+            or self.velocity_boundary_vanish_head_use_at_sampling
+        )
+        return_edge_features = (
+            self.velocity_first_hit_predictor_mode
+            in {
+                "edge_length",
+                "edge_token_attention",
+                "edge_token_attention_replace",
+                "edge_token_attention_logitinput_replace",
+                "edge_token_attention_logitinput_replace_latelength",
+            }
+            or self.velocity_boundary_time_head_weight > 0.0
+            or self.velocity_boundary_time_head_use_at_sampling
+            or self.velocity_terminal_head_weight > 0.0
+            or self.velocity_terminal_head_use_at_sampling
+            or self.sampling_discrete_phase_rollout_use_at_sampling
+            or self.velocity_refiner_mode == "edge_token_attention_delta"
+            or self.branch_relax_head_weight > 0.0
+            or self.branch_relax_head_use_at_sampling
+        )
+        return (
+            return_edge_features,
+            return_first_hit_logits,
+            return_boundary_vanish_logits,
+        )
+
+    def _unpack_velocity_edge_outputs(
+        self,
+        edge_outputs,
+        tokenized_trees,
+        *,
+        return_edge_features,
+        return_first_hit_logits,
+        return_boundary_vanish_logits,
+    ):
+        edge_features = None
+        first_hit_logits = None
+        boundary_vanish_logits = None
+        if return_first_hit_logits and return_boundary_vanish_logits:
+            if return_edge_features:
+                (
+                    velocity,
+                    _mask,
+                    edge_features,
+                    first_hit_logits,
+                    boundary_vanish_logits,
+                ) = edge_outputs
+            else:
+                velocity, _mask, first_hit_logits, boundary_vanish_logits = (
+                    edge_outputs
+                )
+        elif return_first_hit_logits:
+            if return_edge_features:
+                velocity, _mask, edge_features, first_hit_logits = edge_outputs
+            else:
+                velocity, _mask, first_hit_logits = edge_outputs
+        elif return_boundary_vanish_logits:
+            if return_edge_features:
+                velocity, _mask, edge_features, boundary_vanish_logits = edge_outputs
+            else:
+                velocity, _mask, boundary_vanish_logits = edge_outputs
+        else:
+            if return_edge_features:
+                velocity, _mask, edge_features = edge_outputs
+            else:
+                velocity, _mask = edge_outputs
+        edge_split_masks = tokenized_trees[-1]
+        edge_mask = tokenized_trees[-2]
+        return (
+            velocity,
+            edge_split_masks,
+            edge_mask,
+            first_hit_logits,
+            boundary_vanish_logits,
+            edge_features,
+        )
+
+    def _tokenized_batch_size(self, tokenized_trees):
+        if tokenized_trees is None or not tokenized_trees:
+            return 0
+        return int(tokenized_trees[0].shape[0])
+
+    def _tokenized_list_field(self, value):
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple):
+            return list(value)
+        if torch.is_tensor(value):
+            if value.dim() <= 1:
+                return [value]
+            return [value[idx] for idx in range(value.shape[0])]
+        return list(value)
+
+    def _pad_tokenized_tensor_for_concat(self, value, max_tokens, pad_value):
+        if not torch.is_tensor(value):
+            return value
+        current_tokens = int(value.shape[1])
+        if current_tokens == int(max_tokens):
+            return value
+        pad_shape = list(value.shape)
+        pad_shape[1] = int(max_tokens) - current_tokens
+        padding = value.new_full(pad_shape, pad_value)
+        return torch.cat([value, padding], dim=1)
+
+    def _concat_tokenized_tree_batches(self, tokenized_batches):
+        tokenized_batches = [
+            _move_tokenized_batch_to_device(batch, self.device)
+            for batch in tokenized_batches
+            if batch is not None
+        ]
+        if not tokenized_batches:
+            return None
+        max_tokens = max(int(batch[0].shape[1]) for batch in tokenized_batches)
+        padded_features = []
+        padding_masks = []
+        padded_indices = []
+        leaf_masks = []
+        leaf_indices = []
+        edge_masks = []
+        edge_split_masks = []
+        for batch in tokenized_batches:
+            padded_features.append(
+                self._pad_tokenized_tensor_for_concat(batch[0], max_tokens, 0.0)
+            )
+            padding_masks.append(
+                self._pad_tokenized_tensor_for_concat(batch[1], max_tokens, True)
+            )
+            padded_indices.append(
+                self._pad_tokenized_tensor_for_concat(batch[2], max_tokens, 0)
+            )
+            leaf_masks.append(
+                self._pad_tokenized_tensor_for_concat(batch[3], max_tokens, False)
+            )
+            leaf_indices.extend(self._tokenized_list_field(batch[4]))
+            edge_masks.append(
+                self._pad_tokenized_tensor_for_concat(batch[5], max_tokens, False)
+            )
+            edge_split_masks.extend(self._tokenized_list_field(batch[6]))
+        return (
+            torch.cat(padded_features, dim=0),
+            torch.cat(padding_masks, dim=0),
+            torch.cat(padded_indices, dim=0),
+            torch.cat(leaf_masks, dim=0),
+            leaf_indices,
+            torch.cat(edge_masks, dim=0),
+            edge_split_masks,
+        )
+
+    def _pad_phyla_embeddings_for_concat(self, embeddings, max_leaves):
+        if embeddings.size(1) == int(max_leaves):
+            return embeddings
+        pad_shape = (
+            embeddings.size(0),
+            int(max_leaves) - embeddings.size(1),
+            embeddings.size(2),
+        )
+        padding = embeddings.new_zeros(pad_shape)
+        return torch.cat([embeddings, padding], dim=1)
+
+    def _concat_phyla_embeddings_for_batches(self, batches, batch_sizes):
+        phyla_values = [batch.get("phyla_embeddings") for batch in batches]
+        if all(value is None for value in phyla_values):
+            return None
+        if any(value is None for value in phyla_values):
+            return None
+        normalized = []
+        for phyla_embeddings, batch_size in zip(phyla_values, batch_sizes):
+            normalized.append(
+                self.model._normalize_phyla_embeddings(
+                    phyla_embeddings,
+                    int(batch_size),
+                )
+            )
+        max_leaves = max(int(value.size(1)) for value in normalized)
+        normalized = [
+            self._pad_phyla_embeddings_for_concat(value, max_leaves)
+            for value in normalized
+        ]
+        return torch.cat(normalized, dim=0)
+
+    def _encode_prepared_tokenized_trees_once(
+        self,
+        tokenized_trees,
+        times,
+        phyla_embeddings,
+    ):
+        required = (
+            "_prepare_encoder_inputs",
+            "_encode_with_layers",
+            "_decode_outputs",
+        )
+        if not all(hasattr(self.model, name) for name in required):
+            return None
+        (
+            x,
+            padding_mask,
+            leaf_mask,
+            leaf_idx,
+            edge_mask,
+            edge_split_masks,
+            phyla_global_context,
+            phyla_clade_context,
+        ) = self.model._prepare_encoder_inputs(
+            tokenized_trees,
+            t=times,
+            phyla_embeddings=phyla_embeddings,
+        )
+        encoder_input_x = x
+        x = self.model._encode_with_layers(
+            x,
+            padding_mask=padding_mask,
+            layers=self.model.layers,
+            final_layer_norm=self.model.final_layer_norm,
+        )
+        if hasattr(self.model, "block2_layers"):
+            block2_x = self.model._build_block2_input(x, encoder_input_x)
+            x = self.model._encode_with_layers(
+                block2_x,
+                padding_mask=padding_mask,
+                layers=self.model.block2_layers,
+                final_layer_norm=self.model.block2_final_layer_norm,
+            )
+        elif hasattr(self.model, "refine_blocks"):
+            for block in self.model.refine_blocks:
+                block_input_x = self.model._build_refine_block_input(
+                    x,
+                    encoder_input_x,
+                    block["bridge"],
+                )
+                x = self.model._encode_with_layers(
+                    block_input_x,
+                    padding_mask=padding_mask,
+                    layers=block["layers"],
+                    final_layer_norm=block["final_norm"],
+                )
+        return {
+            "encoded": x,
+            "leaf_mask": leaf_mask,
+            "leaf_idx": leaf_idx,
+            "edge_mask": edge_mask,
+            "edge_split_masks": edge_split_masks,
+            "phyla_global_context": phyla_global_context,
+            "phyla_clade_context": phyla_clade_context,
+        }
+
+    def _autoregressive_component_groups_for_batch(self, batch):
+        cached_component_groups = batch.get("_cached_autoregressive_component_groups")
+        if cached_component_groups is not None:
+            return cached_component_groups
+        if "newick_autoregressive_trees" in batch:
+            return [
+                get_structural_polytomy_groups_from_newick(newick_tree)
+                for newick_tree in batch["newick_autoregressive_trees"]
+            ]
+        autoregressive_component_groups = []
+        for labeled_merge_cluster in batch["batched_autoregressive_labels"]:
+            seen_groups = set()
+            groups = []
+            for label in labeled_merge_cluster:
+                components = tuple(int(component) for component in label["components"])
+                if components in seen_groups:
+                    continue
+                seen_groups.add(components)
+                groups.append(list(components))
+            autoregressive_component_groups.append(groups)
+        return autoregressive_component_groups
+
+    def _joint_velocity_autoregressive_forward(
+        self,
+        velocity_batch,
+        autoregressive_batch,
+    ):
+        velocity_batch, velocity_perturb_stats = self._prepare_velocity_training_batch(
+            velocity_batch
+        )
+        autoregressive_batch, ar_prep_stats = (
+            self._prepare_autoregressive_training_batch(autoregressive_batch)
+        )
+        velocity_tokenized = _move_tokenized_batch_to_device(
+            velocity_batch["tokenized_trees"],
+            self.device,
+        )
+        autoregressive_tokenized = _move_tokenized_batch_to_device(
+            autoregressive_batch["tokenized_autoregressive_trees"],
+            self.device,
+        )
+        velocity_batch_size = self._tokenized_batch_size(velocity_tokenized)
+        autoregressive_batch_size = self._tokenized_batch_size(
+            autoregressive_tokenized
+        )
+        if velocity_batch_size <= 0 or autoregressive_batch_size <= 0:
+            return None
+
+        velocity_times = velocity_batch["batched_time"]
+        if torch.is_tensor(velocity_times):
+            velocity_times = velocity_times.to(self.device).reshape(-1)
+        else:
+            velocity_times = torch.tensor(
+                list(velocity_times),
+                dtype=torch.float32,
+                device=self.device,
+            ).reshape(-1)
+        autoregressive_times = self._effective_autoregressive_time_tensor(
+            autoregressive_batch["batched_autoregressive_time"]
+        ).to(self.device).reshape(-1)
+        if int(velocity_times.numel()) != velocity_batch_size:
+            velocity_times = velocity_times[:1].expand(velocity_batch_size)
+        if int(autoregressive_times.numel()) != autoregressive_batch_size:
+            autoregressive_times = autoregressive_times[:1].expand(
+                autoregressive_batch_size
+            )
+        combined_times = torch.cat([velocity_times, autoregressive_times], dim=0)
+
+        combined_phyla_embeddings = self._concat_phyla_embeddings_for_batches(
+            [velocity_batch, autoregressive_batch],
+            [velocity_batch_size, autoregressive_batch_size],
+        )
+        if (
+            combined_phyla_embeddings is None
+            and (
+                velocity_batch.get("phyla_embeddings") is not None
+                or autoregressive_batch.get("phyla_embeddings") is not None
+            )
+        ):
+            return None
+
+        combined_tokenized = velocity_batch.get("_joint_tokenized_trees")
+        if combined_tokenized is not None:
+            combined_tokenized = _move_tokenized_batch_to_device(
+                combined_tokenized,
+                self.device,
+            )
+            combined_batch_size = self._tokenized_batch_size(combined_tokenized)
+            expected_combined_batch_size = (
+                velocity_batch_size + autoregressive_batch_size
+            )
+            if (
+                combined_batch_size != expected_combined_batch_size
+                or int(
+                    velocity_batch.get(
+                        "_joint_velocity_batch_size",
+                        velocity_batch_size,
+                    )
+                )
+                != velocity_batch_size
+                or int(
+                    velocity_batch.get(
+                        "_joint_autoregressive_batch_size",
+                        autoregressive_batch_size,
+                    )
+                )
+                != autoregressive_batch_size
+            ):
+                combined_tokenized = None
+        if combined_tokenized is None:
+            combined_tokenized = self._concat_tokenized_tree_batches(
+                [velocity_tokenized, autoregressive_tokenized]
+            )
+        encoded_payload = self._encode_prepared_tokenized_trees_once(
+            combined_tokenized,
+            combined_times,
+            combined_phyla_embeddings,
+        )
+        if encoded_payload is None:
+            return None
+
+        encoded = encoded_payload["encoded"]
+        leaf_mask = encoded_payload["leaf_mask"]
+        leaf_idx = encoded_payload["leaf_idx"]
+        edge_mask = encoded_payload["edge_mask"]
+        edge_split_masks = encoded_payload["edge_split_masks"]
+        phyla_global_context = encoded_payload["phyla_global_context"]
+        phyla_clade_context = encoded_payload["phyla_clade_context"]
+        velocity_slice = slice(0, velocity_batch_size)
+        autoregressive_slice = slice(
+            velocity_batch_size,
+            velocity_batch_size + autoregressive_batch_size,
+        )
+        (
+            return_edge_features,
+            return_first_hit_logits,
+            return_boundary_vanish_logits,
+        ) = self._velocity_decode_flags()
+        velocity_decoded = self.model._decode_outputs(
+            encoded[velocity_slice],
+            leaf_mask=leaf_mask[velocity_slice],
+            leaf_idx=leaf_idx[velocity_slice],
+            edge_mask=edge_mask[velocity_slice],
+            edge_split_masks=edge_split_masks[velocity_slice],
+            t=velocity_times,
+            return_leafs_only=False,
+            return_edges_only=True,
+            return_edge_features=return_edge_features,
+            return_first_hit_logits=return_first_hit_logits,
+            return_boundary_vanish_logits=return_boundary_vanish_logits,
+            first_hit_case_indices=velocity_batch.get("_first_hit_case_indices"),
+            first_hit_start_topology_features=velocity_batch.get(
+                "_first_hit_start_topology_features"
+            ),
+            first_hit_start_topology_embeddings=velocity_batch.get(
+                "_first_hit_start_topology_embeddings"
+            ),
+            first_hit_start_topology_pad_mask=velocity_batch.get(
+                "_first_hit_start_topology_pad_mask"
+            ),
+            first_hit_start_tree_graph_context=velocity_batch.get(
+                "_first_hit_start_tree_graph_context"
+            ),
+            phyla_global_context=None
+            if phyla_global_context is None
+            else phyla_global_context[velocity_slice],
+            phyla_clade_context=None
+            if phyla_clade_context is None
+            else phyla_clade_context[velocity_slice],
+        )
+        velocity_outputs = self._unpack_velocity_edge_outputs(
+            velocity_decoded,
+            (
+                velocity_tokenized[0],
+                velocity_tokenized[1],
+                velocity_tokenized[2],
+                velocity_tokenized[3],
+                velocity_tokenized[4],
+                edge_mask[velocity_slice],
+                edge_split_masks[velocity_slice],
+            ),
+            return_edge_features=return_edge_features,
+            return_first_hit_logits=return_first_hit_logits,
+            return_boundary_vanish_logits=return_boundary_vanish_logits,
+        )
+
+        autoregressive_component_groups = self._autoregressive_component_groups_for_batch(
+            autoregressive_batch
+        )
+        if autoregressive_batch.get("_cached_autoregressive_component_groups") is None:
+            autoregressive_batch = dict(autoregressive_batch)
+            autoregressive_batch["_cached_autoregressive_component_groups"] = (
+                autoregressive_component_groups
+            )
+        autoregressive_outputs = self.model._decode_outputs(
+            encoded[autoregressive_slice],
+            leaf_mask=leaf_mask[autoregressive_slice],
+            leaf_idx=leaf_idx[autoregressive_slice],
+            edge_mask=edge_mask[autoregressive_slice],
+            edge_split_masks=edge_split_masks[autoregressive_slice],
+            t=autoregressive_times,
+            return_leafs_only=False,
+            return_edges_only=True,
+            autoregressive=True,
+            autoregressive_component_groups=autoregressive_component_groups,
+            autoregressive_case_indices=autoregressive_batch.get(
+                "_autoregressive_case_indices"
+            ),
+            autoregressive_start_topology_features=autoregressive_batch.get(
+                "_autoregressive_start_topology_features"
+            ),
+            phyla_global_context=None
+            if phyla_global_context is None
+            else phyla_global_context[autoregressive_slice],
+            phyla_clade_context=None
+            if phyla_clade_context is None
+            else phyla_clade_context[autoregressive_slice],
+        )
+        return {
+            "velocity_batch": velocity_batch,
+            "autoregressive_batch": autoregressive_batch,
+            "velocity_outputs": velocity_outputs,
+            "autoregressive_outputs": autoregressive_outputs,
+            "velocity_perturb_stats": velocity_perturb_stats,
+            "ar_prep_stats": ar_prep_stats,
+        }
+
     def step_terminal(self, batch, eval=False):
         if batch is None:
             loss = torch.tensor(0.0, device=self.device, requires_grad=not eval)
@@ -13143,8 +14339,22 @@ class TrainingModule(LightningModule):
             "velocity/terminal_head_pred_rate": pred_rate.detach(),
         }
 
-    def step(self, batch, eval=False, autoregressive=False):
+    def step(
+        self,
+        batch,
+        eval=False,
+        autoregressive=False,
+        precomputed_outputs=None,
+        prepared_batch=False,
+        velocity_perturb_stats=None,
+        ar_prep_stats=None,
+    ):
         if self.use_historical_step_impl:
+            if precomputed_outputs is not None or prepared_batch:
+                raise ValueError(
+                    "Historical step implementation does not support "
+                    "precomputed prepared-batch outputs."
+                )
             historical_module = _load_historical_training_module_for_step()
             return historical_module.TrainingModule.step(
                 self, batch, eval=eval, autoregressive=autoregressive
@@ -13153,6 +14363,17 @@ class TrainingModule(LightningModule):
         is_replay_batch = bool(batch.get("_is_replay_batch", False))
         if not eval and not autoregressive:
             self.current_step_value += 1
+        if (
+            batch["phyla_embeddings"] is None
+            and self.live_phyla_model is not None
+            and batch.get("selected_sequences") is not None
+        ):
+            live_embeddings = self._compute_live_phyla_embeddings_for_batch(
+                batch,
+                grad=not eval,
+            )
+            if live_embeddings is not None:
+                batch["phyla_embeddings"] = live_embeddings
         if (
             batch["phyla_embeddings"] is None
             and "ids" in batch
@@ -13212,32 +14433,50 @@ class TrainingModule(LightningModule):
                 batch["phyla_embeddings"] = phyla_embeddings_list
 
         if not autoregressive:
-            batch, velocity_perturb_stats = self._prepare_velocity_training_batch(batch)
-            (
-                v_pred,
-                edge_split_masks,
-                edge_mask,
-                first_hit_logits,
-                boundary_vanish_logits,
-                edge_features,
-            ) = self.forward(
-                batch["tokenized_trees"],
-                batch["batched_time"],
-                batch["phyla_embeddings"],
-                first_hit_case_indices=batch.get("_first_hit_case_indices"),
-                first_hit_start_topology_features=batch.get(
-                    "_first_hit_start_topology_features"
-                ),
-                first_hit_start_topology_embeddings=batch.get(
-                    "_first_hit_start_topology_embeddings"
-                ),
-                first_hit_start_topology_pad_mask=batch.get(
-                    "_first_hit_start_topology_pad_mask"
-                ),
-                first_hit_start_tree_graph_context=batch.get(
-                    "_first_hit_start_tree_graph_context"
-                ),
-            )
+            if prepared_batch:
+                velocity_perturb_stats = velocity_perturb_stats or {
+                    "attempted": 0.0,
+                    "applied": 0.0,
+                }
+            else:
+                batch, velocity_perturb_stats = self._prepare_velocity_training_batch(
+                    batch
+                )
+            if precomputed_outputs is None:
+                (
+                    v_pred,
+                    edge_split_masks,
+                    edge_mask,
+                    first_hit_logits,
+                    boundary_vanish_logits,
+                    edge_features,
+                ) = self.forward(
+                    batch["tokenized_trees"],
+                    batch["batched_time"],
+                    batch["phyla_embeddings"],
+                    first_hit_case_indices=batch.get("_first_hit_case_indices"),
+                    first_hit_start_topology_features=batch.get(
+                        "_first_hit_start_topology_features"
+                    ),
+                    first_hit_start_topology_embeddings=batch.get(
+                        "_first_hit_start_topology_embeddings"
+                    ),
+                    first_hit_start_topology_pad_mask=batch.get(
+                        "_first_hit_start_topology_pad_mask"
+                    ),
+                    first_hit_start_tree_graph_context=batch.get(
+                        "_first_hit_start_tree_graph_context"
+                    ),
+                )
+            else:
+                (
+                    v_pred,
+                    edge_split_masks,
+                    edge_mask,
+                    first_hit_logits,
+                    boundary_vanish_logits,
+                    edge_features,
+                ) = precomputed_outputs
 
             if self.train_tokenized_trees is None:
                 self.train_tokenized_trees = batch["tokenized_trees"]
@@ -13283,6 +14522,9 @@ class TrainingModule(LightningModule):
                 autoregressive_first_hit_mode = (
                     getattr(self.model, "first_hit_head_mode", "base")
                     == "autoregressive_set"
+                )
+                direct_set_bce_weight = float(
+                    getattr(self, "velocity_probe_direct_set_bce_weight", 1.0)
                 )
                 for num, current_newick in enumerate(batch.get("original_trees", [])):
                     if num >= len(sample_mask) or not bool(sample_mask[num]):
@@ -13358,6 +14600,7 @@ class TrainingModule(LightningModule):
                             edge_feature_tensor,
                             target_mask,
                         )
+                        sample_loss = direct_set_bce_weight * sample_loss
                         direct_set_pos_weights.append(1.0)
                     else:
                         logits_tensor = torch.stack(logits).reshape(-1)
@@ -13400,7 +14643,7 @@ class TrainingModule(LightningModule):
                                         max=float(pos_weight_max),
                                     )
                                 pos_weight = pos_weight_value.detach()
-                        sample_loss = F.binary_cross_entropy_with_logits(
+                        sample_loss = direct_set_bce_weight * F.binary_cross_entropy_with_logits(
                             logits_tensor,
                             target_tensor,
                             pos_weight=pos_weight,
@@ -13530,6 +14773,11 @@ class TrainingModule(LightningModule):
                         float(sum(direct_set_pos_weights) / len(direct_set_pos_weights))
                         if direct_set_pos_weights
                         else 1.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ),
+                    "velocity/probe_direct_set_bce_weight": torch.tensor(
+                        direct_set_bce_weight,
                         device=loss.device,
                         dtype=torch.float32,
                     ),
@@ -14618,47 +15866,44 @@ class TrainingModule(LightningModule):
 
             # pdb.set_trace()
         else:
-            batch, ar_prep_stats = self._prepare_autoregressive_training_batch(batch)
+            if prepared_batch:
+                ar_prep_stats = ar_prep_stats or {
+                    "rollin_attempted": 0.0,
+                    "rollin_applied": 0.0,
+                    "dagger_attempted": 0.0,
+                    "dagger_applied": 0.0,
+                    "dagger_rollout_steps": 0.0,
+                    "structure_perturb_attempted": 0.0,
+                    "structure_perturb_applied": 0.0,
+                }
+            else:
+                batch, ar_prep_stats = self._prepare_autoregressive_training_batch(
+                    batch
+                )
             skip_autoregressive_merge_metrics = bool(
                 batch.get("_skip_autoregressive_merge_metrics", False)
             )
-            cached_component_groups = batch.get(
-                "_cached_autoregressive_component_groups"
+            autoregressive_component_groups = (
+                self._autoregressive_component_groups_for_batch(batch)
             )
-            if cached_component_groups is not None:
-                autoregressive_component_groups = cached_component_groups
-            elif "newick_autoregressive_trees" in batch:
-                autoregressive_component_groups = [
-                    get_structural_polytomy_groups_from_newick(newick_tree)
-                    for newick_tree in batch["newick_autoregressive_trees"]
-                ]
-            else:
-                autoregressive_component_groups = []
-                for labeled_merge_cluster in batch["batched_autoregressive_labels"]:
-                    seen_groups = set()
-                    groups = []
-                    for label in labeled_merge_cluster:
-                        components = tuple(int(component) for component in label["components"])
-                        if components in seen_groups:
-                            continue
-                        seen_groups.add(components)
-                        groups.append(list(components))
-                    autoregressive_component_groups.append(groups)
 
             autoregressive_times = self._effective_autoregressive_time_tensor(
                 batch["batched_autoregressive_time"]
             )
-            all_group_logits = self.forward(
-                batch["tokenized_autoregressive_trees"],
-                autoregressive_times,
-                batch["phyla_embeddings"],
-                autoregressive=True,
-                autoregressive_component_groups=autoregressive_component_groups,
-                autoregressive_case_indices=batch.get("_autoregressive_case_indices"),
-                autoregressive_start_topology_features=batch.get(
-                    "_autoregressive_start_topology_features"
-                ),
-            )
+            if precomputed_outputs is None:
+                all_group_logits = self.forward(
+                    batch["tokenized_autoregressive_trees"],
+                    autoregressive_times,
+                    batch["phyla_embeddings"],
+                    autoregressive=True,
+                    autoregressive_component_groups=autoregressive_component_groups,
+                    autoregressive_case_indices=batch.get("_autoregressive_case_indices"),
+                    autoregressive_start_topology_features=batch.get(
+                        "_autoregressive_start_topology_features"
+                    ),
+                )
+            else:
+                all_group_logits = precomputed_outputs
 
             found = {}
             label_targets_by_batch = []
@@ -16839,6 +18084,20 @@ class TrainingModule(LightningModule):
             )[1]
             for td, n_leaves, mapp in zip(trees, num_leaves, mapping)
         ]
+        sampled_newicks = [
+            align_numeric_leaf_labels_to_reference(
+                sampled_newick,
+                start_newick,
+                target_tree=(
+                    target_trees[idx]
+                    if target_trees is not None and idx < len(target_trees)
+                    else None
+                ),
+            )[0]
+            for idx, (sampled_newick, start_newick) in enumerate(
+                zip(sampled_newicks, newick_starting_trees)
+            )
+        ]
         result = (
             sampled_newicks,
             num_topology_changes,
@@ -17057,6 +18316,78 @@ class TrainingModule(LightningModule):
         if self.record:
             wandb.finish()
 
+    def _training_step_profile_enabled(self):
+        frequency = int(getattr(self, "training_step_profile_frequency", 0) or 0)
+        if frequency <= 0:
+            return False
+        step = int(getattr(self, "stepper", 0) or 0)
+        warmup = int(getattr(self, "training_step_profile_warmup_steps", 0) or 0)
+        return step >= warmup and (step % frequency) == 0
+
+    def _training_step_profile_sync(self):
+        if (
+            not bool(getattr(self, "training_step_profile_sync_cuda", True))
+            or not torch.cuda.is_available()
+        ):
+            return
+        try:
+            device = getattr(self, "device", None)
+            if device is not None and getattr(device, "type", None) == "cuda":
+                torch.cuda.synchronize(device)
+            else:
+                torch.cuda.synchronize()
+        except Exception:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+    def _training_step_profile_start(self):
+        if not self._training_step_profile_enabled():
+            return None
+        self._training_step_profile_sync()
+        now = time.perf_counter()
+        return {"_start": now, "_last": now}
+
+    def _training_step_profile_mark(self, profile, label):
+        if profile is None:
+            return
+        self._training_step_profile_sync()
+        now = time.perf_counter()
+        last = profile.get("_last", profile["_start"])
+        profile[label] = profile.get(label, 0.0) + (now - last)
+        profile["_last"] = now
+
+    def _training_step_profile_log(self, profile, logs=None):
+        if profile is None:
+            return
+        self._training_step_profile_sync()
+        now = time.perf_counter()
+        total = now - profile["_start"]
+        profile["total"] = total
+        timing_items = [
+            (key, value)
+            for key, value in profile.items()
+            if not key.startswith("_")
+        ]
+        timing_text = " ".join(
+            f"{key}={float(value):.4f}s" for key, value in timing_items
+        )
+        logging.info(
+            "TRAINING_STEP_PROFILE step=%s %s",
+            int(getattr(self, "stepper", 0) or 0),
+            timing_text,
+        )
+        if logs is None:
+            return
+        device = getattr(self, "device", torch.device("cpu"))
+        for value in logs.values():
+            if torch.is_tensor(value):
+                device = value.device
+                break
+        for key, value in timing_items:
+            logs[f"profile/{key}_sec"] = torch.tensor(float(value), device=device)
+
     def training_step(self, batch, _):
         # Skip if batch is None (all items failed tokenization in collate_fn)
         if batch is None:
@@ -17066,6 +18397,7 @@ class TrainingModule(LightningModule):
         
         # Increment stepper at the START to ensure all logs in this step use the same step number
         self.stepper += 1
+        step_profile = self._training_step_profile_start()
         
         opt = self.optimizers()
         opt.zero_grad()
@@ -17093,6 +18425,7 @@ class TrainingModule(LightningModule):
                 full_path_retry_base_batch = _clone_full_path_replay_retry_base(
                     initial_capped_batch
                 )
+        self._training_step_profile_mark(step_profile, "retry_setup")
 
         if self.deepspeed:
 
@@ -17318,9 +18651,14 @@ class TrainingModule(LightningModule):
                             replay_autoregressive_batch,
                             replay_metric_logs,
                         ) = self._collect_rollout_replay_batches(train=True)
+                    self._training_step_profile_mark(
+                        step_profile,
+                        "rollout_replay_collect",
+                    )
                     velocity_training_batch = batch
                     autoregressive_training_batch = batch
                     terminal_training_batch = None
+                    joint_forward = None
                     control_mode = bool(batch.get("_full_path_control_mode", False))
                     probe_parity_joint = bool(
                         control_mode and self.training_step_probe_parity_joint_update
@@ -17335,34 +18673,120 @@ class TrainingModule(LightningModule):
                         full_path_terminal_samples = (
                             batch.get("full_path_terminal_samples") or []
                         )
-                        if full_path_velocity_samples:
-                            velocity_training_batch = _build_velocity_replay_batch(
+                        if (
+                            full_path_velocity_samples
+                            and full_path_autoregressive_samples
+                            and self.training_step_joint_tokenize_velocity_ar
+                        ):
+                            (
+                                velocity_training_batch,
+                                autoregressive_training_batch,
+                            ) = _build_velocity_autoregressive_replay_batches(
                                 self,
                                 full_path_velocity_samples,
+                                full_path_autoregressive_samples,
+                                joint_raw_graph_batch=batch.get(
+                                    "full_path_joint_tokenizer_raw_graph_batch"
+                                ),
                             )
-                            velocity_training_batch[
-                                "_use_full_path_control_velocity_loss"
-                            ] = True
-                        if full_path_autoregressive_samples:
-                            autoregressive_training_batch = (
-                                _build_autoregressive_replay_batch(
+                            if velocity_training_batch is not None:
+                                velocity_training_batch[
+                                    "_use_full_path_control_velocity_loss"
+                                ] = True
+                        else:
+                            if full_path_velocity_samples:
+                                velocity_training_batch = _build_velocity_replay_batch(
                                     self,
-                                    full_path_autoregressive_samples,
+                                    full_path_velocity_samples,
                                 )
-                            )
-                        if full_path_terminal_samples:
+                                if velocity_training_batch is not None:
+                                    velocity_training_batch[
+                                        "_use_full_path_control_velocity_loss"
+                                    ] = True
+                            if full_path_autoregressive_samples:
+                                autoregressive_training_batch = (
+                                    _build_autoregressive_replay_batch(
+                                        self,
+                                        full_path_autoregressive_samples,
+                                    )
+                                )
+                        if (
+                            full_path_terminal_samples
+                            and self.velocity_terminal_head_weight > 0.0
+                        ):
                             terminal_training_batch = _build_terminal_replay_batch(
                                 self,
                                 full_path_terminal_samples,
                             )
+                        self._training_step_profile_mark(
+                            step_profile,
+                            "full_path_batch_build",
+                        )
+                        if (
+                            probe_parity_joint
+                            and self.live_phyla_model is not None
+                        ):
+                            shared_live_batches = [
+                                velocity_training_batch,
+                                autoregressive_training_batch,
+                            ]
+                            if (
+                                terminal_training_batch is not None
+                                and self.velocity_terminal_head_weight > 0.0
+                            ):
+                                shared_live_batches.append(terminal_training_batch)
+                            self._attach_shared_live_phyla_embeddings_for_batches(
+                                shared_live_batches,
+                                grad=True,
+                            )
+                            self._training_step_profile_mark(
+                                step_profile,
+                                "live_phyla_shared",
+                            )
+                        if probe_parity_joint:
+                            joint_forward = (
+                                self._joint_velocity_autoregressive_forward(
+                                    velocity_training_batch,
+                                    autoregressive_training_batch,
+                                )
+                            )
+                            if joint_forward is not None:
+                                velocity_training_batch = joint_forward[
+                                    "velocity_batch"
+                                ]
+                                autoregressive_training_batch = joint_forward[
+                                    "autoregressive_batch"
+                                ]
+                            self._training_step_profile_mark(
+                                step_profile,
+                                "joint_trunk_forward",
+                            )
+                    else:
+                        self._training_step_profile_mark(
+                            step_profile,
+                            "full_path_batch_build",
+                        )
 
                     # --- HEAD 1: VELOCITY ---
                     if self.training_step_verbose_logging_enabled:
                         logging.info("DEBUG: Starting Velocity Head Training")
+                    velocity_step_kwargs = {}
+                    if joint_forward is not None:
+                        velocity_step_kwargs = {
+                            "precomputed_outputs": joint_forward[
+                                "velocity_outputs"
+                            ],
+                            "prepared_batch": True,
+                            "velocity_perturb_stats": joint_forward[
+                                "velocity_perturb_stats"
+                            ],
+                        }
                     logs_vel = self.step(
                         velocity_training_batch,
                         autoregressive=False,
+                        **velocity_step_kwargs,
                     )
+                    self._training_step_profile_mark(step_profile, "velocity_step")
                     velocity_metric_logs = {
                         k: v for k, v in logs_vel.items() if k.startswith("velocity/")
                     }
@@ -17406,6 +18830,10 @@ class TrainingModule(LightningModule):
                         replay_metric_logs[
                             "replay/velocity_loss_auxiliary_unscaled"
                         ] = replay_velocity_auxiliary_unscaled.detach()
+                    self._training_step_profile_mark(
+                        step_profile,
+                        "velocity_loss_prep",
+                    )
                     if self.rollout_replay_legacy_loss_structure:
                         loss_vel = (
                             self.training_step_velocity_weight
@@ -17475,6 +18903,7 @@ class TrainingModule(LightningModule):
                                 if k != "loss"
                             }
                         )
+                        self._training_step_profile_mark(step_profile, "terminal_step")
                     loss_vel_unscaled_detached = loss_vel_unscaled.detach()
                     loss_vel_regression_unscaled_detached = (
                         loss_vel_regression_unscaled.detach()
@@ -17515,6 +18944,10 @@ class TrainingModule(LightningModule):
                                 pre_ar_grads[p] = g_prev
                                 vel_sq += float(torch.sum(g_prev * g_prev))
                             velocity_grad_norm = vel_sq ** 0.5
+                    self._training_step_profile_mark(
+                        step_profile,
+                        "velocity_backward_or_grad_prep",
+                    )
                     if self.training_step_verbose_logging_enabled:
                         logging.info("DEBUG: Finished Velocity Head Training")
 
@@ -17528,10 +18961,24 @@ class TrainingModule(LightningModule):
                     # --- HEAD 2: AUTOREGRESSIVE ---
                     if self.training_step_verbose_logging_enabled:
                         logging.info("DEBUG: Starting Autoregressive Head Training")
+                    autoregressive_step_kwargs = {}
+                    if joint_forward is not None:
+                        autoregressive_step_kwargs = {
+                            "precomputed_outputs": joint_forward[
+                                "autoregressive_outputs"
+                            ],
+                            "prepared_batch": True,
+                            "ar_prep_stats": joint_forward["ar_prep_stats"],
+                        }
                     logs = self.step(
                         autoregressive_training_batch,
                         eval=control_mode,
                         autoregressive=True,
+                        **autoregressive_step_kwargs,
+                    )
+                    self._training_step_profile_mark(
+                        step_profile,
+                        "autoregressive_step",
                     )
                     if "loss" not in logs:
                         import pickle
@@ -17608,6 +19055,10 @@ class TrainingModule(LightningModule):
                     )
                     logs.update(velocity_metric_logs)
                     logs.update(replay_metric_logs)
+                    self._training_step_profile_mark(
+                        step_profile,
+                        "autoregressive_loss_prep",
+                    )
                     branch_relax_loss_unscaled, branch_relax_logs = (
                         self._branch_relax_training_loss()
                     )
@@ -17624,6 +19075,7 @@ class TrainingModule(LightningModule):
                             branch_relax_loss.detach()
                         )
                         logs.update(branch_relax_logs)
+                    self._training_step_profile_mark(step_profile, "branch_relax")
                     if self.training_step_verbose_logging_enabled:
                         logging.info(
                             "Autoregressive head loss: raw=%.6f scaled=%.6f weight=%.4f",
@@ -17700,6 +19152,7 @@ class TrainingModule(LightningModule):
                             logs["train/autoregressive_grad_scale"] = torch.tensor(
                                 grad_scale, device=device_for_logs
                             )
+                    self._training_step_profile_mark(step_profile, "backward")
                     if self.training_step_gradient_clip_val > 0.0:
                         self.clip_gradients(
                             opt,
@@ -17708,6 +19161,7 @@ class TrainingModule(LightningModule):
                         )
                     opt.step()
                     opt.zero_grad()
+                    self._training_step_profile_mark(step_profile, "optimizer")
 
                     success = True
                     failed = False
@@ -17764,6 +19218,7 @@ class TrainingModule(LightningModule):
             logs["lr"] = lr
             if self.logger_ is not None:
                 self.logger_.log(logs, level=logging.INFO)
+            self._training_step_profile_mark(step_profile, "scalar_logging")
         else:
             print(logs)
 
@@ -17807,6 +19262,7 @@ class TrainingModule(LightningModule):
                 if self.num_warmup_steps > 0:
                     sch1.step()
                     self.num_warmup_steps -= 1
+            self._training_step_profile_mark(step_profile, "scheduler")
 
             # ADD CODE HERE TO UPDATE ADAPTIVE BATCH SIZE SAMPLER
 
@@ -17851,14 +19307,21 @@ class TrainingModule(LightningModule):
                     )
                     self.trainer.should_stop = True
 
+            self._training_step_profile_mark(step_profile, "sample_metrics")
+            self._training_step_profile_log(step_profile, logs)
             return logs["loss"]
         else:
+            self._training_step_profile_log(step_profile, logs)
             return torch.tensor(0)
 
     def validation_step(self, batch, batch_idx):
         pass
 
     def on_before_optimizer_step(self, optimizer):
+        frequency = int(getattr(self, "grad_norm_log_frequency", 1) or 0)
+        if frequency <= 0 or (int(self.stepper) % frequency) != 0:
+            return
+
         # Compute the 2-norm for each layer
         norms = grad_norm(self, norm_type=2)
         if "grad_2.0_norm_total" in norms:
@@ -17910,12 +19373,33 @@ class TrainingModule(LightningModule):
             )
 
     def configure_optimizers(self):
+        parameters = self.parameters()
+        if (
+            self.live_phyla_model is not None
+            and self.live_phyla_unfreeze
+            and self.live_phyla_lr is not None
+        ):
+            live_ids = {id(param) for param in self.live_phyla_model.parameters()}
+            live_params = [
+                param
+                for param in self.live_phyla_model.parameters()
+                if param.requires_grad
+            ]
+            other_params = [
+                param
+                for param in self.parameters()
+                if id(param) not in live_ids and param.requires_grad
+            ]
+            parameters = [
+                {"params": other_params, "lr": self.lr},
+                {"params": live_params, "lr": self.live_phyla_lr},
+            ]
         if self.deepspeed:
-            optimizer = FusedAdam(self.parameters(), lr=self.lr)
+            optimizer = FusedAdam(parameters, lr=self.lr)
         elif self.optimizer_name == "adam":
-            optimizer = optim.Adam(self.parameters(), lr=self.lr)
+            optimizer = optim.Adam(parameters, lr=self.lr)
         else:
-            optimizer = optim.AdamW(self.parameters(), lr=self.lr)
+            optimizer = optim.AdamW(parameters, lr=self.lr)
 
         if self.lr_scheduler == "cosine":
             sch1 = CosineAnnealingLR(
