@@ -65,7 +65,7 @@ canonicalize_topology_newick,
 align_numeric_leaf_labels_to_reference,
 )
 from data.dataset import PhylaDataModule, TreeDataset
-from model.model import TreeDenoiserTokenGT
+from model.model import BirthSetTopologyHead, TreeDenoiserTokenGT
 import numpy as np
 import logging
 from tqdm import tqdm
@@ -104,6 +104,85 @@ class BranchRelaxHead(nn.Module):
         case_features = self.case_embedding(case_indices)
         x = torch.cat([edge_features, numeric_features, case_features], dim=-1)
         return self.net(x).squeeze(-1)
+
+
+def _birthset_full_mask(num_leaves):
+    biological_bits = max(int(num_leaves) - 1, 0)
+    return (1 << biological_bits) - 1 if biological_bits > 0 else 0
+
+
+def _birthset_local_subset_size(local_subset):
+    return int(local_subset).bit_count()
+
+
+def _birthset_local_subset_to_split(local_subset, component_masks):
+    split = 0
+    for idx, component in enumerate(component_masks):
+        if (int(local_subset) >> idx) & 1:
+            split |= int(component)
+    return int(split)
+
+
+def _birthset_valid_local_subset(local_subset, num_components):
+    size = _birthset_local_subset_size(local_subset)
+    return 2 <= size <= max(int(num_components) - 1, 0)
+
+
+def _birthset_valid_rooted_split(split_mask, full_mask):
+    split_mask = int(split_mask) & int(full_mask)
+    return 1 < split_mask.bit_count() < int(full_mask).bit_count()
+
+
+def _birthset_canonical_unrooted_split(split_mask, full_mask):
+    full_mask = int(full_mask)
+    split_mask = int(split_mask) & full_mask
+    complement = full_mask ^ split_mask
+    return min(int(split_mask), int(complement))
+
+
+def _birthset_rooted_splits_compatible(mask_a, mask_b, full_mask):
+    full_mask = int(full_mask)
+    a = int(mask_a) & full_mask
+    b = int(mask_b) & full_mask
+    return (
+        (a & b) == 0
+        or (a & ~b & full_mask) == 0
+        or (b & ~a & full_mask) == 0
+    )
+
+
+def _birthset_map_split_to_local_subset(split_mask, component_masks):
+    split_mask = int(split_mask)
+    parent_mask = 0
+    for component in component_masks:
+        parent_mask |= int(component)
+    if split_mask & ~parent_mask:
+        return None
+    local_subset = 0
+    for idx, component in enumerate(component_masks):
+        component = int(component)
+        overlap = component & split_mask
+        if overlap and overlap != component:
+            return None
+        if overlap:
+            local_subset |= 1 << idx
+    if not _birthset_valid_local_subset(local_subset, len(component_masks)):
+        return None
+    return int(local_subset)
+
+
+def _birthset_candidate_record(local_subset, component_masks, source):
+    local_subset = int(local_subset)
+    return {
+        "local_subset": local_subset,
+        "split_mask": _birthset_local_subset_to_split(
+            local_subset,
+            component_masks,
+        ),
+        "source": str(source),
+        "size": _birthset_local_subset_size(local_subset),
+    }
+
 
 try:
     from deepspeed.ops.adam import FusedAdam
@@ -2580,6 +2659,50 @@ def _build_case_index_tensor_from_group_keys(
     return torch.tensor(indices, dtype=torch.long, device=device)
 
 
+def _case_index_group_keys_for_samples(module, samples):
+    keys = [
+        sample.get("bank_group_key") or sample.get("group_key")
+        for sample in (samples or [])
+    ]
+    if any(_extract_case_index_from_group_key(key) is not None for key in keys):
+        return keys
+
+    dataset_obj = getattr(module, "dataset", None)
+    dataset_splits = []
+    if dataset_obj is not None:
+        dataset_splits.extend(
+            split
+            for split in (
+                getattr(dataset_obj, "dataset_train", None),
+                getattr(dataset_obj, "dataset_val", None),
+                getattr(dataset_obj, "dataset_test", None),
+            )
+            if split is not None
+        )
+    for dataset_split in dataset_splits:
+        for attr in (
+            "overfit_fixed_pair_start_tree_bank_items",
+            "overfit_fixed_pair_target_tree_bank_items",
+        ):
+            items = list(getattr(dataset_split, attr, []) or [])
+            if len(items) != 1:
+                continue
+            key = items[0].get("bank_group_key") or items[0].get("group_key")
+            if _extract_case_index_from_group_key(key) is not None:
+                return [key for _ in keys]
+    return keys
+
+
+def _case_index_group_key_for_pair(module, pair):
+    key = pair.get("bank_group_key") or pair.get("group_key")
+    if _extract_case_index_from_group_key(key) is not None:
+        return key
+    keys = _case_index_group_keys_for_samples(module, [pair])
+    if keys:
+        return keys[0]
+    return key
+
+
 def _selected_sequence_fields_from_samples(samples):
     selected_sequences = [sample.get("selected_sequences") for sample in samples]
     selected_sequence_names = [
@@ -2861,9 +2984,12 @@ def _build_velocity_replay_batch(module, samples, tokenized_override=None):
             else _target_splits_from_velocity_sample(sample)
         )
     first_hit_case_index_tensor = None
-    if getattr(module.model, "first_hit_head_mode", "base") == "case_adapted_mlp":
+    if getattr(module.model, "first_hit_head_mode", "base") in {
+        "case_adapted_mlp",
+        "frozen_start_case_mlp",
+    }:
         first_hit_case_index_tensor = _build_case_index_tensor_from_group_keys(
-            [sample.get("bank_group_key") for sample in samples],
+            _case_index_group_keys_for_samples(module, samples),
             device=module.device,
         )
     dataset_ids = [
@@ -3005,9 +3131,28 @@ def _build_autoregressive_replay_batch(module, samples, tokenized_override=None)
         tokenized = tokenized_override
     tokenized = _move_tokenized_batch_to_device(tokenized, module.device)
     autoregressive_case_index_tensor = None
-    if getattr(module.model, "autoregressive_use_case_conditioning", False):
+    autoregressive_needs_case_indices = bool(
+        getattr(module.model, "autoregressive_use_case_conditioning", False)
+    ) or (
+        bool(
+            getattr(
+                module.model,
+                "autoregressive_use_start_topology_conditioning",
+                False,
+            )
+        )
+        and str(
+            getattr(
+                module.model,
+                "autoregressive_start_topology_conditioning_mode",
+                "",
+            )
+        )
+        in {"frozen_case_probe", "frozen_case_probe_additive"}
+    )
+    if autoregressive_needs_case_indices:
         autoregressive_case_index_tensor = _build_case_index_tensor_from_group_keys(
-            [sample.get("bank_group_key") for sample in samples],
+            _case_index_group_keys_for_samples(module, samples),
             device=module.device,
         )
     dataset_ids = [
@@ -6200,8 +6345,21 @@ def _discrete_phase_rollout(
         phase_exhausted = False
         ar_boundary_complete = False
         rollout_terminal_stop = False
+        birthset_attempted_this_boundary = False
+        topology_decoder_mode = getattr(module, "topology_decoder", "ar")
+        birthset_allows_ar_fallback = (
+            topology_decoder_mode == "birthset_with_ar_fallback"
+            and getattr(module, "birthset_fallback", "ar") == "ar"
+        )
+        birthset_polytomy_unrooted_ok = topology_decoder_mode in {
+            "birthset",
+            "birthset_with_ar_fallback",
+        }
         while (
-            has_polytomy_fast(current_newick, unrooted_ok=False)
+            has_polytomy_fast(
+                current_newick,
+                unrooted_ok=birthset_polytomy_unrooted_ok,
+            )
             and n_events < effective_max_events
         ):
             tokenized_trees = _tokenize_trees_with_structural_cache(
@@ -6232,6 +6390,97 @@ def _discrete_phase_rollout(
                 current_newick,
                 tokenized=tokenized_trees,
             )
+            use_birthset_decoder = (
+                topology_decoder_mode in {"birthset", "birthset_with_ar_fallback"}
+                and not birthset_attempted_this_boundary
+            )
+            if use_birthset_decoder:
+                birthset_attempted_this_boundary = True
+                birthset_plan = module._plan_birthset_boundary_splits(
+                    logit_outputs,
+                    td_ar.keys(),
+                    n_ar,
+                )
+                selected_births = list(birthset_plan.get("selected", []))
+                remaining_events = max(int(effective_max_events) - int(n_events), 0)
+                if remaining_events > 0:
+                    selected_births = selected_births[:remaining_events]
+                else:
+                    selected_births = []
+                if selected_births:
+                    source_newick = current_newick
+                    selected_splits = []
+                    for item in selected_births:
+                        new_split = int(item["split_mask"])
+                        td_ar[new_split] = float(
+                            getattr(
+                                module,
+                                "birthset_birth_length",
+                                autoregressive_birth_length,
+                            )
+                        )
+                        selected_splits.append(new_split)
+                    n_events += len(selected_splits)
+                    current_newick = build_tree_from_splits(
+                        list(td_ar.keys()),
+                        td_ar,
+                        n_ar,
+                        root_leaf=n_ar - 1,
+                        mapping=m_ar,
+                    )[1]
+                    trace["autoregressive"].append(
+                        {
+                            "source_newick": source_newick,
+                            "newick": current_newick,
+                            "target_tree": target_tree,
+                            "time": float(phase),
+                            "phase_idx": int(phase),
+                            "rf_to_target": _trace_rf_to_target(current_newick),
+                            "decoder_mode": "birthset",
+                            "planned_merge_count": int(len(selected_splits)),
+                            "selected_result_splits": selected_splits,
+                            "birthset_metrics": birthset_plan.get("metrics", {}),
+                        }
+                    )
+                    if (
+                        has_polytomy_fast(
+                            current_newick,
+                            unrooted_ok=birthset_polytomy_unrooted_ok,
+                        )
+                        and not birthset_allows_ar_fallback
+                    ):
+                        trace["birthset_incomplete_without_fallback"] = True
+                        trace["stopped_for_no_valid_merge"] = True
+                        phase_exhausted = True
+                        break
+                    continue
+                if not birthset_allows_ar_fallback:
+                    trace["autoregressive"].append(
+                        {
+                            "newick": current_newick,
+                            "target_tree": target_tree,
+                            "time": float(phase),
+                            "phase_idx": int(phase),
+                            "rf_to_target": _trace_rf_to_target(current_newick),
+                            "decoder_mode": "birthset",
+                            "planned_merge_count": 0,
+                            "selected_result_split": None,
+                            "birthset_metrics": birthset_plan.get("metrics", {}),
+                        }
+                    )
+                    trace["birthset_incomplete_without_fallback"] = True
+                    trace["stopped_for_no_valid_merge"] = True
+                    phase_exhausted = True
+                    break
+            if (
+                topology_decoder_mode in {"birthset", "birthset_with_ar_fallback"}
+                and birthset_attempted_this_boundary
+                and not birthset_allows_ar_fallback
+            ):
+                trace["birthset_incomplete_without_fallback"] = True
+                trace["stopped_for_no_valid_merge"] = True
+                phase_exhausted = True
+                break
             planned_merges = _plan_autoregressive_boundary_merges(
                 logit_outputs,
                 td_ar.keys(),
@@ -6247,6 +6496,7 @@ def _discrete_phase_rollout(
                         "time": float(phase),
                         "phase_idx": int(phase),
                         "rf_to_target": _trace_rf_to_target(current_newick),
+                        "decoder_mode": "ar",
                         "planned_merge_count": 0,
                         "selected_result_split": None,
                     }
@@ -6306,6 +6556,7 @@ def _discrete_phase_rollout(
                     "time": float(phase),
                     "phase_idx": int(phase),
                     "rf_to_target": _trace_rf_to_target(current_newick),
+                    "decoder_mode": "ar",
                     "planned_merge_count": int(len(planned_merges)),
                     "selected_result_split": int(new_split),
                     "stop_after_merge_logit": stop_after_merge_logit_value,
@@ -6354,7 +6605,10 @@ def _discrete_phase_rollout(
         if (
             ar_boundary_complete
             or phase_exhausted
-            or not has_polytomy_fast(current_newick, unrooted_ok=False)
+            or not has_polytomy_fast(
+                current_newick,
+                unrooted_ok=birthset_polytomy_unrooted_ok,
+            )
         ):
             phase += 1
             continue
@@ -6392,6 +6646,602 @@ def _discrete_phase_rollout(
         "num_velocity_states": int(len(trace["velocity"])),
         "num_ar_states": int(len(trace["autoregressive"])),
         "final_tree_label_remapped": bool(final_tree_label_remapped),
+        "trace": trace,
+    }
+    if return_trace:
+        return out
+    return out
+
+
+def _slice_rollout_batch_value(value, indices, total_size, device=None):
+    if value is None:
+        return None
+    indices = [int(idx) for idx in indices]
+    if torch.is_tensor(value):
+        if value.ndim >= 1:
+            if int(value.shape[0]) == int(total_size):
+                index_tensor = torch.as_tensor(
+                    indices,
+                    dtype=torch.long,
+                    device=value.device,
+                )
+                return value.index_select(0, index_tensor)
+            if int(value.shape[0]) == 1 and len(indices) != 1:
+                return value.expand(len(indices), *value.shape[1:]).contiguous()
+        return value.to(device) if device is not None else value
+    if isinstance(value, (list, tuple)) and len(value) == int(total_size):
+        return [value[idx] for idx in indices]
+    return value
+
+
+def _tree_to_model_split_lengths_from_batched_tokenized(tokenized, batch_index, newick):
+    tree_obj = Tree(newick)
+    encoder = BHVEncoder()
+    split_masks, split_lengths = encoder.return_BHV_encoding(tree_obj)
+    length_map = {
+        int(mask): float(length)
+        for mask, length in zip(split_masks, split_lengths)
+        if length is not None and float(length) > 1e-8
+    }
+    model_masks = [int(mask) for mask in tokenized[-1][batch_index] if int(mask) != 0]
+    biological_bits = max(tree_obj.n_leaves - 1, 0)
+    full_model_mask = (1 << biological_bits) - 1 if biological_bits > 0 else 0
+
+    td = {}
+    for model_mask in model_masks:
+        edge_length = length_map.get(model_mask)
+        if edge_length is None and full_model_mask:
+            edge_length = length_map.get(full_model_mask ^ model_mask)
+        if edge_length is not None and float(edge_length) > 1e-8:
+            td[int(model_mask)] = float(edge_length)
+    return td, int(tree_obj.n_leaves), tree_obj.id_to_name
+
+
+def _discrete_phase_rollout_batched_birthset(
+    module,
+    start_trees,
+    target_trees,
+    phyla_embeddings,
+    case_indices=None,
+    start_topology_features=None,
+    start_topology_embeddings=None,
+    start_topology_pad_mask=None,
+    *,
+    dt_base: float = 0.02,
+    eps_len: float = 1e-8,
+    max_events: int = 1000,
+    max_steps: int = 1000,
+    max_phases: int = 8,
+    return_trace: bool = False,
+    trace_state_rf: bool = True,
+    explicit_autoregressive_component_groups: bool = True,
+):
+    start_trees = [str(tree) for tree in start_trees]
+    target_trees = [str(tree) if tree is not None else None for tree in target_trees]
+    batch_size = len(start_trees)
+    current_newicks = list(start_trees)
+    phase_by_tree = [0 for _ in range(batch_size)]
+    n_events_by_tree = [0 for _ in range(batch_size)]
+    n_steps_by_tree = [0 for _ in range(batch_size)]
+    done = [False for _ in range(batch_size)]
+
+    rollout_case_indices = None
+    if case_indices is not None:
+        rollout_case_indices = torch.as_tensor(
+            case_indices,
+            dtype=torch.long,
+            device=module.device,
+        ).reshape(-1)
+        if int(rollout_case_indices.shape[0]) == 1 and batch_size > 1:
+            rollout_case_indices = rollout_case_indices.expand(batch_size).contiguous()
+        if int(rollout_case_indices.shape[0]) != batch_size:
+            raise ValueError(
+                "case_indices must have one entry per starting tree for batched rollout."
+            )
+
+    rollout_start_topology_features = start_topology_features
+    if (
+        rollout_start_topology_features is None
+        and (
+            getattr(module.model, "first_hit_head_mode", "base")
+            in {
+                "start_topology_adapter_mlp",
+                "start_topology_raw_pool_concat_mlp",
+            }
+            or getattr(
+                module.model,
+                "autoregressive_use_start_topology_conditioning",
+                False,
+            )
+        )
+    ):
+        rollout_start_topology_features = _build_start_topology_feature_tensor(
+            module,
+            start_trees,
+            device=module.device,
+        )
+
+    rollout_start_topology_embeddings = start_topology_embeddings
+    rollout_start_topology_pad_mask = start_topology_pad_mask
+    if (
+        (
+            rollout_start_topology_embeddings is None
+            or rollout_start_topology_pad_mask is None
+        )
+        and getattr(module.model, "first_hit_head_mode", "base")
+        == "start_topology_cross_attn_mlp"
+    ):
+        (
+            rollout_start_topology_embeddings,
+            rollout_start_topology_pad_mask,
+        ) = _build_start_topology_identity_batch(
+            module,
+            start_trees,
+            device=module.device,
+        )
+
+    rollout_start_tree_graph_context = None
+    if getattr(module.model, "first_hit_head_mode", "base") == "start_tree_graph_token_mlp":
+        rollout_start_tree_graph_context = _build_start_tree_graph_context(
+            module,
+            start_trees,
+            phyla_embeddings,
+            device=module.device,
+            detach=getattr(module.model, "first_hit_start_tree_graph_detach", False),
+        )
+
+    trace = {
+        "velocity": [],
+        "autoregressive": [],
+        "terminal": [],
+        "stopped_for_no_valid_merge": False,
+        "stopped_for_repeated_topology": False,
+        "skipped_no_valid_boundary_revisits": 0.0,
+        "stopped_for_prefix_replay_quota": False,
+        "silent_boundary_recoveries": 0.0,
+        "stopped_for_terminal_head": False,
+        "autoregressive_boundary_stop_count": 0.0,
+        "final_orthant_relax": [],
+        "final_orthant_relax_summary": None,
+    }
+
+    def _trace_rf_to_target(tree_index, tree_newick):
+        if not trace_state_rf or target_trees[tree_index] is None:
+            return None
+        return float(calculate_norm_rf(tree_newick, target_trees[tree_index]))
+
+    effective_max_events = (
+        1000000 if max_events is None or int(max_events) < 0 else int(max_events)
+    )
+    effective_max_steps = (
+        1000000 if max_steps is None or int(max_steps) < 0 else int(max_steps)
+    )
+    effective_max_phases = max(1, int(max_phases))
+
+    while True:
+        active = [
+            idx
+            for idx in range(batch_size)
+            if (
+                not done[idx]
+                and phase_by_tree[idx] < effective_max_phases
+                and n_events_by_tree[idx] < effective_max_events
+                and n_steps_by_tree[idx] < effective_max_steps
+            )
+        ]
+        if not active:
+            break
+
+        for idx in active:
+            n_steps_by_tree[idx] += 1
+            trace["terminal"].append(
+                {
+                    "newick": current_newicks[idx],
+                    "target_tree": target_trees[idx],
+                    "timepoint": float(phase_by_tree[idx]),
+                    "phase_idx": int(phase_by_tree[idx]),
+                    "rf_to_target": _trace_rf_to_target(idx, current_newicks[idx]),
+                    "pred_terminal_prob": None,
+                    "position": "phase_start",
+                    "stop_after_phase": False,
+                    "stop_immediately": False,
+                    "sampling_action": "after_phase",
+                }
+            )
+
+        active_newicks = [current_newicks[idx] for idx in active]
+        tokenized = _tokenize_trees_with_structural_cache(module, active_newicks)
+        phase_tensor = torch.tensor(
+            [float(phase_by_tree[idx]) for idx in active],
+            dtype=torch.float32,
+            device=module.device,
+        )
+        with torch.inference_mode():
+            (
+                velocity,
+                edge_splits,
+                _edge_split_mask,
+                first_hit_logits,
+                boundary_vanish_logits,
+                edge_features,
+            ) = module.forward(
+                tokenized,
+                phase_tensor,
+                _slice_rollout_batch_value(
+                    phyla_embeddings,
+                    active,
+                    batch_size,
+                    device=module.device,
+                ),
+                first_hit_case_indices=_slice_rollout_batch_value(
+                    rollout_case_indices,
+                    active,
+                    batch_size,
+                    device=module.device,
+                ),
+                first_hit_start_topology_features=_slice_rollout_batch_value(
+                    rollout_start_topology_features,
+                    active,
+                    batch_size,
+                    device=module.device,
+                ),
+                first_hit_start_topology_embeddings=_slice_rollout_batch_value(
+                    rollout_start_topology_embeddings,
+                    active,
+                    batch_size,
+                    device=module.device,
+                ),
+                first_hit_start_topology_pad_mask=_slice_rollout_batch_value(
+                    rollout_start_topology_pad_mask,
+                    active,
+                    batch_size,
+                    device=module.device,
+                ),
+                first_hit_start_tree_graph_context=_slice_rollout_batch_value(
+                    rollout_start_tree_graph_context,
+                    active,
+                    batch_size,
+                    device=module.device,
+                ),
+            )
+
+        boundary_indices = []
+        boundary_newicks = []
+        for local_idx, tree_idx in enumerate(active):
+            td, n_leaves, mapping = _tree_to_model_split_lengths_from_batched_tokenized(
+                tokenized,
+                local_idx,
+                current_newicks[tree_idx],
+            )
+            aligned = _align_model_outputs_to_tree_context(
+                module,
+                current_newicks[tree_idx],
+                n_leaves,
+                edge_splits[local_idx],
+                velocity[local_idx, :, 0],
+                first_hit_logits_tree=None
+                if first_hit_logits is None
+                else first_hit_logits[local_idx, :, 0],
+                boundary_vanish_logits_tree=None
+                if boundary_vanish_logits is None
+                else boundary_vanish_logits[local_idx, :, 0],
+                edge_features_tree=None
+                if edge_features is None
+                else edge_features[local_idx],
+                eps_len=eps_len,
+            )
+            aligned_first_hit_logits = module._compute_first_hit_logits(
+                aligned["first_hit_logits"],
+                lengths=aligned["lengths"],
+                velocities=aligned["velocities"],
+                edge_features=aligned["edge_features"],
+                group_sizes=[int(aligned["lengths"].numel())],
+            )
+            lengths = aligned["lengths"].detach().cpu().numpy().astype(np.float64)
+            velocities = aligned["velocities"].detach().cpu().numpy().astype(
+                np.float64
+            )
+            supervised_mask = (
+                aligned["supervised_mask"].detach().cpu().numpy().astype(bool)
+            )
+            masks = [int(x) for x in aligned["aligned_model_masks"]]
+            first_logits = (
+                aligned_first_hit_logits.detach().cpu().numpy().astype(np.float64)
+                if aligned_first_hit_logits is not None
+                else np.full_like(lengths, float("-inf"), dtype=np.float64)
+            )
+            candidate_mask = supervised_mask & (lengths > eps_len)
+            predicted_first_mask, _raw_first_count, _used_first_fallback = (
+                _predict_first_hit_mask_with_fallback(
+                    first_logits,
+                    candidate_mask,
+                    max_edges=getattr(
+                        module,
+                        "velocity_first_hit_sampling_max_edges",
+                        -1,
+                    ),
+                    fallback_threshold=getattr(
+                        module,
+                        "velocity_first_hit_sampling_fallback_threshold",
+                        -1,
+                    ),
+                    fallback_top_k=getattr(
+                        module,
+                        "velocity_first_hit_sampling_fallback_top_k",
+                        -1,
+                    ),
+                )
+            )
+            pred_neg = predicted_first_mask & (velocities < 0.0) & (lengths > eps_len)
+            if not np.any(pred_neg):
+                trace["velocity"].append(
+                    {
+                        "newick_tree": current_newicks[tree_idx],
+                        "target_tree": target_trees[tree_idx],
+                        "timepoint": float(phase_by_tree[tree_idx]),
+                        "phase_idx": int(phase_by_tree[tree_idx]),
+                        "num_leaves": int(n_leaves),
+                        "event": "no_predicted_negative_edges",
+                    }
+                )
+                done[tree_idx] = True
+                continue
+
+            dt_target = float(
+                np.max(lengths[pred_neg] / np.maximum(-velocities[pred_neg], eps_len))
+            )
+            if bool(
+                getattr(
+                    module,
+                    "sampling_discrete_phase_exact_boundary_step_use_at_sampling",
+                    False,
+                )
+            ):
+                dt = float(dt_target)
+            else:
+                dt = min(float(dt_base), dt_target)
+            lengths_new = lengths + dt * velocities
+            collapse_mask = predicted_first_mask.copy()
+            if np.any(collapse_mask):
+                lengths_new[collapse_mask] = 0.0
+            blocked = supervised_mask & (~collapse_mask)
+            if np.any(blocked):
+                lengths_new[blocked] = np.maximum(
+                    lengths_new[blocked],
+                    eps_len * 10.0,
+                )
+
+            td2 = {
+                int(mask): float(length)
+                for mask, length in zip(masks, lengths_new)
+                if float(length) > eps_len
+            }
+            current_newicks[tree_idx] = build_tree_from_splits(
+                list(td2.keys()),
+                td2,
+                n_leaves,
+                root_leaf=n_leaves - 1,
+                mapping=mapping,
+            )[1]
+            trace["velocity"].append(
+                {
+                    "newick_tree": current_newicks[tree_idx],
+                    "target_tree": target_trees[tree_idx],
+                    "timepoint": float(phase_by_tree[tree_idx]),
+                    "phase_idx": int(phase_by_tree[tree_idx]),
+                    "num_leaves": int(n_leaves),
+                    "rf_to_target": _trace_rf_to_target(
+                        tree_idx,
+                        current_newicks[tree_idx],
+                    ),
+                    "predicted_masks": [
+                        masks[i]
+                        for i, on in enumerate(predicted_first_mask.tolist())
+                        if on
+                    ],
+                    "dt_target": float(dt_target),
+                }
+            )
+            if (
+                has_polytomy_fast(current_newicks[tree_idx], unrooted_ok=True)
+                and n_events_by_tree[tree_idx] < effective_max_events
+            ):
+                boundary_indices.append(tree_idx)
+                boundary_newicks.append(current_newicks[tree_idx])
+
+        if boundary_indices:
+            unique_boundary_map = {}
+            unique_boundary_indices = []
+            unique_boundary_newicks = []
+            boundary_unique_ids = []
+            for tree_idx, boundary_newick in zip(boundary_indices, boundary_newicks):
+                case_value = None
+                if rollout_case_indices is not None:
+                    case_value = int(rollout_case_indices[int(tree_idx)].item())
+                key = (
+                    str(boundary_newick),
+                    int(phase_by_tree[int(tree_idx)]),
+                    case_value,
+                    str(start_trees[int(tree_idx)]),
+                )
+                unique_id = unique_boundary_map.get(key)
+                if unique_id is None:
+                    unique_id = len(unique_boundary_indices)
+                    unique_boundary_map[key] = unique_id
+                    unique_boundary_indices.append(int(tree_idx))
+                    unique_boundary_newicks.append(str(boundary_newick))
+                boundary_unique_ids.append(int(unique_id))
+
+            tokenized_boundary = _tokenize_trees_with_structural_cache(
+                module,
+                unique_boundary_newicks,
+            )
+            component_groups = None
+            if explicit_autoregressive_component_groups:
+                component_groups = [
+                    get_structural_polytomy_groups_from_newick(newick)
+                    for newick in unique_boundary_newicks
+                ]
+            boundary_phase_tensor = torch.tensor(
+                [float(phase_by_tree[idx]) for idx in unique_boundary_indices],
+                dtype=torch.float32,
+                device=module.device,
+            )
+            with torch.inference_mode():
+                logit_outputs_batch = module.forward(
+                    tokenized_boundary,
+                    boundary_phase_tensor,
+                    _slice_rollout_batch_value(
+                        phyla_embeddings,
+                        unique_boundary_indices,
+                        batch_size,
+                        device=module.device,
+                    ),
+                    autoregressive=True,
+                    autoregressive_component_groups=component_groups,
+                    autoregressive_case_indices=_slice_rollout_batch_value(
+                        rollout_case_indices,
+                        unique_boundary_indices,
+                        batch_size,
+                        device=module.device,
+                    ),
+                    autoregressive_start_topology_features=_slice_rollout_batch_value(
+                        rollout_start_topology_features,
+                        unique_boundary_indices,
+                        batch_size,
+                        device=module.device,
+                    ),
+                )
+
+            if not isinstance(logit_outputs_batch, (list, tuple)):
+                logit_outputs_batch = [logit_outputs_batch]
+            logit_outputs_by_local_tree = [
+                [] for _ in range(len(unique_boundary_indices))
+            ]
+            for output in logit_outputs_batch:
+                if not isinstance(output, dict):
+                    continue
+                output_batch_index = int(output.get("batch_index", 0))
+                if 0 <= output_batch_index < len(logit_outputs_by_local_tree):
+                    logit_outputs_by_local_tree[output_batch_index].append(output)
+
+            plans_by_unique = []
+            for unique_id, _representative_tree_idx in enumerate(unique_boundary_indices):
+                source_newick = unique_boundary_newicks[unique_id]
+                tokenized_single = tuple(
+                    item[unique_id : unique_id + 1]
+                    if (
+                        torch.is_tensor(item)
+                        and item.ndim >= 1
+                        and int(item.shape[0]) == len(unique_boundary_indices)
+                    )
+                    else (
+                        item[unique_id : unique_id + 1]
+                        if isinstance(item, (list, tuple))
+                        and len(item) == len(unique_boundary_indices)
+                        else item
+                    )
+                    for item in tokenized_boundary
+                )
+                td_ar, n_ar, mapping_ar = _tree_to_model_split_lengths(
+                    module,
+                    source_newick,
+                    tokenized=tokenized_single,
+                )
+                birthset_plan = module._plan_birthset_boundary_splits(
+                    logit_outputs_by_local_tree[unique_id],
+                    td_ar.keys(),
+                    n_ar,
+                )
+                plans_by_unique.append(
+                    {
+                        "source_newick": source_newick,
+                        "td_ar": td_ar,
+                        "n_ar": n_ar,
+                        "mapping_ar": mapping_ar,
+                        "birthset_plan": birthset_plan,
+                        "selected_births": list(birthset_plan.get("selected", [])),
+                    }
+                )
+
+            for local_idx, tree_idx in enumerate(boundary_indices):
+                plan_record = plans_by_unique[boundary_unique_ids[local_idx]]
+                source_newick = plan_record["source_newick"]
+                td_ar = dict(plan_record["td_ar"])
+                n_ar = int(plan_record["n_ar"])
+                mapping_ar = plan_record["mapping_ar"]
+                birthset_plan = plan_record["birthset_plan"]
+                selected_births = list(plan_record["selected_births"])
+                remaining_events = max(
+                    int(effective_max_events) - int(n_events_by_tree[tree_idx]),
+                    0,
+                )
+                selected_births = selected_births[:remaining_events]
+                selected_splits = []
+                for item in selected_births:
+                    split = int(item["split_mask"])
+                    td_ar[split] = float(getattr(module, "birthset_birth_length", 1e-3))
+                    selected_splits.append(split)
+                n_events_by_tree[tree_idx] += len(selected_splits)
+                if selected_splits:
+                    current_newicks[tree_idx] = build_tree_from_splits(
+                        list(td_ar.keys()),
+                        td_ar,
+                        n_ar,
+                        root_leaf=n_ar - 1,
+                        mapping=mapping_ar,
+                    )[1]
+                unresolved = has_polytomy_fast(
+                    current_newicks[tree_idx],
+                    unrooted_ok=True,
+                )
+                trace["autoregressive"].append(
+                    {
+                        "source_newick": source_newick,
+                        "newick": current_newicks[tree_idx],
+                        "target_tree": target_trees[tree_idx],
+                        "time": float(phase_by_tree[tree_idx]),
+                        "phase_idx": int(phase_by_tree[tree_idx]),
+                        "rf_to_target": _trace_rf_to_target(
+                            tree_idx,
+                            current_newicks[tree_idx],
+                        ),
+                        "decoder_mode": "birthset",
+                        "planned_merge_count": int(len(selected_splits)),
+                        "selected_result_splits": selected_splits,
+                        "birthset_metrics": birthset_plan.get("metrics", {}),
+                    }
+                )
+                if unresolved:
+                    trace["birthset_incomplete_without_fallback"] = True
+                    trace["stopped_for_no_valid_merge"] = True
+
+        for idx in active:
+            if not done[idx]:
+                phase_by_tree[idx] += 1
+
+    final_trees = []
+    remapped_flags = []
+    for idx, tree_newick in enumerate(current_newicks):
+        aligned, remapped = align_numeric_leaf_labels_to_reference(
+            tree_newick,
+            start_trees[idx],
+            target_tree=target_trees[idx],
+        )
+        final_trees.append(aligned)
+        remapped_flags.append(bool(remapped))
+
+    out = {
+        "final_trees": final_trees,
+        "final_rf": [
+            float(calculate_norm_rf(tree, target_trees[idx]))
+            if target_trees[idx] is not None
+            else None
+            for idx, tree in enumerate(final_trees)
+        ],
+        "num_velocity_states": int(len(trace["velocity"])),
+        "num_ar_states": int(len(trace["autoregressive"])),
+        "final_tree_label_remapped": remapped_flags,
         "trace": trace,
     }
     if return_trace:
@@ -6460,6 +7310,26 @@ class TrainingModule(LightningModule):
         autoregressive_dagger_max_steps: int = 4,
         autoregressive_structure_perturb_prob: float = 0.0,
         autoregressive_structure_perturb_mode: str = "random_wrong_pair",
+        topology_decoder: str = "ar",
+        birthset_birth_length: float = 1e-3,
+        birthset_lambda_birth: float = 0.2,
+        birthset_lambda_rank: float = 0.1,
+        birthset_lambda_proposal: float = 0.0,
+        birthset_rank_margin: float = 1.0,
+        birthset_pos_weight="auto",
+        birthset_use_train_birth_split_bank: bool = True,
+        birthset_use_small_polytomy_enumeration: bool = True,
+        birthset_use_pair_prefix_candidates: bool = False,
+        birthset_pair_prefix_top_pairs: int = 64,
+        birthset_proposal_pair_target_mode: str = "contained",
+        birthset_proposal_max_expansion_examples: int = 4096,
+        birthset_proposal_max_order_seed_pairs: int = 128,
+        birthset_max_enum_components: int = 12,
+        birthset_max_candidates_per_polytomy: int = 2048,
+        birthset_negatives_per_positive: int = 64,
+        birthset_decoder: str = "greedy",
+        birthset_beam_width: int = 8,
+        birthset_fallback: str = "ar",
         velocity_length_jitter_prob: float = 0.0,
         velocity_length_jitter_scale: float = 0.0,
         velocity_dt_candidate_weight: float = 0.0,
@@ -6849,6 +7719,93 @@ class TrainingModule(LightningModule):
                 f"Invalid autoregressive_target_mode={autoregressive_target_mode!r}. "
                 f"Expected one of {sorted(valid_autoregressive_target_modes)}."
             )
+        valid_topology_decoders = {"ar", "birthset", "birthset_with_ar_fallback"}
+        topology_decoder = str(topology_decoder or "ar").lower()
+        if topology_decoder not in valid_topology_decoders:
+            raise ValueError(
+                f"Invalid topology_decoder={topology_decoder!r}. "
+                f"Expected one of {sorted(valid_topology_decoders)}."
+            )
+        if float(birthset_lambda_birth) < 0.0:
+            raise ValueError(
+                "birthset_lambda_birth must be non-negative, "
+                f"got {birthset_lambda_birth}."
+            )
+        if float(birthset_lambda_rank) < 0.0:
+            raise ValueError(
+                "birthset_lambda_rank must be non-negative, "
+                f"got {birthset_lambda_rank}."
+            )
+        if float(birthset_lambda_proposal) < 0.0:
+            raise ValueError(
+                "birthset_lambda_proposal must be non-negative, "
+                f"got {birthset_lambda_proposal}."
+            )
+        if float(birthset_rank_margin) < 0.0:
+            raise ValueError(
+                "birthset_rank_margin must be non-negative, "
+                f"got {birthset_rank_margin}."
+            )
+        if float(birthset_birth_length) <= 0.0:
+            raise ValueError(
+                "birthset_birth_length must be positive, "
+                f"got {birthset_birth_length}."
+            )
+        if int(birthset_max_enum_components) < 0:
+            raise ValueError(
+                "birthset_max_enum_components must be >= 0, "
+                f"got {birthset_max_enum_components}."
+            )
+        if int(birthset_pair_prefix_top_pairs) < 1:
+            raise ValueError(
+                "birthset_pair_prefix_top_pairs must be >= 1, "
+                f"got {birthset_pair_prefix_top_pairs}."
+            )
+        valid_birthset_proposal_pair_target_modes = {
+            "contained",
+            "strict_minimal",
+        }
+        if (
+            str(birthset_proposal_pair_target_mode)
+            not in valid_birthset_proposal_pair_target_modes
+        ):
+            raise ValueError(
+                "birthset_proposal_pair_target_mode must be one of "
+                f"{sorted(valid_birthset_proposal_pair_target_modes)}, got "
+                f"{birthset_proposal_pair_target_mode}."
+            )
+        if int(birthset_proposal_max_expansion_examples) < 1:
+            raise ValueError(
+                "birthset_proposal_max_expansion_examples must be >= 1, "
+                f"got {birthset_proposal_max_expansion_examples}."
+            )
+        if int(birthset_proposal_max_order_seed_pairs) < 1:
+            raise ValueError(
+                "birthset_proposal_max_order_seed_pairs must be >= 1, "
+                f"got {birthset_proposal_max_order_seed_pairs}."
+            )
+        if int(birthset_max_candidates_per_polytomy) < 1:
+            raise ValueError(
+                "birthset_max_candidates_per_polytomy must be >= 1, "
+                f"got {birthset_max_candidates_per_polytomy}."
+            )
+        if int(birthset_negatives_per_positive) < 1:
+            raise ValueError(
+                "birthset_negatives_per_positive must be >= 1, "
+                f"got {birthset_negatives_per_positive}."
+            )
+        birthset_decoder = str(birthset_decoder or "greedy").lower()
+        if birthset_decoder not in {"greedy", "beam"}:
+            raise ValueError(
+                "birthset_decoder must be one of ['greedy', 'beam'], "
+                f"got {birthset_decoder!r}."
+            )
+        birthset_fallback = str(birthset_fallback or "ar").lower()
+        if birthset_fallback not in {"ar", "balanced_completion", "none"}:
+            raise ValueError(
+                "birthset_fallback must be one of ['ar', 'balanced_completion', 'none'], "
+                f"got {birthset_fallback!r}."
+            )
         valid_training_sampling_modes = {"batch_compare", "harness_sanity"}
         if self.training_sampling_mode not in valid_training_sampling_modes:
             raise ValueError(
@@ -7183,6 +8140,61 @@ class TrainingModule(LightningModule):
         self.autoregressive_structure_perturb_mode = str(
             autoregressive_structure_perturb_mode
         )
+        self.topology_decoder = topology_decoder
+        self.birthset_birth_length = float(birthset_birth_length)
+        self.birthset_lambda_birth = float(birthset_lambda_birth)
+        self.birthset_lambda_rank = float(birthset_lambda_rank)
+        self.birthset_lambda_proposal = float(birthset_lambda_proposal)
+        self.birthset_rank_margin = float(birthset_rank_margin)
+        self.birthset_pos_weight = birthset_pos_weight
+        self.birthset_use_train_birth_split_bank = bool(
+            birthset_use_train_birth_split_bank
+        )
+        self.birthset_use_small_polytomy_enumeration = bool(
+            birthset_use_small_polytomy_enumeration
+        )
+        self.birthset_use_pair_prefix_candidates = bool(
+            birthset_use_pair_prefix_candidates
+        )
+        self.birthset_pair_prefix_top_pairs = int(birthset_pair_prefix_top_pairs)
+        self.birthset_proposal_pair_target_mode = str(
+            birthset_proposal_pair_target_mode
+        )
+        self.birthset_proposal_max_expansion_examples = int(
+            birthset_proposal_max_expansion_examples
+        )
+        self.birthset_proposal_max_order_seed_pairs = int(
+            birthset_proposal_max_order_seed_pairs
+        )
+        self.birthset_max_enum_components = int(birthset_max_enum_components)
+        self.birthset_max_candidates_per_polytomy = int(
+            birthset_max_candidates_per_polytomy
+        )
+        self.birthset_negatives_per_positive = int(
+            birthset_negatives_per_positive
+        )
+        self.birthset_decoder = birthset_decoder
+        self.birthset_beam_width = max(1, int(birthset_beam_width))
+        self.birthset_fallback = birthset_fallback
+        self.birthset_split_bank = set()
+        self.birthset_topology_head = None
+        self.birthset_proposal_head = None
+        if self.topology_decoder in {"birthset", "birthset_with_ar_fallback"}:
+            self.birthset_topology_head = BirthSetTopologyHead(
+                int(self.model.embed_dim),
+                hidden=max(128, int(self.model.embed_dim)),
+                dropout=0.0,
+                context_dim=int(self.model.embed_dim),
+                max_components_norm=max(16, int(self.model.embed_dim)),
+            )
+            if self.birthset_use_pair_prefix_candidates:
+                self.birthset_proposal_head = BirthSetTopologyHead(
+                    int(self.model.embed_dim),
+                    hidden=max(128, int(self.model.embed_dim)),
+                    dropout=0.0,
+                    context_dim=int(self.model.embed_dim),
+                    max_components_norm=max(16, int(self.model.embed_dim)),
+                )
         self.velocity_length_jitter_prob = float(velocity_length_jitter_prob)
         self.velocity_length_jitter_scale = float(velocity_length_jitter_scale)
         self.velocity_dt_candidate_weight = float(velocity_dt_candidate_weight)
@@ -8010,6 +9022,16 @@ class TrainingModule(LightningModule):
     def on_train_start(self):
         super().on_train_start()
         self._reset_training_sampling_schedule()
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["birthset_split_bank"] = sorted(
+            int(split) for split in getattr(self, "birthset_split_bank", set())
+        )
+
+    def on_load_checkpoint(self, checkpoint):
+        bank = checkpoint.get("birthset_split_bank")
+        if bank is not None:
+            self.birthset_split_bank = {int(split) for split in bank}
 
     def _reset_training_sampling_schedule(self):
         frequency = int(self.training_sampling_frequency)
@@ -9757,7 +10779,8 @@ class TrainingModule(LightningModule):
                 return {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
-                    "bank_group_key": sampled_pair.get("bank_group_key"),
+                    "bank_group_key": sampled_pair.get("bank_group_key")
+                    or sampled_pair.get("group_key"),
                     "dataset_id": sampled_pair.get("dataset_id"),
                     "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                     "max_events": int(len(sampled_pair.get("final_labels", []))),
@@ -9776,7 +10799,9 @@ class TrainingModule(LightningModule):
             start_tree = sampled.get("start_tree")
             target_tree = sampled.get("target_tree")
             if start_tree and target_tree:
-                bank_group_key_value = sampled.get("bank_group_key")
+                bank_group_key_value = sampled.get("bank_group_key") or sampled.get(
+                    "group_key"
+                )
                 return {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
@@ -9908,7 +10933,8 @@ class TrainingModule(LightningModule):
         pair = {
             "start_tree": fixed_pair["random_tree"],
             "target_tree": effective_target_tree,
-            "bank_group_key": fixed_pair.get("bank_group_key"),
+            "bank_group_key": fixed_pair.get("bank_group_key")
+            or fixed_pair.get("group_key"),
             "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
             "name_mapping": fixed_pair.get("name_mapping"),
             "selected_sequences": fixed_pair.get("selected_sequences"),
@@ -9918,6 +10944,12 @@ class TrainingModule(LightningModule):
         sample_kwargs = self._build_harness_sample_kwargs(pair, train=True)
         phyla_embeddings = sample_kwargs.get("phyla_embeddings")
         case_indices = sample_kwargs.get("case_indices")
+        if case_indices is not None:
+            case_indices = torch.as_tensor(
+                case_indices,
+                dtype=torch.long,
+                device=self.device,
+            ).reshape(-1)
         start_topology_features = sample_kwargs.get(
             "first_hit_start_topology_features"
         )
@@ -10104,7 +11136,8 @@ class TrainingModule(LightningModule):
         pair = {
             "start_tree": fixed_pair["random_tree"],
             "target_tree": fixed_pair["effective_target_tree"],
-            "bank_group_key": fixed_pair.get("bank_group_key"),
+            "bank_group_key": fixed_pair.get("bank_group_key")
+            or fixed_pair.get("group_key"),
             "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
             "name_mapping": fixed_pair.get("name_mapping"),
             "selected_sequences": fixed_pair.get("selected_sequences"),
@@ -10114,6 +11147,12 @@ class TrainingModule(LightningModule):
         sample_kwargs = self._build_harness_sample_kwargs(pair, train=True)
         phyla_embeddings = sample_kwargs.get("phyla_embeddings")
         case_indices = sample_kwargs.get("case_indices")
+        if case_indices is not None:
+            case_indices = torch.as_tensor(
+                case_indices,
+                dtype=torch.long,
+                device=self.device,
+            ).reshape(-1)
         for event_idx, event in enumerate(final_labels):
             current_newick = event["newick"]
             component_groups = [get_structural_polytomy_groups_from_newick(current_newick)]
@@ -10170,7 +11209,8 @@ class TrainingModule(LightningModule):
         pair = {
             "start_tree": fixed_pair["random_tree"],
             "target_tree": fixed_pair["effective_target_tree"],
-            "bank_group_key": fixed_pair.get("bank_group_key"),
+            "bank_group_key": fixed_pair.get("bank_group_key")
+            or fixed_pair.get("group_key"),
             "n_leaves": len(EteTree(fixed_pair["random_tree"], format=1).get_leaves()),
             "name_mapping": fixed_pair.get("name_mapping"),
             "selected_sequences": fixed_pair.get("selected_sequences"),
@@ -10190,6 +11230,10 @@ class TrainingModule(LightningModule):
         sampled_ar = len(trace.get("autoregressive", []))
         expected_velocity = len(fixed_pair.get("boundary_paths", []) or [])
         expected_ar = len(fixed_pair.get("final_labels", []) or [])
+        sampled_decoder_metrics = self._trace_topology_decoder_metrics(
+            trace,
+            prefix="fixed_path_sampled_",
+        )
         metrics.update(
             {
                 "fixed_path_sample_rf_norm": float(
@@ -10221,6 +11265,7 @@ class TrainingModule(LightningModule):
                 ),
             }
         )
+        metrics.update(sampled_decoder_metrics)
         return metrics
 
     def _build_harness_sample_kwargs(
@@ -10329,7 +11374,9 @@ class TrainingModule(LightningModule):
             or getattr(self.model, "autoregressive_use_case_conditioning", False)
             or needs_frozen_ar_case_probe
         ):
-            case_index = _extract_case_index_from_group_key(pair.get("bank_group_key"))
+            case_index = _extract_case_index_from_group_key(
+                _case_index_group_key_for_pair(self, pair)
+            )
             if case_index is not None:
                 sample_kwargs["case_indices"] = [int(case_index)]
         needs_start_topology_summary = (
@@ -11493,6 +12540,70 @@ class TrainingModule(LightningModule):
             return metrics, relaxed_tree_rows
         return metrics
 
+    def _trace_topology_decoder_metrics(self, trace, prefix="trace_"):
+        events = list((trace or {}).get("autoregressive", []) or [])
+        birthset_events = [
+            event for event in events if event.get("decoder_mode") == "birthset"
+        ]
+        legacy_events = [
+            event
+            for event in events
+            if event.get("decoder_mode")
+            in {"ar", "ar_fallback", "pairwise_threshold", "structured_subset"}
+        ]
+
+        def _selected_split_count(event):
+            splits = event.get("selected_result_splits")
+            if splits is not None:
+                return len(splits)
+            return 1 if event.get("selected_result_split") is not None else 0
+
+        birthset_metrics = [
+            event.get("birthset_metrics", {}) or {} for event in birthset_events
+        ]
+        result = {
+            f"{prefix}topology_trace_entries": float(len(events)),
+            f"{prefix}birthset_events": float(len(birthset_events)),
+            f"{prefix}legacy_ar_events": float(len(legacy_events)),
+            f"{prefix}birthset_inserted_splits": float(
+                sum(_selected_split_count(event) for event in birthset_events)
+            ),
+            f"{prefix}birthset_incomplete_without_fallback": float(
+                1.0
+                if (trace or {}).get("birthset_incomplete_without_fallback", False)
+                else 0.0
+            ),
+        }
+        if birthset_metrics:
+            result[f"{prefix}birthset_required_splits"] = float(
+                sum(
+                    float(metrics.get("num_required_birth_splits", 0.0))
+                    for metrics in birthset_metrics
+                )
+            )
+            result[f"{prefix}birthset_candidate_splits"] = float(
+                sum(
+                    float(metrics.get("num_candidate_splits", 0.0))
+                    for metrics in birthset_metrics
+                )
+            )
+            result[f"{prefix}birthset_ar_fallback_calls"] = float(
+                sum(
+                    float(metrics.get("num_ar_fallback_calls", 0.0))
+                    for metrics in birthset_metrics
+                )
+            )
+            resolved_values = [
+                float(metrics.get("fraction_resolved_without_fallback", 0.0))
+                for metrics in birthset_metrics
+                if "fraction_resolved_without_fallback" in metrics
+            ]
+            if resolved_values:
+                result[
+                    f"{prefix}birthset_fraction_resolved_without_fallback_mean"
+                ] = float(np.mean(resolved_values))
+        return result
+
     def _sample_compare_harness_once(self, pair, train=True):
         sampled_trees, _, _, _, _, trace = self.sample(
             [pair["start_tree"]],
@@ -11532,6 +12643,7 @@ class TrainingModule(LightningModule):
             )
         if self.sample_metrics_trace_topology_repeats_enabled:
             metrics.update(_summarize_trace_topology_repeats(trace))
+        metrics.update(self._trace_topology_decoder_metrics(trace, prefix="trace_"))
         metrics["stopped_for_repeated_topology"] = float(
             1.0 if trace.get("stopped_for_repeated_topology", False) else 0.0
         )
@@ -11745,7 +12857,9 @@ class TrainingModule(LightningModule):
                 or fixed_pair.get("fixed_pair_num_events", 1024)
             )
             name_mapping_value = fixed_pair.get("name_mapping")
-            bank_group_key_value = fixed_pair.get("bank_group_key")
+            bank_group_key_value = fixed_pair.get("bank_group_key") or fixed_pair.get(
+                "group_key"
+            )
             dataset_id_value = fixed_pair.get("dataset_id")
             selected_sequences_value = fixed_pair.get("selected_sequences")
             selected_sequence_names_value = fixed_pair.get("selected_sequence_names")
@@ -11754,7 +12868,9 @@ class TrainingModule(LightningModule):
             target_tree = sampled.get("target_tree")
             max_events_value = int(sampled.get("fixed_pair_num_events", 1024))
             name_mapping_value = sampled.get("name_mapping")
-            bank_group_key_value = sampled.get("bank_group_key")
+            bank_group_key_value = sampled.get("bank_group_key") or sampled.get(
+                "group_key"
+            )
             dataset_id_value = sampled.get("dataset_id")
             selected_sequences_value = sampled.get("selected_sequences")
             selected_sequence_names_value = sampled.get("selected_sequence_names")
@@ -11861,11 +12977,28 @@ class TrainingModule(LightningModule):
     def _sample_metrics_unseen_bank_pairs(self, dataset_split, train=True):
         num_pairs = max(1, int(getattr(self, "sample_metrics_num_pairs", 1)))
         bank_size = self._sample_metrics_bank_size(dataset_split)
-        indices = self._sample_metrics_select_bank_indices(
-            bank_size,
-            num_pairs,
-            train=train,
-        )
+        if bank_size <= 0:
+            return []
+        if num_pairs <= bank_size:
+            indices = self._sample_metrics_select_bank_indices(
+                bank_size,
+                num_pairs,
+                train=train,
+            )
+        else:
+            mode = str(
+                getattr(self, "sample_metrics_unseen_pair_selection_mode", "random_bank")
+            ).strip().lower()
+            seed_for_indices = (
+                int(self.sample_metrics_unseen_start_seed)
+                + int(self.global_step) * 1009
+                + (0 if train else 17)
+            )
+            if mode in {"first", "sequential"}:
+                indices = [idx % bank_size for idx in range(num_pairs)]
+            else:
+                rng = random.Random(seed_for_indices)
+                indices = [rng.randrange(bank_size) for _ in range(num_pairs)]
         random_state = random.getstate()
         seed = (
             int(self.sample_metrics_unseen_start_seed)
@@ -12159,7 +13292,8 @@ class TrainingModule(LightningModule):
                     "target_tree": fixed_pair.get(
                         "effective_target_tree", fixed_pair.get("target_tree")
                     ),
-                    "bank_group_key": fixed_pair.get("bank_group_key"),
+                    "bank_group_key": fixed_pair.get("bank_group_key")
+                    or fixed_pair.get("group_key"),
                     "dataset_id": fixed_pair.get("dataset_id"),
                     "n_leaves": len(
                         EteTree(
@@ -12212,14 +13346,18 @@ class TrainingModule(LightningModule):
                         or fixed_pair.get("fixed_pair_num_events", 1024)
                     )
                     name_mapping_value = fixed_pair.get("name_mapping")
-                    bank_group_key_value = fixed_pair.get("bank_group_key")
+                    bank_group_key_value = fixed_pair.get(
+                        "bank_group_key"
+                    ) or fixed_pair.get("group_key")
                     dataset_id_value = fixed_pair.get("dataset_id")
                 else:
                     start_tree = sampled.get("start_tree")
                     target_tree = sampled.get("target_tree")
                     max_events_value = int(sampled.get("fixed_pair_num_events", 1024))
                     name_mapping_value = None
-                    bank_group_key_value = sampled.get("bank_group_key")
+                    bank_group_key_value = sampled.get("bank_group_key") or sampled.get(
+                        "group_key"
+                    )
                     dataset_id_value = sampled.get("dataset_id")
                 pair = {
                     "start_tree": start_tree,
@@ -12823,6 +13961,7 @@ class TrainingModule(LightningModule):
                 device=self.device,
             ),
         }
+        repeat_summary = {}
         if self.sample_metrics_trace_topology_repeats_enabled:
             repeat_summary = _summarize_trace_topology_repeats(trace)
             for key, value in repeat_summary.items():
@@ -14195,6 +15334,1404 @@ class TrainingModule(LightningModule):
             "velocity_perturb_stats": velocity_perturb_stats,
             "ar_prep_stats": ar_prep_stats,
         }
+
+    def _birthset_num_required_splits(
+        self,
+        num_components,
+        component_masks=None,
+        full_mask=None,
+    ):
+        parent_mask = 0
+        for component in component_masks or []:
+            parent_mask |= int(component)
+        is_root_polytomy = bool(
+            full_mask is not None
+            and int(full_mask) != 0
+            and (int(parent_mask) & int(full_mask)) == int(full_mask)
+        )
+        offset = 3 if is_root_polytomy else 2
+        return max(int(num_components) - offset, 0)
+
+    def _birthset_num_leaves_for_group(self, batch, batch_index, component_masks):
+        num_leaves = batch.get("num_leaves")
+        if isinstance(num_leaves, (list, tuple)) and len(num_leaves) > batch_index:
+            try:
+                return int(num_leaves[batch_index])
+            except Exception:
+                pass
+        if torch.is_tensor(num_leaves):
+            if num_leaves.numel() == 1:
+                return int(num_leaves.item())
+            if num_leaves.numel() > batch_index:
+                return int(num_leaves[batch_index].item())
+        newicks = batch.get("newick_autoregressive_trees")
+        if newicks is not None and len(newicks) > batch_index:
+            try:
+                return int(Tree(newicks[batch_index]).n_leaves)
+            except Exception:
+                pass
+        max_bit = 0
+        for mask in component_masks:
+            max_bit = max(max_bit, int(mask).bit_length())
+        return max_bit + 1 if max_bit > 0 else 0
+
+    def _birthset_update_split_bank_from_labels(self, labels_by_batch):
+        if not self.birthset_use_train_birth_split_bank:
+            return
+        for labeled_merge_cluster in labels_by_batch or []:
+            for label in labeled_merge_cluster or []:
+                result_split = label.get("result_split")
+                if result_split is not None:
+                    self.birthset_split_bank.add(int(result_split))
+
+    def _birthset_candidate_cap_reached(self, candidates_by_subset, force):
+        return (
+            not force
+            and len(candidates_by_subset) >= self.birthset_max_candidates_per_polytomy
+        )
+
+    def _birthset_add_candidate(
+        self,
+        candidates_by_subset,
+        local_subset,
+        component_masks,
+        full_mask,
+        source,
+        *,
+        force=False,
+    ):
+        local_subset = int(local_subset)
+        if not _birthset_valid_local_subset(local_subset, len(component_masks)):
+            return False
+        split_mask = _birthset_local_subset_to_split(local_subset, component_masks)
+        if not _birthset_valid_rooted_split(split_mask, full_mask):
+            return False
+        if self._birthset_candidate_cap_reached(candidates_by_subset, force):
+            return False
+        existing = candidates_by_subset.get(local_subset)
+        if existing is not None and existing.get("source") == "gold":
+            return True
+        candidates_by_subset[local_subset] = _birthset_candidate_record(
+            local_subset,
+            component_masks,
+            source,
+        )
+        return True
+
+    def _birthset_add_pair_prefix_candidates(
+        self,
+        candidates_by_subset,
+        component_masks,
+        full_mask,
+        component_embeddings,
+        context=None,
+    ):
+        proposal_head = self.birthset_proposal_head or self.birthset_topology_head
+        if proposal_head is None or component_embeddings is None:
+            return 0
+        G = len(component_masks)
+        if G < 3:
+            return 0
+
+        pair_subsets = []
+        for left_idx in range(G):
+            for right_idx in range(left_idx + 1, G):
+                subset = (1 << int(left_idx)) | (1 << int(right_idx))
+                if _birthset_valid_local_subset(subset, G):
+                    pair_subsets.append(int(subset))
+        if not pair_subsets:
+            return 0
+
+        H = component_embeddings.detach()
+        ctx = context.detach() if torch.is_tensor(context) else context
+        with torch.inference_mode():
+            pair_logits = proposal_head(
+                H,
+                pair_subsets,
+                context=ctx,
+            )
+        if pair_logits.numel() == 0:
+            return 0
+
+        top_k = min(
+            int(self.birthset_pair_prefix_top_pairs),
+            int(pair_logits.numel()),
+        )
+        top_pair_ids = torch.topk(pair_logits, k=top_k, largest=True).indices.tolist()
+        pair_expansion_items = {}
+        expansion_requests = []
+        for pair_id in top_pair_ids:
+            base_subset = int(pair_subsets[int(pair_id)])
+            remaining = [
+                idx for idx in range(G) if ((base_subset >> int(idx)) & 1) == 0
+            ]
+            items = []
+            for idx in remaining:
+                subset = int(base_subset | (1 << int(idx)))
+                if not _birthset_valid_local_subset(subset, G):
+                    continue
+                items.append((int(idx), subset))
+                expansion_requests.append((int(pair_id), subset))
+            pair_expansion_items[int(pair_id)] = items
+
+        expansion_scores_by_pair = {}
+        if expansion_requests:
+            expansion_subsets_all = [subset for _pair_id, subset in expansion_requests]
+            with torch.inference_mode():
+                expansion_logits_all = proposal_head(
+                    H,
+                    expansion_subsets_all,
+                    context=ctx,
+                )
+            for (pair_id, subset), score in zip(
+                expansion_requests,
+                expansion_logits_all.detach().cpu().tolist(),
+            ):
+                expansion_scores_by_pair.setdefault(int(pair_id), {})[
+                    int(subset)
+                ] = float(score)
+
+        added_count = 0
+        for pair_id in top_pair_ids:
+            if len(candidates_by_subset) >= self.birthset_max_candidates_per_polytomy:
+                break
+            base_subset = int(pair_subsets[int(pair_id)])
+            if self._birthset_add_candidate(
+                candidates_by_subset,
+                base_subset,
+                component_masks,
+                full_mask,
+                "pair_prefix",
+            ):
+                added_count += 1
+
+            expansion_items = pair_expansion_items.get(int(pair_id), [])
+            if not expansion_items:
+                continue
+            ordered_components = sorted(
+                [idx for idx, _subset in expansion_items],
+                key=lambda idx: expansion_scores_by_pair.get(int(pair_id), {}).get(
+                    int(base_subset | (1 << int(idx))),
+                    float("-inf"),
+                ),
+                reverse=True,
+            )
+            prefix_subset = int(base_subset)
+            for idx in ordered_components:
+                next_subset = int(prefix_subset | (1 << int(idx)))
+                if not _birthset_valid_local_subset(next_subset, G):
+                    break
+                if self._birthset_add_candidate(
+                    candidates_by_subset,
+                    next_subset,
+                    component_masks,
+                    full_mask,
+                    "pair_prefix",
+                ):
+                    added_count += 1
+                prefix_subset = next_subset
+                if len(candidates_by_subset) >= self.birthset_max_candidates_per_polytomy:
+                    break
+        return int(added_count)
+
+    def _birthset_build_candidates(
+        self,
+        component_masks,
+        num_leaves,
+        *,
+        gold_splits=None,
+        gold_local_subsets=None,
+        component_embeddings=None,
+        context=None,
+        train=False,
+    ):
+        component_masks = [int(mask) for mask in component_masks]
+        full_mask = _birthset_full_mask(num_leaves)
+        candidates_by_subset = {}
+        gold_splits = [int(split) for split in (gold_splits or [])]
+        gold_local_subsets = [int(mask) for mask in (gold_local_subsets or [])]
+        max_bit_length = max(
+            [int(full_mask).bit_length()]
+            + [int(mask).bit_length() for mask in component_masks]
+            + [int(mask).bit_length() for mask in gold_splits]
+        )
+        if max_bit_length > int(full_mask).bit_length():
+            full_mask = (1 << int(max_bit_length)) - 1
+        gold_mismatches = 0
+
+        if (
+            self.birthset_use_train_birth_split_bank
+            and self.birthset_split_bank
+        ):
+            for split in sorted(self.birthset_split_bank):
+                local_subset = _birthset_map_split_to_local_subset(
+                    split,
+                    component_masks,
+                )
+                if local_subset is None:
+                    continue
+                self._birthset_add_candidate(
+                    candidates_by_subset,
+                    local_subset,
+                    component_masks,
+                    full_mask,
+                    "bank",
+                )
+
+        if (
+            self.birthset_use_small_polytomy_enumeration
+            and len(component_masks) <= self.birthset_max_enum_components
+        ):
+            G = len(component_masks)
+            for size in range(2, G):
+                for combo in itertools.combinations(range(G), size):
+                    local_subset = 0
+                    for idx in combo:
+                        local_subset |= 1 << int(idx)
+                    self._birthset_add_candidate(
+                        candidates_by_subset,
+                        local_subset,
+                        component_masks,
+                        full_mask,
+                        "enum",
+                    )
+                    if len(candidates_by_subset) >= self.birthset_max_candidates_per_polytomy:
+                        break
+                if len(candidates_by_subset) >= self.birthset_max_candidates_per_polytomy:
+                    break
+
+        if self.birthset_use_pair_prefix_candidates:
+            self._birthset_add_pair_prefix_candidates(
+                candidates_by_subset,
+                component_masks,
+                full_mask,
+                component_embeddings,
+                context=context,
+            )
+
+        pre_gold_candidate_splits = {
+            _birthset_canonical_unrooted_split(item["split_mask"], full_mask)
+            for item in candidates_by_subset.values()
+        }
+        pre_gold_candidate_local_subsets = {
+            int(item["local_subset"]) for item in candidates_by_subset.values()
+        }
+        pre_gold_target_count = len(
+            {
+                ("split", int(split))
+                for split in gold_splits
+            }
+            | {
+                ("local", int(local_subset))
+                for local_subset in gold_local_subsets
+            }
+        )
+        pre_gold_target_hits = len(
+            {
+                ("split", int(split))
+                for split in gold_splits
+                if _birthset_canonical_unrooted_split(split, full_mask)
+                in pre_gold_candidate_splits
+            }
+            | {
+                ("local", int(local_subset))
+                for local_subset in gold_local_subsets
+                if int(local_subset) in pre_gold_candidate_local_subsets
+            }
+        )
+
+        if train:
+            for split in gold_splits:
+                local_subset = _birthset_map_split_to_local_subset(
+                    split,
+                    component_masks,
+                )
+                if local_subset is None:
+                    gold_mismatches += 1
+                    continue
+                self._birthset_add_candidate(
+                    candidates_by_subset,
+                    local_subset,
+                    component_masks,
+                    full_mask,
+                    "gold",
+                    force=True,
+                )
+            for local_subset in gold_local_subsets:
+                added = self._birthset_add_candidate(
+                    candidates_by_subset,
+                    local_subset,
+                    component_masks,
+                    full_mask,
+                    "gold",
+                    force=True,
+                )
+                if not added:
+                    gold_mismatches += 1
+
+        candidates = list(candidates_by_subset.values())
+        source_rank = {"gold": 0, "pair_prefix": 1, "bank": 2, "enum": 3}
+        candidates.sort(
+            key=lambda item: (
+                source_rank.get(item["source"], 9),
+                int(item["size"]),
+                int(item["split_mask"]),
+            )
+        )
+        return {
+            "candidates": candidates,
+            "full_mask": int(full_mask),
+            "gold_mismatches": int(gold_mismatches),
+            "pre_gold_target_count": int(pre_gold_target_count),
+            "pre_gold_target_hits": int(pre_gold_target_hits),
+        }
+
+    def _birthset_rank_loss(self, logits, labels):
+        if self.birthset_lambda_rank <= 0.0:
+            return logits.new_tensor(0.0)
+        pos_logits = logits[labels > 0.5]
+        neg_logits = logits[labels <= 0.5]
+        if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+            return logits.new_tensor(0.0)
+        max_neg = min(
+            int(neg_logits.numel()),
+            max(1, int(pos_logits.numel()) * self.birthset_negatives_per_positive),
+        )
+        if int(neg_logits.numel()) > max_neg:
+            neg_logits = torch.topk(neg_logits, k=max_neg, largest=True).values
+        pairwise = (
+            float(self.birthset_rank_margin)
+            - pos_logits.unsqueeze(1)
+            + neg_logits.unsqueeze(0)
+        )
+        return F.relu(pairwise).mean()
+
+    def _birthset_positive_weight(self, labels):
+        value = self.birthset_pos_weight
+        if isinstance(value, str) and value.lower() == "auto":
+            positives = labels.sum().clamp(min=1.0)
+            negatives = (labels.numel() - labels.sum()).clamp(min=1.0)
+            return (negatives / positives).detach()
+        try:
+            return labels.new_tensor(float(value))
+        except Exception:
+            return labels.new_tensor(1.0)
+
+    def _birthset_proposal_positive_weight(self, labels):
+        positives = labels.sum().clamp(min=1.0)
+        negatives = (labels.numel() - labels.sum()).clamp(min=1.0)
+        return (negatives / positives).detach()
+
+    def _birthset_subset_inside_any_gold(self, local_subset, gold_local_subsets):
+        local_subset = int(local_subset)
+        for gold_subset in gold_local_subsets or []:
+            gold_subset = int(gold_subset)
+            if gold_subset and (local_subset & ~gold_subset) == 0:
+                return True
+        return False
+
+    def _birthset_constructive_pair_targets(self, gold_local_subsets, num_components):
+        gold = [
+            int(mask)
+            for mask in sorted({int(mask) for mask in gold_local_subsets or []})
+            if _birthset_valid_local_subset(int(mask), int(num_components))
+        ]
+        if not gold:
+            return set()
+
+        direct_pair_targets = {
+            int(mask)
+            for mask in gold
+            if _birthset_local_subset_size(int(mask)) == 2
+        }
+        if direct_pair_targets:
+            return direct_pair_targets
+
+        # Degenerate/rooted edge case: if the local split labels contain no explicit
+        # two-component clade, use the smallest gold sides as the constructive seeds.
+        min_size = min(_birthset_local_subset_size(mask) for mask in gold)
+        targets = set()
+        for gold_subset in gold:
+            if _birthset_local_subset_size(gold_subset) != int(min_size):
+                continue
+            members = [
+                idx
+                for idx in range(int(num_components))
+                if (int(gold_subset) >> int(idx)) & 1
+            ]
+            for left_pos, left_idx in enumerate(members):
+                for right_idx in members[left_pos + 1 :]:
+                    pair = (1 << int(left_idx)) | (1 << int(right_idx))
+                    if _birthset_valid_local_subset(pair, int(num_components)):
+                        targets.add(int(pair))
+        return targets
+
+    def _birthset_proposal_loss(
+        self,
+        component_embeddings,
+        gold_local_subsets,
+        *,
+        context=None,
+    ):
+        proposal_head = self.birthset_proposal_head
+        if (
+            proposal_head is None
+            or component_embeddings is None
+            or float(self.birthset_lambda_proposal) <= 0.0
+        ):
+            return None
+
+        G = int(component_embeddings.shape[0])
+        gold_local_subsets = [
+            int(mask)
+            for mask in sorted({int(mask) for mask in gold_local_subsets or []})
+            if _birthset_valid_local_subset(int(mask), G)
+        ]
+        if G < 3 or not gold_local_subsets:
+            return None
+
+        device = component_embeddings.device
+        losses = []
+        pair_loss = None
+        expansion_loss = None
+        order_loss = None
+        pair_recall_at_topk = None
+        strict_pair_targets = None
+        if self.birthset_proposal_pair_target_mode == "strict_minimal":
+            strict_pair_targets = self._birthset_constructive_pair_targets(
+                gold_local_subsets,
+                G,
+            )
+
+        pair_subsets = []
+        for left_idx in range(G):
+            for right_idx in range(left_idx + 1, G):
+                subset = (1 << int(left_idx)) | (1 << int(right_idx))
+                if _birthset_valid_local_subset(subset, G):
+                    pair_subsets.append(int(subset))
+
+        if pair_subsets:
+            pair_logits = proposal_head(
+                component_embeddings,
+                pair_subsets,
+                context=context,
+            )
+            pair_labels = torch.tensor(
+                [
+                    1.0
+                    if (
+                        int(subset) in strict_pair_targets
+                        if strict_pair_targets is not None
+                        else self._birthset_subset_inside_any_gold(
+                            subset,
+                            gold_local_subsets,
+                        )
+                    )
+                    else 0.0
+                    for subset in pair_subsets
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_weights = torch.where(
+                pair_labels > 0.5,
+                self._birthset_proposal_positive_weight(pair_labels),
+                pair_labels.new_tensor(1.0),
+            )
+            pair_loss = (
+                F.binary_cross_entropy_with_logits(
+                    pair_logits,
+                    pair_labels,
+                    reduction="none",
+                )
+                * pair_weights
+            ).mean()
+            losses.append(pair_loss)
+
+            top_k = min(int(self.birthset_pair_prefix_top_pairs), len(pair_subsets))
+            top_ids = torch.topk(pair_logits.detach(), k=top_k, largest=True).indices
+            top_pair_subsets = {int(pair_subsets[int(idx)]) for idx in top_ids.tolist()}
+            if strict_pair_targets is not None:
+                if strict_pair_targets:
+                    pair_recall_at_topk = float(
+                        len(top_pair_subsets & strict_pair_targets)
+                    ) / float(len(strict_pair_targets))
+            else:
+                gold_hits = 0
+                for gold_subset in gold_local_subsets:
+                    hit = any(
+                        (pair_subset & ~int(gold_subset)) == 0
+                        for pair_subset in top_pair_subsets
+                    )
+                    gold_hits += 1 if hit else 0
+                pair_recall_at_topk = float(gold_hits) / float(len(gold_local_subsets))
+
+        expansion_subsets = []
+        for combo in itertools.combinations(range(G), 3):
+            subset = 0
+            for idx in combo:
+                subset |= 1 << int(idx)
+            expansion_subsets.append(int(subset))
+        if expansion_subsets:
+            positives = [
+                subset
+                for subset in expansion_subsets
+                if self._birthset_subset_inside_any_gold(subset, gold_local_subsets)
+            ]
+            negatives = [
+                subset
+                for subset in expansion_subsets
+                if not self._birthset_subset_inside_any_gold(subset, gold_local_subsets)
+            ]
+            cap = int(self.birthset_proposal_max_expansion_examples)
+            if len(positives) + len(negatives) > cap:
+                expansion_subsets = positives + negatives[: max(0, cap - len(positives))]
+            else:
+                expansion_subsets = positives + negatives
+
+        if expansion_subsets:
+            expansion_logits = proposal_head(
+                component_embeddings,
+                expansion_subsets,
+                context=context,
+            )
+            expansion_labels = torch.tensor(
+                [
+                    1.0
+                    if self._birthset_subset_inside_any_gold(
+                        subset,
+                        gold_local_subsets,
+                    )
+                    else 0.0
+                    for subset in expansion_subsets
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+            expansion_weights = torch.where(
+                expansion_labels > 0.5,
+                self._birthset_proposal_positive_weight(expansion_labels),
+                expansion_labels.new_tensor(1.0),
+            )
+            expansion_loss = (
+                F.binary_cross_entropy_with_logits(
+                    expansion_logits,
+                    expansion_labels,
+                    reduction="none",
+                )
+                * expansion_weights
+            ).mean()
+            losses.append(expansion_loss)
+
+        order_losses = []
+        if strict_pair_targets is not None:
+            positive_pair_subsets = [
+                subset for subset in pair_subsets if int(subset) in strict_pair_targets
+            ]
+        else:
+            positive_pair_subsets = [
+                subset
+                for subset in pair_subsets
+                if self._birthset_subset_inside_any_gold(subset, gold_local_subsets)
+            ]
+        positive_pair_subsets.sort(
+            key=lambda subset: (
+                min(
+                    (
+                        _birthset_local_subset_size(gold_subset)
+                        for gold_subset in gold_local_subsets
+                        if (int(subset) & ~int(gold_subset)) == 0
+                    ),
+                    default=G + 1,
+                ),
+                int(subset),
+            )
+        )
+        positive_pair_subsets = positive_pair_subsets[
+            : int(self.birthset_proposal_max_order_seed_pairs)
+        ]
+        for pair_subset in positive_pair_subsets:
+            pair_subset = int(pair_subset)
+            expansion_records = []
+            target_ranks = []
+            for idx in range(G):
+                if (pair_subset >> int(idx)) & 1:
+                    continue
+                candidate_subset = int(pair_subset | (1 << int(idx)))
+                if not _birthset_valid_local_subset(candidate_subset, G):
+                    continue
+                containing_sizes = [
+                    _birthset_local_subset_size(gold_subset)
+                    for gold_subset in gold_local_subsets
+                    if (pair_subset & ~int(gold_subset)) == 0
+                    and (candidate_subset & ~int(gold_subset)) == 0
+                ]
+                rank = min(containing_sizes) if containing_sizes else G + 1
+                expansion_records.append(candidate_subset)
+                target_ranks.append(float(rank))
+            if len(expansion_records) < 2:
+                continue
+            seed_logits = proposal_head(
+                component_embeddings,
+                expansion_records,
+                context=context,
+            )
+            rank_tensor = torch.tensor(
+                target_ranks,
+                dtype=torch.float32,
+                device=device,
+            )
+            better = rank_tensor.unsqueeze(1) < rank_tensor.unsqueeze(0)
+            if not bool(better.any().item()):
+                continue
+            pairwise_margin = (
+                float(self.birthset_rank_margin)
+                - seed_logits.unsqueeze(1)
+                + seed_logits.unsqueeze(0)
+            )
+            order_losses.append(F.relu(pairwise_margin[better]).mean())
+        if order_losses:
+            order_loss = torch.stack(order_losses).mean()
+            losses.append(order_loss)
+
+        if not losses:
+            return None
+        return {
+            "loss": torch.stack(losses).mean(),
+            "pair_loss": None if pair_loss is None else pair_loss.detach(),
+            "expansion_loss": None
+            if expansion_loss is None
+            else expansion_loss.detach(),
+            "order_loss": None if order_loss is None else order_loss.detach(),
+            "pair_recall_at_topk": pair_recall_at_topk,
+            "num_pair_examples": float(len(pair_subsets)),
+            "num_expansion_examples": float(len(expansion_subsets)),
+            "num_order_seed_pairs": float(len(positive_pair_subsets)),
+        }
+
+    def _birthset_select_compatible_top_k(
+        self,
+        candidates,
+        logits,
+        k,
+        existing_splits,
+        full_mask,
+    ):
+        if int(k) <= 0 or not candidates:
+            return []
+        if self.birthset_decoder == "beam":
+            return self._birthset_select_compatible_beam(
+                candidates,
+                logits,
+                k,
+                existing_splits,
+                full_mask,
+            )
+        ordered_ids = sorted(
+            range(len(candidates)),
+            key=lambda idx: float(logits[idx].detach().cpu().item()),
+            reverse=True,
+        )
+        selected = []
+        selected_masks = set()
+        selected_keys = set()
+        existing_splits = {int(split) for split in existing_splits}
+        existing_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in existing_splits
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
+        for idx in ordered_ids:
+            if len(selected) >= int(k):
+                break
+            candidate = candidates[idx]
+            split = int(candidate["split_mask"])
+            if split in existing_splits or split in selected_masks:
+                continue
+            if not _birthset_valid_rooted_split(split, full_mask):
+                continue
+            split_key = _birthset_canonical_unrooted_split(split, full_mask)
+            if split_key in existing_keys or split_key in selected_keys:
+                continue
+            if not all(
+                _birthset_rooted_splits_compatible(split, other, full_mask)
+                for other in existing_splits
+            ):
+                continue
+            if not all(
+                _birthset_rooted_splits_compatible(split, other, full_mask)
+                for other in selected_masks
+            ):
+                continue
+            item = dict(candidate)
+            item["score"] = float(logits[idx].detach().cpu().item())
+            selected.append(item)
+            selected_masks.add(split)
+            selected_keys.add(split_key)
+        return selected
+
+    def _birthset_select_compatible_beam(
+        self,
+        candidates,
+        logits,
+        k,
+        existing_splits,
+        full_mask,
+    ):
+        ordered_ids = sorted(
+            range(len(candidates)),
+            key=lambda idx: float(logits[idx].detach().cpu().item()),
+            reverse=True,
+        )
+        existing_splits = {int(split) for split in existing_splits}
+        existing_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in existing_splits
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
+        beam = [([], set(), set(), 0.0)]
+        for idx in ordered_ids:
+            candidate = candidates[idx]
+            split = int(candidate["split_mask"])
+            score = float(logits[idx].detach().cpu().item())
+            next_beam = list(beam)
+            for selected, selected_masks, selected_keys, total_score in beam:
+                if len(selected) >= int(k):
+                    continue
+                if split in existing_splits or split in selected_masks:
+                    continue
+                if not _birthset_valid_rooted_split(split, full_mask):
+                    continue
+                split_key = _birthset_canonical_unrooted_split(split, full_mask)
+                if split_key in existing_keys or split_key in selected_keys:
+                    continue
+                if not all(
+                    _birthset_rooted_splits_compatible(split, other, full_mask)
+                    for other in existing_splits
+                ):
+                    continue
+                if not all(
+                    _birthset_rooted_splits_compatible(split, other, full_mask)
+                    for other in selected_masks
+                ):
+                    continue
+                item = dict(candidate)
+                item["score"] = score
+                next_beam.append(
+                    (
+                        selected + [item],
+                        set(selected_masks) | {split},
+                        set(selected_keys) | {split_key},
+                        total_score + score,
+                    )
+                )
+            next_beam.sort(key=lambda state: (len(state[0]), state[3]), reverse=True)
+            beam = next_beam[: self.birthset_beam_width]
+        exact = [state for state in beam if len(state[0]) == int(k)]
+        chosen = max(exact or beam, key=lambda state: (len(state[0]), state[3]))
+        return chosen[0]
+
+    def _birthset_balanced_completion(
+        self,
+        selected,
+        component_masks,
+        full_mask,
+        k,
+        existing_splits,
+    ):
+        if len(selected) >= int(k):
+            return selected
+        candidates_by_subset = {}
+        G = len(component_masks)
+        for size in range(2, G):
+            for combo in itertools.combinations(range(G), size):
+                local_subset = 0
+                for idx in combo:
+                    local_subset |= 1 << int(idx)
+                self._birthset_add_candidate(
+                    candidates_by_subset,
+                    local_subset,
+                    component_masks,
+                    full_mask,
+                    "balanced",
+                    force=True,
+                )
+        selected_masks = {int(item["split_mask"]) for item in selected}
+        existing_splits = {int(split) for split in existing_splits}
+        ordered = sorted(
+            candidates_by_subset.values(),
+            key=lambda item: (
+                abs(float(item["size"]) - (float(G) / 2.0)),
+                int(item["size"]),
+                int(item["split_mask"]),
+            ),
+        )
+        completed = list(selected)
+        selected_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in selected_masks
+        }
+        existing_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in existing_splits
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
+        for candidate in ordered:
+            if len(completed) >= int(k):
+                break
+            split = int(candidate["split_mask"])
+            if split in selected_masks or split in existing_splits:
+                continue
+            if not _birthset_valid_rooted_split(split, full_mask):
+                continue
+            split_key = _birthset_canonical_unrooted_split(split, full_mask)
+            if split_key in selected_keys or split_key in existing_keys:
+                continue
+            if not all(
+                _birthset_rooted_splits_compatible(split, other, full_mask)
+                for other in existing_splits
+            ):
+                continue
+            if not all(
+                _birthset_rooted_splits_compatible(split, other, full_mask)
+                for other in selected_masks
+            ):
+                continue
+            item = dict(candidate)
+            item["score"] = float("-inf")
+            completed.append(item)
+            selected_masks.add(split)
+            selected_keys.add(split_key)
+        return completed
+
+    def _birthset_step_logs(
+        self,
+        batch,
+        all_group_logits,
+        ar_prep_stats,
+        is_replay_batch,
+        *,
+        update_split_bank=True,
+    ):
+        logs = {}
+        if self.birthset_topology_head is None:
+            anchor_param = next(self.model.parameters())
+            logs["loss"] = anchor_param.sum() * 0.0
+            return logs
+
+        should_update_split_bank = bool(update_split_bank) or bool(
+            getattr(self, "training", False)
+        )
+        if should_update_split_bank:
+            self._birthset_update_split_bank_from_labels(
+                batch.get("batched_autoregressive_labels")
+            )
+
+        label_targets_by_batch = []
+        found = {}
+        for batch_index, labeled_merge_cluster in enumerate(
+            batch["batched_autoregressive_labels"]
+        ):
+            group_targets = {}
+            for label in labeled_merge_cluster:
+                result_split = int(label["result_split"])
+                components = tuple(int(component) for component in label["components"])
+                merge_indices = [int(idx) for idx in label["merge_indices"]]
+                local_subset = 0
+                for idx in merge_indices:
+                    local_subset |= 1 << int(idx)
+                found[(batch_index, result_split)] = False
+                group_targets.setdefault(components, []).append(
+                    (result_split, local_subset)
+                )
+            label_targets_by_batch.append(group_targets)
+
+        losses = []
+        bce_losses = []
+        rank_losses = []
+        proposal_losses = []
+        proposal_pair_losses = []
+        proposal_expansion_losses = []
+        proposal_order_losses = []
+        proposal_pair_recall_values = []
+        proposal_pair_example_counts = []
+        proposal_expansion_example_counts = []
+        proposal_order_seed_pair_counts = []
+        candidate_counts = []
+        positive_counts = []
+        required_counts = []
+        observed_counts = []
+        recall_values = []
+        pre_gold_recall_values = []
+        precision_values = []
+        selected_recall_values = []
+        f1_values = []
+        fully_resolved_values = []
+        mismatch_count = 0
+        no_candidate_count = 0
+
+        loss_device = self.device
+        for group in all_group_logits:
+            component_masks = [int(split) for split in group["splits_represented"]]
+            batch_index = int(group["batch_index"])
+            G = len(component_masks)
+            if G <= 2:
+                continue
+            loss_device = group["group_embeddings"].device
+            group_targets = label_targets_by_batch[batch_index].get(
+                tuple(component_masks),
+                [],
+            )
+            gold_splits = sorted({int(split) for split, _ in group_targets})
+            gold_local_subsets = sorted({int(mask) for _, mask in group_targets})
+            for split in gold_splits:
+                found[(batch_index, split)] = True
+
+            num_leaves = self._birthset_num_leaves_for_group(
+                batch,
+                batch_index,
+                component_masks,
+            )
+            candidate_info = self._birthset_build_candidates(
+                component_masks,
+                num_leaves,
+                gold_splits=gold_splits,
+                gold_local_subsets=gold_local_subsets,
+                component_embeddings=group["group_embeddings"],
+                context=group.get("graph_context"),
+                train=True,
+            )
+            candidates = candidate_info["candidates"]
+            full_mask = candidate_info["full_mask"]
+            mismatch_count += int(candidate_info["gold_mismatches"])
+            candidate_counts.append(float(len(candidates)))
+            positive_counts.append(float(len(gold_splits)))
+            required_counts.append(
+                float(
+                    self._birthset_num_required_splits(
+                        G,
+                        component_masks=component_masks,
+                        full_mask=full_mask,
+                    )
+                )
+            )
+            observed_counts.append(float(len(gold_splits)))
+            if gold_splits:
+                gold_split_keys = {
+                    _birthset_canonical_unrooted_split(split, full_mask)
+                    for split in gold_splits
+                }
+                pre_gold_target_count = int(
+                    candidate_info.get("pre_gold_target_count", 0)
+                )
+                if pre_gold_target_count > 0:
+                    pre_gold_recall_values.append(
+                        float(candidate_info.get("pre_gold_target_hits", 0))
+                        / float(pre_gold_target_count)
+                    )
+                candidate_split_set = {
+                    _birthset_canonical_unrooted_split(item["split_mask"], full_mask)
+                    for item in candidates
+                }
+                recall_values.append(
+                    float(
+                        sum(1 for split in gold_split_keys if split in candidate_split_set)
+                    )
+                    / float(len(gold_split_keys))
+                )
+
+            if not candidates:
+                no_candidate_count += 1
+                continue
+
+            local_subsets = [int(item["local_subset"]) for item in candidates]
+            logits = self.birthset_topology_head(
+                group["group_embeddings"],
+                local_subsets,
+                context=group.get("graph_context"),
+            )
+            gold_split_keys = {
+                _birthset_canonical_unrooted_split(split, full_mask)
+                for split in gold_splits
+            }
+            labels = torch.tensor(
+                [
+                    1.0
+                    if (
+                        _birthset_canonical_unrooted_split(
+                            item["split_mask"],
+                            full_mask,
+                        )
+                        in gold_split_keys
+                        or int(item["local_subset"]) in gold_local_subsets
+                    )
+                    else 0.0
+                    for item in candidates
+                ],
+                dtype=torch.float32,
+                device=logits.device,
+            )
+            pos_weight = self._birthset_positive_weight(labels)
+            weights = torch.where(labels > 0.5, pos_weight, labels.new_tensor(1.0))
+            bce = (
+                F.binary_cross_entropy_with_logits(
+                    logits,
+                    labels,
+                    reduction="none",
+                )
+                * weights
+            ).mean()
+            rank = self._birthset_rank_loss(logits, labels)
+            group_loss = bce + (self.birthset_lambda_rank * rank)
+            proposal = self._birthset_proposal_loss(
+                group["group_embeddings"],
+                gold_local_subsets,
+                context=group.get("graph_context"),
+            )
+            if proposal is not None:
+                proposal_loss = proposal["loss"]
+                group_loss = group_loss + (
+                    float(self.birthset_lambda_proposal) * proposal_loss
+                )
+                proposal_losses.append(proposal_loss.detach())
+                if proposal.get("pair_loss") is not None:
+                    proposal_pair_losses.append(proposal["pair_loss"])
+                if proposal.get("expansion_loss") is not None:
+                    proposal_expansion_losses.append(proposal["expansion_loss"])
+                if proposal.get("order_loss") is not None:
+                    proposal_order_losses.append(proposal["order_loss"])
+                if proposal.get("pair_recall_at_topk") is not None:
+                    proposal_pair_recall_values.append(
+                        float(proposal["pair_recall_at_topk"])
+                    )
+                proposal_pair_example_counts.append(
+                    float(proposal.get("num_pair_examples", 0.0))
+                )
+                proposal_expansion_example_counts.append(
+                    float(proposal.get("num_expansion_examples", 0.0))
+                )
+                proposal_order_seed_pair_counts.append(
+                    float(proposal.get("num_order_seed_pairs", 0.0))
+                )
+            losses.append(group_loss)
+            bce_losses.append(bce.detach())
+            rank_losses.append(rank.detach())
+
+            required = self._birthset_num_required_splits(
+                G,
+                component_masks=component_masks,
+                full_mask=full_mask,
+            )
+            selected = self._birthset_select_compatible_top_k(
+                candidates,
+                logits.detach(),
+                required,
+                existing_splits=set(),
+                full_mask=full_mask,
+            )
+            selected_splits = {
+                _birthset_canonical_unrooted_split(item["split_mask"], full_mask)
+                for item in selected
+            }
+            gold_set = set(gold_split_keys)
+            if selected:
+                precision_values.append(
+                    float(len(selected_splits & gold_set)) / float(len(selected_splits))
+                )
+            if gold_set:
+                selected_recall = float(len(selected_splits & gold_set)) / float(
+                    len(gold_set)
+                )
+                selected_recall_values.append(selected_recall)
+                precision = precision_values[-1] if selected else 0.0
+                if precision + selected_recall > 0.0:
+                    f1_values.append(
+                        2.0 * precision * selected_recall / (precision + selected_recall)
+                    )
+                else:
+                    f1_values.append(0.0)
+            fully_resolved_values.append(
+                1.0 if len(selected) >= int(required) else 0.0
+            )
+
+        missing_explicit_targets = sum(
+            1 for was_found in found.values() if not was_found
+        )
+        if missing_explicit_targets:
+            logs["birthset_stats/missing_explicit_targets"] = torch.tensor(
+                float(missing_explicit_targets),
+                device=loss_device,
+            )
+            if self.verbose:
+                logger.warning(
+                    "Birthset target mapping missed %s explicit AR targets.",
+                    missing_explicit_targets,
+                )
+
+        if losses:
+            birth_loss = torch.stack(losses).mean()
+        else:
+            anchor_param = next(self.model.parameters())
+            birth_loss = anchor_param.sum() * 0.0
+            logs["birthset_stats/no_candidate_loss"] = torch.tensor(
+                1.0,
+                device=loss_device,
+            )
+        logs["loss"] = float(self.birthset_lambda_birth) * birth_loss
+        logs["birthset_stats/loss_unscaled"] = birth_loss.detach()
+        if bce_losses:
+            logs["birthset_stats/bce_loss"] = torch.stack(bce_losses).mean().to(
+                loss_device
+            )
+        if rank_losses:
+            logs["birthset_stats/rank_loss"] = torch.stack(rank_losses).mean().to(
+                loss_device
+            )
+        if proposal_losses:
+            logs["birthset_stats/proposal_loss"] = torch.stack(
+                proposal_losses
+            ).mean().to(loss_device)
+        if proposal_pair_losses:
+            logs["birthset_stats/proposal_pair_loss"] = torch.stack(
+                proposal_pair_losses
+            ).mean().to(loss_device)
+        if proposal_expansion_losses:
+            logs["birthset_stats/proposal_expansion_loss"] = torch.stack(
+                proposal_expansion_losses
+            ).mean().to(loss_device)
+        if proposal_order_losses:
+            logs["birthset_stats/proposal_order_loss"] = torch.stack(
+                proposal_order_losses
+            ).mean().to(loss_device)
+        if proposal_pair_recall_values:
+            logs["birthset_stats/proposal_pair_recall_at_topk"] = torch.tensor(
+                float(np.mean(proposal_pair_recall_values)),
+                device=loss_device,
+            )
+        if proposal_pair_example_counts:
+            logs["birthset_stats/proposal_pair_examples"] = torch.tensor(
+                float(np.mean(proposal_pair_example_counts)),
+                device=loss_device,
+            )
+        if proposal_expansion_example_counts:
+            logs["birthset_stats/proposal_expansion_examples"] = torch.tensor(
+                float(np.mean(proposal_expansion_example_counts)),
+                device=loss_device,
+            )
+        if proposal_order_seed_pair_counts:
+            logs["birthset_stats/proposal_order_seed_pairs"] = torch.tensor(
+                float(np.mean(proposal_order_seed_pair_counts)),
+                device=loss_device,
+            )
+        logs["birthset_stats/lambda_birth"] = torch.tensor(
+            float(self.birthset_lambda_birth),
+            device=loss_device,
+        )
+        logs["birthset_stats/lambda_rank"] = torch.tensor(
+            float(self.birthset_lambda_rank),
+            device=loss_device,
+        )
+        logs["birthset_stats/lambda_proposal"] = torch.tensor(
+            float(self.birthset_lambda_proposal),
+            device=loss_device,
+        )
+        logs["birthset_stats/split_bank_size"] = torch.tensor(
+            float(len(self.birthset_split_bank)),
+            device=loss_device,
+        )
+        logs["birthset_stats/gold_mapping_mismatches"] = torch.tensor(
+            float(mismatch_count),
+            device=loss_device,
+        )
+        logs["birthset_stats/no_candidate_groups"] = torch.tensor(
+            float(no_candidate_count),
+            device=loss_device,
+        )
+        if candidate_counts:
+            logs["birthset_stats/avg_candidates"] = torch.tensor(
+                float(np.mean(candidate_counts)),
+                device=loss_device,
+            )
+        if positive_counts:
+            logs["birthset_stats/avg_positives"] = torch.tensor(
+                float(np.mean(positive_counts)),
+                device=loss_device,
+            )
+        if required_counts:
+            logs["birthset_stats/avg_required_splits"] = torch.tensor(
+                float(np.mean(required_counts)),
+                device=loss_device,
+            )
+        if observed_counts:
+            logs["birthset_stats/avg_observed_gold_splits"] = torch.tensor(
+                float(np.mean(observed_counts)),
+                device=loss_device,
+            )
+        if recall_values:
+            logs["birthset_stats/candidate_recall"] = torch.tensor(
+                float(np.mean(recall_values)),
+                device=loss_device,
+            )
+        if pre_gold_recall_values:
+            logs["birthset_stats/candidate_recall_pre_gold"] = torch.tensor(
+                float(np.mean(pre_gold_recall_values)),
+                device=loss_device,
+            )
+        if precision_values:
+            logs["birthset_stats/selected_precision"] = torch.tensor(
+                float(np.mean(precision_values)),
+                device=loss_device,
+            )
+        if selected_recall_values:
+            logs["birthset_stats/selected_recall"] = torch.tensor(
+                float(np.mean(selected_recall_values)),
+                device=loss_device,
+            )
+        if f1_values:
+            logs["birthset_stats/selected_f1"] = torch.tensor(
+                float(np.mean(f1_values)),
+                device=loss_device,
+            )
+        if fully_resolved_values:
+            logs["birthset_stats/fraction_fully_resolved"] = torch.tensor(
+                float(np.mean(fully_resolved_values)),
+                device=loss_device,
+            )
+        if ar_prep_stats is not None:
+            logs["autoregressive_stats/rollin_attempted"] = torch.tensor(
+                ar_prep_stats["rollin_attempted"],
+                device=loss_device,
+            )
+            logs["autoregressive_stats/rollin_applied"] = torch.tensor(
+                ar_prep_stats["rollin_applied"],
+                device=loss_device,
+            )
+            logs["autoregressive_stats/dagger_attempted"] = torch.tensor(
+                ar_prep_stats["dagger_attempted"],
+                device=loss_device,
+            )
+            logs["autoregressive_stats/dagger_applied"] = torch.tensor(
+                ar_prep_stats["dagger_applied"],
+                device=loss_device,
+            )
+
+        if self.record and not is_replay_batch:
+            wandb_metrics = {
+                "train/birthset_loss": float(birth_loss.detach().item()),
+                "train/birthset_loss_scaled": float(logs["loss"].detach().item()),
+                "birthset_stats/split_bank_size": float(len(self.birthset_split_bank)),
+                "birthset_stats/gold_mapping_mismatches": float(mismatch_count),
+            }
+            for key, value in logs.items():
+                if key.startswith("birthset_stats/") and torch.is_tensor(value):
+                    if value.numel() == 1:
+                        wandb_metrics[key] = float(value.detach().cpu().item())
+            self._wandb_log_filtered(wandb_metrics, step=self.stepper)
+        return logs
+
+    def _plan_birthset_boundary_splits(
+        self,
+        logit_outputs,
+        existing_splits,
+        num_leaves,
+    ):
+        if self.birthset_topology_head is None:
+            return {
+                "selected": [],
+                "metrics": {"num_ar_fallback_calls": 1.0},
+            }
+        full_mask = _birthset_full_mask(num_leaves)
+        max_bit_length = int(full_mask).bit_length()
+        for output in logit_outputs or []:
+            for split in output.get("splits_represented", []) or []:
+                max_bit_length = max(max_bit_length, int(split).bit_length())
+        for split in existing_splits or []:
+            max_bit_length = max(max_bit_length, int(split).bit_length())
+        if max_bit_length > int(full_mask).bit_length():
+            full_mask = (1 << int(max_bit_length)) - 1
+        existing = {int(split) for split in existing_splits}
+        planned_existing = set(existing)
+        selected_all = []
+        metrics = {
+            "num_polytomies": 0.0,
+            "num_candidate_splits": 0.0,
+            "num_selected_birth_splits": 0.0,
+            "num_required_birth_splits": 0.0,
+            "fraction_resolved_without_fallback": 0.0,
+            "num_ar_fallback_calls": 0.0,
+            "num_transformer_forwards": 1.0,
+        }
+        sorted_outputs = sorted(
+            logit_outputs,
+            key=lambda output: float(output["polytomy_pred"].detach().cpu().item()),
+            reverse=True,
+        )
+        resolved_count = 0
+        for group in sorted_outputs:
+            component_masks = [int(split) for split in group["splits_represented"]]
+            G = len(component_masks)
+            required = self._birthset_num_required_splits(
+                G,
+                component_masks=component_masks,
+                full_mask=full_mask,
+            )
+            if required <= 0:
+                continue
+            metrics["num_polytomies"] += 1.0
+            metrics["num_required_birth_splits"] += float(required)
+            candidate_info = self._birthset_build_candidates(
+                component_masks,
+                num_leaves,
+                component_embeddings=group["group_embeddings"],
+                context=group.get("graph_context"),
+                train=False,
+            )
+            candidates = candidate_info["candidates"]
+            metrics["num_candidate_splits"] += float(len(candidates))
+            if not candidates:
+                metrics["num_ar_fallback_calls"] += 1.0
+                continue
+            local_subsets = [int(item["local_subset"]) for item in candidates]
+            with torch.inference_mode():
+                logits = self.birthset_topology_head(
+                    group["group_embeddings"],
+                    local_subsets,
+                    context=group.get("graph_context"),
+                )
+            selected = self._birthset_select_compatible_top_k(
+                candidates,
+                logits,
+                required,
+                planned_existing,
+                full_mask,
+            )
+            if (
+                len(selected) < int(required)
+                and self.birthset_fallback == "balanced_completion"
+            ):
+                selected = self._birthset_balanced_completion(
+                    selected,
+                    component_masks,
+                    full_mask,
+                    required,
+                    planned_existing,
+                )
+            if len(selected) < int(required):
+                metrics["num_ar_fallback_calls"] += 1.0
+            else:
+                resolved_count += 1
+            for item in selected:
+                split = int(item["split_mask"])
+                if split in planned_existing:
+                    continue
+                selected_all.append(item)
+                planned_existing.add(split)
+        metrics["num_selected_birth_splits"] = float(len(selected_all))
+        if metrics["num_polytomies"] > 0.0:
+            metrics["fraction_resolved_without_fallback"] = (
+                float(resolved_count) / metrics["num_polytomies"]
+            )
+        return {"selected": selected_all, "metrics": metrics}
 
     def step_terminal(self, batch, eval=False):
         if batch is None:
@@ -15905,6 +18442,15 @@ class TrainingModule(LightningModule):
             else:
                 all_group_logits = precomputed_outputs
 
+            if self.topology_decoder in {"birthset", "birthset_with_ar_fallback"}:
+                return self._birthset_step_logs(
+                    batch,
+                    all_group_logits,
+                    ar_prep_stats,
+                    is_replay_batch,
+                    update_split_bank=not eval,
+                )
+
             found = {}
             label_targets_by_batch = []
             for batch_index, labeled_merge_cluster in enumerate(batch["batched_autoregressive_labels"]):
@@ -16402,6 +18948,47 @@ class TrainingModule(LightningModule):
             shared_start_topology_features = autoregressive_start_topology_features
         if (
             self.sampling_discrete_phase_rollout_use_at_sampling
+            and len(newick_starting_trees) > 1
+            and target_trees is not None
+            and len(target_trees) == len(newick_starting_trees)
+            and self.topology_decoder == "birthset"
+            and self.birthset_fallback == "none"
+            and not self.velocity_terminal_head_use_at_sampling
+        ):
+            out = _discrete_phase_rollout_batched_birthset(
+                self,
+                newick_starting_trees,
+                target_trees,
+                phyla_embeddings,
+                case_indices=case_indices,
+                start_topology_features=shared_start_topology_features,
+                start_topology_embeddings=first_hit_start_topology_embeddings,
+                start_topology_pad_mask=first_hit_start_topology_pad_mask,
+                dt_base=float(dt_base),
+                eps_len=float(eps_len),
+                max_events=max_events,
+                max_steps=max_steps,
+                max_phases=int(
+                    getattr(self, "sampling_discrete_phase_max_phases", 8)
+                ),
+                return_trace=return_trace,
+                trace_state_rf=bool(trace_state_rf),
+                explicit_autoregressive_component_groups=bool(
+                    explicit_autoregressive_component_groups
+                ),
+            )
+            result = (
+                out["final_trees"],
+                int(out["num_ar_states"]),
+                0.0,
+                0.0,
+                int(out["num_ar_states"]),
+            )
+            if return_trace:
+                return result + (out["trace"],)
+            return result
+        if (
+            self.sampling_discrete_phase_rollout_use_at_sampling
             and len(newick_starting_trees) == 1
             and target_trees is not None
             and len(target_trees) == 1
@@ -16622,6 +19209,10 @@ class TrainingModule(LightningModule):
         ar_single_tree_cache = {}
         tri_mask_cache = {}
         polytomy_group_cache = {}
+        birthset_polytomy_unrooted_ok = self.topology_decoder in {
+            "birthset",
+            "birthset_with_ar_fallback",
+        }
 
         def _sampling_log_info(message):
             if not sampling_disable_inner_logging:
@@ -16645,13 +19236,19 @@ class TrainingModule(LightningModule):
 
         def _get_polytomy_group_artifacts(newick_value):
             if not sampling_cache_polytomy_groups:
-                return None, has_polytomy_fast(newick_value, unrooted_ok=False)
+                return None, has_polytomy_fast(
+                    newick_value,
+                    unrooted_ok=birthset_polytomy_unrooted_ok,
+                )
             cached = polytomy_group_cache.get(newick_value)
             if cached is None:
                 groups = get_structural_polytomy_groups_from_newick(newick_value)
                 cached = {
                     "groups": groups,
-                    "has_polytomy": bool(groups),
+                    "has_polytomy": has_polytomy_fast(
+                        newick_value,
+                        unrooted_ok=birthset_polytomy_unrooted_ok,
+                    ),
                 }
                 polytomy_group_cache[newick_value] = cached
             return cached["groups"], cached["has_polytomy"]
@@ -16686,6 +19283,17 @@ class TrainingModule(LightningModule):
                 cached["component_groups"],
                 cached["structural_cache_item"],
             )
+
+        def _slice_single_tree_conditioning(value, tree_index):
+            if value is None:
+                return None
+            if torch.is_tensor(value):
+                if value.ndim >= 1 and int(value.shape[0]) == len(newick_starting_trees):
+                    return value[int(tree_index) : int(tree_index) + 1]
+                return value
+            if isinstance(value, (list, tuple)) and len(value) == len(newick_starting_trees):
+                return [value[int(tree_index)]]
+            return value
 
         def _prefix_replay_quota_satisfied():
             if (
@@ -16807,6 +19415,7 @@ class TrainingModule(LightningModule):
 
         t = 0.0
         n_events = 0
+        n_events_by_tree = [0] * len(newick_starting_trees)
         n_steps = 0
         n_topology_changes = 0
         num_topology_changes = 0
@@ -16817,10 +19426,15 @@ class TrainingModule(LightningModule):
         oversize_boundary_topologies = [set() for _ in newick_starting_trees]
         stop_for_repeated_topology = False
         stop_for_no_valid_merge = False
+        def _event_budget_remaining():
+            if max_events is None:
+                return True
+            return any(int(count) < int(max_events) for count in n_events_by_tree)
+
         while (
             t < T
             and (max_steps is None or n_steps < max_steps)
-            and (max_events is None or n_events < max_events)
+            and _event_budget_remaining()
         ):
             n_steps += 1
 
@@ -17780,16 +20394,22 @@ class TrainingModule(LightningModule):
                     topology_changed = True
                     stop_after_no_valid_merge_requested = False
                     boundary_merge_cap = (
-                        float("inf") if max_events is None else int(max_events)
+                        float("inf")
+                        if max_events is None
+                        else max(0, int(max_events) - int(n_events_by_tree[b_idx]))
                     )
                     if int(max_autoregressive_merges_per_boundary) >= 0:
                         boundary_merge_cap = min(
                             boundary_merge_cap,
                             int(max_autoregressive_merges_per_boundary),
                         )
+                    birthset_attempted_this_boundary = False
                     while (
                         topology_changed
-                        and (max_events is None or n_events < max_events)
+                        and (
+                            max_events is None
+                            or int(n_events_by_tree[b_idx]) < int(max_events)
+                        )
                         and num_merges < boundary_merge_cap
                     ):
                         boundary_state_key = tuple(sorted(int(mask) for mask in td2.keys()))
@@ -17819,10 +20439,14 @@ class TrainingModule(LightningModule):
                         polytomy_nodes = (
                             cached_has_polytomy
                             if cached_has_polytomy is not None
-                            else has_polytomy_fast(td2_newick, unrooted_ok=False)
+                            else has_polytomy_fast(
+                                td2_newick,
+                                unrooted_ok=birthset_polytomy_unrooted_ok,
+                            )
                         )
                         # td2 = {m: float(l) for m, l in zip(active_masks, L_new)}
 
+                        trace_event = None
                         if polytomy_nodes:
                             # For autoregressive step, we just use standard tokenizer for now as it's rare event
                             tokenized_trees = (
@@ -17835,17 +20459,18 @@ class TrainingModule(LightningModule):
                                     autoregressive_time_value = (
                                         self._sampling_autoregressive_time_value(
                                             t,
-                                            event_index=n_events,
+                                            event_index=n_events_by_tree[b_idx],
                                             max_events=max_events,
                                         )
                                     )
-                                    trace["autoregressive"].append(
-                                        {
-                                            "newick": td2_newick,
-                                            "target_tree": target_tree_for_trace,
-                                            "time": autoregressive_time_value,
-                                        }
-                                    )
+                                    trace_event = {
+                                        "source_newick": td2_newick,
+                                        "newick": td2_newick,
+                                        "target_tree": target_tree_for_trace,
+                                        "time": autoregressive_time_value,
+                                        "decoder_mode": "boundary_state",
+                                    }
+                                    trace["autoregressive"].append(trace_event)
                                     if (
                                         prefix_replay_autoregressive_quota > 0
                                         and _build_legacy_autoregressive_oracle_sample(
@@ -17895,15 +20520,140 @@ class TrainingModule(LightningModule):
                                 tokenized_trees,
                                 self._sampling_autoregressive_time_tensor(
                                     t,
-                                    event_index=n_events,
+                                    event_index=n_events_by_tree[b_idx],
                                     max_events=max_events,
                                 ),
-                                phyla_embeddings,
+                                _slice_single_tree_conditioning(
+                                    phyla_embeddings,
+                                    b_idx,
+                                ),
                                 autoregressive=True,
                                 autoregressive_component_groups=autoregressive_component_groups,
-                                autoregressive_case_indices=case_index_tensor,
-                                autoregressive_start_topology_features=start_topology_feature_tensor,
+                                autoregressive_case_indices=_slice_single_tree_conditioning(
+                                    case_index_tensor,
+                                    b_idx,
+                                ),
+                                autoregressive_start_topology_features=_slice_single_tree_conditioning(
+                                    start_topology_feature_tensor,
+                                    b_idx,
+                                ),
                             )
+
+                        birthset_allows_ar_fallback = (
+                            self.topology_decoder == "birthset_with_ar_fallback"
+                            and self.birthset_fallback == "ar"
+                        )
+                        use_birthset_decoder = (
+                            self.topology_decoder
+                            in {"birthset", "birthset_with_ar_fallback"}
+                            and not birthset_attempted_this_boundary
+                        )
+                        if use_birthset_decoder:
+                            birthset_attempted_this_boundary = True
+                            birthset_plan = self._plan_birthset_boundary_splits(
+                                logit_outputs,
+                                td2.keys(),
+                                n_leaves,
+                            )
+                            selected_births = list(birthset_plan.get("selected", []))
+                            if max_events is not None:
+                                remaining_events = max(
+                                    int(max_events) - int(n_events_by_tree[b_idx]),
+                                    0,
+                                )
+                                selected_births = selected_births[:remaining_events]
+                            if selected_births:
+                                top_change = False
+                                selected_splits = []
+                                for item in selected_births:
+                                    new_split = int(item["split_mask"])
+                                    to_print = [
+                                        i
+                                        for i in range(new_split.bit_length())
+                                        if (new_split >> i) & 1
+                                    ]
+                                    _sampling_log_info(
+                                        f"Birthset inserted split {new_split}: {to_print}"
+                                    )
+                                    td2[new_split] = float(
+                                        self.birthset_birth_length
+                                    )
+                                    n_events += 1
+                                    n_events_by_tree[b_idx] += 1
+                                    num_topology_changes += 1
+                                    top_change = True
+                                    selected_splits.append(new_split)
+                                if top_change:
+                                    num_merges += 1
+                                    topology_changed = True
+                                    post_birthset_newick = build_tree_from_splits(
+                                        list(td2.keys()),
+                                        td2,
+                                        n_leaves,
+                                        root_leaf=n_leaves - 1,
+                                        mapping=mapp,
+                                    )[1]
+                                    still_polytomy = has_polytomy_fast(
+                                        post_birthset_newick,
+                                        unrooted_ok=birthset_polytomy_unrooted_ok,
+                                    )
+                                    if trace_event is not None:
+                                        trace_event.update(
+                                            {
+                                                "newick": post_birthset_newick,
+                                                "decoder_mode": "birthset",
+                                                "planned_merge_count": int(
+                                                    len(selected_splits)
+                                                ),
+                                                "selected_result_splits": [
+                                                    int(split)
+                                                    for split in selected_splits
+                                                ],
+                                                "birthset_metrics": birthset_plan.get(
+                                                    "metrics",
+                                                    {},
+                                                ),
+                                                "birthset_unresolved_after_insert": float(
+                                                    1.0 if still_polytomy else 0.0
+                                                ),
+                                            }
+                                        )
+                                    if still_polytomy and not birthset_allows_ar_fallback:
+                                        no_valid_boundary_topologies[b_idx].add(
+                                            boundary_state_key
+                                        )
+                                        if stop_on_no_valid_merge:
+                                            stop_after_no_valid_merge_requested = True
+                                        if trace is not None:
+                                            trace[
+                                                "birthset_incomplete_without_fallback"
+                                            ] = True
+                                        topology_changed = False
+                                        break
+                                    continue
+                            if not birthset_allows_ar_fallback:
+                                if trace_event is not None:
+                                    trace_event.update(
+                                        {
+                                            "decoder_mode": "birthset",
+                                            "planned_merge_count": 0,
+                                            "selected_result_split": None,
+                                            "birthset_metrics": birthset_plan.get(
+                                                "metrics",
+                                                {},
+                                            ),
+                                            "birthset_unresolved_after_insert": 1.0,
+                                        }
+                                    )
+                                no_valid_boundary_topologies[b_idx].add(
+                                    boundary_state_key
+                                )
+                                if stop_on_no_valid_merge:
+                                    stop_after_no_valid_merge_requested = True
+                                if trace is not None:
+                                    trace["birthset_incomplete_without_fallback"] = True
+                                topology_changed = False
+                                break
                         
                         planned_merges = _plan_autoregressive_boundary_merges(
                             logit_outputs,
@@ -17917,10 +20667,21 @@ class TrainingModule(LightningModule):
                         stop_after_merge_requested = False
                         if not planned_merges:
                             _sampling_log_info("No valid merges found!")
+                            if trace_event is not None:
+                                trace_event.update(
+                                    {
+                                        "decoder_mode": "ar_fallback"
+                                        if birthset_attempted_this_boundary
+                                        else "ar",
+                                        "planned_merge_count": 0,
+                                        "selected_result_split": None,
+                                    }
+                                )
                             no_valid_boundary_topologies[b_idx].add(boundary_state_key)
                             if stop_on_no_valid_merge:
                                 stop_after_no_valid_merge_requested = True
                         else:
+                            selected_result_splits_for_trace = []
                             for planned in planned_merges:
                                 polytomy_sizes.append(len(planned["splits_represented"]))
 
@@ -17949,8 +20710,12 @@ class TrainingModule(LightningModule):
                                     # immediate re-collapse while keeping geometry local.
                                     td2[new_split] = float(autoregressive_birth_length)
                                     n_events += 1
+                                    n_events_by_tree[b_idx] += 1
                                     num_topology_changes += 1
                                     top_change = True
+                                    selected_result_splits_for_trace.append(
+                                        int(new_split)
+                                    )
                                     if (
                                         self.autoregressive_stop_after_merge_use_at_sampling
                                         and planned.get("decoder_mode")
@@ -17969,6 +20734,18 @@ class TrainingModule(LightningModule):
                                     _sampling_log_info(
                                         "Structured AR requested boundary stop after the applied merge."
                                     )
+                            if trace_event is not None:
+                                trace_event.update(
+                                    {
+                                        "decoder_mode": "ar_fallback"
+                                        if birthset_attempted_this_boundary
+                                        else "ar",
+                                        "planned_merge_count": int(
+                                            len(planned_merges)
+                                        ),
+                                        "selected_result_splits": selected_result_splits_for_trace,
+                                    }
+                                )
                         topology_changed = top_change
                         if stop_after_merge_requested:
                             topology_changed = False
@@ -17976,7 +20753,10 @@ class TrainingModule(LightningModule):
                             topology_changed = False
 
                     if topology_changed and (
-                        (max_events is not None and n_events >= max_events)
+                        (
+                            max_events is not None
+                            and int(n_events_by_tree[b_idx]) >= int(max_events)
+                        )
                         or num_merges >= boundary_merge_cap
                     ):
                         _sampling_log_info(

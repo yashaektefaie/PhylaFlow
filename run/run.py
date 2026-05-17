@@ -75,6 +75,91 @@ class ThresholdStepCheckpoint(Callback):
             self._next_step += self.every_n_train_steps
 
 
+def _birthset_trainer_kwargs(config):
+    trainer_cfg = config.get("trainer") or {}
+    nested_cfg = {}
+    nested_cfg.update(config.get("birthset") or {})
+    nested_cfg.update(trainer_cfg.get("birthset") or {})
+
+    def pick(name, nested_name=None, default=None):
+        if name in trainer_cfg:
+            return trainer_cfg[name]
+        if name in config:
+            return config[name]
+        if nested_name is not None and nested_name in nested_cfg:
+            return nested_cfg[nested_name]
+        if name in nested_cfg:
+            return nested_cfg[name]
+        return default
+
+    return {
+        "topology_decoder": pick("topology_decoder", default="ar"),
+        "birthset_birth_length": pick("birthset_birth_length", "birth_length", 1e-3),
+        "birthset_lambda_birth": pick("birthset_lambda_birth", "lambda_birth", 0.2),
+        "birthset_lambda_rank": pick("birthset_lambda_rank", "lambda_rank", 0.1),
+        "birthset_lambda_proposal": pick(
+            "birthset_lambda_proposal",
+            "lambda_proposal",
+            0.0,
+        ),
+        "birthset_rank_margin": pick("birthset_rank_margin", "rank_margin", 1.0),
+        "birthset_pos_weight": pick("birthset_pos_weight", "pos_weight", "auto"),
+        "birthset_use_train_birth_split_bank": pick(
+            "birthset_use_train_birth_split_bank",
+            "use_train_birth_split_bank",
+            True,
+        ),
+        "birthset_use_small_polytomy_enumeration": pick(
+            "birthset_use_small_polytomy_enumeration",
+            "use_small_polytomy_enumeration",
+            True,
+        ),
+        "birthset_use_pair_prefix_candidates": pick(
+            "birthset_use_pair_prefix_candidates",
+            "use_pair_prefix_candidates",
+            False,
+        ),
+        "birthset_pair_prefix_top_pairs": pick(
+            "birthset_pair_prefix_top_pairs",
+            "top_pairs",
+            64,
+        ),
+        "birthset_proposal_pair_target_mode": pick(
+            "birthset_proposal_pair_target_mode",
+            "proposal_pair_target_mode",
+            "contained",
+        ),
+        "birthset_proposal_max_expansion_examples": pick(
+            "birthset_proposal_max_expansion_examples",
+            "proposal_max_expansion_examples",
+            4096,
+        ),
+        "birthset_proposal_max_order_seed_pairs": pick(
+            "birthset_proposal_max_order_seed_pairs",
+            "proposal_max_order_seed_pairs",
+            128,
+        ),
+        "birthset_max_enum_components": pick(
+            "birthset_max_enum_components",
+            "max_enum_components",
+            12,
+        ),
+        "birthset_max_candidates_per_polytomy": pick(
+            "birthset_max_candidates_per_polytomy",
+            "max_candidates_per_polytomy",
+            2048,
+        ),
+        "birthset_negatives_per_positive": pick(
+            "birthset_negatives_per_positive",
+            "negatives_per_positive",
+            64,
+        ),
+        "birthset_decoder": pick("birthset_decoder", "decoder", "greedy"),
+        "birthset_beam_width": pick("birthset_beam_width", "beam_width", 8),
+        "birthset_fallback": pick("birthset_fallback", "fallback", "ar"),
+    }
+
+
 def _set_global_seed(seed):
     if seed is None:
         return
@@ -478,6 +563,34 @@ def _load_model_init_checkpoint(model, checkpoint_path, device):
     return model
 
 
+def _load_training_module_init_checkpoint(module, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    current_state = module.state_dict()
+    loadable = {}
+    skipped = []
+    for key, value in state_dict.items():
+        current_value = current_state.get(key)
+        if current_value is None:
+            skipped.append(key)
+            continue
+        if hasattr(value, "shape") and hasattr(current_value, "shape"):
+            if tuple(value.shape) != tuple(current_value.shape):
+                skipped.append(key)
+                continue
+        loadable[key] = value
+    missing, unexpected = module.load_state_dict(loadable, strict=False)
+    print(
+        "Initialized TrainingModule weights from checkpoint: "
+        f"{checkpoint_path} "
+        f"(loaded={len(loadable)}, skipped={len(skipped)}, "
+        f"missing={len(missing)}, unexpected={len(unexpected)})"
+    )
+    if skipped:
+        print(f"Skipped checkpoint tensors: {skipped[:8]}")
+    return module
+
+
 def _resolve_checkpoint_paths(trainer_cfg):
     init_checkpoint_path = trainer_cfg.get("init_checkpoint_path")
     resume_ckpt_path = trainer_cfg.get("resume_ckpt_path")
@@ -615,6 +728,7 @@ def init_worker(config_file, device_id):
         autoregressive_structure_perturb_mode=config["trainer"].get(
             "autoregressive_structure_perturb_mode", "random_wrong_pair"
         ),
+        **_birthset_trainer_kwargs(config),
         velocity_length_jitter_prob=config["trainer"].get(
             "velocity_length_jitter_prob", 0.0
         ),
@@ -1241,6 +1355,7 @@ def run_test():
         autoregressive_structure_perturb_mode=config["trainer"].get(
             "autoregressive_structure_perturb_mode", "random_wrong_pair"
         ),
+        **_birthset_trainer_kwargs(config),
         velocity_length_jitter_prob=config["trainer"].get(
             "velocity_length_jitter_prob", 0.0
         ),
@@ -1932,6 +2047,7 @@ def run_overfit():
         autoregressive_structure_perturb_mode=config["trainer"].get(
             "autoregressive_structure_perturb_mode", "random_wrong_pair"
         ),
+        **_birthset_trainer_kwargs(config),
         velocity_length_jitter_prob=config["trainer"].get(
             "velocity_length_jitter_prob", 0.0
         ),
@@ -2413,6 +2529,24 @@ def run_overfit():
         ),
         verbose=True,  # Enable verbose logging for overfitting
     )
+    init_training_module_checkpoint_path = config["trainer"].get(
+        "init_training_module_checkpoint_path"
+    )
+    if init_training_module_checkpoint_path:
+        if resume_ckpt_path:
+            raise ValueError(
+                "Use either trainer.init_training_module_checkpoint_path or "
+                "trainer.resume_ckpt_path, not both."
+            )
+        init_training_module_checkpoint_path = os.path.abspath(
+            init_training_module_checkpoint_path
+        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = _load_training_module_init_checkpoint(
+            model,
+            init_training_module_checkpoint_path,
+            device,
+        )
     model.legacy_first_hit_gather_only = bool(
         config["trainer"].get("legacy_first_hit_gather_only", False)
     )
@@ -2600,6 +2734,7 @@ def main():
         autoregressive_structure_perturb_mode=config["trainer"].get(
             "autoregressive_structure_perturb_mode", "random_wrong_pair"
         ),
+        **_birthset_trainer_kwargs(config),
         velocity_length_jitter_prob=config["trainer"].get(
             "velocity_length_jitter_prob", 0.0
         ),
@@ -3080,6 +3215,24 @@ def main():
             "dynamic_start_bank_save_improved_checkpoint", False
         ),
     )
+    init_training_module_checkpoint_path = config["trainer"].get(
+        "init_training_module_checkpoint_path"
+    )
+    if init_training_module_checkpoint_path:
+        if resume_ckpt_path:
+            raise ValueError(
+                "Use either trainer.init_training_module_checkpoint_path or "
+                "trainer.resume_ckpt_path, not both."
+            )
+        init_training_module_checkpoint_path = os.path.abspath(
+            init_training_module_checkpoint_path
+        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = _load_training_module_init_checkpoint(
+            model,
+            init_training_module_checkpoint_path,
+            device,
+        )
     model.legacy_first_hit_gather_only = bool(
         config["trainer"].get("legacy_first_hit_gather_only", False)
     )

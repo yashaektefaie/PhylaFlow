@@ -234,6 +234,107 @@ class StructuredSubsetMergeHead(nn.Module):
         }
 
 
+class BirthSetTopologyHead(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        hidden: int = 256,
+        dropout: float = 0.1,
+        context_dim: int | None = None,
+        max_components_norm: int = 128,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.context_dim = int(d_model if context_dim is None else context_dim)
+        self.max_components_norm = max(1, int(max_components_norm))
+        input_dim = (5 * int(d_model)) + self.context_dim + 3
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, max(1, hidden // 2)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(1, hidden // 2), 1),
+        )
+
+    def forward(
+        self,
+        component_embeddings: torch.Tensor,
+        candidate_subsets,
+        context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Score complete local birth-split candidates in one shot.
+
+        component_embeddings: [G, D]
+        candidate_subsets: iterable of integer local component bitmasks
+        context: optional [context_dim] graph/global context
+        returns logits: [M]
+        """
+        H = self.norm(component_embeddings)
+        G, D = H.shape
+        candidate_subsets = [int(mask) for mask in candidate_subsets]
+        if G <= 0 or not candidate_subsets:
+            return H.new_empty((0,))
+
+        rows = []
+        for subset in candidate_subsets:
+            rows.append(
+                [
+                    1.0 if ((subset >> idx) & 1) else 0.0
+                    for idx in range(G)
+                ]
+            )
+        in_mask = H.new_tensor(rows)
+        in_counts = in_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        out_mask = 1.0 - in_mask
+        out_counts = out_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+        h_in_sum = in_mask @ H
+        h_out_sum = out_mask @ H
+        h_in_mean = h_in_sum / in_counts
+        h_out_mean = h_out_sum / out_counts
+
+        if context is None:
+            context = H.new_zeros((self.context_dim,))
+        else:
+            context = context.to(device=H.device, dtype=H.dtype)
+            if context.ndim != 1 or int(context.shape[0]) != self.context_dim:
+                raise ValueError(
+                    f"context must have shape [{self.context_dim}] for birthset head"
+                )
+
+        subset_sizes = in_counts.squeeze(-1)
+        min_sizes = torch.minimum(subset_sizes, H.new_full(subset_sizes.shape, float(G)) - subset_sizes)
+        size_features = torch.stack(
+            [
+                subset_sizes / max(float(G), 1.0),
+                min_sizes / max(float(G), 1.0),
+                H.new_full(
+                    subset_sizes.shape,
+                    float(G) / float(self.max_components_norm),
+                ),
+            ],
+            dim=-1,
+        )
+        context_expand = context.unsqueeze(0).expand(len(candidate_subsets), -1)
+        features = torch.cat(
+            [
+                h_in_mean + h_out_mean,
+                (h_in_mean - h_out_mean).abs(),
+                h_in_mean * h_out_mean,
+                h_in_sum + h_out_sum,
+                (h_in_sum - h_out_sum).abs(),
+                context_expand,
+                size_features,
+            ],
+            dim=-1,
+        )
+        return self.mlp(features).squeeze(-1)
+
+
 class AutoregressiveGroupRefinementBlock(nn.Module):
     def __init__(
         self,
@@ -2543,6 +2644,7 @@ class TreeDenoiserTokenGT(nn.Module):
                         "logits": logits,
                         "splits_represented": group_splits,
                         "group_embeddings": group_embeddings,
+                        "graph_context": x[b, 0, :],
                         "decoder_mode": self.autoregressive_head_mode,
                     }
                     group_output.update(head_outputs)

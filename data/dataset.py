@@ -29,6 +29,7 @@ import pytorch_lightning as pl
 from utils.bhv_utils import (
     BHVEncoder,
     _split_multi_label_training_events,
+    get_structural_polytomy_groups_from_newick,
     return_sampled_tree_orthant_velocity,
     return_sampled_tree_boundary_decisions,
     return_tree_boundary_merge_paths,
@@ -39,6 +40,88 @@ from utils.random_tree import Tree
 from ete3 import Tree as EteTree
 from utils.utils import get_possible_ids, remove_bit
 from utils.bhv_movie import build_tree_from_splits
+
+
+def _birthset_local_subset_for_components(
+    split_mask: int,
+    component_masks: List[int],
+) -> Optional[int]:
+    split_mask = int(split_mask)
+    parent_mask = 0
+    for component in component_masks:
+        parent_mask |= int(component)
+    if parent_mask == 0 or (split_mask & ~parent_mask):
+        return None
+
+    local_subset = 0
+    for idx, component in enumerate(component_masks):
+        component = int(component)
+        overlap = component & split_mask
+        if overlap and overlap != component:
+            return None
+        if overlap:
+            local_subset |= 1 << int(idx)
+
+    G = len(component_masks)
+    subset_size = int(local_subset).bit_count()
+    if 2 <= subset_size <= max(G - 1, 0):
+        return int(local_subset)
+    return None
+
+
+def _birthset_boundary_training_event(boundary_newick: str, birth_splits) -> Optional[Dict[str, Any]]:
+    try:
+        groups = [
+            tuple(int(component) for component in group)
+            for group in get_structural_polytomy_groups_from_newick(boundary_newick)
+        ]
+    except Exception:
+        return None
+    if not groups:
+        return None
+
+    labels: List[Dict[str, Any]] = []
+    seen = set()
+    for group in groups:
+        if len(group) <= 2:
+            continue
+        for birth_split in birth_splits or []:
+            local_subset = _birthset_local_subset_for_components(
+                int(birth_split),
+                list(group),
+            )
+            if local_subset is None:
+                continue
+            merge_indices = [
+                idx
+                for idx in range(len(group))
+                if (int(local_subset) >> int(idx)) & 1
+            ]
+            if len(merge_indices) < 2:
+                continue
+            result_split = 0
+            for idx in merge_indices:
+                result_split |= int(group[idx])
+            key = (int(result_split), tuple(group), tuple(merge_indices))
+            if key in seen:
+                continue
+            seen.add(key)
+            labels.append(
+                {
+                    "result_split": int(result_split),
+                    "parent_split": int(np.bitwise_or.reduce(group)),
+                    "components": [int(component) for component in group],
+                    "merge_indices": [int(idx) for idx in merge_indices],
+                }
+            )
+
+    if not labels:
+        return None
+    return {
+        "newick": str(boundary_newick),
+        "labels": labels,
+        "stop_after_merge": True,
+    }
 
 
 def _detach_tensors(value):
@@ -459,6 +542,7 @@ class TreeDataset(Dataset):
         overfit_fixed_pair_joint_bank_jsonl_path: Optional[str] = None,
         overfit_split_multi_subset_events: bool = False,
         overfit_full_path_control_mode: bool = False,
+        overfit_full_path_control_birthset_boundary_labels: bool = False,
         overfit_full_path_control_seed: int = 42,
         overfit_full_path_control_use_discrete_phase_time: bool = False,
         overfit_full_path_control_terminal_label_mode: str = "phase_start",
@@ -746,6 +830,9 @@ class TreeDataset(Dataset):
         self._overfit_fixed_pair_target_tree_groups: Dict[str, List[Dict[str, Any]]] = {}
         self.overfit_split_multi_subset_events = bool(
             overfit_split_multi_subset_events
+        )
+        self.overfit_full_path_control_birthset_boundary_labels = bool(
+            overfit_full_path_control_birthset_boundary_labels
         )
         self.size_detector = SizeDetector()
         # State tracker for adaptive batching (index, subtree_size, num_subtrees)
@@ -1461,17 +1548,24 @@ class TreeDataset(Dataset):
                 if self.overfit_full_path_control_use_discrete_phase_time
                 else float(path["global_time"])
             )
-            boundary_events = []
-            for event in path.get("events", []):
-                if not event.get("labels"):
-                    continue
-                boundary_events.append(
-                    {
-                        "newick": str(event["newick"]),
-                        "labels": list(event["labels"]),
-                    }
+            if self.overfit_full_path_control_birthset_boundary_labels:
+                birthset_event = _birthset_boundary_training_event(
+                    str(path["start_newick"]),
+                    path.get("births", []),
                 )
-            boundary_events = _split_multi_label_training_events(boundary_events)
+                boundary_events = [] if birthset_event is None else [birthset_event]
+            else:
+                boundary_events = []
+                for event in path.get("events", []):
+                    if not event.get("labels"):
+                        continue
+                    boundary_events.append(
+                        {
+                            "newick": str(event["newick"]),
+                            "labels": list(event["labels"]),
+                        }
+                    )
+                boundary_events = _split_multi_label_training_events(boundary_events)
             for event in boundary_events:
                 autoregressive_samples.append(
                     _attach_pair_group({
@@ -3796,6 +3890,9 @@ class PhylaDataModule(pl.LightningDataModule):
             overfit_full_path_control_mode=config["data"].get(
                 "overfit_full_path_control_mode", False
             ),
+            overfit_full_path_control_birthset_boundary_labels=config["data"].get(
+                "overfit_full_path_control_birthset_boundary_labels", False
+            ),
             overfit_full_path_control_seed=config["data"].get(
                 "overfit_full_path_control_seed", 42
             ),
@@ -3913,6 +4010,9 @@ class PhylaDataModule(pl.LightningDataModule):
             ),
             overfit_full_path_control_mode=config["data"].get(
                 "overfit_full_path_control_mode", False
+            ),
+            overfit_full_path_control_birthset_boundary_labels=config["data"].get(
+                "overfit_full_path_control_birthset_boundary_labels", False
             ),
             overfit_full_path_control_seed=config["data"].get(
                 "overfit_full_path_control_seed", 42
