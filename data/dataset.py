@@ -2221,10 +2221,12 @@ class TreeDataset(Dataset):
                     dataset_id=meta.get("id"),
                 )
 
+            using_selected_fixed_bank_subset = False
             if (
                 forced_bank_selection is not None
                 and forced_bank_selection.get("selected_original_labels")
             ):
+                using_selected_fixed_bank_subset = True
                 real_tree_newick = str(
                     forced_bank_selection["forced_target_tree_newick"]
                 ).strip()
@@ -2263,7 +2265,11 @@ class TreeDataset(Dataset):
 
             # Pruning logic for adaptive batching
 
-            if preset_subtree_size is not None and len(leaves) > preset_subtree_size:
+            if (
+                not using_selected_fixed_bank_subset
+                and preset_subtree_size is not None
+                and len(leaves) > preset_subtree_size
+            ):
                 keep_count = max(2, int(preset_subtree_size))
                 candidate_leaf_names = sorted(
                     [str(leaf.name) for leaf in leaves],
@@ -2351,84 +2357,85 @@ class TreeDataset(Dataset):
                 # Update leaves for size tracking
                 leaves = t.get_leaves()
 
-            real_tree_original_label_newick = t.write(format=1)
+            if not using_selected_fixed_bank_subset:
+                real_tree_original_label_newick = t.write(format=1)
 
-            current_size = len(leaves)
-            self.chosen_tree = (index, current_size, 1)  # (index, size, num_subtrees)
+                current_size = len(leaves)
+                self.chosen_tree = (index, current_size, 1)  # (index, size, num_subtrees)
 
-            # Normalize tree indices to 0..N-1 and subset sequences
-            # Sort leaves for deterministic indexing
-            leaves.sort(key=lambda x: _numeric_name_sort_key(x.name))
+                # Normalize tree indices to 0..N-1 and subset sequences
+                # Sort leaves for deterministic indexing
+                leaves.sort(key=lambda x: _numeric_name_sort_key(x.name))
 
-            new_seqs = {}
-            original_names_map = {}
-            seq_ordering_map = {}
+                new_seqs = {}
+                original_names_map = {}
+                seq_ordering_map = {}
 
-            for i, leaf in enumerate(leaves):
-                original_node_name = leaf.name
-                # Resolve taxon name: check translate map, else use node name
-                taxon_name = translate_map.get(original_node_name, original_node_name)
+                for i, leaf in enumerate(leaves):
+                    original_node_name = leaf.name
+                    # Resolve taxon name: check translate map, else use node name
+                    taxon_name = translate_map.get(original_node_name, original_node_name)
 
-                # Map new index (0..N-1) to sequence
-                new_idx_str = str(i)
-                # Store sequences using the new index as key
-                new_seqs[new_idx_str] = seqs.get(taxon_name, "")
+                    # Map new index (0..N-1) to sequence
+                    new_idx_str = str(i)
+                    # Store sequences using the new index as key
+                    new_seqs[new_idx_str] = seqs.get(taxon_name, "")
 
-                # Rename leaf in the tree
-                leaf.name = new_idx_str
+                    # Rename leaf in the tree
+                    leaf.name = new_idx_str
 
-                # Record mapping if needed
-                original_names_map[new_idx_str] = taxon_name
+                    # Record mapping if needed
+                    original_names_map[new_idx_str] = taxon_name
 
-                seq_ordering_map[original_node_name] = new_idx_str
+                    seq_ordering_map[original_node_name] = new_idx_str
 
-            # Serialize the normalized tree
-            real_tree_newick = t.write(format=1)
+                # Serialize the normalized tree
+                real_tree_newick = t.write(format=1)
 
-            # Re-parse purely to ensure we are passing consistent objects
-            # (Though prune modifies in-place, let's keep it safe)
-            t_pruned = EteTree(real_tree_newick, format=1)
+                # Re-parse purely to ensure we are passing consistent objects
+                # (Though prune modifies in-place, let's keep it safe)
+                t_pruned = EteTree(real_tree_newick, format=1)
 
-            def _remap_random_tree_to_dataset_indexing(random_tree_newick: str) -> str:
-                t_random = EteTree(random_tree_newick, format=1)
-                dataset_leaf_names = set(new_seqs.keys())
+                def _remap_random_tree_to_dataset_indexing(random_tree_newick: str) -> str:
+                    t_random = EteTree(random_tree_newick, format=1)
+                    dataset_leaf_names = set(new_seqs.keys())
 
-                # Now remap the random tree to make the indices match up with the real tree.
-                if self.sanity_check:
-                    for leaf in t_random.get_leaves():
-                        name = leaf.name
-                        if name in dataset_leaf_names:
-                            continue
-                        if name in seq_ordering_map:
-                            leaf.name = seq_ordering_map[name]
-                        else:
-                            raise Exception(
-                                "Leaf name in random tree not found in original names map!"
-                            )
-                else:
-                    for leaf in t_random.get_leaves():
-                        raw_name = leaf.name
-                        if raw_name in dataset_leaf_names:
-                            continue
-                        try:
-                            name = str(int(raw_name))
-                        except ValueError:
-                            name = raw_name
-                        if name in seq_ordering_map:
-                            leaf.name = seq_ordering_map[name]
-                        else:
-                            raise Exception(
-                                "Leaf name in random tree not found in original names map!"
-                            )
-                return t_random.write(format=1)
+                    # Now remap the random tree to make the indices match up with the real tree.
+                    if self.sanity_check:
+                        for leaf in t_random.get_leaves():
+                            name = leaf.name
+                            if name in dataset_leaf_names:
+                                continue
+                            if name in seq_ordering_map:
+                                leaf.name = seq_ordering_map[name]
+                            else:
+                                raise Exception(
+                                    "Leaf name in random tree not found in original names map!"
+                                )
+                    else:
+                        for leaf in t_random.get_leaves():
+                            raw_name = leaf.name
+                            if raw_name in dataset_leaf_names:
+                                continue
+                            try:
+                                name = str(int(raw_name))
+                            except ValueError:
+                                name = raw_name
+                            if name in seq_ordering_map:
+                                leaf.name = seq_ordering_map[name]
+                            else:
+                                raise Exception(
+                                    "Leaf name in random tree not found in original names map!"
+                                )
+                    return t_random.write(format=1)
 
-            sample_source_tree = t_pruned
-            if self.overfit_start_boundary_prefix_k >= 0 and (
-                self.sanity_check or self.random_sanity_check
-            ):
-                # Keep start/target prefix resolution in the original leaf-name space,
-                # then remap both together into dataset indexing.
-                sample_source_tree = real_tree_original_label_newick
+                sample_source_tree = t_pruned
+                if self.overfit_start_boundary_prefix_k >= 0 and (
+                    self.sanity_check or self.random_sanity_check
+                ):
+                    # Keep start/target prefix resolution in the original leaf-name space,
+                    # then remap both together into dataset indexing.
+                    sample_source_tree = real_tree_original_label_newick
 
         def _build_pair(
             forced_start_tree_newick: Optional[str] = None,
