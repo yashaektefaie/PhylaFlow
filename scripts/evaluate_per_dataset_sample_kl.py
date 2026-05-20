@@ -120,14 +120,14 @@ def _prune_and_remap_tree(raw_newick: str, seq_ordering_map: Dict[str, str]) -> 
 
 def _sample_posterior_subset_trees(
     dataset_split,
-    dataset_index: int,
+    dataset_key: int | str,
     seq_ordering_map: Dict[str, str],
     count: int,
     rng: random.Random,
 ) -> List[str]:
-    raw_trees = list(dataset_split.return_posterior_trees(int(dataset_index)))
+    raw_trees = list(dataset_split.return_posterior_trees(dataset_key))
     if not raw_trees:
-        raise ValueError(f"No posterior trees for dataset index {dataset_index}")
+        raise ValueError(f"No posterior trees for dataset {dataset_key}")
 
     out: List[str] = []
     attempts = 0
@@ -141,7 +141,7 @@ def _sample_posterior_subset_trees(
             continue
     if len(out) < count:
         raise RuntimeError(
-            f"Only built {len(out)} posterior subset trees for index {dataset_index}; "
+            f"Only built {len(out)} posterior subset trees for dataset {dataset_key}; "
             f"needed {count}."
         )
     return out
@@ -211,6 +211,7 @@ def _evaluate_case(
     *,
     num_samples: int,
     seed: int,
+    dump_trees_dir: Path | None = None,
 ) -> Dict[str, Any]:
     case_rng = random.Random(f"{seed}:case:{case_idx}:samples:{source_index}")
     sample = _sample_dataset_item(dataset_split, source_index, seed, case_idx)
@@ -222,19 +223,19 @@ def _evaluate_case(
         raise ValueError(f"Sample for index {source_index} has no seq_ordering_map")
 
     pair = _build_pair_from_sample(sample, source_index)
+    posterior_dataset_key = pair.get("dataset_id")
+    if posterior_dataset_key in {None, ""}:
+        posterior_dataset_key = source_index
     posterior_trees = _sample_posterior_subset_trees(
         dataset_split,
-        source_index,
+        posterior_dataset_key,
         seq_ordering_map,
         count=int(num_samples),
         rng=case_rng,
     )
 
     with torch.inference_mode():
-        phyla_embeddings = module._compute_live_phyla_embeddings_for_pair(pair)
         sample_kwargs = module._build_harness_sample_kwargs(pair, train=True)
-        if phyla_embeddings is not None:
-            sample_kwargs["phyla_embeddings"] = phyla_embeddings
         sample_kwargs["return_trace"] = False
         sample_kwargs["trace_state_rf"] = False
 
@@ -325,13 +326,32 @@ def _evaluate_case(
         "sample_sec_mean": float(np.asarray(sample_times, dtype=np.float64).mean()),
         "sample_sec_total": float(np.asarray(sample_times, dtype=np.float64).sum()),
     }
+    if dump_trees_dir is not None:
+        dump_trees_dir.mkdir(parents=True, exist_ok=True)
+        dump_payload = {
+            "case_idx": int(case_idx),
+            "source_bank_index": int(source_index),
+            "dataset_id": str(pair.get("dataset_id")),
+            "posterior_trees": posterior_trees,
+            "start_trees": start_trees,
+            "sampled_trees": sampled_trees,
+        }
+        dump_path = dump_trees_dir / f"case_{case_idx:04d}_{pair.get('dataset_id')}.json"
+        with dump_path.open("w", encoding="utf-8") as handle:
+            json.dump(dump_payload, handle)
+            handle.write("\n")
+        row["tree_dump_path"] = str(dump_path.resolve())
     return row
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Checkpoint to evaluate, or 'random-init' to leave model weights random.",
+    )
     parser.add_argument("--sample-config", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--num-datasets", type=int, default=32)
@@ -339,6 +359,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260514)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--label", default=None)
+    parser.add_argument("--dump-trees", action="store_true")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -371,17 +392,27 @@ def main() -> None:
     dataset = PhylaDataModule(config, train_ids=train_ids, test_ids=test_ids)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     phyla_flow = return_model(config)
-    phyla_flow = _load_model_init_checkpoint(phyla_flow, args.checkpoint, device)
+    random_init = str(args.checkpoint).lower() in {"random-init", "random_init", "none"}
+    if not random_init:
+        phyla_flow = _load_model_init_checkpoint(phyla_flow, args.checkpoint, device)
     phyla_flow.to(device)
     module = TrainingModule(**_training_module_kwargs(config, phyla_flow, dataset))
     module.legacy_first_hit_gather_only = bool(
         trainer_cfg.get("legacy_first_hit_gather_only", False)
     )
-    module_state_info = _load_full_module_state_if_available(
-        module,
-        args.checkpoint,
-        device,
-    )
+    if random_init:
+        module_state_info = {
+            "loaded_full_module_state": 0,
+            "random_init": 1,
+            "missing_keys": [],
+            "unexpected_keys": [],
+        }
+    else:
+        module_state_info = _load_full_module_state_if_available(
+            module,
+            args.checkpoint,
+            device,
+        )
     module.to(device)
     module.eval()
     if torch.cuda.is_available():
@@ -399,6 +430,7 @@ def main() -> None:
 
     rows: List[Dict[str, Any]] = []
     eval_start = time.perf_counter()
+    dump_trees_dir = output_dir / "tree_dumps" if args.dump_trees else None
     with rows_path.open("w", encoding="utf-8") as rows_handle:
         for case_idx, source_index in enumerate(selected_indices):
             case_start = time.perf_counter()
@@ -409,6 +441,7 @@ def main() -> None:
                 int(case_idx),
                 num_samples=int(args.num_samples),
                 seed=int(args.seed),
+                dump_trees_dir=dump_trees_dir,
             )
             row["case_elapsed_sec"] = float(time.perf_counter() - case_start)
             rows.append(row)
@@ -435,7 +468,11 @@ def main() -> None:
     aggregate = _aggregate_scalar_rows(rows)
     summary = {
         "label": args.label,
-        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "checkpoint": (
+            "random-init"
+            if random_init
+            else str(Path(args.checkpoint).resolve())
+        ),
         "config": str(Path(args.config).resolve()),
         "sample_config": str(Path(args.sample_config).resolve()),
         "effective_config": str(effective_config_path.resolve()),

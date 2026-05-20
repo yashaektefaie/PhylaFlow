@@ -3187,6 +3187,15 @@ def _build_autoregressive_replay_batch(module, samples, tokenized_override=None)
             device=module.device,
         ),
         "batched_autoregressive_labels": [sample["labels"] for sample in samples],
+        "batched_birthset_precomputed": [
+            sample.get("birthset_precomputed") for sample in samples
+        ],
+        "_birthset_precomputed_candidate_info_enabled": bool(
+            any(
+                bool(sample.get("_birthset_precomputed_candidate_info_enabled", False))
+                for sample in samples
+            )
+        ),
         "batched_autoregressive_stop_after_merge": torch.tensor(
             [
                 1.0 if sample.get("stop_after_merge", False) else 0.0
@@ -7287,6 +7296,7 @@ class TrainingModule(LightningModule):
         live_phyla_lr: float | None = None,
         live_phyla_input_mode: str = "raw-full",
         live_phyla_max_input_tokens: int = 0,
+        live_phyla_device: str | None = None,
         velocity_loss_mode: str = "weighted",
         velocity_loss_plain_weight: float = 0.5,
         velocity_sign_eps: float = 1e-3,
@@ -7320,10 +7330,12 @@ class TrainingModule(LightningModule):
         birthset_use_train_birth_split_bank: bool = True,
         birthset_use_small_polytomy_enumeration: bool = True,
         birthset_use_pair_prefix_candidates: bool = False,
+        birthset_use_component_phyla_conditioning: bool = False,
         birthset_pair_prefix_top_pairs: int = 64,
         birthset_proposal_pair_target_mode: str = "contained",
         birthset_proposal_max_expansion_examples: int = 4096,
         birthset_proposal_max_order_seed_pairs: int = 128,
+        birthset_proposal_train_topk: bool = False,
         birthset_max_enum_components: int = 12,
         birthset_max_candidates_per_polytomy: int = 2048,
         birthset_negatives_per_positive: int = 64,
@@ -7591,6 +7603,12 @@ class TrainingModule(LightningModule):
             0,
             int(live_phyla_max_input_tokens or 0),
         )
+        live_phyla_device = (
+            None
+            if live_phyla_device in (None, "", "auto")
+            else str(live_phyla_device)
+        )
+        self.live_phyla_device_config = live_phyla_device
         self.live_phyla_model = None
         self._live_phyla_device = None
         self.phyla_precomputed_name_to_embedding = None
@@ -7626,7 +7644,11 @@ class TrainingModule(LightningModule):
                 sys.argv = original_argv
 
         if self.live_phyla_checkpoint_path is not None:
-            live_device = "cuda" if torch.cuda.is_available() else "cpu"
+            live_device = (
+                self.live_phyla_device_config
+                if self.live_phyla_device_config is not None
+                else ("cuda" if torch.cuda.is_available() else "cpu")
+            )
             try:
                 self.live_phyla_model = _load_live_phyla_beta_model(
                     self.live_phyla_checkpoint_path,
@@ -7640,9 +7662,10 @@ class TrainingModule(LightningModule):
                 else:
                     self.live_phyla_model.eval()
                 logging.info(
-                    "Loaded live Phyla-beta checkpoint from %s (unfreeze=%s)",
+                    "Loaded live Phyla-beta checkpoint from %s (unfreeze=%s, device=%s)",
                     self.live_phyla_checkpoint_path,
                     self.live_phyla_unfreeze,
+                    self._live_phyla_device,
                 )
             except Exception as e:
                 raise RuntimeError(
@@ -8156,6 +8179,9 @@ class TrainingModule(LightningModule):
         self.birthset_use_pair_prefix_candidates = bool(
             birthset_use_pair_prefix_candidates
         )
+        self.birthset_use_component_phyla_conditioning = bool(
+            birthset_use_component_phyla_conditioning
+        )
         self.birthset_pair_prefix_top_pairs = int(birthset_pair_prefix_top_pairs)
         self.birthset_proposal_pair_target_mode = str(
             birthset_proposal_pair_target_mode
@@ -8166,6 +8192,7 @@ class TrainingModule(LightningModule):
         self.birthset_proposal_max_order_seed_pairs = int(
             birthset_proposal_max_order_seed_pairs
         )
+        self.birthset_proposal_train_topk = bool(birthset_proposal_train_topk)
         self.birthset_max_enum_components = int(birthset_max_enum_components)
         self.birthset_max_candidates_per_polytomy = int(
             birthset_max_candidates_per_polytomy
@@ -8180,12 +8207,18 @@ class TrainingModule(LightningModule):
         self.birthset_topology_head = None
         self.birthset_proposal_head = None
         if self.topology_decoder in {"birthset", "birthset_with_ar_fallback"}:
+            birthset_component_phyla_dim = (
+                int(getattr(self.model, "phyla_dim", 0))
+                if self.birthset_use_component_phyla_conditioning
+                else None
+            )
             self.birthset_topology_head = BirthSetTopologyHead(
                 int(self.model.embed_dim),
                 hidden=max(128, int(self.model.embed_dim)),
                 dropout=0.0,
                 context_dim=int(self.model.embed_dim),
                 max_components_norm=max(16, int(self.model.embed_dim)),
+                component_phyla_dim=birthset_component_phyla_dim,
             )
             if self.birthset_use_pair_prefix_candidates:
                 self.birthset_proposal_head = BirthSetTopologyHead(
@@ -8194,6 +8227,7 @@ class TrainingModule(LightningModule):
                     dropout=0.0,
                     context_dim=int(self.model.embed_dim),
                     max_components_norm=max(16, int(self.model.embed_dim)),
+                    component_phyla_dim=birthset_component_phyla_dim,
                 )
         self.velocity_length_jitter_prob = float(velocity_length_jitter_prob)
         self.velocity_length_jitter_scale = float(velocity_length_jitter_scale)
@@ -14227,8 +14261,16 @@ class TrainingModule(LightningModule):
     def _ensure_live_phyla_device(self):
         if self.live_phyla_model is None:
             raise ValueError("Live Phyla model not loaded.")
-        target = torch.device(self.device)
-        if self._live_phyla_device != str(target):
+        target = torch.device(
+            self.live_phyla_device_config
+            if self.live_phyla_device_config is not None
+            else self.device
+        )
+        try:
+            actual = next(self.live_phyla_model.parameters()).device
+        except StopIteration:
+            actual = torch.device(self._live_phyla_device or target)
+        if str(actual) != str(target) or self._live_phyla_device != str(target):
             self.live_phyla_model.to(target)
             self.live_phyla_model.device = target
             self._live_phyla_device = str(target)
@@ -15065,6 +15107,7 @@ class TrainingModule(LightningModule):
             edge_split_masks,
             phyla_global_context,
             phyla_clade_context,
+            phyla_embeddings,
         ) = self.model._prepare_encoder_inputs(
             tokenized_trees,
             t=times,
@@ -15106,6 +15149,7 @@ class TrainingModule(LightningModule):
             "edge_split_masks": edge_split_masks,
             "phyla_global_context": phyla_global_context,
             "phyla_clade_context": phyla_clade_context,
+            "phyla_embeddings": phyla_embeddings,
         }
 
     def _autoregressive_component_groups_for_batch(self, batch):
@@ -15236,6 +15280,7 @@ class TrainingModule(LightningModule):
         edge_split_masks = encoded_payload["edge_split_masks"]
         phyla_global_context = encoded_payload["phyla_global_context"]
         phyla_clade_context = encoded_payload["phyla_clade_context"]
+        encoded_phyla_embeddings = encoded_payload.get("phyla_embeddings")
         velocity_slice = slice(0, velocity_batch_size)
         autoregressive_slice = slice(
             velocity_batch_size,
@@ -15277,6 +15322,9 @@ class TrainingModule(LightningModule):
             phyla_clade_context=None
             if phyla_clade_context is None
             else phyla_clade_context[velocity_slice],
+            phyla_embeddings=None
+            if encoded_phyla_embeddings is None
+            else encoded_phyla_embeddings[velocity_slice],
         )
         velocity_outputs = self._unpack_velocity_edge_outputs(
             velocity_decoded,
@@ -15325,6 +15373,9 @@ class TrainingModule(LightningModule):
             phyla_clade_context=None
             if phyla_clade_context is None
             else phyla_clade_context[autoregressive_slice],
+            phyla_embeddings=None
+            if encoded_phyla_embeddings is None
+            else encoded_phyla_embeddings[autoregressive_slice],
         )
         return {
             "velocity_batch": velocity_batch,
@@ -15424,6 +15475,7 @@ class TrainingModule(LightningModule):
         component_masks,
         full_mask,
         component_embeddings,
+        component_phyla_embeddings=None,
         context=None,
     ):
         proposal_head = self.birthset_proposal_head or self.birthset_topology_head
@@ -15444,11 +15496,17 @@ class TrainingModule(LightningModule):
 
         H = component_embeddings.detach()
         ctx = context.detach() if torch.is_tensor(context) else context
+        phyla_ctx = (
+            component_phyla_embeddings.detach()
+            if torch.is_tensor(component_phyla_embeddings)
+            else component_phyla_embeddings
+        )
         with torch.inference_mode():
             pair_logits = proposal_head(
                 H,
                 pair_subsets,
                 context=ctx,
+                component_phyla_embeddings=phyla_ctx,
             )
         if pair_logits.numel() == 0:
             return 0
@@ -15482,6 +15540,7 @@ class TrainingModule(LightningModule):
                     H,
                     expansion_subsets_all,
                     context=ctx,
+                    component_phyla_embeddings=phyla_ctx,
                 )
             for (pair_id, subset), score in zip(
                 expansion_requests,
@@ -15542,6 +15601,7 @@ class TrainingModule(LightningModule):
         gold_splits=None,
         gold_local_subsets=None,
         component_embeddings=None,
+        component_phyla_embeddings=None,
         context=None,
         train=False,
     ):
@@ -15606,6 +15666,7 @@ class TrainingModule(LightningModule):
                 component_masks,
                 full_mask,
                 component_embeddings,
+                component_phyla_embeddings=component_phyla_embeddings,
                 context=context,
             )
 
@@ -15766,12 +15827,230 @@ class TrainingModule(LightningModule):
                         targets.add(int(pair))
         return targets
 
+    def _birthset_proposal_loss_from_precomputed(
+        self,
+        component_embeddings,
+        *,
+        component_phyla_embeddings=None,
+        context=None,
+        precomputed=None,
+    ):
+        proposal_head = self.birthset_proposal_head
+        if proposal_head is None or component_embeddings is None or not precomputed:
+            return None
+        if precomputed.get("train_topk_dynamic"):
+            return None
+
+        device = component_embeddings.device
+        proposal_profile = None
+        if self._training_step_profile_enabled():
+            self._training_step_profile_sync()
+            proposal_profile = {"_last": time.perf_counter()}
+
+        def _proposal_profile_mark(label):
+            if proposal_profile is None:
+                return
+            self._training_step_profile_sync()
+            now = time.perf_counter()
+            last = proposal_profile.get("_last", now)
+            proposal_profile[label] = (
+                proposal_profile.get(label, 0.0) + (now - last)
+            )
+            proposal_profile["_last"] = now
+
+        losses = []
+        pair_loss = None
+        expansion_loss = None
+        order_loss = None
+        pair_recall_at_topk = None
+
+        pair_subsets = [int(x) for x in precomputed.get("pair_subsets") or []]
+        pair_labels_values = [
+            float(x) for x in precomputed.get("pair_labels") or []
+        ]
+        if len(pair_labels_values) != len(pair_subsets):
+            return None
+        _proposal_profile_mark("pair_prep")
+
+        pair_score_by_subset = {}
+        top_pair_subsets = set()
+        if pair_subsets:
+            pair_logits = proposal_head(
+                component_embeddings,
+                pair_subsets,
+                context=context,
+                component_phyla_embeddings=component_phyla_embeddings,
+            )
+            _proposal_profile_mark("pair_forward")
+            pair_labels = torch.tensor(
+                pair_labels_values,
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_weights = torch.where(
+                pair_labels > 0.5,
+                self._birthset_proposal_positive_weight(pair_labels),
+                pair_labels.new_tensor(1.0),
+            )
+            pair_loss = (
+                F.binary_cross_entropy_with_logits(
+                    pair_logits,
+                    pair_labels,
+                    reduction="none",
+                )
+                * pair_weights
+            ).mean()
+            losses.append(pair_loss)
+            top_k = min(int(self.birthset_pair_prefix_top_pairs), len(pair_subsets))
+            top_ids = torch.topk(pair_logits.detach(), k=top_k, largest=True).indices
+            top_pair_subsets = {int(pair_subsets[int(idx)]) for idx in top_ids.tolist()}
+            pair_score_by_subset = {
+                int(pair_subsets[int(idx)]): float(score)
+                for idx, score in enumerate(pair_logits.detach().cpu().tolist())
+            }
+            strict_pair_targets = {
+                int(x) for x in precomputed.get("strict_pair_targets") or []
+            }
+            if strict_pair_targets:
+                pair_recall_at_topk = float(
+                    len(top_pair_subsets & strict_pair_targets)
+                ) / float(len(strict_pair_targets))
+            else:
+                gold_local_subsets = [
+                    int(x) for x in precomputed.get("gold_local_subsets") or []
+                ]
+                if gold_local_subsets:
+                    gold_hits = 0
+                    for gold_subset in gold_local_subsets:
+                        hit = any(
+                            (pair_subset & ~int(gold_subset)) == 0
+                            for pair_subset in top_pair_subsets
+                        )
+                        gold_hits += 1 if hit else 0
+                    pair_recall_at_topk = float(gold_hits) / float(
+                        len(gold_local_subsets)
+                    )
+            _proposal_profile_mark("pair_loss")
+        else:
+            _proposal_profile_mark("pair_forward")
+            _proposal_profile_mark("pair_loss")
+
+        expansion_subsets = precomputed.get("expansion_subsets")
+        expansion_labels_values = precomputed.get("expansion_labels")
+        if expansion_subsets is not None:
+            expansion_subsets = [int(x) for x in expansion_subsets]
+            expansion_labels_values = [
+                float(x) for x in (expansion_labels_values or [])
+            ]
+            if len(expansion_labels_values) != len(expansion_subsets):
+                return None
+        _proposal_profile_mark("expansion_prep")
+
+        if expansion_subsets:
+            expansion_logits = proposal_head(
+                component_embeddings,
+                expansion_subsets,
+                context=context,
+                component_phyla_embeddings=component_phyla_embeddings,
+            )
+            _proposal_profile_mark("expansion_forward")
+            expansion_labels = torch.tensor(
+                expansion_labels_values,
+                dtype=torch.float32,
+                device=device,
+            )
+            expansion_weights = torch.where(
+                expansion_labels > 0.5,
+                self._birthset_proposal_positive_weight(expansion_labels),
+                expansion_labels.new_tensor(1.0),
+            )
+            expansion_loss = (
+                F.binary_cross_entropy_with_logits(
+                    expansion_logits,
+                    expansion_labels,
+                    reduction="none",
+                )
+                * expansion_weights
+            ).mean()
+            losses.append(expansion_loss)
+            _proposal_profile_mark("expansion_loss")
+        else:
+            _proposal_profile_mark("expansion_forward")
+            _proposal_profile_mark("expansion_loss")
+
+        _proposal_profile_mark("order_seed_prep")
+        order_losses = []
+        order_candidate_subsets = [
+            int(x) for x in precomputed.get("order_candidate_subsets") or []
+        ]
+        order_slices = list(precomputed.get("order_slices") or [])
+        if order_candidate_subsets:
+            order_logits_all = proposal_head(
+                component_embeddings,
+                order_candidate_subsets,
+                context=context,
+                component_phyla_embeddings=component_phyla_embeddings,
+            )
+            _proposal_profile_mark("order_forward")
+            for start, end, target_ranks in order_slices:
+                seed_logits = order_logits_all[int(start) : int(end)]
+                if int(seed_logits.numel()) < 2:
+                    continue
+                rank_tensor = torch.tensor(
+                    [float(x) for x in target_ranks],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                better = rank_tensor.unsqueeze(1) < rank_tensor.unsqueeze(0)
+                if not bool(better.any().item()):
+                    continue
+                pairwise_margin = (
+                    float(self.birthset_rank_margin)
+                    - seed_logits.unsqueeze(1)
+                    + seed_logits.unsqueeze(0)
+                )
+                order_losses.append(F.relu(pairwise_margin[better]).mean())
+            _proposal_profile_mark("order_loss")
+        else:
+            _proposal_profile_mark("order_forward")
+            _proposal_profile_mark("order_loss")
+        if order_losses:
+            order_loss = torch.stack(order_losses).mean()
+            losses.append(order_loss)
+        _proposal_profile_mark("finalize")
+
+        if not losses:
+            return None
+        result = {
+            "loss": torch.stack(losses).mean(),
+            "pair_loss": None if pair_loss is None else pair_loss.detach(),
+            "expansion_loss": None
+            if expansion_loss is None
+            else expansion_loss.detach(),
+            "order_loss": None if order_loss is None else order_loss.detach(),
+            "pair_recall_at_topk": pair_recall_at_topk,
+            "num_pair_examples": float(len(pair_subsets)),
+            "num_expansion_examples": float(len(expansion_subsets or [])),
+            "num_order_seed_pairs": float(
+                precomputed.get("positive_pair_count", 0.0)
+            ),
+        }
+        if proposal_profile is not None:
+            result["profile"] = {
+                key: float(value)
+                for key, value in proposal_profile.items()
+                if not key.startswith("_")
+            }
+        return result
+
     def _birthset_proposal_loss(
         self,
         component_embeddings,
         gold_local_subsets,
         *,
+        component_phyla_embeddings=None,
         context=None,
+        precomputed=None,
     ):
         proposal_head = self.birthset_proposal_head
         if (
@@ -15790,18 +16069,44 @@ class TrainingModule(LightningModule):
         if G < 3 or not gold_local_subsets:
             return None
 
+        precomputed_result = self._birthset_proposal_loss_from_precomputed(
+            component_embeddings,
+            component_phyla_embeddings=component_phyla_embeddings,
+            context=context,
+            precomputed=precomputed,
+        )
+        if precomputed_result is not None:
+            return precomputed_result
+
         device = component_embeddings.device
+        proposal_profile = None
+        if self._training_step_profile_enabled():
+            self._training_step_profile_sync()
+            proposal_profile = {"_last": time.perf_counter()}
+
+        def _proposal_profile_mark(label):
+            if proposal_profile is None:
+                return
+            self._training_step_profile_sync()
+            now = time.perf_counter()
+            last = proposal_profile.get("_last", now)
+            proposal_profile[label] = (
+                proposal_profile.get(label, 0.0) + (now - last)
+            )
+            proposal_profile["_last"] = now
+
         losses = []
         pair_loss = None
         expansion_loss = None
         order_loss = None
         pair_recall_at_topk = None
         strict_pair_targets = None
+        constructive_pair_targets = self._birthset_constructive_pair_targets(
+            gold_local_subsets,
+            G,
+        )
         if self.birthset_proposal_pair_target_mode == "strict_minimal":
-            strict_pair_targets = self._birthset_constructive_pair_targets(
-                gold_local_subsets,
-                G,
-            )
+            strict_pair_targets = constructive_pair_targets
 
         pair_subsets = []
         for left_idx in range(G):
@@ -15809,13 +16114,18 @@ class TrainingModule(LightningModule):
                 subset = (1 << int(left_idx)) | (1 << int(right_idx))
                 if _birthset_valid_local_subset(subset, G):
                     pair_subsets.append(int(subset))
+        _proposal_profile_mark("pair_prep")
 
+        top_pair_subsets = set()
+        pair_score_by_subset = {}
         if pair_subsets:
             pair_logits = proposal_head(
                 component_embeddings,
                 pair_subsets,
                 context=context,
+                component_phyla_embeddings=component_phyla_embeddings,
             )
+            _proposal_profile_mark("pair_forward")
             pair_labels = torch.tensor(
                 [
                     1.0
@@ -15851,6 +16161,10 @@ class TrainingModule(LightningModule):
             top_k = min(int(self.birthset_pair_prefix_top_pairs), len(pair_subsets))
             top_ids = torch.topk(pair_logits.detach(), k=top_k, largest=True).indices
             top_pair_subsets = {int(pair_subsets[int(idx)]) for idx in top_ids.tolist()}
+            pair_score_by_subset = {
+                int(pair_subsets[int(idx)]): float(score)
+                for idx, score in enumerate(pair_logits.detach().cpu().tolist())
+            }
             if strict_pair_targets is not None:
                 if strict_pair_targets:
                     pair_recall_at_topk = float(
@@ -15865,13 +16179,30 @@ class TrainingModule(LightningModule):
                     )
                     gold_hits += 1 if hit else 0
                 pair_recall_at_topk = float(gold_hits) / float(len(gold_local_subsets))
+            _proposal_profile_mark("pair_loss")
 
         expansion_subsets = []
-        for combo in itertools.combinations(range(G), 3):
-            subset = 0
-            for idx in combo:
-                subset |= 1 << int(idx)
-            expansion_subsets.append(int(subset))
+        if self.birthset_proposal_train_topk and top_pair_subsets:
+            seed_pair_subsets = set(top_pair_subsets) | set(constructive_pair_targets)
+            seen_expansion_subsets = set()
+            for pair_subset in sorted(seed_pair_subsets):
+                pair_subset = int(pair_subset)
+                for idx in range(G):
+                    if (pair_subset >> int(idx)) & 1:
+                        continue
+                    subset = int(pair_subset | (1 << int(idx)))
+                    if not _birthset_valid_local_subset(subset, G):
+                        continue
+                    if subset in seen_expansion_subsets:
+                        continue
+                    seen_expansion_subsets.add(subset)
+                    expansion_subsets.append(subset)
+        else:
+            for combo in itertools.combinations(range(G), 3):
+                subset = 0
+                for idx in combo:
+                    subset |= 1 << int(idx)
+                expansion_subsets.append(int(subset))
         if expansion_subsets:
             positives = [
                 subset
@@ -15888,13 +16219,16 @@ class TrainingModule(LightningModule):
                 expansion_subsets = positives + negatives[: max(0, cap - len(positives))]
             else:
                 expansion_subsets = positives + negatives
+        _proposal_profile_mark("expansion_prep")
 
         if expansion_subsets:
             expansion_logits = proposal_head(
                 component_embeddings,
                 expansion_subsets,
                 context=context,
+                component_phyla_embeddings=component_phyla_embeddings,
             )
+            _proposal_profile_mark("expansion_forward")
             expansion_labels = torch.tensor(
                 [
                     1.0
@@ -15922,34 +16256,57 @@ class TrainingModule(LightningModule):
                 * expansion_weights
             ).mean()
             losses.append(expansion_loss)
+            _proposal_profile_mark("expansion_loss")
 
         order_losses = []
-        if strict_pair_targets is not None:
-            positive_pair_subsets = [
-                subset for subset in pair_subsets if int(subset) in strict_pair_targets
-            ]
-        else:
-            positive_pair_subsets = [
-                subset
-                for subset in pair_subsets
-                if self._birthset_subset_inside_any_gold(subset, gold_local_subsets)
-            ]
-        positive_pair_subsets.sort(
-            key=lambda subset: (
-                min(
-                    (
-                        _birthset_local_subset_size(gold_subset)
-                        for gold_subset in gold_local_subsets
-                        if (int(subset) & ~int(gold_subset)) == 0
-                    ),
-                    default=G + 1,
+        if self.birthset_proposal_train_topk and top_pair_subsets:
+            positive_pair_subsets = sorted(
+                {
+                    int(subset)
+                    for subset in set(constructive_pair_targets)
+                    if _birthset_valid_local_subset(int(subset), G)
+                },
+                key=lambda subset: (
+                    -float(pair_score_by_subset.get(int(subset), float("-inf"))),
+                    int(subset),
                 ),
-                int(subset),
             )
-        )
+        else:
+            if strict_pair_targets is not None:
+                positive_pair_subsets = [
+                    subset
+                    for subset in pair_subsets
+                    if int(subset) in strict_pair_targets
+                ]
+            else:
+                positive_pair_subsets = [
+                    subset
+                    for subset in pair_subsets
+                    if self._birthset_subset_inside_any_gold(
+                        subset,
+                        gold_local_subsets,
+                    )
+                ]
+            positive_pair_subsets.sort(
+                key=lambda subset: (
+                    min(
+                        (
+                            _birthset_local_subset_size(gold_subset)
+                            for gold_subset in gold_local_subsets
+                            if (int(subset) & ~int(gold_subset)) == 0
+                        ),
+                        default=G + 1,
+                    ),
+                    int(subset),
+                ),
+            )
         positive_pair_subsets = positive_pair_subsets[
             : int(self.birthset_proposal_max_order_seed_pairs)
         ]
+        _proposal_profile_mark("order_seed_prep")
+
+        order_candidate_subsets = []
+        order_slices = []
         for pair_subset in positive_pair_subsets:
             pair_subset = int(pair_subset)
             expansion_records = []
@@ -15971,32 +16328,45 @@ class TrainingModule(LightningModule):
                 target_ranks.append(float(rank))
             if len(expansion_records) < 2:
                 continue
-            seed_logits = proposal_head(
+            start = len(order_candidate_subsets)
+            order_candidate_subsets.extend(expansion_records)
+            order_slices.append((start, len(order_candidate_subsets), target_ranks))
+
+        if order_candidate_subsets:
+            order_logits_all = proposal_head(
                 component_embeddings,
-                expansion_records,
+                order_candidate_subsets,
                 context=context,
+                component_phyla_embeddings=component_phyla_embeddings,
             )
-            rank_tensor = torch.tensor(
-                target_ranks,
-                dtype=torch.float32,
-                device=device,
-            )
-            better = rank_tensor.unsqueeze(1) < rank_tensor.unsqueeze(0)
-            if not bool(better.any().item()):
-                continue
-            pairwise_margin = (
-                float(self.birthset_rank_margin)
-                - seed_logits.unsqueeze(1)
-                + seed_logits.unsqueeze(0)
-            )
-            order_losses.append(F.relu(pairwise_margin[better]).mean())
+            _proposal_profile_mark("order_forward")
+            for start, end, target_ranks in order_slices:
+                seed_logits = order_logits_all[int(start) : int(end)]
+                if int(seed_logits.numel()) < 2:
+                    continue
+                rank_tensor = torch.tensor(
+                    target_ranks,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                better = rank_tensor.unsqueeze(1) < rank_tensor.unsqueeze(0)
+                if not bool(better.any().item()):
+                    continue
+                pairwise_margin = (
+                    float(self.birthset_rank_margin)
+                    - seed_logits.unsqueeze(1)
+                    + seed_logits.unsqueeze(0)
+                )
+                order_losses.append(F.relu(pairwise_margin[better]).mean())
+            _proposal_profile_mark("order_loss")
         if order_losses:
             order_loss = torch.stack(order_losses).mean()
             losses.append(order_loss)
+        _proposal_profile_mark("finalize")
 
         if not losses:
             return None
-        return {
+        result = {
             "loss": torch.stack(losses).mean(),
             "pair_loss": None if pair_loss is None else pair_loss.detach(),
             "expansion_loss": None
@@ -16008,6 +16378,13 @@ class TrainingModule(LightningModule):
             "num_expansion_examples": float(len(expansion_subsets)),
             "num_order_seed_pairs": float(len(positive_pair_subsets)),
         }
+        if proposal_profile is not None:
+            result["profile"] = {
+                key: float(value)
+                for key, value in proposal_profile.items()
+                if not key.startswith("_")
+            }
+        return result
 
     def _birthset_select_compatible_top_k(
         self,
@@ -16204,6 +16581,51 @@ class TrainingModule(LightningModule):
             selected_keys.add(split_key)
         return completed
 
+    def _birthset_precomputed_group_for(
+        self,
+        batch,
+        batch_index,
+        component_masks,
+    ):
+        precomputed_by_batch = batch.get("batched_birthset_precomputed")
+        if not isinstance(precomputed_by_batch, (list, tuple)):
+            return None
+        if int(batch_index) >= len(precomputed_by_batch):
+            return None
+        sample_precomputed = precomputed_by_batch[int(batch_index)]
+        if not isinstance(sample_precomputed, dict):
+            return None
+        groups = sample_precomputed.get("groups_by_components")
+        if not isinstance(groups, dict):
+            return None
+        key = tuple(int(mask) for mask in component_masks)
+        group = groups.get(key)
+        if group is None:
+            # Be tolerant of future JSON-style materialization that may stringify keys.
+            group = groups.get(str(key))
+        if isinstance(group, dict):
+            return group
+        return None
+
+    def _birthset_candidate_info_from_precomputed(
+        self,
+        batch,
+        precomputed_group,
+    ):
+        if not bool(batch.get("_birthset_precomputed_candidate_info_enabled", False)):
+            return None
+        if self.birthset_use_train_birth_split_bank:
+            return None
+        if not isinstance(precomputed_group, dict):
+            return None
+        candidate_info = precomputed_group.get("candidate_info")
+        if not isinstance(candidate_info, dict):
+            return None
+        candidates = candidate_info.get("candidates")
+        if not isinstance(candidates, list):
+            return None
+        return candidate_info
+
     def _birthset_step_logs(
         self,
         batch,
@@ -16253,6 +16675,7 @@ class TrainingModule(LightningModule):
         proposal_pair_losses = []
         proposal_expansion_losses = []
         proposal_order_losses = []
+        proposal_profiles = []
         proposal_pair_recall_values = []
         proposal_pair_example_counts = []
         proposal_expansion_example_counts = []
@@ -16278,6 +16701,11 @@ class TrainingModule(LightningModule):
             if G <= 2:
                 continue
             loss_device = group["group_embeddings"].device
+            component_phyla_embeddings = (
+                group.get("component_phyla_embeddings")
+                if self.birthset_use_component_phyla_conditioning
+                else None
+            )
             group_targets = label_targets_by_batch[batch_index].get(
                 tuple(component_masks),
                 [],
@@ -16287,20 +16715,31 @@ class TrainingModule(LightningModule):
             for split in gold_splits:
                 found[(batch_index, split)] = True
 
+            precomputed_group = self._birthset_precomputed_group_for(
+                batch,
+                batch_index,
+                component_masks,
+            )
             num_leaves = self._birthset_num_leaves_for_group(
                 batch,
                 batch_index,
                 component_masks,
             )
-            candidate_info = self._birthset_build_candidates(
-                component_masks,
-                num_leaves,
-                gold_splits=gold_splits,
-                gold_local_subsets=gold_local_subsets,
-                component_embeddings=group["group_embeddings"],
-                context=group.get("graph_context"),
-                train=True,
+            candidate_info = self._birthset_candidate_info_from_precomputed(
+                batch,
+                precomputed_group,
             )
+            if candidate_info is None:
+                candidate_info = self._birthset_build_candidates(
+                    component_masks,
+                    num_leaves,
+                    gold_splits=gold_splits,
+                    gold_local_subsets=gold_local_subsets,
+                    component_embeddings=group["group_embeddings"],
+                    component_phyla_embeddings=component_phyla_embeddings,
+                    context=group.get("graph_context"),
+                    train=True,
+                )
             candidates = candidate_info["candidates"]
             full_mask = candidate_info["full_mask"]
             mismatch_count += int(candidate_info["gold_mismatches"])
@@ -16349,28 +16788,40 @@ class TrainingModule(LightningModule):
                 group["group_embeddings"],
                 local_subsets,
                 context=group.get("graph_context"),
+                component_phyla_embeddings=component_phyla_embeddings,
             )
             gold_split_keys = {
                 _birthset_canonical_unrooted_split(split, full_mask)
                 for split in gold_splits
             }
-            labels = torch.tensor(
-                [
-                    1.0
-                    if (
-                        _birthset_canonical_unrooted_split(
-                            item["split_mask"],
-                            full_mask,
+            precomputed_candidate_labels = candidate_info.get("candidate_labels")
+            if (
+                precomputed_candidate_labels is not None
+                and len(precomputed_candidate_labels) == len(candidates)
+            ):
+                labels = torch.tensor(
+                    [float(value) for value in precomputed_candidate_labels],
+                    dtype=torch.float32,
+                    device=logits.device,
+                )
+            else:
+                labels = torch.tensor(
+                    [
+                        1.0
+                        if (
+                            _birthset_canonical_unrooted_split(
+                                item["split_mask"],
+                                full_mask,
+                            )
+                            in gold_split_keys
+                            or int(item["local_subset"]) in gold_local_subsets
                         )
-                        in gold_split_keys
-                        or int(item["local_subset"]) in gold_local_subsets
-                    )
-                    else 0.0
-                    for item in candidates
-                ],
-                dtype=torch.float32,
-                device=logits.device,
-            )
+                        else 0.0
+                        for item in candidates
+                    ],
+                    dtype=torch.float32,
+                    device=logits.device,
+                )
             pos_weight = self._birthset_positive_weight(labels)
             weights = torch.where(labels > 0.5, pos_weight, labels.new_tensor(1.0))
             bce = (
@@ -16386,13 +16837,19 @@ class TrainingModule(LightningModule):
             proposal = self._birthset_proposal_loss(
                 group["group_embeddings"],
                 gold_local_subsets,
+                component_phyla_embeddings=component_phyla_embeddings,
                 context=group.get("graph_context"),
+                precomputed=None
+                if precomputed_group is None
+                else precomputed_group.get("proposal"),
             )
             if proposal is not None:
                 proposal_loss = proposal["loss"]
                 group_loss = group_loss + (
                     float(self.birthset_lambda_proposal) * proposal_loss
                 )
+                if proposal.get("profile"):
+                    proposal_profiles.append(dict(proposal["profile"]))
                 proposal_losses.append(proposal_loss.detach())
                 if proposal.get("pair_loss") is not None:
                     proposal_pair_losses.append(proposal["pair_loss"])
@@ -16522,6 +16979,42 @@ class TrainingModule(LightningModule):
             logs["birthset_stats/proposal_order_seed_pairs"] = torch.tensor(
                 float(np.mean(proposal_order_seed_pair_counts)),
                 device=loss_device,
+            )
+        if proposal_profiles and self._training_step_profile_enabled():
+            profile_keys = sorted(
+                {
+                    key
+                    for profile in proposal_profiles
+                    for key in profile.keys()
+                    if key not in {"groups"}
+                }
+            )
+            profile_summary = {
+                "groups": float(len(proposal_profiles)),
+            }
+            profile_summary.update(
+                {
+                    key: float(
+                        sum(float(profile.get(key, 0.0)) for profile in proposal_profiles)
+                    )
+                    for key in profile_keys
+                }
+            )
+            for key, value in profile_summary.items():
+                logs[f"birthset_stats/proposal_profile/{key}"] = torch.tensor(
+                    float(value),
+                    device=loss_device,
+                )
+            timing_text = " ".join(
+                f"{key}={float(value):.4f}s"
+                for key, value in profile_summary.items()
+                if key != "groups"
+            )
+            logging.info(
+                "BIRTHSET_PROPOSAL_PROFILE step=%s groups=%s %s",
+                int(getattr(self, "stepper", 0) or 0),
+                int(profile_summary["groups"]),
+                timing_text,
             )
         logs["birthset_stats/lambda_birth"] = torch.tensor(
             float(self.birthset_lambda_birth),
@@ -16670,6 +17163,11 @@ class TrainingModule(LightningModule):
         for group in sorted_outputs:
             component_masks = [int(split) for split in group["splits_represented"]]
             G = len(component_masks)
+            component_phyla_embeddings = (
+                group.get("component_phyla_embeddings")
+                if self.birthset_use_component_phyla_conditioning
+                else None
+            )
             required = self._birthset_num_required_splits(
                 G,
                 component_masks=component_masks,
@@ -16683,6 +17181,7 @@ class TrainingModule(LightningModule):
                 component_masks,
                 num_leaves,
                 component_embeddings=group["group_embeddings"],
+                component_phyla_embeddings=component_phyla_embeddings,
                 context=group.get("graph_context"),
                 train=False,
             )
@@ -16697,6 +17196,7 @@ class TrainingModule(LightningModule):
                     group["group_embeddings"],
                     local_subsets,
                     context=group.get("graph_context"),
+                    component_phyla_embeddings=component_phyla_embeddings,
                 )
             selected = self._birthset_select_compatible_top_k(
                 candidates,
@@ -22104,6 +22604,12 @@ class TrainingModule(LightningModule):
 
         # Compute the 2-norm for each layer
         norms = grad_norm(self, norm_type=2)
+
+        def _grad_norm_scalar(value):
+            if torch.is_tensor(value):
+                return float(value.detach().cpu().item())
+            return float(value)
+
         if "grad_2.0_norm_total" in norms:
             total = norms["grad_2.0_norm_total"]
         else:
@@ -22113,13 +22619,18 @@ class TrainingModule(LightningModule):
                 keys = [k for k in norms.keys() if "total" in k]
                 if keys:
                     total = norms[keys[0]]
+        total = _grad_norm_scalar(total)
 
         # total = norms.get("grad_2.0_norm_total", 0.0)
 
         layer_norms = {k: v for k, v in norms.items() if "total" not in k}
         if layer_norms:
-            max_grad = max(layer_norms.values())
-            mean_grad = torch.mean(torch.stack(list(layer_norms.values())))
+            layer_norm_values = [
+                _grad_norm_scalar(value)
+                for value in layer_norms.values()
+            ]
+            max_grad = max(layer_norm_values)
+            mean_grad = sum(layer_norm_values) / max(len(layer_norm_values), 1)
         else:
             max_grad = 0.0
             mean_grad = 0.0

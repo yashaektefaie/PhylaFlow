@@ -119,6 +119,11 @@ def _birthset_trainer_kwargs(config):
             "use_pair_prefix_candidates",
             False,
         ),
+        "birthset_use_component_phyla_conditioning": pick(
+            "birthset_use_component_phyla_conditioning",
+            "use_component_phyla_conditioning",
+            False,
+        ),
         "birthset_pair_prefix_top_pairs": pick(
             "birthset_pair_prefix_top_pairs",
             "top_pairs",
@@ -138,6 +143,11 @@ def _birthset_trainer_kwargs(config):
             "birthset_proposal_max_order_seed_pairs",
             "proposal_max_order_seed_pairs",
             128,
+        ),
+        "birthset_proposal_train_topk": pick(
+            "birthset_proposal_train_topk",
+            "proposal_train_topk",
+            False,
         ),
         "birthset_max_enum_components": pick(
             "birthset_max_enum_components",
@@ -665,6 +675,7 @@ def init_worker(config_file, device_id):
             "live_phyla_max_input_tokens",
             0,
         ),
+        live_phyla_device=config["trainer"].get("live_phyla_device"),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -1292,6 +1303,7 @@ def run_test():
             "live_phyla_max_input_tokens",
             0,
         ),
+        live_phyla_device=config["trainer"].get("live_phyla_device"),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -1984,6 +1996,7 @@ def run_overfit():
             "live_phyla_max_input_tokens",
             0,
         ),
+        live_phyla_device=config["trainer"].get("live_phyla_device"),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -2595,7 +2608,7 @@ def run_overfit():
         trainer_args["val_check_interval"] = config["trainer"]["val_callback_freq"]
 
     trainer_args["accelerator"] = "gpu"
-    trainer_args["devices"] = 1
+    trainer_args["devices"] = config["trainer"].get("devices", 1)
 
     trainer = Trainer(**trainer_args)
     trainer.fit(
@@ -2671,6 +2684,7 @@ def main():
             "live_phyla_max_input_tokens",
             0,
         ),
+        live_phyla_device=config["trainer"].get("live_phyla_device"),
         velocity_loss_mode=config["trainer"].get("velocity_loss_mode", "weighted"),
         velocity_loss_plain_weight=config["trainer"].get(
             "velocity_loss_plain_weight", 0.5
@@ -3279,6 +3293,7 @@ def main():
         ]
 
     trainer_args["accelerator"] = "gpu"
+    trainer_args["devices"] = config["trainer"].get("devices", 1)
     trainer = Trainer(**trainer_args)
     trainer.fit(
         model,

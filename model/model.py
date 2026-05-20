@@ -242,12 +242,26 @@ class BirthSetTopologyHead(nn.Module):
         dropout: float = 0.1,
         context_dim: int | None = None,
         max_components_norm: int = 128,
+        component_phyla_dim: int | None = None,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.context_dim = int(d_model if context_dim is None else context_dim)
         self.max_components_norm = max(1, int(max_components_norm))
+        self.component_phyla_dim = (
+            0 if component_phyla_dim is None else int(component_phyla_dim)
+        )
+        self.component_phyla_proj = None
+        if self.component_phyla_dim > 0:
+            self.component_phyla_proj = nn.Sequential(
+                nn.LayerNorm(self.component_phyla_dim),
+                nn.Linear(self.component_phyla_dim, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
         input_dim = (5 * int(d_model)) + self.context_dim + 3
+        if self.component_phyla_proj is not None:
+            input_dim += 5 * int(d_model)
         self.mlp = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden),
@@ -264,6 +278,7 @@ class BirthSetTopologyHead(nn.Module):
         component_embeddings: torch.Tensor,
         candidate_subsets,
         context: torch.Tensor | None = None,
+        component_phyla_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Score complete local birth-split candidates in one shot.
@@ -271,6 +286,8 @@ class BirthSetTopologyHead(nn.Module):
         component_embeddings: [G, D]
         candidate_subsets: iterable of integer local component bitmasks
         context: optional [context_dim] graph/global context
+        component_phyla_embeddings: optional [G, component_phyla_dim] pooled
+            sequence embeddings for the same components
         returns logits: [M]
         """
         H = self.norm(component_embeddings)
@@ -332,6 +349,50 @@ class BirthSetTopologyHead(nn.Module):
             ],
             dim=-1,
         )
+        if self.component_phyla_proj is not None:
+            if component_phyla_embeddings is None:
+                P = H.new_zeros((G, D))
+            else:
+                component_phyla_embeddings = component_phyla_embeddings.to(
+                    device=H.device,
+                    dtype=H.dtype,
+                )
+                if (
+                    component_phyla_embeddings.ndim != 2
+                    or int(component_phyla_embeddings.shape[0]) != int(G)
+                    or int(component_phyla_embeddings.shape[1])
+                    != int(self.component_phyla_dim)
+                ):
+                    raise ValueError(
+                        "component_phyla_embeddings must have shape "
+                        f"[{G}, {self.component_phyla_dim}] for birthset head"
+                    )
+                P = self.component_phyla_proj(component_phyla_embeddings)
+
+            p_in_sum = in_mask @ P
+            p_out_sum = out_mask @ P
+            p_in_mean = p_in_sum / in_counts
+            p_out_mean = p_out_sum / out_counts
+            phyla_sum = p_in_mean + p_out_mean
+            phyla_abs_diff = (p_in_mean - p_out_mean).abs()
+            phyla_product = p_in_mean * p_out_mean
+            phyla_struct_sum_interaction = (
+                (h_in_mean + h_out_mean) * phyla_sum
+            )
+            phyla_struct_diff_interaction = (
+                (h_in_mean - h_out_mean).abs() * phyla_abs_diff
+            )
+            features = torch.cat(
+                [
+                    features,
+                    phyla_sum,
+                    phyla_abs_diff,
+                    phyla_product,
+                    phyla_struct_sum_interaction,
+                    phyla_struct_diff_interaction,
+                ],
+                dim=-1,
+            )
         return self.mlp(features).squeeze(-1)
 
 
@@ -1347,6 +1408,55 @@ class TreeDenoiserTokenGT(nn.Module):
             return torch.zeros(0, self.embed_dim, device=device)
         return self.split_mask_proj(binary_masks)
 
+    def _compute_component_phyla_embeddings(
+        self,
+        phyla_embeddings,
+        batch_index,
+        component_masks,
+        leaf_indices=None,
+        *,
+        device,
+        dtype,
+    ):
+        if phyla_embeddings is None:
+            return None
+        if int(batch_index) >= int(phyla_embeddings.size(0)):
+            return None
+        leaf_embeddings = phyla_embeddings[int(batch_index)].to(
+            device=device,
+            dtype=dtype,
+        )
+        num_leaf_embeddings = int(leaf_embeddings.size(0))
+        if num_leaf_embeddings <= 0:
+            return None
+
+        if leaf_indices is not None:
+            if torch.is_tensor(leaf_indices):
+                leaf_bits = [int(idx) for idx in leaf_indices.detach().cpu().tolist()]
+            else:
+                leaf_bits = [int(idx) for idx in leaf_indices]
+            leaf_count = min(len(leaf_bits), num_leaf_embeddings)
+            leaf_bits = leaf_bits[:leaf_count]
+            leaf_embeddings = leaf_embeddings[:leaf_count]
+        else:
+            leaf_bits = list(range(num_leaf_embeddings))
+
+        rows = []
+        for component_mask in component_masks or []:
+            mask_int = int(component_mask)
+            select = torch.tensor(
+                [bool((mask_int >> bit) & 1) for bit in leaf_bits],
+                device=device,
+                dtype=torch.bool,
+            )
+            if bool(select.any().item()):
+                rows.append(leaf_embeddings[select].mean(dim=0))
+            else:
+                rows.append(leaf_embeddings.new_zeros((leaf_embeddings.size(-1),)))
+        if not rows:
+            return None
+        return torch.stack(rows, dim=0)
+
     def _normalize_phyla_embeddings(self, phyla_embeddings, batch_size):
         if phyla_embeddings is None:
             return None
@@ -1620,6 +1730,8 @@ class TreeDenoiserTokenGT(nn.Module):
         phyla_global_context = None
         phyla_clade_context = None
         if phyla_embeddings is not None:
+            if phyla_embeddings.device != x.device:
+                phyla_embeddings = phyla_embeddings.to(device=x.device)
             phyla_global_context = self._compute_global_phyla_context(
                 phyla_embeddings,
                 leaf_idx,
@@ -1703,6 +1815,7 @@ class TreeDenoiserTokenGT(nn.Module):
             edge_split_masks,
             phyla_global_context,
             phyla_clade_context,
+            phyla_embeddings,
         )
 
     def _encode_with_layers(self, x, padding_mask, layers, final_layer_norm):
@@ -2405,6 +2518,7 @@ class TreeDenoiserTokenGT(nn.Module):
         first_hit_start_tree_graph_context=None,
         phyla_global_context=None,
         phyla_clade_context=None,
+        phyla_embeddings=None,
     ):
         B, _T, D = x.shape
         leaf_idx_list = list(leaf_idx) if isinstance(leaf_idx, (list, tuple)) else [leaf_idx]
@@ -2647,6 +2761,20 @@ class TreeDenoiserTokenGT(nn.Module):
                         "graph_context": x[b, 0, :],
                         "decoder_mode": self.autoregressive_head_mode,
                     }
+                    component_phyla_embeddings = (
+                        self._compute_component_phyla_embeddings(
+                            phyla_embeddings,
+                            b,
+                            group_splits,
+                            leaf_idx_list[b],
+                            device=group_embeddings.device,
+                            dtype=group_embeddings.dtype,
+                        )
+                    )
+                    if component_phyla_embeddings is not None:
+                        group_output["component_phyla_embeddings"] = (
+                            component_phyla_embeddings
+                        )
                     group_output.update(head_outputs)
                     all_group_logits.append(group_output)
             return all_group_logits
@@ -2793,6 +2921,7 @@ class TreeDenoiserTokenGT(nn.Module):
             edge_split_masks,
             phyla_global_context,
             phyla_clade_context,
+            phyla_embeddings,
         ) = (
             self._prepare_encoder_inputs(
                 tokenized_tree_batch,
@@ -2830,6 +2959,7 @@ class TreeDenoiserTokenGT(nn.Module):
             first_hit_start_tree_graph_context=first_hit_start_tree_graph_context,
             phyla_global_context=phyla_global_context,
             phyla_clade_context=phyla_clade_context,
+            phyla_embeddings=phyla_embeddings,
         )
 
 
@@ -2939,6 +3069,7 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
             edge_split_masks,
             phyla_global_context,
             phyla_clade_context,
+            phyla_embeddings,
         ) = (
             self._prepare_encoder_inputs(
                 tokenized_tree_batch,
@@ -2983,6 +3114,7 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
             first_hit_start_tree_graph_context=first_hit_start_tree_graph_context,
             phyla_global_context=phyla_global_context,
             phyla_clade_context=phyla_clade_context,
+            phyla_embeddings=phyla_embeddings,
         )
 
 
@@ -3113,6 +3245,7 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
             edge_split_masks,
             phyla_global_context,
             phyla_clade_context,
+            phyla_embeddings,
         ) = (
             self._prepare_encoder_inputs(
                 tokenized_tree_batch,
@@ -3163,6 +3296,7 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
             first_hit_start_tree_graph_context=first_hit_start_tree_graph_context,
             phyla_global_context=phyla_global_context,
             phyla_clade_context=phyla_clade_context,
+            phyla_embeddings=phyla_embeddings,
         )
 
 

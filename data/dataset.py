@@ -19,6 +19,7 @@ import os
 import re
 import json
 import math
+import itertools
 import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -121,6 +122,538 @@ def _birthset_boundary_training_event(boundary_newick: str, birth_splits) -> Opt
         "newick": str(boundary_newick),
         "labels": labels,
         "stop_after_merge": True,
+    }
+
+
+def _birthset_full_mask_for_num_leaves(num_leaves: int) -> int:
+    biological_bits = max(int(num_leaves) - 1, 0)
+    return (1 << biological_bits) - 1 if biological_bits > 0 else 0
+
+
+def _birthset_local_subset_size(local_subset: int) -> int:
+    return int(local_subset).bit_count()
+
+
+def _birthset_local_subset_to_split(
+    local_subset: int,
+    component_masks: List[int],
+) -> int:
+    split = 0
+    for idx, component in enumerate(component_masks):
+        if (int(local_subset) >> int(idx)) & 1:
+            split |= int(component)
+    return int(split)
+
+
+def _birthset_valid_local_subset(local_subset: int, num_components: int) -> bool:
+    size = _birthset_local_subset_size(local_subset)
+    return 2 <= size <= max(int(num_components) - 1, 0)
+
+
+def _birthset_valid_rooted_split(split_mask: int, full_mask: int) -> bool:
+    split_mask = int(split_mask) & int(full_mask)
+    return 1 < split_mask.bit_count() < int(full_mask).bit_count()
+
+
+def _birthset_canonical_unrooted_split(split_mask: int, full_mask: int) -> int:
+    full_mask = int(full_mask)
+    split_mask = int(split_mask) & full_mask
+    complement = full_mask ^ split_mask
+    return min(int(split_mask), int(complement))
+
+
+def _birthset_candidate_record(
+    local_subset: int,
+    component_masks: List[int],
+    source: str,
+) -> Dict[str, Any]:
+    local_subset = int(local_subset)
+    return {
+        "local_subset": local_subset,
+        "split_mask": _birthset_local_subset_to_split(local_subset, component_masks),
+        "source": str(source),
+        "size": _birthset_local_subset_size(local_subset),
+    }
+
+
+def _birthset_add_candidate_record(
+    candidates_by_subset: Dict[int, Dict[str, Any]],
+    local_subset: int,
+    component_masks: List[int],
+    full_mask: int,
+    source: str,
+    *,
+    max_candidates: int,
+    force: bool = False,
+) -> bool:
+    local_subset = int(local_subset)
+    if not _birthset_valid_local_subset(local_subset, len(component_masks)):
+        return False
+    split_mask = _birthset_local_subset_to_split(local_subset, component_masks)
+    if not _birthset_valid_rooted_split(split_mask, full_mask):
+        return False
+    if not force and len(candidates_by_subset) >= int(max_candidates):
+        return False
+    existing = candidates_by_subset.get(local_subset)
+    if existing is not None and existing.get("source") == "gold":
+        return True
+    candidates_by_subset[local_subset] = _birthset_candidate_record(
+        local_subset,
+        component_masks,
+        source,
+    )
+    return True
+
+
+def _birthset_num_required_splits_for_group(
+    num_components: int,
+    component_masks: List[int],
+    full_mask: int,
+) -> int:
+    parent_mask = 0
+    for component in component_masks:
+        parent_mask |= int(component)
+    is_root_polytomy = bool(
+        int(full_mask) != 0 and (int(parent_mask) & int(full_mask)) == int(full_mask)
+    )
+    offset = 3 if is_root_polytomy else 2
+    return max(int(num_components) - offset, 0)
+
+
+def _birthset_subset_inside_any_gold(
+    local_subset: int,
+    gold_local_subsets: List[int],
+) -> bool:
+    local_subset = int(local_subset)
+    for gold_subset in gold_local_subsets or []:
+        gold_subset = int(gold_subset)
+        if gold_subset and (local_subset & ~gold_subset) == 0:
+            return True
+    return False
+
+
+def _birthset_constructive_pair_targets(
+    gold_local_subsets: List[int],
+    num_components: int,
+) -> set[int]:
+    gold = [
+        int(mask)
+        for mask in sorted({int(mask) for mask in gold_local_subsets or []})
+        if _birthset_valid_local_subset(int(mask), int(num_components))
+    ]
+    if not gold:
+        return set()
+
+    direct_pair_targets = {
+        int(mask)
+        for mask in gold
+        if _birthset_local_subset_size(int(mask)) == 2
+    }
+    if direct_pair_targets:
+        return direct_pair_targets
+
+    min_size = min(_birthset_local_subset_size(mask) for mask in gold)
+    targets = set()
+    for gold_subset in gold:
+        if _birthset_local_subset_size(gold_subset) != int(min_size):
+            continue
+        members = [
+            idx
+            for idx in range(int(num_components))
+            if (int(gold_subset) >> int(idx)) & 1
+        ]
+        for left_pos, left_idx in enumerate(members):
+            for right_idx in members[left_pos + 1 :]:
+                pair = (1 << int(left_idx)) | (1 << int(right_idx))
+                if _birthset_valid_local_subset(pair, int(num_components)):
+                    targets.add(int(pair))
+    return targets
+
+
+def _birthset_num_leaves_for_precompute(
+    sample: Dict[str, Any],
+    component_masks: List[int],
+    gold_splits: List[int],
+) -> int:
+    if sample.get("num_leaves") is not None:
+        try:
+            return int(sample["num_leaves"])
+        except Exception:
+            pass
+    max_bit = 0
+    for mask in list(component_masks or []) + list(gold_splits or []):
+        max_bit = max(max_bit, int(mask).bit_length())
+    if max_bit > 0:
+        return int(max_bit + 1)
+    newick = sample.get("newick") or sample.get("newick_tree")
+    if newick:
+        try:
+            return int(Tree(str(newick)).n_leaves)
+        except Exception:
+            pass
+    return 0
+
+
+def _birthset_precompute_group(
+    sample: Dict[str, Any],
+    component_masks: List[int],
+    group_targets: List[Tuple[int, int]],
+    *,
+    use_small_polytomy_enumeration: bool,
+    use_static_pair_triple_candidates: bool,
+    max_enum_components: int,
+    max_candidates_per_polytomy: int,
+    proposal_pair_target_mode: str,
+    proposal_max_expansion_examples: int,
+    proposal_max_order_seed_pairs: int,
+    proposal_train_topk: bool,
+) -> Dict[str, Any]:
+    component_masks = [int(mask) for mask in component_masks]
+    G = len(component_masks)
+    gold_splits = sorted({int(split) for split, _ in group_targets})
+    gold_local_subsets = sorted(
+        {
+            int(mask)
+            for _, mask in group_targets
+            if _birthset_valid_local_subset(int(mask), G)
+        }
+    )
+    num_leaves = _birthset_num_leaves_for_precompute(
+        sample,
+        component_masks,
+        gold_splits,
+    )
+    full_mask = _birthset_full_mask_for_num_leaves(num_leaves)
+    max_bit_length = max(
+        [int(full_mask).bit_length()]
+        + [int(mask).bit_length() for mask in component_masks]
+        + [int(mask).bit_length() for mask in gold_splits]
+    )
+    if max_bit_length > int(full_mask).bit_length():
+        full_mask = (1 << int(max_bit_length)) - 1
+
+    candidates_by_subset: Dict[int, Dict[str, Any]] = {}
+    if use_small_polytomy_enumeration and G <= int(max_enum_components):
+        for size in range(2, G):
+            for combo in itertools.combinations(range(G), size):
+                local_subset = 0
+                for idx in combo:
+                    local_subset |= 1 << int(idx)
+                _birthset_add_candidate_record(
+                    candidates_by_subset,
+                    local_subset,
+                    component_masks,
+                    full_mask,
+                    "enum",
+                    max_candidates=max_candidates_per_polytomy,
+                )
+                if len(candidates_by_subset) >= int(max_candidates_per_polytomy):
+                    break
+            if len(candidates_by_subset) >= int(max_candidates_per_polytomy):
+                break
+
+    if use_static_pair_triple_candidates and G > int(max_enum_components):
+        for left_idx in range(G):
+            for right_idx in range(left_idx + 1, G):
+                subset = (1 << int(left_idx)) | (1 << int(right_idx))
+                _birthset_add_candidate_record(
+                    candidates_by_subset,
+                    subset,
+                    component_masks,
+                    full_mask,
+                    "pair_static",
+                    max_candidates=max_candidates_per_polytomy,
+                )
+                if len(candidates_by_subset) >= int(max_candidates_per_polytomy):
+                    break
+            if len(candidates_by_subset) >= int(max_candidates_per_polytomy):
+                break
+        if len(candidates_by_subset) < int(max_candidates_per_polytomy):
+            for combo in itertools.combinations(range(G), 3):
+                subset = 0
+                for idx in combo:
+                    subset |= 1 << int(idx)
+                _birthset_add_candidate_record(
+                    candidates_by_subset,
+                    subset,
+                    component_masks,
+                    full_mask,
+                    "triple_static",
+                    max_candidates=max_candidates_per_polytomy,
+                )
+                if len(candidates_by_subset) >= int(max_candidates_per_polytomy):
+                    break
+
+    pre_gold_candidate_splits = {
+        _birthset_canonical_unrooted_split(item["split_mask"], full_mask)
+        for item in candidates_by_subset.values()
+    }
+    pre_gold_candidate_local_subsets = {
+        int(item["local_subset"]) for item in candidates_by_subset.values()
+    }
+    pre_gold_target_count = len(
+        {("split", int(split)) for split in gold_splits}
+        | {("local", int(local_subset)) for local_subset in gold_local_subsets}
+    )
+    pre_gold_target_hits = len(
+        {
+            ("split", int(split))
+            for split in gold_splits
+            if _birthset_canonical_unrooted_split(split, full_mask)
+            in pre_gold_candidate_splits
+        }
+        | {
+            ("local", int(local_subset))
+            for local_subset in gold_local_subsets
+            if int(local_subset) in pre_gold_candidate_local_subsets
+        }
+    )
+
+    gold_mismatches = 0
+    for split in gold_splits:
+        local_subset = _birthset_local_subset_for_components(
+            split,
+            component_masks,
+        )
+        if local_subset is None:
+            gold_mismatches += 1
+            continue
+        _birthset_add_candidate_record(
+            candidates_by_subset,
+            local_subset,
+            component_masks,
+            full_mask,
+            "gold",
+            max_candidates=max_candidates_per_polytomy,
+            force=True,
+        )
+    for local_subset in gold_local_subsets:
+        added = _birthset_add_candidate_record(
+            candidates_by_subset,
+            local_subset,
+            component_masks,
+            full_mask,
+            "gold",
+            max_candidates=max_candidates_per_polytomy,
+            force=True,
+        )
+        if not added:
+            gold_mismatches += 1
+
+    candidates = list(candidates_by_subset.values())
+    source_rank = {"gold": 0, "pair_static": 1, "triple_static": 2, "bank": 3, "enum": 4}
+    candidates.sort(
+        key=lambda item: (
+            source_rank.get(item["source"], 9),
+            int(item["size"]),
+            int(item["split_mask"]),
+        )
+    )
+    gold_split_keys = {
+        _birthset_canonical_unrooted_split(split, full_mask)
+        for split in gold_splits
+    }
+    candidate_labels = [
+        1.0
+        if (
+            _birthset_canonical_unrooted_split(item["split_mask"], full_mask)
+            in gold_split_keys
+            or int(item["local_subset"]) in gold_local_subsets
+        )
+        else 0.0
+        for item in candidates
+    ]
+
+    pair_subsets = []
+    for left_idx in range(G):
+        for right_idx in range(left_idx + 1, G):
+            subset = (1 << int(left_idx)) | (1 << int(right_idx))
+            if _birthset_valid_local_subset(subset, G):
+                pair_subsets.append(int(subset))
+    constructive_pair_targets = _birthset_constructive_pair_targets(
+        gold_local_subsets,
+        G,
+    )
+    strict_pair_targets = (
+        constructive_pair_targets
+        if str(proposal_pair_target_mode) == "strict_minimal"
+        else None
+    )
+    pair_labels = [
+        1.0
+        if (
+            int(subset) in strict_pair_targets
+            if strict_pair_targets is not None
+            else _birthset_subset_inside_any_gold(subset, gold_local_subsets)
+        )
+        else 0.0
+        for subset in pair_subsets
+    ]
+
+    expansion_subsets = None
+    expansion_labels = None
+    if not bool(proposal_train_topk):
+        expansion_subsets = []
+        for combo in itertools.combinations(range(G), 3):
+            subset = 0
+            for idx in combo:
+                subset |= 1 << int(idx)
+            expansion_subsets.append(int(subset))
+        if expansion_subsets:
+            positives = [
+                subset
+                for subset in expansion_subsets
+                if _birthset_subset_inside_any_gold(subset, gold_local_subsets)
+            ]
+            negatives = [
+                subset
+                for subset in expansion_subsets
+                if not _birthset_subset_inside_any_gold(subset, gold_local_subsets)
+            ]
+            cap = int(proposal_max_expansion_examples)
+            if len(positives) + len(negatives) > cap:
+                expansion_subsets = positives + negatives[: max(0, cap - len(positives))]
+            else:
+                expansion_subsets = positives + negatives
+            expansion_labels = [
+                1.0
+                if _birthset_subset_inside_any_gold(subset, gold_local_subsets)
+                else 0.0
+                for subset in expansion_subsets
+            ]
+
+    if strict_pair_targets is not None:
+        positive_pair_subsets = [
+            subset for subset in pair_subsets if int(subset) in strict_pair_targets
+        ]
+    else:
+        positive_pair_subsets = [
+            subset
+            for subset in pair_subsets
+            if _birthset_subset_inside_any_gold(subset, gold_local_subsets)
+        ]
+    positive_pair_subsets.sort(
+        key=lambda subset: (
+            min(
+                (
+                    _birthset_local_subset_size(gold_subset)
+                    for gold_subset in gold_local_subsets
+                    if (int(subset) & ~int(gold_subset)) == 0
+                ),
+                default=G + 1,
+            ),
+            int(subset),
+        )
+    )
+    positive_pair_subsets = positive_pair_subsets[
+        : int(proposal_max_order_seed_pairs)
+    ]
+    order_candidate_subsets = []
+    order_slices = []
+    for pair_subset in positive_pair_subsets:
+        pair_subset = int(pair_subset)
+        target_ranks = []
+        start = len(order_candidate_subsets)
+        for idx in range(G):
+            if (pair_subset >> int(idx)) & 1:
+                continue
+            candidate_subset = int(pair_subset | (1 << int(idx)))
+            if not _birthset_valid_local_subset(candidate_subset, G):
+                continue
+            containing_sizes = [
+                _birthset_local_subset_size(gold_subset)
+                for gold_subset in gold_local_subsets
+                if (pair_subset & ~int(gold_subset)) == 0
+                and (candidate_subset & ~int(gold_subset)) == 0
+            ]
+            rank = min(containing_sizes) if containing_sizes else G + 1
+            order_candidate_subsets.append(candidate_subset)
+            target_ranks.append(float(rank))
+        end = len(order_candidate_subsets)
+        if end - start >= 2:
+            order_slices.append((start, end, target_ranks))
+        else:
+            del order_candidate_subsets[start:end]
+
+    return {
+        "components": tuple(component_masks),
+        "gold_splits": gold_splits,
+        "gold_local_subsets": gold_local_subsets,
+        "candidate_info": {
+            "candidates": candidates,
+            "candidate_labels": candidate_labels,
+            "full_mask": int(full_mask),
+            "gold_mismatches": int(gold_mismatches),
+            "pre_gold_target_count": int(pre_gold_target_count),
+            "pre_gold_target_hits": int(pre_gold_target_hits),
+            "static_pair_triple_candidates": bool(use_static_pair_triple_candidates),
+        },
+        "proposal": {
+            "pair_subsets": pair_subsets,
+            "pair_labels": pair_labels,
+            "strict_pair_targets": sorted(int(x) for x in strict_pair_targets or []),
+            "gold_local_subsets": gold_local_subsets,
+            "expansion_subsets": expansion_subsets,
+            "expansion_labels": expansion_labels,
+            "order_candidate_subsets": order_candidate_subsets,
+            "order_slices": order_slices,
+            "positive_pair_count": int(len(positive_pair_subsets)),
+            "train_topk_dynamic": bool(proposal_train_topk),
+        },
+        "required_splits": int(
+            _birthset_num_required_splits_for_group(G, component_masks, full_mask)
+        ),
+    }
+
+
+def _birthset_precompute_sample(
+    sample: Dict[str, Any],
+    *,
+    use_small_polytomy_enumeration: bool,
+    use_static_pair_triple_candidates: bool,
+    max_enum_components: int,
+    max_candidates_per_polytomy: int,
+    proposal_pair_target_mode: str,
+    proposal_max_expansion_examples: int,
+    proposal_max_order_seed_pairs: int,
+    proposal_train_topk: bool,
+) -> Optional[Dict[str, Any]]:
+    labels = sample.get("labels") or sample.get("autoregressive_labels")
+    if not labels:
+        return None
+    group_targets: Dict[Tuple[int, ...], List[Tuple[int, int]]] = {}
+    for label in labels:
+        if not isinstance(label, dict):
+            continue
+        components = tuple(int(component) for component in label.get("components", []))
+        if not components:
+            continue
+        merge_indices = [int(idx) for idx in label.get("merge_indices", [])]
+        local_subset = 0
+        for idx in merge_indices:
+            local_subset |= 1 << int(idx)
+        result_split = int(label.get("result_split", 0))
+        group_targets.setdefault(components, []).append((result_split, local_subset))
+    if not group_targets:
+        return None
+    groups_by_components = {}
+    for components, targets in group_targets.items():
+        groups_by_components[components] = _birthset_precompute_group(
+            sample,
+            list(components),
+            targets,
+            use_small_polytomy_enumeration=use_small_polytomy_enumeration,
+            use_static_pair_triple_candidates=use_static_pair_triple_candidates,
+            max_enum_components=max_enum_components,
+            max_candidates_per_polytomy=max_candidates_per_polytomy,
+            proposal_pair_target_mode=proposal_pair_target_mode,
+            proposal_max_expansion_examples=proposal_max_expansion_examples,
+            proposal_max_order_seed_pairs=proposal_max_order_seed_pairs,
+            proposal_train_topk=proposal_train_topk,
+        )
+    return {
+        "groups_by_components": groups_by_components,
+        "num_groups": int(len(groups_by_components)),
     }
 
 
@@ -3724,6 +4257,37 @@ class PhylaDataModule(pl.LightningDataModule):
                 config["data"].get("full_path_precompute_tokenizer_graph_cache", False),
             )
         )
+        self.full_path_precompute_birthset_targets = bool(
+            config["data"].get("full_path_precompute_birthset_targets", False)
+        )
+        self.full_path_precompute_birthset_candidate_info = bool(
+            config["data"].get("full_path_precompute_birthset_candidate_info", False)
+        )
+        self.full_path_birthset_static_pair_triple_candidates = bool(
+            config["data"].get("full_path_birthset_static_pair_triple_candidates", True)
+        )
+        trainer_cfg = config.get("trainer", {})
+        self.birthset_use_small_polytomy_enumeration = bool(
+            trainer_cfg.get("birthset_use_small_polytomy_enumeration", True)
+        )
+        self.birthset_max_enum_components = int(
+            trainer_cfg.get("birthset_max_enum_components", 12)
+        )
+        self.birthset_max_candidates_per_polytomy = int(
+            trainer_cfg.get("birthset_max_candidates_per_polytomy", 2048)
+        )
+        self.birthset_proposal_pair_target_mode = str(
+            trainer_cfg.get("birthset_proposal_pair_target_mode", "contained")
+        )
+        self.birthset_proposal_max_expansion_examples = int(
+            trainer_cfg.get("birthset_proposal_max_expansion_examples", 4096)
+        )
+        self.birthset_proposal_max_order_seed_pairs = int(
+            trainer_cfg.get("birthset_proposal_max_order_seed_pairs", 128)
+        )
+        self.birthset_proposal_train_topk = bool(
+            trainer_cfg.get("birthset_proposal_train_topk", False)
+        )
         self.full_path_use_terminal_samples = (
             float(config.get("trainer", {}).get("velocity_terminal_head_weight", 0.0))
             > 0.0
@@ -4496,6 +5060,41 @@ class PhylaDataModule(pl.LightningDataModule):
                 out_key="newick_tokenizer_raw_graph",
             )
 
+    def _attach_birthset_precompute_to_full_path_samples(
+        self,
+        autoregressive_samples,
+    ):
+        if not (
+            self.full_path_precompute_birthset_targets
+            or self.full_path_precompute_birthset_candidate_info
+        ):
+            return
+        for sample in autoregressive_samples:
+            sample["_birthset_precomputed_candidate_info_enabled"] = bool(
+                self.full_path_precompute_birthset_candidate_info
+            )
+            if sample.get("birthset_precomputed") is not None:
+                continue
+            precomputed = _birthset_precompute_sample(
+                sample,
+                use_small_polytomy_enumeration=self.birthset_use_small_polytomy_enumeration,
+                use_static_pair_triple_candidates=(
+                    self.full_path_birthset_static_pair_triple_candidates
+                ),
+                max_enum_components=self.birthset_max_enum_components,
+                max_candidates_per_polytomy=self.birthset_max_candidates_per_polytomy,
+                proposal_pair_target_mode=self.birthset_proposal_pair_target_mode,
+                proposal_max_expansion_examples=(
+                    self.birthset_proposal_max_expansion_examples
+                ),
+                proposal_max_order_seed_pairs=(
+                    self.birthset_proposal_max_order_seed_pairs
+                ),
+                proposal_train_topk=self.birthset_proposal_train_topk,
+            )
+            if precomputed is not None:
+                sample["birthset_precomputed"] = precomputed
+
     def _collate_bhv_tree_entry(self, tree_newick):
         key = str(tree_newick)
         cached = self._collate_bhv_tree_cache.get(key)
@@ -4540,6 +5139,9 @@ class PhylaDataModule(pl.LightningDataModule):
             full_path_control_mode
             and self.full_path_precompute_tokenizer_raw_graphs
         ):
+            self._attach_birthset_precompute_to_full_path_samples(
+                full_path_autoregressive_samples
+            )
             self._attach_tokenizer_raw_graph_to_full_path_samples(
                 full_path_velocity_samples,
                 full_path_autoregressive_samples,
@@ -4577,6 +5179,10 @@ class PhylaDataModule(pl.LightningDataModule):
                         full_path_joint_tokenizer_raw_graph_batch[
                             "autoregressive_count"
                         ] = int(len(full_path_autoregressive_samples))
+        elif full_path_control_mode:
+            self._attach_birthset_precompute_to_full_path_samples(
+                full_path_autoregressive_samples
+            )
 
         if self.use_historical_collate:
             flat_batch = []
@@ -4695,6 +5301,9 @@ class PhylaDataModule(pl.LightningDataModule):
                     to_run["full_path_joint_tokenizer_raw_graph_batch"] = (
                         full_path_joint_tokenizer_raw_graph_batch
                     )
+                to_run["_birthset_precomputed_candidate_info_enabled"] = bool(
+                    self.full_path_precompute_birthset_candidate_info
+                )
                 to_run["_full_path_control_mode"] = True
             return to_run
 
@@ -4877,6 +5486,9 @@ class PhylaDataModule(pl.LightningDataModule):
                 to_run["full_path_joint_tokenizer_raw_graph_batch"] = (
                     full_path_joint_tokenizer_raw_graph_batch
                 )
+            to_run["_birthset_precomputed_candidate_info_enabled"] = bool(
+                self.full_path_precompute_birthset_candidate_info
+            )
             to_run["_full_path_control_mode"] = True
         return to_run
 
