@@ -1,4 +1,7 @@
 import math
+import logging
+import os
+import time
 from collections import OrderedDict
 from math import log, sqrt
 
@@ -272,6 +275,19 @@ class BirthSetTopologyHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(max(1, hidden // 2), 1),
         )
+        expansion_input_dim = (6 * int(d_model)) + self.context_dim + 3
+        if self.component_phyla_proj is not None:
+            expansion_input_dim += 4 * int(d_model)
+        self.expansion_mlp = nn.Sequential(
+            nn.LayerNorm(expansion_input_dim),
+            nn.Linear(expansion_input_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, max(1, hidden // 2)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(1, hidden // 2), 1),
+        )
 
     def forward(
         self,
@@ -291,10 +307,57 @@ class BirthSetTopologyHead(nn.Module):
         returns logits: [M]
         """
         H = self.norm(component_embeddings)
+        features = self._candidate_features(
+            H,
+            candidate_subsets,
+            context=context,
+            component_phyla_embeddings=component_phyla_embeddings,
+        )
+        if features.numel() == 0:
+            return H.new_empty((0,))
+        return self.mlp(features).squeeze(-1)
+
+    def _project_component_phyla(
+        self,
+        H: torch.Tensor,
+        component_phyla_embeddings: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        if self.component_phyla_proj is None:
+            return None
+        G, D = H.shape
+        if component_phyla_embeddings is None:
+            return H.new_zeros((G, D))
+        component_phyla_embeddings = component_phyla_embeddings.to(
+            device=H.device,
+            dtype=H.dtype,
+        )
+        if (
+            component_phyla_embeddings.ndim != 2
+            or int(component_phyla_embeddings.shape[0]) != int(G)
+            or int(component_phyla_embeddings.shape[1])
+            != int(self.component_phyla_dim)
+        ):
+            raise ValueError(
+                "component_phyla_embeddings must have shape "
+                f"[{G}, {self.component_phyla_dim}] for birthset head"
+            )
+        return self.component_phyla_proj(component_phyla_embeddings)
+
+    def _candidate_features(
+        self,
+        H: torch.Tensor,
+        candidate_subsets,
+        context: torch.Tensor | None = None,
+        component_phyla_embeddings: torch.Tensor | None = None,
+        projected_component_phyla: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         G, D = H.shape
         candidate_subsets = [int(mask) for mask in candidate_subsets]
         if G <= 0 or not candidate_subsets:
-            return H.new_empty((0,))
+            input_dim = (5 * int(D)) + self.context_dim + 3
+            if self.component_phyla_proj is not None:
+                input_dim += 5 * int(D)
+            return H.new_empty((0, input_dim))
 
         rows = []
         for subset in candidate_subsets:
@@ -350,24 +413,9 @@ class BirthSetTopologyHead(nn.Module):
             dim=-1,
         )
         if self.component_phyla_proj is not None:
-            if component_phyla_embeddings is None:
-                P = H.new_zeros((G, D))
-            else:
-                component_phyla_embeddings = component_phyla_embeddings.to(
-                    device=H.device,
-                    dtype=H.dtype,
-                )
-                if (
-                    component_phyla_embeddings.ndim != 2
-                    or int(component_phyla_embeddings.shape[0]) != int(G)
-                    or int(component_phyla_embeddings.shape[1])
-                    != int(self.component_phyla_dim)
-                ):
-                    raise ValueError(
-                        "component_phyla_embeddings must have shape "
-                        f"[{G}, {self.component_phyla_dim}] for birthset head"
-                    )
-                P = self.component_phyla_proj(component_phyla_embeddings)
+            P = projected_component_phyla
+            if P is None:
+                P = self._project_component_phyla(H, component_phyla_embeddings)
 
             p_in_sum = in_mask @ P
             p_out_sum = out_mask @ P
@@ -393,7 +441,743 @@ class BirthSetTopologyHead(nn.Module):
                 ],
                 dim=-1,
             )
-        return self.mlp(features).squeeze(-1)
+        return features
+
+    @staticmethod
+    def _subset_indices_from_masks(candidate_subsets, num_components: int):
+        return [
+            [
+                int(idx)
+                for idx in range(int(num_components))
+                if (int(mask) >> int(idx)) & 1
+            ]
+            for mask in candidate_subsets
+        ]
+
+    def _packed_components(
+        self,
+        component_embeddings_list,
+        component_phyla_embeddings_list=None,
+    ):
+        if not component_embeddings_list:
+            return None
+        device = component_embeddings_list[0].device
+        counts = [
+            int(component_embeddings.shape[0])
+            for component_embeddings in component_embeddings_list
+        ]
+        H_parts = [self.norm(component_embeddings) for component_embeddings in component_embeddings_list]
+        H_flat = torch.cat(H_parts, dim=0)
+        group_ids = torch.repeat_interleave(
+            torch.arange(len(counts), device=device, dtype=torch.long),
+            torch.tensor(counts, device=device, dtype=torch.long),
+        )
+        group_sums = H_flat.new_zeros((len(counts), H_flat.shape[-1]))
+        if H_flat.numel() > 0:
+            group_sums.index_add_(0, group_ids, H_flat)
+        group_counts = torch.tensor(counts, device=device, dtype=H_flat.dtype)
+
+        P_flat = None
+        phyla_group_sums = None
+        if self.component_phyla_proj is not None:
+            phyla_parts = []
+            component_phyla_embeddings_list = component_phyla_embeddings_list or [
+                None for _ in component_embeddings_list
+            ]
+            for component_embeddings, phyla_embeddings in zip(
+                component_embeddings_list,
+                component_phyla_embeddings_list,
+            ):
+                G = int(component_embeddings.shape[0])
+                if phyla_embeddings is None:
+                    phyla_parts.append(
+                        component_embeddings.new_zeros((G, self.component_phyla_dim))
+                    )
+                else:
+                    phyla_embeddings = phyla_embeddings.to(
+                        device=component_embeddings.device,
+                        dtype=component_embeddings.dtype,
+                    )
+                    if (
+                        phyla_embeddings.ndim != 2
+                        or int(phyla_embeddings.shape[0]) != G
+                        or int(phyla_embeddings.shape[1]) != int(self.component_phyla_dim)
+                    ):
+                        raise ValueError(
+                            "component_phyla_embeddings must have shape "
+                            f"[{G}, {self.component_phyla_dim}] for birthset head"
+                        )
+                    phyla_parts.append(phyla_embeddings)
+            P_flat = self.component_phyla_proj(torch.cat(phyla_parts, dim=0))
+            phyla_group_sums = P_flat.new_zeros((len(counts), P_flat.shape[-1]))
+            if P_flat.numel() > 0:
+                phyla_group_sums.index_add_(0, group_ids, P_flat)
+
+        return {
+            "H_flat": H_flat,
+            "group_sums": group_sums,
+            "group_counts": group_counts,
+            "component_offsets": torch.cumsum(
+                torch.tensor([0] + counts[:-1], device=device, dtype=torch.long),
+                dim=0,
+            ),
+            "P_flat": P_flat,
+            "phyla_group_sums": phyla_group_sums,
+        }
+
+    def _context_tensor(self, H_flat, num_groups: int, contexts):
+        if contexts is None:
+            contexts = [None for _ in range(int(num_groups))]
+        context_rows = []
+        for context in contexts:
+            if context is None:
+                context_rows.append(H_flat.new_zeros((self.context_dim,)))
+            else:
+                context = context.to(device=H_flat.device, dtype=H_flat.dtype)
+                if context.ndim != 1 or int(context.shape[0]) != self.context_dim:
+                    raise ValueError(
+                        f"context must have shape [{self.context_dim}] for birthset head"
+                    )
+                context_rows.append(context)
+        return torch.stack(context_rows, dim=0)
+
+    def _flat_candidate_logits_from_indices(
+        self,
+        component_embeddings_list,
+        candidate_component_indices_list,
+        contexts=None,
+        component_phyla_embeddings_list=None,
+    ):
+        counts = [
+            len(indices_group or [])
+            for indices_group in candidate_component_indices_list
+        ]
+        if not any(counts):
+            device = component_embeddings_list[0].device if component_embeddings_list else None
+            if device is None:
+                return []
+            return [component_embeddings_list[0].new_empty((0,)) for _ in counts]
+
+        packed = self._packed_components(
+            component_embeddings_list,
+            component_phyla_embeddings_list=component_phyla_embeddings_list,
+        )
+        H_flat = packed["H_flat"]
+        group_sums = packed["group_sums"]
+        group_counts = packed["group_counts"]
+        component_offsets = packed["component_offsets"]
+        P_flat = packed["P_flat"]
+        phyla_group_sums = packed["phyla_group_sums"]
+        D = int(H_flat.shape[-1])
+
+        candidate_group_ids = []
+        candidate_component_counts = []
+        flat_component_indices = []
+        flat_candidate_ids = []
+        component_counts_cpu = [
+            int(component_embeddings.shape[0])
+            for component_embeddings in component_embeddings_list
+        ]
+        offsets_cpu = [0]
+        for count in component_counts_cpu[:-1]:
+            offsets_cpu.append(offsets_cpu[-1] + int(count))
+        for group_idx, group_indices in enumerate(candidate_component_indices_list):
+            group_count = component_counts_cpu[int(group_idx)]
+            group_offset = offsets_cpu[int(group_idx)]
+            for indices in group_indices or []:
+                candidate_id = len(candidate_component_counts)
+                cleaned = [
+                    int(idx)
+                    for idx in indices
+                    if 0 <= int(idx) < int(group_count)
+                ]
+                candidate_group_ids.append(int(group_idx))
+                candidate_component_counts.append(float(len(cleaned)))
+                for idx in cleaned:
+                    flat_component_indices.append(int(group_offset + idx))
+                    flat_candidate_ids.append(int(candidate_id))
+
+        M = len(candidate_component_counts)
+        if M <= 0:
+            return [H_flat.new_empty((0,)) for _ in counts]
+
+        candidate_group_ids_t = torch.tensor(
+            candidate_group_ids,
+            device=H_flat.device,
+            dtype=torch.long,
+        )
+        candidate_counts_t = torch.tensor(
+            candidate_component_counts,
+            device=H_flat.device,
+            dtype=H_flat.dtype,
+        ).clamp(min=1.0)
+        h_in_sum = H_flat.new_zeros((M, D))
+        if flat_component_indices:
+            flat_component_indices_t = torch.tensor(
+                flat_component_indices,
+                device=H_flat.device,
+                dtype=torch.long,
+            )
+            flat_candidate_ids_t = torch.tensor(
+                flat_candidate_ids,
+                device=H_flat.device,
+                dtype=torch.long,
+            )
+            h_in_sum.index_add_(0, flat_candidate_ids_t, H_flat[flat_component_indices_t])
+        h_out_sum = group_sums[candidate_group_ids_t] - h_in_sum
+        out_counts = (
+            group_counts[candidate_group_ids_t] - candidate_counts_t
+        ).clamp(min=1.0)
+        h_in_mean = h_in_sum / candidate_counts_t.unsqueeze(-1)
+        h_out_mean = h_out_sum / out_counts.unsqueeze(-1)
+
+        subset_sizes = candidate_counts_t
+        group_count_for_candidate = group_counts[candidate_group_ids_t]
+        min_sizes = torch.minimum(
+            subset_sizes,
+            group_count_for_candidate - subset_sizes,
+        )
+        size_features = torch.stack(
+            [
+                subset_sizes / group_count_for_candidate.clamp(min=1.0),
+                min_sizes / group_count_for_candidate.clamp(min=1.0),
+                group_count_for_candidate / float(self.max_components_norm),
+            ],
+            dim=-1,
+        )
+        context_expand = self._context_tensor(
+            H_flat,
+            len(component_embeddings_list),
+            contexts,
+        )[candidate_group_ids_t]
+        features = torch.cat(
+            [
+                h_in_mean + h_out_mean,
+                (h_in_mean - h_out_mean).abs(),
+                h_in_mean * h_out_mean,
+                h_in_sum + h_out_sum,
+                (h_in_sum - h_out_sum).abs(),
+                context_expand,
+                size_features,
+            ],
+            dim=-1,
+        )
+        if self.component_phyla_proj is not None:
+            p_in_sum = H_flat.new_zeros((M, D))
+            if flat_component_indices:
+                p_in_sum.index_add_(0, flat_candidate_ids_t, P_flat[flat_component_indices_t])
+            p_out_sum = phyla_group_sums[candidate_group_ids_t] - p_in_sum
+            p_in_mean = p_in_sum / candidate_counts_t.unsqueeze(-1)
+            p_out_mean = p_out_sum / out_counts.unsqueeze(-1)
+            phyla_sum = p_in_mean + p_out_mean
+            phyla_abs_diff = (p_in_mean - p_out_mean).abs()
+            features = torch.cat(
+                [
+                    features,
+                    phyla_sum,
+                    phyla_abs_diff,
+                    p_in_mean * p_out_mean,
+                    (h_in_mean + h_out_mean) * phyla_sum,
+                    (h_in_mean - h_out_mean).abs() * phyla_abs_diff,
+                ],
+                dim=-1,
+            )
+
+        logits = self.mlp(features).squeeze(-1)
+        outputs = []
+        offset = 0
+        for count in counts:
+            if count <= 0:
+                outputs.append(logits.new_empty((0,)))
+            else:
+                outputs.append(logits[offset : offset + count])
+                offset += count
+        return outputs
+
+    def score_many(
+        self,
+        component_embeddings_list,
+        candidate_subsets_list,
+        contexts=None,
+        component_phyla_embeddings_list=None,
+        candidate_component_indices_list=None,
+    ):
+        contexts = contexts or [None for _ in component_embeddings_list]
+        component_phyla_embeddings_list = component_phyla_embeddings_list or [
+            None for _ in component_embeddings_list
+        ]
+        if candidate_component_indices_list is None:
+            candidate_component_indices_list = [
+                self._subset_indices_from_masks(
+                    subsets or [],
+                    int(component_embeddings.shape[0]),
+                )
+                for component_embeddings, subsets in zip(
+                    component_embeddings_list,
+                    candidate_subsets_list,
+                )
+            ]
+        if not (
+            len(component_embeddings_list)
+            == len(candidate_subsets_list)
+            == len(contexts)
+            == len(component_phyla_embeddings_list)
+            == len(candidate_component_indices_list)
+        ):
+            raise ValueError("score_many inputs must have equal lengths")
+        return self._flat_candidate_logits_from_indices(
+            component_embeddings_list,
+            candidate_component_indices_list,
+            contexts=contexts,
+            component_phyla_embeddings_list=component_phyla_embeddings_list,
+        )
+
+        feature_parts = []
+        counts = []
+        for component_embeddings, subsets, context, component_phyla_embeddings in zip(
+            component_embeddings_list,
+            candidate_subsets_list,
+            contexts,
+            component_phyla_embeddings_list,
+        ):
+            H = self.norm(component_embeddings)
+            P = self._project_component_phyla(H, component_phyla_embeddings)
+            features = self._candidate_features(
+                H,
+                subsets,
+                context=context,
+                projected_component_phyla=P,
+            )
+            count = int(features.shape[0])
+            counts.append(count)
+            if count > 0:
+                feature_parts.append(features)
+
+        if not feature_parts:
+            device = component_embeddings_list[0].device if component_embeddings_list else None
+            if device is None:
+                return []
+            return [component_embeddings_list[0].new_empty((0,)) for _ in counts]
+
+        logits = self.mlp(torch.cat(feature_parts, dim=0)).squeeze(-1)
+        outputs = []
+        offset = 0
+        for count in counts:
+            if count <= 0:
+                outputs.append(logits.new_empty((0,)))
+            else:
+                outputs.append(logits[offset : offset + count])
+                offset += count
+        return outputs
+
+    def score_pair_expansions(
+        self,
+        component_embeddings: torch.Tensor,
+        seed_pair_subsets,
+        add_indices,
+        context: torch.Tensor | None = None,
+        component_phyla_embeddings: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Score conditional next-component additions for already chosen seed pairs.
+
+        seed_pair_subsets: iterable of integer local component bitmasks
+        add_indices: iterable of component indices to add to each seed pair
+        returns logits: [M]
+        """
+        H = self.norm(component_embeddings)
+        G, D = H.shape
+        seed_pair_subsets = [int(mask) for mask in seed_pair_subsets]
+        add_indices = [int(idx) for idx in add_indices]
+        if G <= 0 or not seed_pair_subsets or not add_indices:
+            return H.new_empty((0,))
+        if len(seed_pair_subsets) != len(add_indices):
+            raise ValueError("seed_pair_subsets and add_indices must have equal length")
+        features = self._pair_expansion_features(
+            H,
+            seed_pair_subsets,
+            add_indices,
+            context=context,
+            component_phyla_embeddings=component_phyla_embeddings,
+        )
+        if features.numel() == 0:
+            return H.new_empty((0,))
+        return self.expansion_mlp(features).squeeze(-1)
+
+    def _pair_expansion_features(
+        self,
+        H: torch.Tensor,
+        seed_pair_subsets,
+        add_indices,
+        context: torch.Tensor | None = None,
+        component_phyla_embeddings: torch.Tensor | None = None,
+        projected_component_phyla: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        G, D = H.shape
+        seed_pair_subsets = [int(mask) for mask in seed_pair_subsets]
+        add_indices = [int(idx) for idx in add_indices]
+        if G <= 0 or not seed_pair_subsets or not add_indices:
+            input_dim = (6 * int(D)) + self.context_dim + 3
+            if self.component_phyla_proj is not None:
+                input_dim += 4 * int(D)
+            return H.new_empty((0, input_dim))
+        if len(seed_pair_subsets) != len(add_indices):
+            raise ValueError("seed_pair_subsets and add_indices must have equal length")
+
+        rows = []
+        for subset in seed_pair_subsets:
+            rows.append(
+                [
+                    1.0 if ((subset >> idx) & 1) else 0.0
+                    for idx in range(G)
+                ]
+            )
+        pair_mask = H.new_tensor(rows)
+        pair_counts = pair_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        add_index_tensor = torch.tensor(
+            add_indices,
+            device=H.device,
+            dtype=torch.long,
+        )
+        add_h = H[add_index_tensor]
+        pair_sum = pair_mask @ H
+        pair_mean = pair_sum / pair_counts
+
+        expanded_mask = pair_mask.clone()
+        expanded_mask[
+            torch.arange(len(add_indices), device=H.device),
+            add_index_tensor,
+        ] = 1.0
+        expanded_counts = expanded_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        out_mask = 1.0 - expanded_mask
+        out_counts = out_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        expanded_sum = expanded_mask @ H
+        out_sum = out_mask @ H
+        expanded_mean = expanded_sum / expanded_counts
+        out_mean = out_sum / out_counts
+
+        if context is None:
+            context = H.new_zeros((self.context_dim,))
+        else:
+            context = context.to(device=H.device, dtype=H.dtype)
+            if context.ndim != 1 or int(context.shape[0]) != self.context_dim:
+                raise ValueError(
+                    f"context must have shape [{self.context_dim}] for birthset head"
+                )
+        context_expand = context.unsqueeze(0).expand(len(seed_pair_subsets), -1)
+        pair_sizes = pair_counts.squeeze(-1)
+        expanded_sizes = expanded_counts.squeeze(-1)
+        size_features = torch.stack(
+            [
+                pair_sizes / max(float(G), 1.0),
+                expanded_sizes / max(float(G), 1.0),
+                H.new_full(
+                    expanded_sizes.shape,
+                    float(G) / float(self.max_components_norm),
+                ),
+            ],
+            dim=-1,
+        )
+        features = torch.cat(
+            [
+                pair_mean,
+                add_h,
+                pair_mean * add_h,
+                (pair_mean - add_h).abs(),
+                expanded_mean + out_mean,
+                (expanded_mean - out_mean).abs(),
+                context_expand,
+                size_features,
+            ],
+            dim=-1,
+        )
+        if self.component_phyla_proj is not None:
+            P = projected_component_phyla
+            if P is None:
+                P = self._project_component_phyla(H, component_phyla_embeddings)
+            p_pair_sum = pair_mask @ P
+            p_pair_mean = p_pair_sum / pair_counts
+            p_add = P[add_index_tensor]
+            features = torch.cat(
+                [
+                    features,
+                    p_pair_mean,
+                    p_add,
+                    p_pair_mean * p_add,
+                    (p_pair_mean - p_add).abs(),
+                ],
+                dim=-1,
+            )
+        return features
+
+    def _flat_pair_expansion_logits_from_indices(
+        self,
+        component_embeddings_list,
+        seed_pair_component_indices_list,
+        add_indices_list,
+        contexts=None,
+        component_phyla_embeddings_list=None,
+    ):
+        counts = [
+            min(len(seed_indices or []), len(add_indices or []))
+            for seed_indices, add_indices in zip(
+                seed_pair_component_indices_list,
+                add_indices_list,
+            )
+        ]
+        if not any(counts):
+            device = component_embeddings_list[0].device if component_embeddings_list else None
+            if device is None:
+                return []
+            return [component_embeddings_list[0].new_empty((0,)) for _ in counts]
+
+        packed = self._packed_components(
+            component_embeddings_list,
+            component_phyla_embeddings_list=component_phyla_embeddings_list,
+        )
+        H_flat = packed["H_flat"]
+        group_sums = packed["group_sums"]
+        group_counts = packed["group_counts"]
+        P_flat = packed["P_flat"]
+        phyla_group_sums = packed["phyla_group_sums"]
+        D = int(H_flat.shape[-1])
+
+        component_counts_cpu = [
+            int(component_embeddings.shape[0])
+            for component_embeddings in component_embeddings_list
+        ]
+        offsets_cpu = [0]
+        for count in component_counts_cpu[:-1]:
+            offsets_cpu.append(offsets_cpu[-1] + int(count))
+
+        expansion_group_ids = []
+        pair_component_counts = []
+        add_new_flags = []
+        add_flat_indices = []
+        flat_pair_component_indices = []
+        flat_expansion_ids = []
+        for group_idx, (seed_group, add_group) in enumerate(
+            zip(seed_pair_component_indices_list, add_indices_list)
+        ):
+            group_count = component_counts_cpu[int(group_idx)]
+            group_offset = offsets_cpu[int(group_idx)]
+            limit = min(len(seed_group or []), len(add_group or []))
+            for local_idx in range(int(limit)):
+                seed_indices = [
+                    int(idx)
+                    for idx in (seed_group[local_idx] or [])
+                    if 0 <= int(idx) < int(group_count)
+                ]
+                add_idx = int(add_group[local_idx])
+                if add_idx < 0 or add_idx >= int(group_count):
+                    continue
+                expansion_id = len(pair_component_counts)
+                expansion_group_ids.append(int(group_idx))
+                pair_component_counts.append(float(len(seed_indices)))
+                add_new_flags.append(0.0 if add_idx in set(seed_indices) else 1.0)
+                add_flat_indices.append(int(group_offset + add_idx))
+                for seed_idx in seed_indices:
+                    flat_pair_component_indices.append(int(group_offset + seed_idx))
+                    flat_expansion_ids.append(int(expansion_id))
+
+        M = len(pair_component_counts)
+        if M <= 0:
+            return [H_flat.new_empty((0,)) for _ in counts]
+
+        expansion_group_ids_t = torch.tensor(
+            expansion_group_ids,
+            device=H_flat.device,
+            dtype=torch.long,
+        )
+        pair_counts_t = torch.tensor(
+            pair_component_counts,
+            device=H_flat.device,
+            dtype=H_flat.dtype,
+        ).clamp(min=1.0)
+        add_new_t = torch.tensor(
+            add_new_flags,
+            device=H_flat.device,
+            dtype=H_flat.dtype,
+        )
+        add_flat_indices_t = torch.tensor(
+            add_flat_indices,
+            device=H_flat.device,
+            dtype=torch.long,
+        )
+
+        pair_sum = H_flat.new_zeros((M, D))
+        if flat_pair_component_indices:
+            flat_pair_component_indices_t = torch.tensor(
+                flat_pair_component_indices,
+                device=H_flat.device,
+                dtype=torch.long,
+            )
+            flat_expansion_ids_t = torch.tensor(
+                flat_expansion_ids,
+                device=H_flat.device,
+                dtype=torch.long,
+            )
+            pair_sum.index_add_(
+                0,
+                flat_expansion_ids_t,
+                H_flat[flat_pair_component_indices_t],
+            )
+        add_h = H_flat[add_flat_indices_t]
+        pair_mean = pair_sum / pair_counts_t.unsqueeze(-1)
+        expanded_sum = pair_sum + add_h * add_new_t.unsqueeze(-1)
+        expanded_counts = pair_counts_t + add_new_t
+        out_sum = group_sums[expansion_group_ids_t] - expanded_sum
+        out_counts = (
+            group_counts[expansion_group_ids_t] - expanded_counts
+        ).clamp(min=1.0)
+        expanded_mean = expanded_sum / expanded_counts.unsqueeze(-1).clamp(min=1.0)
+        out_mean = out_sum / out_counts.unsqueeze(-1)
+
+        group_count_for_expansion = group_counts[expansion_group_ids_t]
+        size_features = torch.stack(
+            [
+                pair_counts_t / group_count_for_expansion.clamp(min=1.0),
+                expanded_counts / group_count_for_expansion.clamp(min=1.0),
+                group_count_for_expansion / float(self.max_components_norm),
+            ],
+            dim=-1,
+        )
+        context_expand = self._context_tensor(
+            H_flat,
+            len(component_embeddings_list),
+            contexts,
+        )[expansion_group_ids_t]
+        features = torch.cat(
+            [
+                pair_mean,
+                add_h,
+                pair_mean * add_h,
+                (pair_mean - add_h).abs(),
+                expanded_mean + out_mean,
+                (expanded_mean - out_mean).abs(),
+                context_expand,
+                size_features,
+            ],
+            dim=-1,
+        )
+        if self.component_phyla_proj is not None:
+            p_pair_sum = H_flat.new_zeros((M, D))
+            if flat_pair_component_indices:
+                p_pair_sum.index_add_(
+                    0,
+                    flat_expansion_ids_t,
+                    P_flat[flat_pair_component_indices_t],
+                )
+            p_pair_mean = p_pair_sum / pair_counts_t.unsqueeze(-1)
+            p_add = P_flat[add_flat_indices_t]
+            features = torch.cat(
+                [
+                    features,
+                    p_pair_mean,
+                    p_add,
+                    p_pair_mean * p_add,
+                    (p_pair_mean - p_add).abs(),
+                ],
+                dim=-1,
+            )
+
+        logits = self.expansion_mlp(features).squeeze(-1)
+        outputs = []
+        offset = 0
+        for count in counts:
+            if count <= 0:
+                outputs.append(logits.new_empty((0,)))
+            else:
+                outputs.append(logits[offset : offset + count])
+                offset += count
+        return outputs
+
+    def score_pair_expansions_many(
+        self,
+        component_embeddings_list,
+        seed_pair_subsets_list,
+        add_indices_list,
+        contexts=None,
+        component_phyla_embeddings_list=None,
+        seed_pair_component_indices_list=None,
+    ):
+        contexts = contexts or [None for _ in component_embeddings_list]
+        component_phyla_embeddings_list = component_phyla_embeddings_list or [
+            None for _ in component_embeddings_list
+        ]
+        if seed_pair_component_indices_list is None:
+            seed_pair_component_indices_list = [
+                self._subset_indices_from_masks(
+                    seed_pair_subsets or [],
+                    int(component_embeddings.shape[0]),
+                )
+                for component_embeddings, seed_pair_subsets in zip(
+                    component_embeddings_list,
+                    seed_pair_subsets_list,
+                )
+            ]
+        if not (
+            len(component_embeddings_list)
+            == len(seed_pair_subsets_list)
+            == len(add_indices_list)
+            == len(contexts)
+            == len(component_phyla_embeddings_list)
+            == len(seed_pair_component_indices_list)
+        ):
+            raise ValueError("score_pair_expansions_many inputs must have equal lengths")
+        return self._flat_pair_expansion_logits_from_indices(
+            component_embeddings_list,
+            seed_pair_component_indices_list,
+            add_indices_list,
+            contexts=contexts,
+            component_phyla_embeddings_list=component_phyla_embeddings_list,
+        )
+
+        feature_parts = []
+        counts = []
+        for (
+            component_embeddings,
+            seed_pair_subsets,
+            add_indices,
+            context,
+            component_phyla_embeddings,
+        ) in zip(
+            component_embeddings_list,
+            seed_pair_subsets_list,
+            add_indices_list,
+            contexts,
+            component_phyla_embeddings_list,
+        ):
+            H = self.norm(component_embeddings)
+            P = self._project_component_phyla(H, component_phyla_embeddings)
+            features = self._pair_expansion_features(
+                H,
+                seed_pair_subsets,
+                add_indices,
+                context=context,
+                projected_component_phyla=P,
+            )
+            count = int(features.shape[0])
+            counts.append(count)
+            if count > 0:
+                feature_parts.append(features)
+
+        if not feature_parts:
+            device = component_embeddings_list[0].device if component_embeddings_list else None
+            if device is None:
+                return []
+            return [component_embeddings_list[0].new_empty((0,)) for _ in counts]
+
+        logits = self.expansion_mlp(torch.cat(feature_parts, dim=0)).squeeze(-1)
+        outputs = []
+        offset = 0
+        for count in counts:
+            if count <= 0:
+                outputs.append(logits.new_empty((0,)))
+            else:
+                outputs.append(logits[offset : offset + count])
+                offset += count
+        return outputs
 
 
 class AutoregressiveGroupRefinementBlock(nn.Module):
@@ -1352,7 +2136,7 @@ class TreeDenoiserTokenGT(nn.Module):
 
         return emb
 
-    def _create_split_binary_masks(self, split_masks, device, dtype=None):
+    def _create_split_binary_masks(self, split_masks, device, dtype=None, cache=True):
         if not split_masks:
             return torch.zeros(
                 0,
@@ -1363,46 +2147,82 @@ class TreeDenoiserTokenGT(nn.Module):
 
         dtype = self.graph_token.dtype if dtype is None else dtype
         split_masks_tuple = tuple(int(mask) for mask in split_masks)
-        cache_key = (
-            split_masks_tuple,
-            str(device),
-            str(dtype),
+        cache_key = None
+        if cache:
+            cache_key = (
+                split_masks_tuple,
+                str(device),
+                str(dtype),
+            )
+        binary_masks = (
+            None
+            if cache_key is None
+            else self._split_identity_binary_cache.get(cache_key)
         )
-        binary_masks = self._split_identity_binary_cache.get(cache_key)
-        cache_writable = not torch.is_inference_mode_enabled()
+        cache_writable = bool(cache) and not torch.is_inference_mode_enabled()
         if binary_masks is None or (
             not torch.is_inference_mode_enabled() and binary_masks.is_inference()
         ):
-            binary_masks = torch.zeros(
-                len(split_masks_tuple),
-                self.max_split_bits,
-                device=device,
-                dtype=dtype,
-            )
-            for row_idx, mask_int in enumerate(split_masks_tuple):
-                bit_idx = 0
-                while mask_int and bit_idx < self.max_split_bits:
-                    if mask_int & 1:
-                        binary_masks[row_idx, bit_idx] = 1.0
-                    mask_int >>= 1
-                    bit_idx += 1
-            if cache_writable:
+            min_mask_int = min(split_masks_tuple)
+            max_mask_int = max(split_masks_tuple)
+            if min_mask_int >= 0 and max_mask_int < (1 << 63):
+                active_bits = min(int(self.max_split_bits), 63)
+                mask_tensor = torch.tensor(split_masks_tuple, dtype=torch.long)
+                if torch.device(device).type != "cpu":
+                    mask_tensor = mask_tensor.to(device=device, non_blocking=True)
+                else:
+                    mask_tensor = mask_tensor.to(device=device)
+                bit_positions = torch.arange(
+                    active_bits,
+                    dtype=torch.long,
+                    device=device,
+                )
+                binary_masks = (
+                    (mask_tensor.unsqueeze(1) >> bit_positions.unsqueeze(0)) & 1
+                ).to(dtype=dtype)
+                if active_bits < int(self.max_split_bits):
+                    binary_masks = torch.cat(
+                        [
+                            binary_masks,
+                            binary_masks.new_zeros(
+                                len(split_masks_tuple),
+                                int(self.max_split_bits) - active_bits,
+                            ),
+                        ],
+                        dim=1,
+                    )
+            else:
+                # Arbitrary-size Python int fallback for datasets with >63 active bits.
+                rows = [
+                    [
+                        1.0 if ((mask_int >> bit_idx) & 1) else 0.0
+                        for bit_idx in range(self.max_split_bits)
+                    ]
+                    for mask_int in split_masks_tuple
+                ]
+                binary_masks = torch.tensor(rows, dtype=dtype)
+                if torch.device(device).type != "cpu":
+                    binary_masks = binary_masks.to(device=device, non_blocking=True)
+                else:
+                    binary_masks = binary_masks.to(device=device)
+            if cache_writable and cache_key is not None:
                 self._split_identity_binary_cache[cache_key] = binary_masks
                 if (
                     len(self._split_identity_binary_cache)
                     > self._split_identity_binary_cache_max
                 ):
                     self._split_identity_binary_cache.popitem(last=False)
-        else:
+        elif cache_key is not None:
             self._split_identity_binary_cache.move_to_end(cache_key)
 
         return binary_masks
 
-    def create_split_identity_embedding(self, split_masks, device):
+    def create_split_identity_embedding(self, split_masks, device, cache=True):
         binary_masks = self._create_split_binary_masks(
             split_masks,
             device,
             dtype=self.graph_token.dtype,
+            cache=cache,
         )
         if binary_masks.numel() == 0:
             return torch.zeros(0, self.embed_dim, device=device)
@@ -2509,8 +3329,11 @@ class TreeDenoiserTokenGT(nn.Module):
         return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_group_indices=None,
+        autoregressive_group_splits=None,
         autoregressive_case_indices=None,
         autoregressive_start_topology_features=None,
+        autoregressive_return_head_outputs=True,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -2561,11 +3384,72 @@ class TreeDenoiserTokenGT(nn.Module):
             return torch.zeros(B, 0, D, device=x.device)
 
         if autoregressive:
+            autoregressive_return_head_outputs = bool(
+                autoregressive_return_head_outputs
+            )
+            ar_decode_profile_enabled = str(
+                os.environ.get("PHYLA_AR_DECODE_PROFILE", "")
+            ).lower() in {"1", "true", "yes", "on"}
+            ar_decode_profile = None
+            if ar_decode_profile_enabled:
+                ar_decode_profile = {
+                    "_last": time.perf_counter(),
+                    "groups": 0,
+                    "components": 0,
+                }
+                if torch.cuda.is_available() and x.is_cuda:
+                    torch.cuda.synchronize(x.device)
+
+            def _ar_profile_mark(label):
+                if ar_decode_profile is None:
+                    return
+                if torch.cuda.is_available() and x.is_cuda:
+                    torch.cuda.synchronize(x.device)
+                now = time.perf_counter()
+                last = ar_decode_profile.get("_last", now)
+                ar_decode_profile[label] = ar_decode_profile.get(label, 0.0) + (
+                    now - last
+                )
+                ar_decode_profile["_last"] = now
+
+            def _ar_profile_add(label, value):
+                if ar_decode_profile is None:
+                    return
+                ar_decode_profile[label] = ar_decode_profile.get(label, 0) + int(value)
+
             x_no_graph = x[:, 1:, :]
             all_group_logits = []
             num_leaves = [int(leaf_mask[b].sum().item()) + 1 for b in range(B)]
+            _ar_profile_mark("setup")
 
-            if autoregressive_component_groups is None:
+            if (
+                autoregressive_group_indices is not None
+                and autoregressive_group_splits is not None
+                and len(autoregressive_group_indices) == B
+                and len(autoregressive_group_splits) == B
+            ):
+                batch_polytomy_index = []
+                batch_polytomy_splits = []
+                for groups_b, splits_b in zip(
+                    autoregressive_group_indices,
+                    autoregressive_group_splits,
+                ):
+                    tensor_groups = [
+                        torch.as_tensor(
+                            group,
+                            dtype=torch.long,
+                            device=x.device,
+                        )
+                        for group in (groups_b or [])
+                    ]
+                    batch_polytomy_index.append(tensor_groups)
+                    batch_polytomy_splits.append(
+                        [
+                            [int(component) for component in group_splits]
+                            for group_splits in (splits_b or [])
+                        ]
+                    )
+            elif autoregressive_component_groups is None:
                 batch_polytomy_index, batch_polytomy_splits = (
                     get_batch_structural_polytomy_indices(
                         edge_split_masks,
@@ -2583,6 +3467,7 @@ class TreeDenoiserTokenGT(nn.Module):
                         num_leaves=num_leaves,
                     )
                 )
+            _ar_profile_mark("group_index_build")
 
             autoregressive_case_context = None
             if self.autoregressive_use_case_conditioning:
@@ -2602,9 +3487,10 @@ class TreeDenoiserTokenGT(nn.Module):
                     raise ValueError(
                         "autoregressive_case_indices must have shape [batch]"
                     )
-                autoregressive_case_context = self.autoregressive_case_proj(
-                    self.autoregressive_case_embedding(autoregressive_case_indices)
-                )
+                    autoregressive_case_context = self.autoregressive_case_proj(
+                        self.autoregressive_case_embedding(autoregressive_case_indices)
+                    )
+            _ar_profile_mark("case_context")
 
             autoregressive_start_topology_context = None
             autoregressive_start_topology_head_context = None
@@ -2693,16 +3579,40 @@ class TreeDenoiserTokenGT(nn.Module):
                                 autoregressive_start_topology_features
                             )
                         )
+            _ar_profile_mark("conditioning_context")
+
+            ar_identity_slices = []
+            flat_ar_split_masks = []
+            for group_splits_for_tree in batch_polytomy_splits:
+                tree_slices = []
+                for group_splits in group_splits_for_tree:
+                    start = len(flat_ar_split_masks)
+                    flat_ar_split_masks.extend(int(split) for split in group_splits)
+                    tree_slices.append((start, len(flat_ar_split_masks)))
+                ar_identity_slices.append(tree_slices)
+            if flat_ar_split_masks:
+                flat_ar_identity = self.create_split_identity_embedding(
+                    flat_ar_split_masks,
+                    x.device,
+                    cache=False,
+                ).to(dtype=x.dtype)
+            else:
+                flat_ar_identity = torch.zeros(0, D, device=x.device, dtype=x.dtype)
+            _ar_profile_mark("split_identity")
 
             for b, groups in enumerate(batch_polytomy_index):
                 for num, group in enumerate(groups):
                     if group.size(0) <= 1:
                         continue
+                    _ar_profile_add("groups", 1)
+                    _ar_profile_add("components", int(group.size(0)))
                     group_embeddings = x_no_graph[b, group, :]
                     group_splits = batch_polytomy_splits[b][num]
-                    group_identity = self.create_split_identity_embedding(
-                        group_splits, x.device
-                    )
+                    _ar_profile_mark("group_gather")
+                    identity_start, identity_end = ar_identity_slices[b][num]
+                    group_identity = flat_ar_identity[
+                        int(identity_start) : int(identity_end)
+                    ]
 
                     group_embeddings = group_embeddings + (
                         self.split_identity_scale * group_identity
@@ -2729,38 +3639,49 @@ class TreeDenoiserTokenGT(nn.Module):
                                 dtype=group_embeddings.dtype,
                             )
                         )
+                    _ar_profile_mark("conditioning_add")
                     for refinement_block in self.autoregressive_group_refinement:
                         group_embeddings = refinement_block(group_embeddings)
-                    group_head_context = (
-                        None
-                        if autoregressive_start_topology_head_context is None
-                        else autoregressive_start_topology_head_context[b]
-                    )
-                    if self.autoregressive_head_mode == "structured_subset":
-                        head_outputs = self.structured_subset_head(
-                            group_embeddings,
-                            context=group_head_context,
+                    _ar_profile_mark("group_refinement")
+                    head_outputs = {}
+                    logits = None
+                    polytomy_pred = None
+                    if autoregressive_return_head_outputs:
+                        group_head_context = (
+                            None
+                            if autoregressive_start_topology_head_context is None
+                            else autoregressive_start_topology_head_context[b]
                         )
-                        logits = head_outputs["logits"]
+                        if self.autoregressive_head_mode == "structured_subset":
+                            head_outputs = self.structured_subset_head(
+                                group_embeddings,
+                                context=group_head_context,
+                            )
+                            logits = head_outputs["logits"]
+                        else:
+                            logits = self.pairwise_head(
+                                group_embeddings,
+                                context=group_head_context,
+                            )
+                        polytomy_pred = self.group_head(
+                            self.final_layer_norm(group_embeddings).mean(dim=0)
+                        )
                     else:
                         head_outputs = {}
-                        logits = self.pairwise_head(
-                            group_embeddings,
-                            context=group_head_context,
-                        )
+                    _ar_profile_mark("merge_head")
 
                     group_output = {
                         "batch_index": b,
                         "group_indices": group,
-                        "polytomy_pred": self.group_head(
-                            self.final_layer_norm(group_embeddings).mean(dim=0)
-                        ),
-                        "logits": logits,
                         "splits_represented": group_splits,
                         "group_embeddings": group_embeddings,
                         "graph_context": x[b, 0, :],
                         "decoder_mode": self.autoregressive_head_mode,
                     }
+                    if autoregressive_return_head_outputs:
+                        group_output["polytomy_pred"] = polytomy_pred
+                        group_output["logits"] = logits
+                    _ar_profile_mark("output_base")
                     component_phyla_embeddings = (
                         self._compute_component_phyla_embeddings(
                             phyla_embeddings,
@@ -2775,11 +3696,53 @@ class TreeDenoiserTokenGT(nn.Module):
                         group_output["component_phyla_embeddings"] = (
                             component_phyla_embeddings
                         )
+                    _ar_profile_mark("component_phyla")
                     group_output.update(head_outputs)
                     all_group_logits.append(group_output)
+                    _ar_profile_mark("append")
+            if ar_decode_profile is not None:
+                if torch.cuda.is_available() and x.is_cuda:
+                    torch.cuda.synchronize(x.device)
+                timing_text = " ".join(
+                    f"{key}={float(value):.4f}s"
+                    for key, value in ar_decode_profile.items()
+                    if not key.startswith("_")
+                    and key not in {"groups", "components"}
+                )
+                logging.info(
+                    "AR_DECODE_PROFILE batch=%s groups=%s components=%s %s",
+                    int(B),
+                    int(ar_decode_profile.get("groups", 0)),
+                    int(ar_decode_profile.get("components", 0)),
+                    timing_text,
+                )
             return all_group_logits
 
         if return_edges_only:
+            velocity_decode_profile_enabled = str(
+                os.environ.get("PHYLA_VELOCITY_DECODE_PROFILE", "")
+            ).lower() in {"1", "true", "yes", "on"}
+            velocity_decode_profile = None
+            if velocity_decode_profile_enabled:
+                velocity_decode_profile = {
+                    "_last": time.perf_counter(),
+                    "batch": int(B),
+                }
+                if torch.cuda.is_available() and x.is_cuda:
+                    torch.cuda.synchronize(x.device)
+
+            def _velocity_profile_mark(label):
+                if velocity_decode_profile is None:
+                    return
+                if torch.cuda.is_available() and x.is_cuda:
+                    torch.cuda.synchronize(x.device)
+                now = time.perf_counter()
+                last = velocity_decode_profile.get("_last", now)
+                velocity_decode_profile[label] = (
+                    velocity_decode_profile.get(label, 0.0) + (now - last)
+                )
+                velocity_decode_profile["_last"] = now
+
             x_no_graph = x[:, 1:, :]
             edge_mask_bool = edge_mask.bool()
             edge_lists = [x_no_graph[b][edge_mask_bool[b]] for b in range(B)]
@@ -2788,19 +3751,30 @@ class TreeDenoiserTokenGT(nn.Module):
                 edge_clade_context_lists = [
                     phyla_clade_context[b][edge_mask_bool[b]] for b in range(B)
                 ]
-            split_identity_lists = []
-            for b in range(B):
-                n_b = edge_lists[b].size(0)
-                if n_b == 0:
-                    split_identity_lists.append(torch.zeros(0, D, device=x.device, dtype=x.dtype))
+            _velocity_profile_mark("edge_gather")
+            edge_counts = [int(edges_b.size(0)) for edges_b in edge_lists]
+            flat_edge_split_masks = []
+            for b, n_b in enumerate(edge_counts):
+                if n_b <= 0:
                     continue
-                split_identity_lists.append(
-                    self.create_split_identity_embedding(
-                        edge_split_masks[b][:n_b],
-                        x.device,
-                    ).to(dtype=x.dtype)
+                flat_edge_split_masks.extend(
+                    int(split) for split in edge_split_masks[b][:n_b]
                 )
+            if flat_edge_split_masks:
+                flat_split_identity = self.create_split_identity_embedding(
+                    flat_edge_split_masks,
+                    x.device,
+                    cache=False,
+                ).to(dtype=x.dtype)
+            else:
+                flat_split_identity = torch.zeros(0, D, device=x.device, dtype=x.dtype)
+            split_identity_lists = []
+            offset = 0
+            for n_b in edge_counts:
+                split_identity_lists.append(flat_split_identity[offset : offset + n_b])
+                offset += int(n_b)
             max_edges = max((e.size(0) for e in edge_lists), default=0)
+            _velocity_profile_mark("split_identity")
 
             if max_edges == 0:
                 return torch.zeros(B, 0, D, device=x.device), torch.ones(
@@ -2817,6 +3791,7 @@ class TreeDenoiserTokenGT(nn.Module):
                     B, max_edges, D, device=x.device, dtype=x.dtype
                 )
             edge_pad_mask = torch.ones(B, max_edges, device=x.device, dtype=torch.bool)
+            _velocity_profile_mark("pad_alloc")
 
             for b, edges_b in enumerate(edge_lists):
                 n_b = edges_b.size(0)
@@ -2832,8 +3807,10 @@ class TreeDenoiserTokenGT(nn.Module):
                         :n_b
                     ].to(device=x.device, dtype=x.dtype)
                 edge_pad_mask[b, :n_b] = False
+            _velocity_profile_mark("pad_fill")
 
             edge_outputs = self.edge_output_layer(padded_edges)
+            _velocity_profile_mark("edge_output_layer")
             if return_first_hit_logits or return_boundary_vanish_logits:
                 first_hit_logits = None
                 boundary_vanish_logits = None
@@ -2843,6 +3820,7 @@ class TreeDenoiserTokenGT(nn.Module):
                         first_hit_edges = first_hit_edges + (
                             self.phyla_clade_context_scale * padded_clade_context
                         )
+                    _velocity_profile_mark("first_hit_input")
                     first_hit_logits = self._compute_first_hit_logits_from_edges(
                         first_hit_edges,
                         edge_pad_mask,
@@ -2856,9 +3834,23 @@ class TreeDenoiserTokenGT(nn.Module):
                         start_tree_graph_context=first_hit_start_tree_graph_context,
                         phyla_global_context=phyla_global_context,
                     )
+                    _velocity_profile_mark("first_hit_head")
                 if return_boundary_vanish_logits:
                     boundary_vanish_logits = self.boundary_vanish_edge_head(
                         padded_edges
+                    )
+                    _velocity_profile_mark("boundary_vanish_head")
+                if velocity_decode_profile is not None:
+                    timing_text = " ".join(
+                        f"{key}={float(value):.4f}s"
+                        for key, value in velocity_decode_profile.items()
+                        if not key.startswith("_") and key != "batch"
+                    )
+                    logging.info(
+                        "VELOCITY_DECODE_PROFILE batch=%s max_edges=%s %s",
+                        int(velocity_decode_profile.get("batch", 0)),
+                        int(max_edges),
+                        timing_text,
                     )
                 if return_first_hit_logits and return_boundary_vanish_logits:
                     if return_edge_features:
@@ -2884,7 +3876,31 @@ class TreeDenoiserTokenGT(nn.Module):
                 return edge_outputs, edge_pad_mask, boundary_vanish_logits
 
             if return_edge_features:
+                if velocity_decode_profile is not None:
+                    timing_text = " ".join(
+                        f"{key}={float(value):.4f}s"
+                        for key, value in velocity_decode_profile.items()
+                        if not key.startswith("_") and key != "batch"
+                    )
+                    logging.info(
+                        "VELOCITY_DECODE_PROFILE batch=%s max_edges=%s %s",
+                        int(velocity_decode_profile.get("batch", 0)),
+                        int(max_edges),
+                        timing_text,
+                    )
                 return edge_outputs, edge_pad_mask, padded_edges
+            if velocity_decode_profile is not None:
+                timing_text = " ".join(
+                    f"{key}={float(value):.4f}s"
+                    for key, value in velocity_decode_profile.items()
+                    if not key.startswith("_") and key != "batch"
+                )
+                logging.info(
+                    "VELOCITY_DECODE_PROFILE batch=%s max_edges=%s %s",
+                    int(velocity_decode_profile.get("batch", 0)),
+                    int(max_edges),
+                    timing_text,
+                )
             return edge_outputs, edge_pad_mask
 
         if return_all_tokens:
@@ -2904,8 +3920,11 @@ class TreeDenoiserTokenGT(nn.Module):
         return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_group_indices=None,
+        autoregressive_group_splits=None,
         autoregressive_case_indices=None,
         autoregressive_start_topology_features=None,
+        autoregressive_return_head_outputs=True,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -2950,8 +3969,11 @@ class TreeDenoiserTokenGT(nn.Module):
             return_boundary_vanish_logits=return_boundary_vanish_logits,
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
+            autoregressive_group_indices=autoregressive_group_indices,
+            autoregressive_group_splits=autoregressive_group_splits,
             autoregressive_case_indices=autoregressive_case_indices,
             autoregressive_start_topology_features=autoregressive_start_topology_features,
+            autoregressive_return_head_outputs=autoregressive_return_head_outputs,
             first_hit_case_indices=first_hit_case_indices,
             first_hit_start_topology_features=first_hit_start_topology_features,
             first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
@@ -3052,8 +4074,11 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
         return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_group_indices=None,
+        autoregressive_group_splits=None,
         autoregressive_case_indices=None,
         autoregressive_start_topology_features=None,
+        autoregressive_return_head_outputs=True,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -3105,8 +4130,11 @@ class TreeDenoiserTokenGTTwoBlock(TreeDenoiserTokenGT):
             return_boundary_vanish_logits=return_boundary_vanish_logits,
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
+            autoregressive_group_indices=autoregressive_group_indices,
+            autoregressive_group_splits=autoregressive_group_splits,
             autoregressive_case_indices=autoregressive_case_indices,
             autoregressive_start_topology_features=autoregressive_start_topology_features,
+            autoregressive_return_head_outputs=autoregressive_return_head_outputs,
             first_hit_case_indices=first_hit_case_indices,
             first_hit_start_topology_features=first_hit_start_topology_features,
             first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,
@@ -3228,8 +4256,11 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
         return_boundary_vanish_logits=False,
         autoregressive=False,
         autoregressive_component_groups=None,
+        autoregressive_group_indices=None,
+        autoregressive_group_splits=None,
         autoregressive_case_indices=None,
         autoregressive_start_topology_features=None,
+        autoregressive_return_head_outputs=True,
         first_hit_case_indices=None,
         first_hit_start_topology_features=None,
         first_hit_start_topology_embeddings=None,
@@ -3287,8 +4318,11 @@ class TreeDenoiserTokenGTMultiBlock(TreeDenoiserTokenGT):
             return_boundary_vanish_logits=return_boundary_vanish_logits,
             autoregressive=autoregressive,
             autoregressive_component_groups=autoregressive_component_groups,
+            autoregressive_group_indices=autoregressive_group_indices,
+            autoregressive_group_splits=autoregressive_group_splits,
             autoregressive_case_indices=autoregressive_case_indices,
             autoregressive_start_topology_features=autoregressive_start_topology_features,
+            autoregressive_return_head_outputs=autoregressive_return_head_outputs,
             first_hit_case_indices=first_hit_case_indices,
             first_hit_start_topology_features=first_hit_start_topology_features,
             first_hit_start_topology_embeddings=first_hit_start_topology_embeddings,

@@ -416,6 +416,59 @@ def get_batch_explicit_structural_group_indices(
     return batch_group_index, batch_group_splits
 
 
+def get_explicit_structural_group_indices_from_edge_splits(
+    edge_split_masks,
+    structural_groups,
+    node_num,
+    num_leaves=None,
+):
+    n_b = int(num_leaves or 0)
+    if n_b <= 1:
+        n_b = _resolve_num_leaves(None, 0, edge_split_masks)
+    if n_b <= 1:
+        return [], []
+
+    bio_full = _bio_full_mask(n_b)
+    mask_to_positions = {}
+    edge_start = int(node_num)
+    for edge_idx, split in enumerate(edge_split_masks or []):
+        split_int = int(split)
+        if split_int == 0:
+            continue
+        bio_mask = _orient_split_away_from_dummy(split_int, n_b)
+        if bio_mask == 0 or bio_mask == bio_full:
+            continue
+        mask_to_positions.setdefault(int(bio_mask), []).append(
+            int(edge_start + int(edge_idx))
+        )
+
+    groups = []
+    group_splits = []
+    for group in structural_groups or []:
+        group = [int(component) for component in group]
+        if len(group) < 2:
+            continue
+
+        group_indices = []
+        valid_group = True
+        for component in group:
+            positions = _lookup_component_positions(
+                mask_to_positions,
+                component,
+                bio_full,
+            )
+            if not positions:
+                valid_group = False
+                break
+            group_indices.append(int(positions[0]))
+
+        if valid_group:
+            groups.append(group_indices)
+            group_splits.append(group)
+
+    return groups, group_splits
+
+
 def _merge_schedule_for_parent(parent, atoms, target_clusters):
     target_clusters = _sort_masks(target_clusters)
     if not target_clusters:

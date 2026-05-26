@@ -144,6 +144,11 @@ def _birthset_trainer_kwargs(config):
             "proposal_max_order_seed_pairs",
             128,
         ),
+        "birthset_proposal_order_weight": pick(
+            "birthset_proposal_order_weight",
+            "proposal_order_weight",
+            0.0,
+        ),
         "birthset_proposal_train_topk": pick(
             "birthset_proposal_train_topk",
             "proposal_train_topk",
@@ -167,6 +172,16 @@ def _birthset_trainer_kwargs(config):
         "birthset_decoder": pick("birthset_decoder", "decoder", "greedy"),
         "birthset_beam_width": pick("birthset_beam_width", "beam_width", 8),
         "birthset_fallback": pick("birthset_fallback", "fallback", "ar"),
+        "birthset_oracle_target_candidates_use_at_sampling": pick(
+            "birthset_oracle_target_candidates_use_at_sampling",
+            "oracle_target_candidates_use_at_sampling",
+            False,
+        ),
+        "birthset_oracle_cardinality_use_at_sampling": pick(
+            "birthset_oracle_cardinality_use_at_sampling",
+            "oracle_cardinality_use_at_sampling",
+            False,
+        ),
     }
 
 

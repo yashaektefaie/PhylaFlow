@@ -90,7 +90,7 @@ trainer:
   velocity_probe_direct_set_include_base_samples: true
   training_step_probe_parity_joint_update: true
   training_step_joint_tokenize_velocity_ar: false
-  training_step_full_path_replay_initial_retry_attempt: 1
+  training_step_full_path_replay_initial_retry_attempt: 0
   skip_repeated_no_valid_boundary_use_at_sampling: false
   rollout_replay_velocity_weight: 0.0
   rollout_replay_autoregressive_weight: 0.0

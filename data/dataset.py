@@ -30,6 +30,7 @@ import pytorch_lightning as pl
 from utils.bhv_utils import (
     BHVEncoder,
     _split_multi_label_training_events,
+    get_explicit_structural_group_indices_from_edge_splits,
     get_structural_polytomy_groups_from_newick,
     return_sampled_tree_orthant_velocity,
     return_sampled_tree_boundary_decisions,
@@ -134,6 +135,18 @@ def _birthset_local_subset_size(local_subset: int) -> int:
     return int(local_subset).bit_count()
 
 
+def _birthset_local_subset_indices(
+    local_subset: int,
+    num_components: int,
+) -> List[int]:
+    local_subset = int(local_subset)
+    return [
+        int(idx)
+        for idx in range(int(num_components))
+        if (local_subset >> int(idx)) & 1
+    ]
+
+
 def _birthset_local_subset_to_split(
     local_subset: int,
     component_masks: List[int],
@@ -170,6 +183,10 @@ def _birthset_candidate_record(
     local_subset = int(local_subset)
     return {
         "local_subset": local_subset,
+        "component_indices": _birthset_local_subset_indices(
+            local_subset,
+            len(component_masks),
+        ),
         "split_mask": _birthset_local_subset_to_split(local_subset, component_masks),
         "source": str(source),
         "size": _birthset_local_subset_size(local_subset),
@@ -270,6 +287,79 @@ def _birthset_constructive_pair_targets(
     return targets
 
 
+def _birthset_next_expansion_target(
+    pair_subset: int,
+    gold_local_subsets: List[int],
+) -> Optional[int]:
+    pair_subset = int(pair_subset)
+    pair_size = _birthset_local_subset_size(pair_subset)
+    containing = [
+        int(gold_subset)
+        for gold_subset in gold_local_subsets or []
+        if (pair_subset & ~int(gold_subset)) == 0
+        and _birthset_local_subset_size(int(gold_subset)) > pair_size
+    ]
+    if not containing:
+        return None
+    return min(
+        containing,
+        key=lambda subset: (_birthset_local_subset_size(subset), int(subset)),
+    )
+
+
+def _birthset_conditional_expansion_examples(
+    seed_pair_subsets: List[int],
+    gold_local_subsets: List[int],
+    num_components: int,
+    max_examples: int,
+) -> Tuple[List[int], List[int], List[int], List[float]]:
+    seed_pairs: List[int] = []
+    add_indices: List[int] = []
+    expansion_subsets: List[int] = []
+    expansion_labels: List[float] = []
+    for pair_subset in seed_pair_subsets or []:
+        pair_subset = int(pair_subset)
+        target_subset = _birthset_next_expansion_target(
+            pair_subset,
+            gold_local_subsets,
+        )
+        for idx in range(int(num_components)):
+            if (pair_subset >> int(idx)) & 1:
+                continue
+            expanded_subset = int(pair_subset | (1 << int(idx)))
+            if not _birthset_valid_local_subset(
+                expanded_subset,
+                int(num_components),
+            ):
+                continue
+            label = (
+                1.0
+                if target_subset is not None
+                and (expanded_subset & ~int(target_subset)) == 0
+                else 0.0
+            )
+            seed_pairs.append(pair_subset)
+            add_indices.append(int(idx))
+            expansion_subsets.append(expanded_subset)
+            expansion_labels.append(float(label))
+
+    cap = int(max_examples)
+    if cap > 0 and len(expansion_subsets) > cap:
+        positive_ids = [
+            idx for idx, label in enumerate(expansion_labels) if float(label) > 0.5
+        ]
+        negative_ids = [
+            idx for idx, label in enumerate(expansion_labels) if float(label) <= 0.5
+        ]
+        keep_ids = positive_ids + negative_ids[: max(0, cap - len(positive_ids))]
+        seed_pairs = [seed_pairs[idx] for idx in keep_ids]
+        add_indices = [add_indices[idx] for idx in keep_ids]
+        expansion_subsets = [expansion_subsets[idx] for idx in keep_ids]
+        expansion_labels = [expansion_labels[idx] for idx in keep_ids]
+
+    return seed_pairs, add_indices, expansion_subsets, expansion_labels
+
+
 def _birthset_num_leaves_for_precompute(
     sample: Dict[str, Any],
     component_masks: List[int],
@@ -285,13 +375,130 @@ def _birthset_num_leaves_for_precompute(
         max_bit = max(max_bit, int(mask).bit_length())
     if max_bit > 0:
         return int(max_bit + 1)
-    newick = sample.get("newick") or sample.get("newick_tree")
+    newick = (
+        sample.get("newick")
+        or sample.get("autoregressive_newick")
+        or sample.get("newick_tree")
+    )
     if newick:
         try:
             return int(Tree(str(newick)).n_leaves)
         except Exception:
             pass
     return 0
+
+
+def _full_path_target_splits_from_velocity_sample(sample: Dict[str, Any]) -> List[int]:
+    try:
+        tree_obj = Tree(sample["newick_tree"])
+        masks, lengths = BHVEncoder().return_BHV_encoding(tree_obj)
+    except Exception:
+        return []
+    len_map = {
+        int(mask): float(length)
+        for mask, length in zip(masks, lengths)
+        if length is not None
+    }
+    model_masks = [
+        int(mask)
+        for mask, length in zip(masks, lengths)
+        if length is not None and float(length) > 1e-8 and int(mask) != 0
+    ]
+    if not model_masks:
+        return []
+    real_max_bit = max(int(mask).bit_length() for mask in model_masks)
+    full_mask = (1 << real_max_bit) - 1 if real_max_bit > 0 else 0
+    taus = []
+    matched = []
+    for orig_mask, velocity in (sample.get("velocity") or {}).items():
+        velocity = float(velocity)
+        mask = int(orig_mask)
+        try:
+            num_leaves = int(sample["num_leaves"])
+        except Exception:
+            num_leaves = 0
+        if num_leaves > 0 and mask.bit_length() == real_max_bit + 1:
+            mask = remove_bit(mask, num_leaves - 1)
+        elif mask.bit_length() > real_max_bit + 1:
+            continue
+        matched_mask = mask
+        if matched_mask not in model_masks:
+            complement = full_mask ^ matched_mask
+            if complement in model_masks:
+                matched_mask = complement
+            else:
+                continue
+        k_bits = int(matched_mask).bit_count()
+        if min(k_bits, real_max_bit - k_bits) == 1:
+            continue
+        length = len_map.get(int(matched_mask))
+        if length is None and full_mask:
+            length = len_map.get(full_mask ^ int(matched_mask))
+        if length is None or float(length) <= 1e-8 or velocity >= -1e-3:
+            continue
+        taus.append(float(length) / max(-velocity, 1e-3))
+        matched.append(int(matched_mask))
+    if not taus:
+        return []
+    tau_min = min(taus)
+    return sorted(mask for mask, tau in zip(matched, taus) if abs(tau - tau_min) <= 1e-3)
+
+
+def _probe_direct_set_precompute_for_velocity_sample(
+    sample: Dict[str, Any],
+    target_splits: List[int],
+) -> Optional[Dict[str, Any]]:
+    raw_graph = sample.get("newick_tree_tokenizer_raw_graph")
+    if not isinstance(raw_graph, dict):
+        return None
+    try:
+        edge_split_masks = [int(mask) for mask in raw_graph.get("edge_split_masks", [])]
+    except Exception:
+        return None
+    split_masks_nonzero = [mask for mask in edge_split_masks if int(mask) != 0]
+    if not split_masks_nonzero:
+        return None
+    real_max_bit = max(int(mask).bit_length() for mask in split_masks_nonzero)
+    full_mask = (1 << int(real_max_bit)) - 1 if real_max_bit > 0 else 0
+    try:
+        tree_obj = Tree(sample["newick_tree"])
+        bhv_masks, bhv_lengths = BHVEncoder().return_BHV_encoding(tree_obj)
+        bhv_len_map = {
+            int(mask): float(length)
+            for mask, length in zip(bhv_masks, bhv_lengths)
+            if length is not None
+        }
+    except Exception:
+        return None
+
+    target_set = {int(mask) for mask in target_splits or []}
+    edge_indices = []
+    targets = []
+    matched_masks = []
+    for edge_idx, mask in enumerate(edge_split_masks):
+        mask = int(mask)
+        if mask == 0:
+            continue
+        k_bits = mask.bit_count()
+        if min(k_bits, real_max_bit - k_bits) == 1:
+            continue
+        edge_length = bhv_len_map.get(mask)
+        if edge_length is None and full_mask:
+            edge_length = bhv_len_map.get(full_mask ^ mask)
+        if edge_length is None or float(edge_length) <= 1e-8:
+            continue
+        edge_indices.append(int(edge_idx))
+        targets.append(1.0 if mask in target_set else 0.0)
+        matched_masks.append(mask)
+
+    if not edge_indices:
+        return None
+    return {
+        "edge_indices": edge_indices,
+        "targets": targets,
+        "matched_masks": matched_masks,
+        "target_set": sorted(target_set),
+    }
 
 
 def _birthset_precompute_group(
@@ -306,6 +513,7 @@ def _birthset_precompute_group(
     proposal_pair_target_mode: str,
     proposal_max_expansion_examples: int,
     proposal_max_order_seed_pairs: int,
+    proposal_order_weight: float,
     proposal_train_topk: bool,
 ) -> Dict[str, Any]:
     component_masks = [int(mask) for mask in component_masks]
@@ -465,11 +673,13 @@ def _birthset_precompute_group(
     ]
 
     pair_subsets = []
+    pair_indices = []
     for left_idx in range(G):
         for right_idx in range(left_idx + 1, G):
             subset = (1 << int(left_idx)) | (1 << int(right_idx))
             if _birthset_valid_local_subset(subset, G):
                 pair_subsets.append(int(subset))
+                pair_indices.append([int(left_idx), int(right_idx)])
     constructive_pair_targets = _birthset_constructive_pair_targets(
         gold_local_subsets,
         G,
@@ -489,38 +699,6 @@ def _birthset_precompute_group(
         else 0.0
         for subset in pair_subsets
     ]
-
-    expansion_subsets = None
-    expansion_labels = None
-    if not bool(proposal_train_topk):
-        expansion_subsets = []
-        for combo in itertools.combinations(range(G), 3):
-            subset = 0
-            for idx in combo:
-                subset |= 1 << int(idx)
-            expansion_subsets.append(int(subset))
-        if expansion_subsets:
-            positives = [
-                subset
-                for subset in expansion_subsets
-                if _birthset_subset_inside_any_gold(subset, gold_local_subsets)
-            ]
-            negatives = [
-                subset
-                for subset in expansion_subsets
-                if not _birthset_subset_inside_any_gold(subset, gold_local_subsets)
-            ]
-            cap = int(proposal_max_expansion_examples)
-            if len(positives) + len(negatives) > cap:
-                expansion_subsets = positives + negatives[: max(0, cap - len(positives))]
-            else:
-                expansion_subsets = positives + negatives
-            expansion_labels = [
-                1.0
-                if _birthset_subset_inside_any_gold(subset, gold_local_subsets)
-                else 0.0
-                for subset in expansion_subsets
-            ]
 
     if strict_pair_targets is not None:
         positive_pair_subsets = [
@@ -548,32 +726,58 @@ def _birthset_precompute_group(
     positive_pair_subsets = positive_pair_subsets[
         : int(proposal_max_order_seed_pairs)
     ]
+    expansion_seed_pairs = None
+    expansion_add_indices = None
+    expansion_subsets = None
+    expansion_labels = None
+    if not bool(proposal_train_topk):
+        (
+            expansion_seed_pairs,
+            expansion_add_indices,
+            expansion_subsets,
+            expansion_labels,
+        ) = _birthset_conditional_expansion_examples(
+            positive_pair_subsets,
+            gold_local_subsets,
+            G,
+            int(proposal_max_expansion_examples),
+        )
+    expansion_seed_pair_indices = (
+        [
+            _birthset_local_subset_indices(pair_subset, G)
+            for pair_subset in expansion_seed_pairs
+        ]
+        if expansion_seed_pairs is not None
+        else None
+    )
+
     order_candidate_subsets = []
     order_slices = []
-    for pair_subset in positive_pair_subsets:
-        pair_subset = int(pair_subset)
-        target_ranks = []
-        start = len(order_candidate_subsets)
-        for idx in range(G):
-            if (pair_subset >> int(idx)) & 1:
-                continue
-            candidate_subset = int(pair_subset | (1 << int(idx)))
-            if not _birthset_valid_local_subset(candidate_subset, G):
-                continue
-            containing_sizes = [
-                _birthset_local_subset_size(gold_subset)
-                for gold_subset in gold_local_subsets
-                if (pair_subset & ~int(gold_subset)) == 0
-                and (candidate_subset & ~int(gold_subset)) == 0
-            ]
-            rank = min(containing_sizes) if containing_sizes else G + 1
-            order_candidate_subsets.append(candidate_subset)
-            target_ranks.append(float(rank))
-        end = len(order_candidate_subsets)
-        if end - start >= 2:
-            order_slices.append((start, end, target_ranks))
-        else:
-            del order_candidate_subsets[start:end]
+    if float(proposal_order_weight) > 0.0:
+        for pair_subset in positive_pair_subsets:
+            pair_subset = int(pair_subset)
+            target_ranks = []
+            start = len(order_candidate_subsets)
+            for idx in range(G):
+                if (pair_subset >> int(idx)) & 1:
+                    continue
+                candidate_subset = int(pair_subset | (1 << int(idx)))
+                if not _birthset_valid_local_subset(candidate_subset, G):
+                    continue
+                containing_sizes = [
+                    _birthset_local_subset_size(gold_subset)
+                    for gold_subset in gold_local_subsets
+                    if (pair_subset & ~int(gold_subset)) == 0
+                    and (candidate_subset & ~int(gold_subset)) == 0
+                ]
+                rank = min(containing_sizes) if containing_sizes else G + 1
+                order_candidate_subsets.append(candidate_subset)
+                target_ranks.append(float(rank))
+            end = len(order_candidate_subsets)
+            if end - start >= 2:
+                order_slices.append((start, end, target_ranks))
+            else:
+                del order_candidate_subsets[start:end]
 
     return {
         "components": tuple(component_masks),
@@ -581,6 +785,10 @@ def _birthset_precompute_group(
         "gold_local_subsets": gold_local_subsets,
         "candidate_info": {
             "candidates": candidates,
+            "candidate_component_indices": [
+                list(item.get("component_indices", []))
+                for item in candidates
+            ],
             "candidate_labels": candidate_labels,
             "full_mask": int(full_mask),
             "gold_mismatches": int(gold_mismatches),
@@ -590,9 +798,13 @@ def _birthset_precompute_group(
         },
         "proposal": {
             "pair_subsets": pair_subsets,
+            "pair_indices": pair_indices,
             "pair_labels": pair_labels,
             "strict_pair_targets": sorted(int(x) for x in strict_pair_targets or []),
             "gold_local_subsets": gold_local_subsets,
+            "expansion_seed_pairs": expansion_seed_pairs,
+            "expansion_seed_pair_indices": expansion_seed_pair_indices,
+            "expansion_add_indices": expansion_add_indices,
             "expansion_subsets": expansion_subsets,
             "expansion_labels": expansion_labels,
             "order_candidate_subsets": order_candidate_subsets,
@@ -616,6 +828,7 @@ def _birthset_precompute_sample(
     proposal_pair_target_mode: str,
     proposal_max_expansion_examples: int,
     proposal_max_order_seed_pairs: int,
+    proposal_order_weight: float,
     proposal_train_topk: bool,
 ) -> Optional[Dict[str, Any]]:
     labels = sample.get("labels") or sample.get("autoregressive_labels")
@@ -635,6 +848,23 @@ def _birthset_precompute_sample(
         result_split = int(label.get("result_split", 0))
         group_targets.setdefault(components, []).append((result_split, local_subset))
     if not group_targets:
+        group_targets = {}
+
+    boundary_newick = (
+        sample.get("newick")
+        or sample.get("autoregressive_newick")
+        or sample.get("newick_tree")
+    )
+    if boundary_newick:
+        try:
+            for group in get_structural_polytomy_groups_from_newick(str(boundary_newick)):
+                components = tuple(int(component) for component in group)
+                if components and components not in group_targets:
+                    group_targets[components] = []
+        except Exception:
+            pass
+
+    if not group_targets:
         return None
     groups_by_components = {}
     for components, targets in group_targets.items():
@@ -649,6 +879,7 @@ def _birthset_precompute_sample(
             proposal_pair_target_mode=proposal_pair_target_mode,
             proposal_max_expansion_examples=proposal_max_expansion_examples,
             proposal_max_order_seed_pairs=proposal_max_order_seed_pairs,
+            proposal_order_weight=proposal_order_weight,
             proposal_train_topk=proposal_train_topk,
         )
     return {
@@ -1971,12 +2202,28 @@ class TreeDataset(Dataset):
         selected_sequences: Optional[List[str]] = None,
         selected_sequence_names: Optional[List[str]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        num_leaves = None
+        if selected_sequences is not None:
+            num_leaves = len(selected_sequences)
+        if num_leaves is None and num_to_name:
+            try:
+                numeric_indices = [
+                    int(key)
+                    for key, value in num_to_name.items()
+                    if value not in (None, "", "ROOT_DUMMY")
+                ]
+                if numeric_indices:
+                    num_leaves = max(numeric_indices) + 1
+            except Exception:
+                num_leaves = None
         for samples in groups:
             for sample in samples:
                 sample.setdefault("dataset_id", str(dataset_id).upper())
                 sample.setdefault("id", sample_id)
                 sample.setdefault("num_to_name", num_to_name)
                 sample.setdefault("seq_ordering_map", seq_ordering_map)
+                if num_leaves is not None:
+                    sample.setdefault("num_leaves", int(num_leaves))
                 if selected_sequences is not None:
                     sample.setdefault("selected_sequences", list(selected_sequences))
                 if selected_sequence_names is not None:
@@ -4285,6 +4532,9 @@ class PhylaDataModule(pl.LightningDataModule):
         self.birthset_proposal_max_order_seed_pairs = int(
             trainer_cfg.get("birthset_proposal_max_order_seed_pairs", 128)
         )
+        self.birthset_proposal_order_weight = float(
+            trainer_cfg.get("birthset_proposal_order_weight", 0.0)
+        )
         self.birthset_proposal_train_topk = bool(
             trainer_cfg.get("birthset_proposal_train_topk", False)
         )
@@ -4301,6 +4551,15 @@ class PhylaDataModule(pl.LightningDataModule):
         self.velocity_probe_direct_set_anchor_only = bool(
             config.get("trainer", {}).get(
                 "velocity_probe_direct_set_anchor_only",
+                False,
+            )
+        )
+        self.velocity_probe_direct_set_loss = bool(
+            config.get("trainer", {}).get("velocity_probe_direct_set_loss", False)
+        )
+        self.velocity_probe_direct_set_include_base_samples = bool(
+            config.get("trainer", {}).get(
+                "velocity_probe_direct_set_include_base_samples",
                 False,
             )
         )
@@ -4828,6 +5087,241 @@ class PhylaDataModule(pl.LightningDataModule):
                 return anchor_samples
         return samples
 
+    def _raw_graph_batch_from_samples(self, samples, raw_graph_key):
+        raw_graphs = [sample.get(raw_graph_key) for sample in samples or []]
+        if not raw_graphs or not all(raw_graph is not None for raw_graph in raw_graphs):
+            return None
+        return self._pack_tokenizer_raw_graph_batch(raw_graphs)
+
+    def _build_collated_full_path_velocity_batch(self, samples):
+        all_samples = list(samples or [])
+        selected_samples = self._select_velocity_samples_for_joint_tokenizer(all_samples)
+        if not selected_samples:
+            return None
+        dataset_ids = [
+            str(sample.get("dataset_id")).upper()
+            if sample.get("dataset_id") is not None
+            else None
+            for sample in selected_samples
+        ]
+        ids = [
+            sample.get("id") or dataset_id or str(idx)
+            for idx, (sample, dataset_id) in enumerate(zip(selected_samples, dataset_ids))
+        ]
+        direct_targets = []
+        direct_mask = []
+        include_base_samples = bool(
+            self.velocity_probe_direct_set_include_base_samples
+        )
+        use_direct_loss = bool(self.velocity_probe_direct_set_loss)
+        for sample in selected_samples:
+            use_direct = bool(
+                use_direct_loss and (sample.get("anchor_family") or include_base_samples)
+            )
+            direct_mask.append(use_direct)
+            direct_targets.append(
+                _full_path_target_splits_from_velocity_sample(sample)
+                if use_direct
+                else []
+            )
+        direct_precomputed = [
+            _probe_direct_set_precompute_for_velocity_sample(sample, targets)
+            if use_direct
+            else None
+            for sample, targets, use_direct in zip(
+                selected_samples,
+                direct_targets,
+                direct_mask,
+            )
+        ]
+        return {
+            "_is_replay_batch": True,
+            "_skip_training_augmentations": True,
+            "_use_full_path_control_velocity_loss": True,
+            "_use_probe_parity_direct_set_loss": bool(any(direct_mask)),
+            "_tokenized_trees_raw_graph_batch": self._raw_graph_batch_from_samples(
+                selected_samples,
+                "newick_tree_tokenizer_raw_graph",
+            ),
+            "batched_time": torch.tensor(
+                [float(sample["timepoint"]) for sample in selected_samples],
+                dtype=torch.float32,
+            ),
+            "phyla_embeddings": None,
+            "original_trees": [sample["newick_tree"] for sample in selected_samples],
+            "start_trees": [
+                sample.get("start_tree", sample.get("newick_tree"))
+                for sample in selected_samples
+            ],
+            "target_trees": [sample["target_tree"] for sample in selected_samples],
+            "bank_group_key": [sample.get("bank_group_key") for sample in selected_samples],
+            "batched_velocity": [sample["velocity"] for sample in selected_samples],
+            "velocity_next_boundary_trees": [
+                sample.get("velocity_next_boundary_tree") for sample in selected_samples
+            ],
+            "num_leaves": [int(sample["num_leaves"]) for sample in selected_samples],
+            "ids": ids,
+            "dataset_ids": dataset_ids,
+            "mappings": [sample.get("num_to_name") for sample in selected_samples],
+            "selected_sequences": [
+                sample.get("selected_sequences") for sample in selected_samples
+            ],
+            "selected_sequence_names": [
+                sample.get("selected_sequence_names") for sample in selected_samples
+            ],
+            "_probe_direct_set_targets": direct_targets,
+            "_probe_direct_set_sample_mask": direct_mask,
+            "_cached_probe_direct_set_items": direct_precomputed,
+        }
+
+    def _build_collated_full_path_autoregressive_batch(self, samples):
+        samples = list(samples or [])
+        if not samples:
+            return None
+        dataset_ids = [
+            str(sample.get("dataset_id")).upper()
+            if sample.get("dataset_id") is not None
+            else None
+            for sample in samples
+        ]
+        ids = [
+            sample.get("id") or dataset_id or str(idx)
+            for idx, (sample, dataset_id) in enumerate(zip(samples, dataset_ids))
+        ]
+        component_groups = [
+            get_structural_polytomy_groups_from_newick(sample["newick"])
+            for sample in samples
+        ]
+        precomputed_group_indices = []
+        precomputed_group_splits = []
+        precomputed_group_indices_available = True
+        for sample, groups in zip(samples, component_groups):
+            raw_graph = sample.get("newick_tokenizer_raw_graph")
+            if not (
+                isinstance(raw_graph, dict)
+                and bool(raw_graph.get("_tree_tokenizer_raw_graph_cache", False))
+            ):
+                precomputed_group_indices_available = False
+                break
+            try:
+                group_indices, group_splits = (
+                    get_explicit_structural_group_indices_from_edge_splits(
+                        raw_graph.get("edge_split_masks", []),
+                        groups,
+                        int(raw_graph["node_num"]),
+                        num_leaves=int(sample["num_leaves"]),
+                    )
+                )
+            except Exception:
+                precomputed_group_indices_available = False
+                break
+            precomputed_group_indices.append(group_indices)
+            precomputed_group_splits.append(group_splits)
+        return {
+            "_is_replay_batch": True,
+            "_skip_training_augmentations": True,
+            "_tokenized_autoregressive_trees_raw_graph_batch": (
+                self._raw_graph_batch_from_samples(samples, "newick_tokenizer_raw_graph")
+            ),
+            "newick_autoregressive_trees": [sample["newick"] for sample in samples],
+            "_cached_autoregressive_component_groups": component_groups,
+            "_cached_autoregressive_group_indices": (
+                precomputed_group_indices
+                if precomputed_group_indices_available
+                else None
+            ),
+            "_cached_autoregressive_group_splits": (
+                precomputed_group_splits
+                if precomputed_group_indices_available
+                else None
+            ),
+            "start_trees": [
+                sample.get("start_tree", sample.get("newick")) for sample in samples
+            ],
+            "target_trees": [sample["target_tree"] for sample in samples],
+            "bank_group_key": [sample.get("bank_group_key") for sample in samples],
+            "batched_autoregressive_time": torch.tensor(
+                [float(sample["time"]) for sample in samples],
+                dtype=torch.float32,
+            ),
+            "batched_autoregressive_labels": [sample["labels"] for sample in samples],
+            "batched_birthset_precomputed": [
+                sample.get("birthset_precomputed") for sample in samples
+            ],
+            "_birthset_precomputed_candidate_info_enabled": bool(
+                any(
+                    bool(sample.get("_birthset_precomputed_candidate_info_enabled", False))
+                    for sample in samples
+                )
+            ),
+            "batched_autoregressive_stop_after_merge": torch.tensor(
+                [
+                    1.0 if sample.get("stop_after_merge", False) else 0.0
+                    for sample in samples
+                ],
+                dtype=torch.float32,
+            ),
+            "phyla_embeddings": None,
+            "num_leaves": [int(sample["num_leaves"]) for sample in samples],
+            "ids": ids,
+            "dataset_ids": dataset_ids,
+            "mappings": [sample.get("num_to_name") for sample in samples],
+            "selected_sequences": [
+                sample.get("selected_sequences") for sample in samples
+            ],
+            "selected_sequence_names": [
+                sample.get("selected_sequence_names") for sample in samples
+            ],
+        }
+
+    def _build_collated_full_path_terminal_batch(self, samples):
+        samples = list(samples or [])
+        if not samples:
+            return None
+        dataset_ids = [
+            str(sample.get("dataset_id")).upper()
+            if sample.get("dataset_id") is not None
+            else None
+            for sample in samples
+        ]
+        ids = [
+            sample.get("id") or dataset_id or str(idx)
+            for idx, (sample, dataset_id) in enumerate(zip(samples, dataset_ids))
+        ]
+        return {
+            "_is_replay_batch": True,
+            "_skip_training_augmentations": True,
+            "_tokenized_trees_raw_graph_batch": self._raw_graph_batch_from_samples(
+                samples,
+                "newick_tree_tokenizer_raw_graph",
+            ),
+            "batched_time": torch.tensor(
+                [float(sample["timepoint"]) for sample in samples],
+                dtype=torch.float32,
+            ),
+            "batched_terminal_stop": torch.tensor(
+                [1.0 if sample.get("terminal_stop", False) else 0.0 for sample in samples],
+                dtype=torch.float32,
+            ),
+            "phyla_embeddings": None,
+            "original_trees": [sample["newick_tree"] for sample in samples],
+            "start_trees": [
+                sample.get("start_tree", sample.get("newick_tree")) for sample in samples
+            ],
+            "target_trees": [sample.get("target_tree") for sample in samples],
+            "bank_group_key": [sample.get("bank_group_key") for sample in samples],
+            "num_leaves": [int(sample["num_leaves"]) for sample in samples],
+            "ids": ids,
+            "dataset_ids": dataset_ids,
+            "mappings": [sample.get("num_to_name") for sample in samples],
+            "selected_sequences": [
+                sample.get("selected_sequences") for sample in samples
+            ],
+            "selected_sequence_names": [
+                sample.get("selected_sequence_names") for sample in samples
+            ],
+        }
+
     def _pack_tokenizer_raw_graph_batch(self, raw_graphs, task_types=None):
         raw_graphs = [raw_graph for raw_graph in raw_graphs if raw_graph is not None]
         if not raw_graphs:
@@ -5090,6 +5584,7 @@ class PhylaDataModule(pl.LightningDataModule):
                 proposal_max_order_seed_pairs=(
                     self.birthset_proposal_max_order_seed_pairs
                 ),
+                proposal_order_weight=self.birthset_proposal_order_weight,
                 proposal_train_topk=self.birthset_proposal_train_topk,
             )
             if precomputed is not None:
@@ -5119,6 +5614,9 @@ class PhylaDataModule(pl.LightningDataModule):
         full_path_autoregressive_samples = []
         full_path_terminal_samples = []
         full_path_joint_tokenizer_raw_graph_batch = None
+        full_path_velocity_batch = None
+        full_path_autoregressive_batch = None
+        full_path_terminal_batch = None
         full_path_control_mode = False
         for item in batch:
             if item is None:
@@ -5183,6 +5681,44 @@ class PhylaDataModule(pl.LightningDataModule):
             self._attach_birthset_precompute_to_full_path_samples(
                 full_path_autoregressive_samples
             )
+
+        if full_path_control_mode:
+            full_path_velocity_batch = self._build_collated_full_path_velocity_batch(
+                full_path_velocity_samples
+            )
+            full_path_autoregressive_batch = (
+                self._build_collated_full_path_autoregressive_batch(
+                    full_path_autoregressive_samples
+                )
+            )
+            if self.full_path_use_terminal_samples:
+                full_path_terminal_batch = self._build_collated_full_path_terminal_batch(
+                    full_path_terminal_samples
+                )
+            if (
+                isinstance(full_path_joint_tokenizer_raw_graph_batch, dict)
+                and full_path_velocity_batch is not None
+                and full_path_autoregressive_batch is not None
+            ):
+                for sub_batch in (
+                    full_path_velocity_batch,
+                    full_path_autoregressive_batch,
+                ):
+                    sub_batch["_joint_tokenizer_raw_graph_batch"] = (
+                        full_path_joint_tokenizer_raw_graph_batch
+                    )
+                    sub_batch["_joint_velocity_batch_size"] = int(
+                        full_path_joint_tokenizer_raw_graph_batch.get(
+                            "velocity_count",
+                            0,
+                        )
+                    )
+                    sub_batch["_joint_autoregressive_batch_size"] = int(
+                        full_path_joint_tokenizer_raw_graph_batch.get(
+                            "autoregressive_count",
+                            0,
+                        )
+                    )
 
         if self.use_historical_collate:
             flat_batch = []
@@ -5301,6 +5837,14 @@ class PhylaDataModule(pl.LightningDataModule):
                     to_run["full_path_joint_tokenizer_raw_graph_batch"] = (
                         full_path_joint_tokenizer_raw_graph_batch
                     )
+                if full_path_velocity_batch is not None:
+                    to_run["full_path_velocity_batch"] = full_path_velocity_batch
+                if full_path_autoregressive_batch is not None:
+                    to_run["full_path_autoregressive_batch"] = (
+                        full_path_autoregressive_batch
+                    )
+                if full_path_terminal_batch is not None:
+                    to_run["full_path_terminal_batch"] = full_path_terminal_batch
                 to_run["_birthset_precomputed_candidate_info_enabled"] = bool(
                     self.full_path_precompute_birthset_candidate_info
                 )
@@ -5486,6 +6030,12 @@ class PhylaDataModule(pl.LightningDataModule):
                 to_run["full_path_joint_tokenizer_raw_graph_batch"] = (
                     full_path_joint_tokenizer_raw_graph_batch
                 )
+            if full_path_velocity_batch is not None:
+                to_run["full_path_velocity_batch"] = full_path_velocity_batch
+            if full_path_autoregressive_batch is not None:
+                to_run["full_path_autoregressive_batch"] = full_path_autoregressive_batch
+            if full_path_terminal_batch is not None:
+                to_run["full_path_terminal_batch"] = full_path_terminal_batch
             to_run["_birthset_precomputed_candidate_info_enabled"] = bool(
                 self.full_path_precompute_birthset_candidate_info
             )
