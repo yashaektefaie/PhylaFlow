@@ -2347,26 +2347,33 @@ class TreeDataset(Dataset):
                     )
                 boundary_events = _split_multi_label_training_events(boundary_events)
             for event in boundary_events:
+                event_newick = str(event["newick"])
+                try:
+                    event_num_leaves = int(Tree(event_newick).n_leaves)
+                except Exception:
+                    event_num_leaves = int(Tree(source_tree).n_leaves)
                 autoregressive_samples.append(
                     _attach_pair_group({
                         "path_index": int(path_index),
-                        "newick": str(event["newick"]),
+                        "newick": event_newick,
                         "target_tree": target_tree,
                         "labels": list(event["labels"]),
                         "stop_after_merge": bool(
                             event.get("stop_after_merge", False)
                         ),
                         "time": boundary_time,
+                        "num_leaves": event_num_leaves,
                     })
                 )
                 if self.overfit_full_path_control_terminal_include_ar_states:
                     terminal_samples.append(
                         _attach_pair_group({
                             "path_index": int(path_index),
-                            "newick_tree": str(event["newick"]),
+                            "newick_tree": event_newick,
                             "timepoint": boundary_time,
                             "terminal_stop": False,
                             "target_tree": target_tree,
+                            "num_leaves": event_num_leaves,
                         })
                     )
             if self.overfit_full_path_control_terminal_label_mode == "phase_start":
@@ -5174,6 +5181,34 @@ class PhylaDataModule(pl.LightningDataModule):
             "_cached_probe_direct_set_items": direct_precomputed,
         }
 
+    @staticmethod
+    def _full_path_structural_num_leaves(sample, groups):
+        """Return the tree leaf count expected by structural split helpers."""
+        sample_num_leaves = 0
+        try:
+            sample_num_leaves = int(sample.get("num_leaves") or 0)
+        except Exception:
+            sample_num_leaves = 0
+
+        max_component_bit = 0
+        for group in groups or []:
+            for component in group or []:
+                max_component_bit = max(
+                    max_component_bit,
+                    int(component).bit_length(),
+                )
+
+        # Full-path AR samples can carry biological sequence counts, while the
+        # tree utilities count ROOT_DUMMY too. If a component already needs the
+        # highest reported bit, the structural tree has one additional leaf.
+        if max_component_bit > 0 and sample_num_leaves <= max_component_bit:
+            return int(max_component_bit + 1)
+        if sample_num_leaves > 0:
+            return int(sample_num_leaves)
+        if max_component_bit > 0:
+            return int(max_component_bit + 1)
+        return 0
+
     def _build_collated_full_path_autoregressive_batch(self, samples):
         samples = list(samples or [])
         if not samples:
@@ -5209,7 +5244,10 @@ class PhylaDataModule(pl.LightningDataModule):
                         raw_graph.get("edge_split_masks", []),
                         groups,
                         int(raw_graph["node_num"]),
-                        num_leaves=int(sample["num_leaves"]),
+                        num_leaves=self._full_path_structural_num_leaves(
+                            sample,
+                            groups,
+                        ),
                     )
                 )
             except Exception:

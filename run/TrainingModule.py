@@ -5589,6 +5589,9 @@ def _predsim_overrun_trace_to_sampling_trace(out, target_tree):
         "velocity": [],
         "autoregressive": [],
         "stopped_for_no_valid_merge": False,
+        "stopped_for_birthset_underresolved": False,
+        "birthset_underresolved_boundary": False,
+        "birthset_underresolved_boundary_count": 0.0,
         "stopped_for_repeated_topology": False,
         "skipped_no_valid_boundary_revisits": 0.0,
         "stopped_for_prefix_replay_quota": False,
@@ -5619,6 +5622,15 @@ def _predsim_overrun_trace_to_sampling_trace(out, target_tree):
                 }
             )
     return trace
+
+
+def _mark_birthset_underresolved(trace):
+    if trace is None:
+        return
+    trace["birthset_underresolved_boundary"] = True
+    trace["birthset_underresolved_boundary_count"] = float(
+        trace.get("birthset_underresolved_boundary_count", 0.0) or 0.0
+    ) + 1.0
 
 
 def _predsim_overrun_rollout(
@@ -6151,6 +6163,9 @@ def _discrete_phase_rollout(
         "autoregressive": [],
         "terminal": [],
         "stopped_for_no_valid_merge": False,
+        "stopped_for_birthset_underresolved": False,
+        "birthset_underresolved_boundary": False,
+        "birthset_underresolved_boundary_count": 0.0,
         "stopped_for_repeated_topology": False,
         "skipped_no_valid_boundary_revisits": 0.0,
         "stopped_for_prefix_replay_quota": False,
@@ -6602,8 +6617,7 @@ def _discrete_phase_rollout(
                         ):
                             ar_boundary_complete = True
                         else:
-                            trace["birthset_incomplete_without_fallback"] = True
-                            trace["stopped_for_no_valid_merge"] = True
+                            _mark_birthset_underresolved(trace)
                             phase_exhausted = True
                         break
                     continue
@@ -6637,8 +6651,7 @@ def _discrete_phase_rollout(
                             "birthset_metrics": birthset_metrics,
                         }
                     )
-                    trace["birthset_incomplete_without_fallback"] = True
-                    trace["stopped_for_no_valid_merge"] = True
+                    _mark_birthset_underresolved(trace)
                     phase_exhausted = True
                     break
             if (
@@ -6646,8 +6659,7 @@ def _discrete_phase_rollout(
                 and birthset_attempted_this_boundary
                 and not birthset_allows_ar_fallback
             ):
-                trace["birthset_incomplete_without_fallback"] = True
-                trace["stopped_for_no_valid_merge"] = True
+                _mark_birthset_underresolved(trace)
                 phase_exhausted = True
                 break
             planned_merges = _plan_autoregressive_boundary_merges(
@@ -6964,6 +6976,9 @@ def _discrete_phase_rollout_batched_birthset(
         "autoregressive": [],
         "terminal": [],
         "stopped_for_no_valid_merge": False,
+        "stopped_for_birthset_underresolved": False,
+        "birthset_underresolved_boundary": False,
+        "birthset_underresolved_boundary_count": 0.0,
         "stopped_for_repeated_topology": False,
         "skipped_no_valid_boundary_revisits": 0.0,
         "stopped_for_prefix_replay_quota": False,
@@ -7382,8 +7397,7 @@ def _discrete_phase_rollout_batched_birthset(
                     }
                 )
                 if unresolved:
-                    trace["birthset_incomplete_without_fallback"] = True
-                    trace["stopped_for_no_valid_merge"] = True
+                    _mark_birthset_underresolved(trace)
 
         for idx in active:
             if not done[idx]:
@@ -10923,6 +10937,7 @@ class TrainingModule(LightningModule):
                 "_sampled_tree": "sampled_tree",
                 "_bank_group_key": "bank_group_key",
                 "_source_bank_index": "source_bank_index",
+                "_dataset_id": "dataset_id",
                 "_n_leaves": "n_leaves",
             }
             for private_key, public_key in field_map.items():
@@ -10987,19 +11002,22 @@ class TrainingModule(LightningModule):
             if sampled_pair is not None:
                 start_tree = sampled_pair["random_tree"]
                 target_tree = sampled_pair["effective_target_tree"]
+                dataset_id_value = sampled_pair.get("dataset_id")
+                name_mapping = sampled_pair.get("name_mapping")
+                if name_mapping is None:
+                    name_mapping = self._sample_metrics_name_mapping_for_dataset(
+                        dataset_split,
+                        dataset_id=dataset_id_value,
+                    )
                 return {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
                     "bank_group_key": sampled_pair.get("bank_group_key")
                     or sampled_pair.get("group_key"),
-                    "dataset_id": sampled_pair.get("dataset_id"),
+                    "dataset_id": dataset_id_value,
                     "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                     "max_events": int(len(sampled_pair.get("final_labels", []))),
-                    "name_mapping": (
-                        dataset_split.return_nexus_number_to_name(0)
-                        if hasattr(dataset_split, "return_nexus_number_to_name")
-                        else None
-                    ),
+                    "name_mapping": name_mapping,
                     "selected_sequences": sampled_pair.get("selected_sequences"),
                     "selected_sequence_names": sampled_pair.get(
                         "selected_sequence_names"
@@ -11013,18 +11031,21 @@ class TrainingModule(LightningModule):
                 bank_group_key_value = sampled.get("bank_group_key") or sampled.get(
                     "group_key"
                 )
+                dataset_id_value = sampled.get("dataset_id")
+                name_mapping = sampled.get("name_mapping") or sampled.get("num_to_name")
+                if name_mapping is None:
+                    name_mapping = self._sample_metrics_name_mapping_for_dataset(
+                        dataset_split,
+                        dataset_id=dataset_id_value,
+                    )
                 return {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
                     "bank_group_key": bank_group_key_value,
-                    "dataset_id": sampled.get("dataset_id"),
+                    "dataset_id": dataset_id_value,
                     "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                     "max_events": int(sampled.get("fixed_pair_num_events", 1024)),
-                    "name_mapping": (
-                        dataset_split.return_nexus_number_to_name(0)
-                        if hasattr(dataset_split, "return_nexus_number_to_name")
-                        else None
-                    ),
+                    "name_mapping": name_mapping,
                     "selected_sequences": sampled.get("selected_sequences"),
                     "selected_sequence_names": sampled.get(
                         "selected_sequence_names"
@@ -11037,11 +11058,13 @@ class TrainingModule(LightningModule):
         if fixed_pair is not None:
             start_tree = fixed_pair["random_tree"]
             target_tree = fixed_pair["effective_target_tree"]
-            name_mapping = (
-                dataset_split.return_nexus_number_to_name(0)
-                if hasattr(dataset_split, "return_nexus_number_to_name")
-                else fixed_pair.get("name_mapping")
-            )
+            dataset_id_value = fixed_pair.get("dataset_id")
+            name_mapping = fixed_pair.get("name_mapping")
+            if name_mapping is None:
+                name_mapping = self._sample_metrics_name_mapping_for_dataset(
+                    dataset_split,
+                    dataset_id=dataset_id_value,
+                )
             explicit_max_events = max(
                 int(getattr(dataset_split, "overfit_event_prefix_count", -1)),
                 -1,
@@ -11053,7 +11076,7 @@ class TrainingModule(LightningModule):
             pair = {
                 "start_tree": start_tree,
                 "target_tree": target_tree,
-                "dataset_id": fixed_pair.get("dataset_id"),
+                "dataset_id": dataset_id_value,
                 "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
                 "max_events": int(max_events),
                 "name_mapping": name_mapping,
@@ -11128,7 +11151,10 @@ class TrainingModule(LightningModule):
         if pair.get("name_mapping") is None and hasattr(dataset_split, "return_nexus_number_to_name"):
             try:
                 pair = dict(pair)
-                pair["name_mapping"] = dataset_split.return_nexus_number_to_name(0)
+                pair["name_mapping"] = self._sample_metrics_name_mapping_for_dataset(
+                    dataset_split,
+                    dataset_id=pair.get("dataset_id"),
+                )
             except Exception:
                 pass
         return pair
@@ -11469,6 +11495,11 @@ class TrainingModule(LightningModule):
                 "fixed_path_stopped_for_no_valid_merge": float(
                     1.0 if trace.get("stopped_for_no_valid_merge", False) else 0.0
                 ),
+                "fixed_path_stopped_for_birthset_underresolved": float(
+                    1.0
+                    if trace.get("stopped_for_birthset_underresolved", False)
+                    else 0.0
+                ),
                 "fixed_path_stopped_for_repeated_topology": float(
                     1.0
                     if trace.get("stopped_for_repeated_topology", False)
@@ -11498,6 +11529,14 @@ class TrainingModule(LightningModule):
         phyla_embeddings = None
         if self.live_phyla_model is not None:
             phyla_embeddings = self._compute_live_phyla_embeddings_for_pair(pair)
+        if phyla_embeddings is None and pair.get("selected_sequence_names"):
+            embeddings = self._lookup_precomputed_phyla_embeddings(
+                list(pair.get("selected_sequence_names") or []),
+                device=self.device,
+                dataset_id=pair.get("dataset_id"),
+            )
+            if embeddings is not None:
+                phyla_embeddings = embeddings.unsqueeze(0)
         if phyla_embeddings is None:
             phyla_embeddings = self._resolve_precomputed_phyla_embeddings_for_tree(
                 pair["start_tree"],
@@ -12772,6 +12811,19 @@ class TrainingModule(LightningModule):
         birthset_metrics = [
             event.get("birthset_metrics", {}) or {} for event in birthset_events
         ]
+        underresolved_boundary = bool(
+            (trace or {}).get(
+                "birthset_underresolved_boundary",
+                (trace or {}).get("birthset_incomplete_without_fallback", False),
+            )
+        )
+        underresolved_boundary_count = float(
+            (trace or {}).get(
+                "birthset_underresolved_boundary_count",
+                1.0 if underresolved_boundary else 0.0,
+            )
+            or 0.0
+        )
         result = {
             f"{prefix}topology_trace_entries": float(len(events)),
             f"{prefix}birthset_events": float(len(birthset_events)),
@@ -12779,10 +12831,11 @@ class TrainingModule(LightningModule):
             f"{prefix}birthset_inserted_splits": float(
                 sum(_selected_split_count(event) for event in birthset_events)
             ),
-            f"{prefix}birthset_incomplete_without_fallback": float(
-                1.0
-                if (trace or {}).get("birthset_incomplete_without_fallback", False)
-                else 0.0
+            f"{prefix}birthset_underresolved_boundary": float(
+                1.0 if underresolved_boundary else 0.0
+            ),
+            f"{prefix}birthset_underresolved_boundary_count": float(
+                underresolved_boundary_count
             ),
         }
         if birthset_metrics:
@@ -12816,20 +12869,37 @@ class TrainingModule(LightningModule):
                     for metrics in birthset_metrics
                 )
             )
-            result[f"{prefix}birthset_ar_fallback_calls"] = float(
+            result[f"{prefix}birthset_underresolved_polytomies"] = float(
                 sum(
-                    float(metrics.get("num_ar_fallback_calls", 0.0))
+                    float(
+                        metrics.get(
+                            "num_underresolved_polytomies",
+                            metrics.get("num_ar_fallback_calls", 0.0),
+                        )
+                    )
+                    for metrics in birthset_metrics
+                )
+            )
+            result[f"{prefix}birthset_empty_candidate_polytomies"] = float(
+                sum(
+                    float(metrics.get("num_empty_candidate_polytomies", 0.0))
                     for metrics in birthset_metrics
                 )
             )
             resolved_values = [
-                float(metrics.get("fraction_resolved_without_fallback", 0.0))
+                float(
+                    metrics.get(
+                        "fraction_resolved_by_birthset",
+                        metrics.get("fraction_resolved_without_fallback", 0.0),
+                    )
+                )
                 for metrics in birthset_metrics
-                if "fraction_resolved_without_fallback" in metrics
+                if "fraction_resolved_by_birthset" in metrics
+                or "fraction_resolved_without_fallback" in metrics
             ]
             if resolved_values:
                 result[
-                    f"{prefix}birthset_fraction_resolved_without_fallback_mean"
+                    f"{prefix}birthset_fraction_resolved_by_birthset_mean"
                 ] = float(np.mean(resolved_values))
         return result
 
@@ -12865,6 +12935,10 @@ class TrainingModule(LightningModule):
             "_n_leaves": int(pair["n_leaves"]),
             "_bank_group_key": pair.get("bank_group_key"),
             "_source_bank_index": pair.get("source_bank_index"),
+            "_dataset_id": pair.get("dataset_id"),
+            "sampled_tree_has_polytomy": float(
+                1.0 if has_polytomy_fast(sampled_tree, unrooted_ok=True) else 0.0
+            ),
         }
         if likelihood_scorer is not None:
             metrics["branch_relax_after_log_likelihood"] = float(
@@ -12878,6 +12952,9 @@ class TrainingModule(LightningModule):
         )
         metrics["stopped_for_no_valid_merge"] = float(
             1.0 if trace.get("stopped_for_no_valid_merge", False) else 0.0
+        )
+        metrics["stopped_for_birthset_underresolved"] = float(
+            1.0 if trace.get("stopped_for_birthset_underresolved", False) else 0.0
         )
         metrics["skipped_no_valid_boundary_revisits"] = float(
             trace.get("skipped_no_valid_boundary_revisits", 0.0)
@@ -13042,6 +13119,28 @@ class TrainingModule(LightningModule):
         except TypeError:
             return 0
 
+    def _sample_metrics_name_mapping_for_dataset(
+        self,
+        dataset_split,
+        *,
+        dataset_id=None,
+        fallback_index=0,
+    ):
+        if dataset_split is None or not hasattr(dataset_split, "return_nexus_number_to_name"):
+            return None
+        index = int(fallback_index)
+        if dataset_id is not None:
+            dataset_key = str(dataset_id).upper()
+            for idx, meta in enumerate(getattr(dataset_split, "_index", []) or []):
+                raw_id = meta.get("dataset_id", meta.get("id"))
+                if raw_id is not None and str(raw_id).upper() == dataset_key:
+                    index = int(idx)
+                    break
+        try:
+            return dataset_split.return_nexus_number_to_name(index)
+        except Exception:
+            return None
+
     def _sample_metrics_select_bank_indices(self, total_count, num_pairs, train=True):
         total_count = max(0, int(total_count))
         if total_count <= 0:
@@ -13096,7 +13195,7 @@ class TrainingModule(LightningModule):
             start_tree = sampled.get("start_tree")
             target_tree = sampled.get("target_tree")
             max_events_value = int(sampled.get("fixed_pair_num_events", 1024))
-            name_mapping_value = sampled.get("name_mapping")
+            name_mapping_value = sampled.get("name_mapping") or sampled.get("num_to_name")
             bank_group_key_value = sampled.get("bank_group_key") or sampled.get(
                 "group_key"
             )
@@ -13111,10 +13210,10 @@ class TrainingModule(LightningModule):
         )
         mapping = name_mapping_value
         if mapping is None and not topology_stream_index_path:
-            mapping = (
-                dataset_split.return_nexus_number_to_name(0)
-                if hasattr(dataset_split, "return_nexus_number_to_name")
-                else None
+            mapping = self._sample_metrics_name_mapping_for_dataset(
+                dataset_split,
+                dataset_id=dataset_id_value,
+                fallback_index=pair_index,
             )
         return {
             "start_tree": str(start_tree),
@@ -13621,12 +13720,13 @@ class TrainingModule(LightningModule):
                     "name_mapping": (
                         fixed_pair.get("name_mapping")
                         if fixed_pair.get("name_mapping") is not None
-                        else (
-                            dataset_split.return_nexus_number_to_name(0)
-                            if hasattr(dataset_split, "return_nexus_number_to_name")
-                            else None
+                        else self._sample_metrics_name_mapping_for_dataset(
+                            dataset_split,
+                            dataset_id=fixed_pair.get("dataset_id"),
                         )
                     ),
+                    "selected_sequences": fixed_pair.get("selected_sequences"),
+                    "selected_sequence_names": fixed_pair.get("selected_sequence_names"),
                 }
                 rows.append(self._sample_compare_harness_once(pair, train=train))
                 self._log_sample_metrics_progress(
@@ -13668,15 +13768,25 @@ class TrainingModule(LightningModule):
                         "bank_group_key"
                     ) or fixed_pair.get("group_key")
                     dataset_id_value = fixed_pair.get("dataset_id")
+                    selected_sequences_value = fixed_pair.get("selected_sequences")
+                    selected_sequence_names_value = fixed_pair.get(
+                        "selected_sequence_names"
+                    )
                 else:
                     start_tree = sampled.get("start_tree")
                     target_tree = sampled.get("target_tree")
                     max_events_value = int(sampled.get("fixed_pair_num_events", 1024))
-                    name_mapping_value = None
+                    name_mapping_value = sampled.get("name_mapping") or sampled.get(
+                        "num_to_name"
+                    )
                     bank_group_key_value = sampled.get("bank_group_key") or sampled.get(
                         "group_key"
                     )
                     dataset_id_value = sampled.get("dataset_id")
+                    selected_sequences_value = sampled.get("selected_sequences")
+                    selected_sequence_names_value = sampled.get(
+                        "selected_sequence_names"
+                    )
                 pair = {
                     "start_tree": start_tree,
                     "target_tree": target_tree,
@@ -13687,12 +13797,14 @@ class TrainingModule(LightningModule):
                     "name_mapping": (
                         name_mapping_value
                         if name_mapping_value is not None
-                        else (
-                            dataset_split.return_nexus_number_to_name(0)
-                            if hasattr(dataset_split, "return_nexus_number_to_name")
-                            else None
+                        else self._sample_metrics_name_mapping_for_dataset(
+                            dataset_split,
+                            dataset_id=dataset_id_value,
+                            fallback_index=pair_index,
                         )
                     ),
+                    "selected_sequences": selected_sequences_value,
+                    "selected_sequence_names": selected_sequence_names_value,
                 }
                 rows.append(self._sample_compare_harness_once(pair, train=train))
                 self._log_sample_metrics_progress(
@@ -15448,6 +15560,59 @@ class TrainingModule(LightningModule):
         ]
         return torch.cat(normalized, dim=0)
 
+    def _attach_precomputed_phyla_embeddings_for_batch(self, batch):
+        if not isinstance(batch, dict):
+            return False
+        if batch.get("phyla_embeddings") is not None:
+            return True
+        if "ids" not in batch:
+            return False
+
+        batch_size = len(batch.get("ids") or [])
+        if batch_size <= 0:
+            return False
+
+        mappings = batch.get("mappings") or [None] * batch_size
+        num_leaves = batch.get("num_leaves") or [None] * batch_size
+        dataset_ids = batch.get("dataset_ids") or [None] * batch_size
+        selected_names = batch.get("selected_sequence_names") or [None] * batch_size
+        if isinstance(mappings, dict):
+            mappings = [mappings] * batch_size
+        if isinstance(selected_names, tuple):
+            selected_names = list(selected_names)
+        if selected_names and all(isinstance(item, str) for item in selected_names):
+            selected_names = [selected_names] * batch_size
+
+        phyla_embeddings_list = []
+        for i in range(batch_size):
+            dataset_id = dataset_ids[i] if i < len(dataset_ids) else None
+            embeddings = None
+            names = selected_names[i] if i < len(selected_names) else None
+            if names:
+                embeddings = self._lookup_precomputed_phyla_embeddings(
+                    list(names),
+                    device=self.device,
+                    dataset_id=dataset_id,
+                )
+            if embeddings is None:
+                mapping = mappings[i] if i < len(mappings) else None
+                num_leaf = num_leaves[i] if i < len(num_leaves) else None
+                ordered_names = self._ordered_leaf_names_from_mapping(
+                    mapping,
+                    num_leaf=num_leaf,
+                )
+                embeddings = self._lookup_precomputed_phyla_embeddings(
+                    ordered_names or [],
+                    device=self.device,
+                    dataset_id=dataset_id,
+                )
+            if embeddings is None:
+                return False
+            phyla_embeddings_list.append(embeddings)
+
+        batch["phyla_embeddings"] = phyla_embeddings_list
+        return True
+
     def _encode_prepared_tokenized_trees_once(
         self,
         tokenized_trees,
@@ -15708,6 +15873,9 @@ class TrainingModule(LightningModule):
             )
         combined_times = torch.cat([velocity_times, autoregressive_times], dim=0)
 
+        if self.live_phyla_model is None:
+            self._attach_precomputed_phyla_embeddings_for_batch(velocity_batch)
+            self._attach_precomputed_phyla_embeddings_for_batch(autoregressive_batch)
         combined_phyla_embeddings = self._concat_phyla_embeddings_for_batches(
             [velocity_batch, autoregressive_batch],
             [velocity_batch_size, autoregressive_batch_size],
@@ -17730,9 +17898,14 @@ class TrainingModule(LightningModule):
     ):
         if not bool(batch.get("_birthset_precomputed_candidate_info_enabled", False)):
             return None
+        if self.birthset_proposal_train_topk:
+            return None
         if self.birthset_use_train_birth_split_bank:
             return None
         if not isinstance(precomputed_group, dict):
+            return None
+        proposal = precomputed_group.get("proposal")
+        if isinstance(proposal, dict) and bool(proposal.get("train_topk_dynamic")):
             return None
         candidate_info = precomputed_group.get("candidate_info")
         if not isinstance(candidate_info, dict):
@@ -18092,7 +18265,15 @@ class TrainingModule(LightningModule):
                     precomputed=proposal_precomputed,
                 )
             else:
-                proposal = None
+                proposal = self._birthset_proposal_loss(
+                    record["component_embeddings"],
+                    record.get("gold_local_subsets", []),
+                    component_phyla_embeddings=record.get(
+                        "component_phyla_embeddings"
+                    ),
+                    context=record.get("context"),
+                    precomputed=None,
+                )
             bce_losses.append(bce.detach())
             rank_losses.append(rank.detach())
             if proposal is not None:
@@ -18389,7 +18570,7 @@ class TrainingModule(LightningModule):
         if self.birthset_topology_head is None:
             return {
                 "selected": [],
-                "metrics": {"num_ar_fallback_calls": 1.0},
+                "metrics": {"num_underresolved_polytomies": 1.0},
             }
         full_mask = _birthset_full_mask(num_leaves)
         max_bit_length = int(full_mask).bit_length()
@@ -18455,8 +18636,9 @@ class TrainingModule(LightningModule):
             "num_selected_birth_splits": 0.0,
             "num_required_birth_splits": 0.0,
             "num_default_required_birth_splits": 0.0,
-            "fraction_resolved_without_fallback": 0.0,
-            "num_ar_fallback_calls": 0.0,
+            "fraction_resolved_by_birthset": 0.0,
+            "num_underresolved_polytomies": 0.0,
+            "num_empty_candidate_polytomies": 0.0,
             "num_transformer_forwards": 1.0,
             "num_oracle_candidate_splits": 0.0,
             "num_oracle_cardinality_splits": 0.0,
@@ -18552,7 +18734,8 @@ class TrainingModule(LightningModule):
             candidates = candidate_info["candidates"]
             metrics["num_candidate_splits"] += float(len(candidates))
             if not candidates:
-                metrics["num_ar_fallback_calls"] += 1.0
+                metrics["num_underresolved_polytomies"] += 1.0
+                metrics["num_empty_candidate_polytomies"] += 1.0
                 continue
             local_subsets = [int(item["local_subset"]) for item in candidates]
             with torch.inference_mode():
@@ -18581,7 +18764,7 @@ class TrainingModule(LightningModule):
                     planned_existing,
                 )
             if len(selected) < int(required):
-                metrics["num_ar_fallback_calls"] += 1.0
+                metrics["num_underresolved_polytomies"] += 1.0
             else:
                 resolved_count += 1
             for item in selected:
@@ -18592,7 +18775,7 @@ class TrainingModule(LightningModule):
                 planned_existing.add(split)
         metrics["num_selected_birth_splits"] = float(len(selected_all))
         if metrics["num_polytomies"] > 0.0:
-            metrics["fraction_resolved_without_fallback"] = (
+            metrics["fraction_resolved_by_birthset"] = (
                 float(resolved_count) / metrics["num_polytomies"]
             )
         return {"selected": selected_all, "metrics": metrics}
@@ -21376,6 +21559,9 @@ class TrainingModule(LightningModule):
                 "velocity": [],
                 "autoregressive": [],
                 "stopped_for_no_valid_merge": False,
+                "stopped_for_birthset_underresolved": False,
+                "birthset_underresolved_boundary": False,
+                "birthset_underresolved_boundary_count": 0.0,
                 "stopped_for_repeated_topology": False,
                 "skipped_no_valid_boundary_revisits": 0.0,
                 "stopped_for_prefix_replay_quota": False,
@@ -21638,6 +21824,7 @@ class TrainingModule(LightningModule):
         oversize_boundary_topologies = [set() for _ in newick_starting_trees]
         stop_for_repeated_topology = False
         stop_for_no_valid_merge = False
+        stop_for_birthset_underresolved = False
         def _event_budget_remaining():
             if max_events is None:
                 return True
@@ -22605,6 +22792,7 @@ class TrainingModule(LightningModule):
                     num_merges = 0
                     topology_changed = True
                     stop_after_no_valid_merge_requested = False
+                    stop_after_birthset_underresolved_requested = False
                     boundary_merge_cap = (
                         float("inf")
                         if max_events is None
@@ -22848,11 +23036,9 @@ class TrainingModule(LightningModule):
                                             boundary_state_key
                                         )
                                         if stop_on_no_valid_merge:
-                                            stop_after_no_valid_merge_requested = True
+                                            stop_after_birthset_underresolved_requested = True
                                         if trace is not None:
-                                            trace[
-                                                "birthset_incomplete_without_fallback"
-                                            ] = True
+                                            _mark_birthset_underresolved(trace)
                                         topology_changed = False
                                         break
                                     continue
@@ -22874,9 +23060,9 @@ class TrainingModule(LightningModule):
                                     boundary_state_key
                                 )
                                 if stop_on_no_valid_merge:
-                                    stop_after_no_valid_merge_requested = True
+                                    stop_after_birthset_underresolved_requested = True
                                 if trace is not None:
-                                    trace["birthset_incomplete_without_fallback"] = True
+                                    _mark_birthset_underresolved(trace)
                                 topology_changed = False
                                 break
                         
@@ -22976,6 +23162,8 @@ class TrainingModule(LightningModule):
                             topology_changed = False
                         if stop_after_no_valid_merge_requested:
                             topology_changed = False
+                        if stop_after_birthset_underresolved_requested:
+                            topology_changed = False
 
                     if topology_changed and (
                         (
@@ -23052,6 +23240,10 @@ class TrainingModule(LightningModule):
                         stop_for_no_valid_merge = True
                         if trace is not None:
                             trace["stopped_for_no_valid_merge"] = True
+                    if stop_after_birthset_underresolved_requested:
+                        stop_for_birthset_underresolved = True
+                        if trace is not None:
+                            trace["stopped_for_birthset_underresolved"] = True
 
                 new_trees.append(td2)
                 if prefix_replay_stop_requested:
@@ -23064,6 +23256,8 @@ class TrainingModule(LightningModule):
             if stop_for_repeated_topology:
                 break
             if stop_for_no_valid_merge:
+                break
+            if stop_for_birthset_underresolved:
                 break
 
             if n_steps % 100 == 0:
