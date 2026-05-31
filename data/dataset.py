@@ -2004,6 +2004,16 @@ class TreeDataset(Dataset):
         self.overfit_full_path_control_frontier_level_labels = bool(
             overfit_full_path_control_frontier_level_labels
         )
+        if (
+            self.overfit_full_path_control_birthset_boundary_labels
+            and self.overfit_full_path_control_frontier_level_labels
+        ):
+            raise ValueError(
+                "overfit_full_path_control_birthset_boundary_labels and "
+                "overfit_full_path_control_frontier_level_labels are mutually "
+                "exclusive. Boundary labels train one-shot birthset targets; "
+                "frontier labels train the packed-frontier merge decoder."
+            )
         self.size_detector = SizeDetector()
         # State tracker for adaptive batching (index, subtree_size, num_subtrees)
         # Default initialization
