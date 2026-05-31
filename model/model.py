@@ -694,6 +694,158 @@ class BirthSetTopologyHead(nn.Module):
                 offset += count
         return outputs
 
+    def score_many_packed(
+        self,
+        component_embeddings_list,
+        candidate_counts,
+        candidate_group_ids,
+        candidate_component_counts,
+        flat_candidate_ids,
+        flat_component_group_ids,
+        flat_component_local_indices,
+        contexts=None,
+        component_phyla_embeddings_list=None,
+        *,
+        return_flat: bool = False,
+    ):
+        if not component_embeddings_list:
+            return (None, []) if return_flat else []
+        counts = [int(count) for count in candidate_counts]
+        if not any(counts):
+            empty = component_embeddings_list[0].new_empty((0,))
+            outputs = [empty for _ in counts]
+            return (empty, outputs) if return_flat else outputs
+
+        packed = self._packed_components(
+            component_embeddings_list,
+            component_phyla_embeddings_list=component_phyla_embeddings_list,
+        )
+        H_flat = packed["H_flat"]
+        group_sums = packed["group_sums"]
+        group_counts = packed["group_counts"]
+        component_offsets = packed["component_offsets"]
+        P_flat = packed["P_flat"]
+        phyla_group_sums = packed["phyla_group_sums"]
+        D = int(H_flat.shape[-1])
+        device = H_flat.device
+
+        candidate_group_ids_t = torch.as_tensor(
+            candidate_group_ids,
+            device=device,
+            dtype=torch.long,
+        )
+        M = int(candidate_group_ids_t.numel())
+        if M <= 0:
+            empty = H_flat.new_empty((0,))
+            outputs = [empty for _ in counts]
+            return (empty, outputs) if return_flat else outputs
+        candidate_counts_t = torch.as_tensor(
+            candidate_component_counts,
+            device=device,
+            dtype=H_flat.dtype,
+        ).clamp(min=1.0)
+        if int(candidate_counts_t.numel()) != M:
+            raise ValueError("candidate_component_counts must match candidate_group_ids")
+
+        h_in_sum = H_flat.new_zeros((M, D))
+        flat_candidate_ids_t = torch.as_tensor(
+            flat_candidate_ids,
+            device=device,
+            dtype=torch.long,
+        )
+        flat_component_group_ids_t = torch.as_tensor(
+            flat_component_group_ids,
+            device=device,
+            dtype=torch.long,
+        )
+        flat_component_local_indices_t = torch.as_tensor(
+            flat_component_local_indices,
+            device=device,
+            dtype=torch.long,
+        )
+        if int(flat_candidate_ids_t.numel()) > 0:
+            flat_component_indices_t = (
+                component_offsets[flat_component_group_ids_t]
+                + flat_component_local_indices_t
+            )
+            h_in_sum.index_add_(
+                0,
+                flat_candidate_ids_t,
+                H_flat[flat_component_indices_t],
+            )
+        h_out_sum = group_sums[candidate_group_ids_t] - h_in_sum
+        out_counts = (
+            group_counts[candidate_group_ids_t] - candidate_counts_t
+        ).clamp(min=1.0)
+        h_in_mean = h_in_sum / candidate_counts_t.unsqueeze(-1)
+        h_out_mean = h_out_sum / out_counts.unsqueeze(-1)
+
+        group_count_for_candidate = group_counts[candidate_group_ids_t]
+        min_sizes = torch.minimum(
+            candidate_counts_t,
+            group_count_for_candidate - candidate_counts_t,
+        )
+        size_features = torch.stack(
+            [
+                candidate_counts_t / group_count_for_candidate.clamp(min=1.0),
+                min_sizes / group_count_for_candidate.clamp(min=1.0),
+                group_count_for_candidate / float(self.max_components_norm),
+            ],
+            dim=-1,
+        )
+        context_expand = self._context_tensor(
+            H_flat,
+            len(component_embeddings_list),
+            contexts,
+        )[candidate_group_ids_t]
+        features = torch.cat(
+            [
+                h_in_mean + h_out_mean,
+                (h_in_mean - h_out_mean).abs(),
+                h_in_mean * h_out_mean,
+                h_in_sum + h_out_sum,
+                (h_in_sum - h_out_sum).abs(),
+                context_expand,
+                size_features,
+            ],
+            dim=-1,
+        )
+        if self.component_phyla_proj is not None:
+            p_in_sum = H_flat.new_zeros((M, D))
+            if int(flat_candidate_ids_t.numel()) > 0:
+                p_in_sum.index_add_(
+                    0,
+                    flat_candidate_ids_t,
+                    P_flat[flat_component_indices_t],
+                )
+            p_out_sum = phyla_group_sums[candidate_group_ids_t] - p_in_sum
+            p_in_mean = p_in_sum / candidate_counts_t.unsqueeze(-1)
+            p_out_mean = p_out_sum / out_counts.unsqueeze(-1)
+            phyla_sum = p_in_mean + p_out_mean
+            phyla_abs_diff = (p_in_mean - p_out_mean).abs()
+            features = torch.cat(
+                [
+                    features,
+                    phyla_sum,
+                    phyla_abs_diff,
+                    p_in_mean * p_out_mean,
+                    (h_in_mean + h_out_mean) * phyla_sum,
+                    (h_in_mean - h_out_mean).abs() * phyla_abs_diff,
+                ],
+                dim=-1,
+            )
+
+        logits = self.mlp(features).squeeze(-1)
+        outputs = []
+        offset = 0
+        for count in counts:
+            if count <= 0:
+                outputs.append(logits.new_empty((0,)))
+            else:
+                outputs.append(logits[offset : offset + int(count)])
+                offset += int(count)
+        return (logits, outputs) if return_flat else outputs
+
     def score_many(
         self,
         component_embeddings_list,
@@ -2305,6 +2457,44 @@ class TreeDenoiserTokenGT(nn.Module):
             )
         return phyla_embeddings
 
+    def _leaf_index_metadata(self, leaf_idx_list, batch_size, device):
+        leaf_idx_list = (
+            list(leaf_idx_list)
+            if isinstance(leaf_idx_list, (list, tuple))
+            else [leaf_idx_list]
+        )
+        if len(leaf_idx_list) < int(batch_size):
+            leaf_idx_list = leaf_idx_list + [()] * (int(batch_size) - len(leaf_idx_list))
+
+        counts_cpu = []
+        normalized = []
+        max_count = 0
+        for value in leaf_idx_list[: int(batch_size)]:
+            if torch.is_tensor(value):
+                tensor = value.detach().to(device=device, dtype=torch.long).reshape(-1)
+            else:
+                tensor = torch.as_tensor(value, device=device, dtype=torch.long).reshape(-1)
+            count = int(tensor.numel())
+            counts_cpu.append(count)
+            normalized.append(tensor)
+            max_count = max(max_count, count)
+
+        counts = torch.tensor(counts_cpu, device=device, dtype=torch.long)
+        if max_count <= 0:
+            leaf_bits = torch.zeros((int(batch_size), 0), device=device, dtype=torch.long)
+            leaf_valid = torch.zeros((int(batch_size), 0), device=device, dtype=torch.bool)
+            return leaf_bits, leaf_valid, counts
+
+        leaf_bits = torch.zeros((int(batch_size), int(max_count)), device=device, dtype=torch.long)
+        leaf_valid = torch.zeros((int(batch_size), int(max_count)), device=device, dtype=torch.bool)
+        for batch_idx, tensor in enumerate(normalized):
+            count = int(tensor.numel())
+            if count <= 0:
+                continue
+            leaf_bits[int(batch_idx), :count] = tensor
+            leaf_valid[int(batch_idx), :count] = True
+        return leaf_bits, leaf_valid, counts
+
     def _compute_leaf_phyla_token_additions(
         self,
         phyla_proj_full,
@@ -2320,15 +2510,38 @@ class TreeDenoiserTokenGT(nn.Module):
             device=device,
             dtype=dtype,
         )
-        for b, leaf_indices in enumerate(leaf_idx_list):
-            if leaf_indices.numel() == 0:
+        leaf_idx_list = (
+            list(leaf_idx_list)
+            if isinstance(leaf_idx_list, (list, tuple))
+            else [leaf_idx_list]
+        )
+        batch_ids = []
+        target_positions = []
+        source_positions = []
+        for b, leaf_indices in enumerate(leaf_idx_list[: phyla_proj_full.size(0)]):
+            if not torch.is_tensor(leaf_indices):
+                leaf_indices = torch.as_tensor(leaf_indices, dtype=torch.long)
+            leaf_indices = leaf_indices.to(device=device, dtype=torch.long).reshape(-1)
+            if int(leaf_indices.numel()) == 0:
                 continue
-            leaf_count = leaf_indices.numel()
+            leaf_count = int(leaf_indices.numel())
             if phyla_proj_full.size(1) < leaf_count:
                 raise ValueError(
                     f"Need {leaf_count} phyla embeddings, got {phyla_proj_full.size(1)}"
                 )
-            additions[b, leaf_indices] = phyla_proj_full[b, :leaf_count].to(dtype)
+            batch_ids.append(
+                torch.full((leaf_count,), int(b), device=device, dtype=torch.long)
+            )
+            target_positions.append(leaf_indices)
+            source_positions.append(torch.arange(leaf_count, device=device, dtype=torch.long))
+        if batch_ids:
+            batch_ids_t = torch.cat(batch_ids, dim=0)
+            target_positions_t = torch.cat(target_positions, dim=0)
+            source_positions_t = torch.cat(source_positions, dim=0)
+            additions[batch_ids_t, target_positions_t] = phyla_proj_full[
+                batch_ids_t,
+                source_positions_t,
+            ].to(dtype)
         return additions
 
     def _compute_split_phyla_token_additions(
@@ -2351,46 +2564,83 @@ class TreeDenoiserTokenGT(nn.Module):
         zero_raw = torch.zeros(
             phyla_embeddings.size(-1), device=device, dtype=phyla_embeddings.dtype
         )
-
-        for b, leaf_indices in enumerate(leaf_idx_list):
-            if leaf_indices.numel() == 0:
+        edge_batches = []
+        edge_positions = []
+        split_masks = []
+        for b, masks_b in enumerate(edge_split_masks):
+            positions_b = torch.nonzero(edge_mask[b], as_tuple=True)[0]
+            edge_count = min(int(positions_b.numel()), len(masks_b))
+            if edge_count <= 0:
                 continue
+            edge_batches.append(
+                torch.full((edge_count,), int(b), device=device, dtype=torch.long)
+            )
+            edge_positions.append(positions_b[:edge_count].to(device=device, dtype=torch.long))
+            split_masks.extend(int(mask) for mask in masks_b[:edge_count])
+        if not split_masks:
+            return additions
 
-            leaf_count = leaf_indices.numel()
-            if phyla_embeddings.size(1) < leaf_count:
-                raise ValueError(
-                    f"Need {leaf_count} phyla embeddings, got {phyla_embeddings.size(1)}"
-                )
+        edge_batches_t = torch.cat(edge_batches, dim=0)
+        edge_positions_t = torch.cat(edge_positions, dim=0)
+        valid_splits = torch.tensor(
+            [int(mask) != 0 for mask in split_masks],
+            device=device,
+            dtype=torch.bool,
+        )
+        if not bool(valid_splits.any().item()):
+            return additions
 
-            raw_leaf_embeddings = phyla_embeddings[b, :leaf_count]
-            leaf_bits = [int(idx.item()) for idx in leaf_indices]
-            edge_positions = torch.nonzero(edge_mask[b], as_tuple=True)[0]
-            split_masks_b = edge_split_masks[b]
-            edge_count = min(edge_positions.numel(), len(split_masks_b))
+        leaf_bits, leaf_valid, leaf_counts = self._leaf_index_metadata(
+            leaf_idx_list,
+            phyla_embeddings.size(0),
+            device,
+        )
+        if int(leaf_counts.max().item()) > int(phyla_embeddings.size(1)):
+            raise ValueError(
+                f"Need {int(leaf_counts.max().item())} phyla embeddings, got {phyla_embeddings.size(1)}"
+            )
+        max_leaf_count = int(leaf_bits.shape[1])
+        if max_leaf_count <= 0:
+            return additions
 
-            for edge_idx in range(edge_count):
-                split_mask = int(split_masks_b[edge_idx])
-                if split_mask == 0:
-                    continue
-                select = torch.tensor(
-                    [bool((split_mask >> bit) & 1) for bit in leaf_bits],
-                    device=device,
-                    dtype=torch.bool,
-                )
-                inside = (
-                    raw_leaf_embeddings[select].mean(dim=0)
-                    if select.any()
-                    else zero_raw
-                )
-                outside = (
-                    raw_leaf_embeddings[~select].mean(dim=0)
-                    if (~select).any()
-                    else zero_raw
-                )
-                split_feature = torch.cat([inside, outside], dim=0)
-                additions[b, edge_positions[edge_idx]] = self.phyla_split_proj(
-                    split_feature
-                ).to(dtype)
+        split_binary = self._create_split_binary_masks(
+            split_masks,
+            device,
+            dtype=phyla_embeddings.dtype,
+        )
+        leaf_bits_for_edge = leaf_bits.index_select(0, edge_batches_t)
+        leaf_valid_for_edge = leaf_valid.index_select(0, edge_batches_t)
+        source_columns = leaf_bits_for_edge.clamp(min=0, max=int(self.max_split_bits) - 1)
+        in_mask = split_binary.gather(1, source_columns).to(dtype=phyla_embeddings.dtype)
+        in_mask = in_mask * leaf_valid_for_edge.to(dtype=phyla_embeddings.dtype)
+        out_mask = (leaf_valid_for_edge.to(dtype=phyla_embeddings.dtype) - in_mask).clamp_min(0.0)
+        raw_leaf_embeddings = phyla_embeddings.index_select(0, edge_batches_t)[
+            :,
+            :max_leaf_count,
+            :
+        ].to(device=device)
+        inside_count = in_mask.sum(dim=1).clamp_min(1.0)
+        outside_count = out_mask.sum(dim=1).clamp_min(1.0)
+        inside = torch.bmm(in_mask.unsqueeze(1), raw_leaf_embeddings).squeeze(1)
+        outside = torch.bmm(out_mask.unsqueeze(1), raw_leaf_embeddings).squeeze(1)
+        inside = inside / inside_count.unsqueeze(1)
+        outside = outside / outside_count.unsqueeze(1)
+        inside = torch.where(
+            (in_mask.sum(dim=1) > 0).unsqueeze(1),
+            inside,
+            zero_raw.unsqueeze(0),
+        )
+        outside = torch.where(
+            (out_mask.sum(dim=1) > 0).unsqueeze(1),
+            outside,
+            zero_raw.unsqueeze(0),
+        )
+        split_features = torch.cat([inside, outside], dim=1)
+        projected = self.phyla_split_proj(split_features).to(dtype)
+        additions[
+            edge_batches_t[valid_splits],
+            edge_positions_t[valid_splits],
+        ] = projected[valid_splits]
         return additions
 
     def _compute_clade_phyla_token_context(
@@ -2415,85 +2665,89 @@ class TreeDenoiserTokenGT(nn.Module):
         zero_raw = torch.zeros(
             phyla_embeddings.size(-1), device=device, dtype=phyla_embeddings.dtype
         )
-
-        for b, leaf_indices in enumerate(leaf_idx_list):
-            leaf_count = int(leaf_indices.numel())
-            if leaf_count <= 0:
-                continue
-            if phyla_embeddings.size(1) < leaf_count:
-                raise ValueError(
-                    f"Need {leaf_count} phyla embeddings, got {phyla_embeddings.size(1)}"
-                )
-
-            edge_positions = torch.nonzero(edge_mask[b], as_tuple=True)[0]
-            split_masks_b = edge_split_masks[b]
-            edge_count = min(int(edge_positions.numel()), len(split_masks_b))
+        edge_batches = []
+        edge_positions = []
+        split_masks = []
+        for b, masks_b in enumerate(edge_split_masks):
+            positions_b = torch.nonzero(edge_mask[b], as_tuple=True)[0]
+            edge_count = min(int(positions_b.numel()), len(masks_b))
             if edge_count <= 0:
                 continue
-
-            raw_leaf_embeddings = phyla_embeddings[b, :leaf_count].to(device=device)
-            leaf_bits = [int(idx) for idx in leaf_indices.detach().cpu().tolist()]
-            split_mask_values = [
+            edge_batches.append(
+                torch.full((edge_count,), int(b), device=device, dtype=torch.long)
+            )
+            edge_positions.append(positions_b[:edge_count].to(device=device, dtype=torch.long))
+            split_masks.extend(
                 int(mask.item()) if torch.is_tensor(mask) else int(mask)
-                for mask in split_masks_b[:edge_count]
-            ]
-            split_binary = self._create_split_binary_masks(
-                split_mask_values,
-                device,
-                dtype=raw_leaf_embeddings.dtype,
+                for mask in masks_b[:edge_count]
             )
-            select_f = raw_leaf_embeddings.new_zeros(edge_count, leaf_count)
-            valid_leaf_columns = [
-                (leaf_pos, bit)
-                for leaf_pos, bit in enumerate(leaf_bits)
-                if 0 <= bit < self.max_split_bits
-            ]
-            if valid_leaf_columns:
-                target_columns = torch.tensor(
-                    [leaf_pos for leaf_pos, _bit in valid_leaf_columns],
-                    device=device,
-                    dtype=torch.long,
-                )
-                source_columns = torch.tensor(
-                    [bit for _leaf_pos, bit in valid_leaf_columns],
-                    device=device,
-                    dtype=torch.long,
-                )
-                select_f[:, target_columns] = split_binary.index_select(
-                    1,
-                    source_columns,
-                )
-            split_select = select_f > 0
-            outside_f = (~split_select).to(dtype=raw_leaf_embeddings.dtype)
-            valid_splits = torch.tensor(
-                [split_mask != 0 for split_mask in split_mask_values],
-                device=device,
-                dtype=torch.bool,
-            )
+        if not split_masks:
+            return context
 
-            inside_count = select_f.sum(dim=1)
-            outside_count = outside_f.sum(dim=1)
-            inside = select_f @ raw_leaf_embeddings
-            outside = outside_f @ raw_leaf_embeddings
-            inside = inside / inside_count.clamp_min(1.0).unsqueeze(1)
-            outside = outside / outside_count.clamp_min(1.0).unsqueeze(1)
-            inside = torch.where(
-                inside_count.unsqueeze(1) > 0,
-                inside,
-                zero_raw.unsqueeze(0),
-            )
-            outside = torch.where(
-                outside_count.unsqueeze(1) > 0,
-                outside,
-                zero_raw.unsqueeze(0),
-            )
+        edge_batches_t = torch.cat(edge_batches, dim=0)
+        edge_positions_t = torch.cat(edge_positions, dim=0)
+        valid_splits = torch.tensor(
+            [int(mask) != 0 for mask in split_masks],
+            device=device,
+            dtype=torch.bool,
+        )
+        if not bool(valid_splits.any().item()):
+            return context
 
-            clade_features = torch.cat([inside, outside], dim=1)
-            projected = self.phyla_clade_proj(clade_features).to(dtype)
-            if valid_splits.any():
-                context[b, edge_positions[:edge_count][valid_splits]] = projected[
-                    valid_splits
-                ]
+        leaf_bits, leaf_valid, leaf_counts = self._leaf_index_metadata(
+            leaf_idx_list,
+            phyla_embeddings.size(0),
+            device,
+        )
+        if int(leaf_counts.max().item()) > int(phyla_embeddings.size(1)):
+            raise ValueError(
+                f"Need {int(leaf_counts.max().item())} phyla embeddings, got {phyla_embeddings.size(1)}"
+            )
+        max_leaf_count = int(leaf_bits.shape[1])
+        if max_leaf_count <= 0:
+            return context
+
+        split_binary = self._create_split_binary_masks(
+            split_masks,
+            device,
+            dtype=phyla_embeddings.dtype,
+        )
+        leaf_bits_for_edge = leaf_bits.index_select(0, edge_batches_t)
+        leaf_valid_for_edge = leaf_valid.index_select(0, edge_batches_t)
+        source_columns = leaf_bits_for_edge.clamp(min=0, max=int(self.max_split_bits) - 1)
+        select_f = split_binary.gather(1, source_columns).to(dtype=phyla_embeddings.dtype)
+        select_f = select_f * leaf_valid_for_edge.to(dtype=phyla_embeddings.dtype)
+        outside_f = (
+            leaf_valid_for_edge.to(dtype=phyla_embeddings.dtype) - select_f
+        ).clamp_min(0.0)
+        raw_leaf_embeddings = phyla_embeddings.index_select(0, edge_batches_t)[
+            :,
+            :max_leaf_count,
+            :
+        ].to(device=device)
+
+        inside_count_raw = select_f.sum(dim=1)
+        outside_count_raw = outside_f.sum(dim=1)
+        inside = torch.bmm(select_f.unsqueeze(1), raw_leaf_embeddings).squeeze(1)
+        outside = torch.bmm(outside_f.unsqueeze(1), raw_leaf_embeddings).squeeze(1)
+        inside = inside / inside_count_raw.clamp_min(1.0).unsqueeze(1)
+        outside = outside / outside_count_raw.clamp_min(1.0).unsqueeze(1)
+        inside = torch.where(
+            inside_count_raw.unsqueeze(1) > 0,
+            inside,
+            zero_raw.unsqueeze(0),
+        )
+        outside = torch.where(
+            outside_count_raw.unsqueeze(1) > 0,
+            outside,
+            zero_raw.unsqueeze(0),
+        )
+        clade_features = torch.cat([inside, outside], dim=1)
+        projected = self.phyla_clade_proj(clade_features).to(dtype)
+        context[
+            edge_batches_t[valid_splits],
+            edge_positions_t[valid_splits],
+        ] = projected[valid_splits]
         return context
 
     def _compute_global_phyla_context(
@@ -2505,26 +2759,30 @@ class TreeDenoiserTokenGT(nn.Module):
     ):
         if not self.phyla_use_global_context or self.phyla_global_proj is None:
             return None
-        pooled = []
-        for b, leaf_indices in enumerate(leaf_idx_list):
-            leaf_count = int(leaf_indices.numel())
-            if leaf_count <= 0:
-                pooled.append(
-                    torch.zeros(
-                        phyla_embeddings.size(-1),
-                        device=device,
-                        dtype=phyla_embeddings.dtype,
-                    )
-                )
-                continue
-            if phyla_embeddings.size(1) < leaf_count:
-                raise ValueError(
-                    f"Need {leaf_count} phyla embeddings, got {phyla_embeddings.size(1)}"
-                )
-            pooled.append(
-                phyla_embeddings[b, :leaf_count].to(device=device).mean(dim=0)
+        leaf_bits, leaf_valid, leaf_counts = self._leaf_index_metadata(
+            leaf_idx_list,
+            phyla_embeddings.size(0),
+            device,
+        )
+        if int(leaf_counts.numel()) > 0 and int(leaf_counts.max().item()) > int(
+            phyla_embeddings.size(1)
+        ):
+            raise ValueError(
+                f"Need {int(leaf_counts.max().item())} phyla embeddings, got {phyla_embeddings.size(1)}"
             )
-        pooled = torch.stack(pooled, dim=0).to(device=device)
+        max_leaf_count = int(leaf_valid.shape[1])
+        if max_leaf_count <= 0:
+            pooled = phyla_embeddings.new_zeros(
+                (phyla_embeddings.size(0), phyla_embeddings.size(-1)),
+            ).to(device=device)
+        else:
+            valid = leaf_valid[:, :max_leaf_count].to(
+                device=device,
+                dtype=phyla_embeddings.dtype,
+            )
+            embeddings = phyla_embeddings[:, :max_leaf_count, :].to(device=device)
+            pooled = (embeddings * valid.unsqueeze(-1)).sum(dim=1)
+            pooled = pooled / valid.sum(dim=1).clamp_min(1.0).unsqueeze(1)
         return self.phyla_global_proj(pooled).to(dtype)
 
     def _prepare_encoder_inputs(
@@ -3599,6 +3857,210 @@ class TreeDenoiserTokenGT(nn.Module):
             else:
                 flat_ar_identity = torch.zeros(0, D, device=x.device, dtype=x.dtype)
             _ar_profile_mark("split_identity")
+
+            if (
+                not autoregressive_return_head_outputs
+                and len(self.autoregressive_group_refinement) == 0
+            ):
+                group_meta = []
+                flat_batch_parts = []
+                flat_token_parts = []
+                flat_group_id_parts = []
+                flat_component_split_masks = []
+                can_vectorize_groups = True
+                group_id = 0
+                for b, groups in enumerate(batch_polytomy_index):
+                    for num, group in enumerate(groups):
+                        group = group.to(device=x.device, dtype=torch.long).reshape(-1)
+                        group_size = int(group.numel())
+                        if group_size <= 1:
+                            continue
+                        group_splits = [
+                            int(split) for split in batch_polytomy_splits[b][num]
+                        ]
+                        if len(group_splits) != group_size:
+                            can_vectorize_groups = False
+                            break
+                        identity_start, identity_end = ar_identity_slices[b][num]
+                        if int(identity_end) - int(identity_start) != group_size:
+                            can_vectorize_groups = False
+                            break
+                        group_meta.append(
+                            {
+                                "batch_index": int(b),
+                                "group_indices": group,
+                                "splits_represented": group_splits,
+                                "start": len(flat_component_split_masks),
+                                "end": len(flat_component_split_masks) + group_size,
+                            }
+                        )
+                        flat_batch_parts.append(
+                            torch.full(
+                                (group_size,),
+                                int(b),
+                                device=x.device,
+                                dtype=torch.long,
+                            )
+                        )
+                        flat_token_parts.append(group)
+                        flat_group_id_parts.append(
+                            torch.full(
+                                (group_size,),
+                                int(group_id),
+                                device=x.device,
+                                dtype=torch.long,
+                            )
+                        )
+                        flat_component_split_masks.extend(group_splits)
+                        _ar_profile_add("groups", 1)
+                        _ar_profile_add("components", group_size)
+                        group_id += 1
+                    if not can_vectorize_groups:
+                        break
+
+                if can_vectorize_groups and group_meta:
+                    flat_batch_ids = torch.cat(flat_batch_parts, dim=0)
+                    flat_token_ids = torch.cat(flat_token_parts, dim=0)
+                    flat_group_ids = torch.cat(flat_group_id_parts, dim=0)
+                    flat_group_embeddings = x_no_graph[flat_batch_ids, flat_token_ids, :]
+                    _ar_profile_mark("group_gather")
+
+                    flat_group_identity = self.create_split_identity_embedding(
+                        flat_component_split_masks,
+                        x.device,
+                        cache=False,
+                    ).to(dtype=x.dtype)
+                    flat_group_embeddings = flat_group_embeddings + (
+                        self.split_identity_scale * flat_group_identity
+                    )
+                    if autoregressive_case_context is not None:
+                        flat_group_embeddings = flat_group_embeddings + (
+                            autoregressive_case_context.index_select(0, flat_batch_ids)
+                        )
+                    if autoregressive_start_topology_context is not None:
+                        flat_group_embeddings = flat_group_embeddings + (
+                            autoregressive_start_topology_context.index_select(
+                                0,
+                                flat_batch_ids,
+                            )
+                        )
+                    if autoregressive_phyla_context is not None:
+                        flat_group_embeddings = flat_group_embeddings + (
+                            self.phyla_global_context_scale
+                            * autoregressive_phyla_context.index_select(
+                                0,
+                                flat_batch_ids,
+                            )
+                        )
+                    if phyla_clade_context is not None:
+                        flat_group_embeddings = flat_group_embeddings + (
+                            self.phyla_clade_context_scale
+                            * phyla_clade_context[
+                                flat_batch_ids,
+                                flat_token_ids,
+                                :,
+                            ].to(device=flat_group_embeddings.device, dtype=x.dtype)
+                        )
+                    _ar_profile_mark("conditioning_add")
+                    _ar_profile_mark("group_refinement")
+                    _ar_profile_mark("merge_head")
+
+                    flat_component_phyla = None
+                    if phyla_embeddings is not None and flat_component_split_masks:
+                        leaf_bits, leaf_valid, leaf_counts = self._leaf_index_metadata(
+                            leaf_idx_list,
+                            phyla_embeddings.size(0),
+                            x.device,
+                        )
+                        if int(leaf_counts.numel()) > 0 and int(
+                            leaf_counts.max().item()
+                        ) > int(phyla_embeddings.size(1)):
+                            raise ValueError(
+                                f"Need {int(leaf_counts.max().item())} phyla embeddings, got {phyla_embeddings.size(1)}"
+                            )
+                        max_leaf_count = int(leaf_bits.shape[1])
+                        if max_leaf_count > 0:
+                            split_binary = self._create_split_binary_masks(
+                                flat_component_split_masks,
+                                x.device,
+                                dtype=phyla_embeddings.dtype,
+                            )
+                            component_leaf_bits = leaf_bits.index_select(
+                                0,
+                                flat_batch_ids,
+                            )
+                            component_leaf_valid = leaf_valid.index_select(
+                                0,
+                                flat_batch_ids,
+                            )
+                            source_columns = component_leaf_bits.clamp(
+                                min=0,
+                                max=int(self.max_split_bits) - 1,
+                            )
+                            component_mask = split_binary.gather(1, source_columns).to(
+                                dtype=phyla_embeddings.dtype
+                            )
+                            component_mask = component_mask * component_leaf_valid.to(
+                                dtype=phyla_embeddings.dtype
+                            )
+                            raw_leaf_embeddings = phyla_embeddings.index_select(
+                                0,
+                                flat_batch_ids,
+                            )[:, :max_leaf_count, :].to(device=x.device, dtype=x.dtype)
+                            component_counts = component_mask.sum(dim=1)
+                            component_sum = torch.bmm(
+                                component_mask.to(dtype=x.dtype).unsqueeze(1),
+                                raw_leaf_embeddings,
+                            ).squeeze(1)
+                            flat_component_phyla = component_sum / component_counts.to(
+                                dtype=x.dtype
+                            ).clamp_min(1.0).unsqueeze(1)
+                            flat_component_phyla = torch.where(
+                                component_counts.unsqueeze(1) > 0,
+                                flat_component_phyla,
+                                flat_component_phyla.new_zeros(
+                                    flat_component_phyla.shape
+                                ),
+                            )
+                    _ar_profile_mark("component_phyla")
+
+                    all_group_logits = []
+                    for meta in group_meta:
+                        start = int(meta["start"])
+                        end = int(meta["end"])
+                        batch_index = int(meta["batch_index"])
+                        group_output = {
+                            "batch_index": batch_index,
+                            "group_indices": meta["group_indices"],
+                            "splits_represented": meta["splits_represented"],
+                            "group_embeddings": flat_group_embeddings[start:end],
+                            "graph_context": x[batch_index, 0, :],
+                            "decoder_mode": self.autoregressive_head_mode,
+                        }
+                        if flat_component_phyla is not None:
+                            group_output["component_phyla_embeddings"] = (
+                                flat_component_phyla[start:end]
+                            )
+                        all_group_logits.append(group_output)
+                    _ar_profile_mark("output_base")
+                    _ar_profile_mark("append")
+                    if ar_decode_profile is not None:
+                        if torch.cuda.is_available() and x.is_cuda:
+                            torch.cuda.synchronize(x.device)
+                        timing_text = " ".join(
+                            f"{key}={float(value):.4f}s"
+                            for key, value in ar_decode_profile.items()
+                            if not key.startswith("_")
+                            and key not in {"groups", "components"}
+                        )
+                        logging.info(
+                            "AR_DECODE_PROFILE batch=%s groups=%s components=%s %s",
+                            int(B),
+                            int(ar_decode_profile.get("groups", 0)),
+                            int(ar_decode_profile.get("components", 0)),
+                            timing_text,
+                        )
+                    return all_group_logits
 
             for b, groups in enumerate(batch_polytomy_index):
                 for num, group in enumerate(groups):

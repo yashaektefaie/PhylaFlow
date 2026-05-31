@@ -5,6 +5,19 @@ Branch: `yasha-dev-newar`
 
 This memo summarizes the speed work on the OrthoMaM 29-leaf fixed-pair full-path training setup using the birthset topology decoder. The main outcome is that the GPU training step is now fast when batches are already prepared, but real end-to-end training is still dominated by full-path dataloader/collate construction at large external batch sizes.
 
+## Correction From 2026-05-29
+
+The original table below mislabeled `joint_trunk_forward` time as full profiled training-step time. The `0.312s` number came from:
+
+```text
+logs/benchmark_full_orthomam29leaf_staticgold_precompute_b16_nocap_20260521_gpu2.log
+step=25 joint_trunk_forward=0.3123s autoregressive_step=7.6316s total=8.8534s
+```
+
+So that number was useful for isolating the trunk forward, but it was not end-to-end step throughput.
+
+Re-running the old batch-64 benchmark path on 2026-05-29 gave warmed full `training_step` totals of `0.803s` and `1.037s`, while wall-clock was still dominated by dataloader/collate. For the current 4-dataset static-candidate setup, row-level preload alone took `78.6s` and ran slower than the non-preloaded run (`~0.64 it/s` versus `~1.0 it/s` at batch 4). Fully pre-collated batch-64 training exposed another measured bottleneck: Lightning was recursively transferring the huge nested full-path batch before `training_step`. Overriding `transfer_batch_to_device` for full-path batches improved repeated pre-collated batch-64 wall throughput from `0.08 it/s` to `0.49 it/s`.
+
 ## Current Throughput
 
 Measured on an RTX A6000 with `num_workers=32`, frozen/precomputed Phyla embeddings, full-path velocity plus birthset AR training, and CUDA-synchronized profiling.

@@ -124,6 +124,11 @@ def _birthset_trainer_kwargs(config):
             "use_component_phyla_conditioning",
             False,
         ),
+        "birthset_binary_pair_mode": pick(
+            "birthset_binary_pair_mode",
+            "binary_pair_mode",
+            False,
+        ),
         "birthset_pair_prefix_top_pairs": pick(
             "birthset_pair_prefix_top_pairs",
             "top_pairs",

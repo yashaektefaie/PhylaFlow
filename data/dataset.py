@@ -20,6 +20,7 @@ import re
 import json
 import math
 import itertools
+import time
 import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -506,6 +507,7 @@ def _birthset_precompute_group(
     component_masks: List[int],
     group_targets: List[Tuple[int, int]],
     *,
+    binary_pair_mode: bool,
     use_small_polytomy_enumeration: bool,
     use_static_pair_triple_candidates: bool,
     max_enum_components: int,
@@ -541,7 +543,19 @@ def _birthset_precompute_group(
         full_mask = (1 << int(max_bit_length)) - 1
 
     candidates_by_subset: Dict[int, Dict[str, Any]] = {}
-    if use_small_polytomy_enumeration and G <= int(max_enum_components):
+    if binary_pair_mode:
+        for left_idx in range(G):
+            for right_idx in range(left_idx + 1, G):
+                subset = (1 << int(left_idx)) | (1 << int(right_idx))
+                _birthset_add_candidate_record(
+                    candidates_by_subset,
+                    subset,
+                    component_masks,
+                    full_mask,
+                    "binary_pair",
+                    max_candidates=max_candidates_per_polytomy,
+                )
+    elif use_small_polytomy_enumeration and G <= int(max_enum_components):
         for size in range(2, G):
             for combo in itertools.combinations(range(G), size):
                 local_subset = 0
@@ -689,18 +703,28 @@ def _birthset_precompute_group(
         if str(proposal_pair_target_mode) == "strict_minimal"
         else None
     )
-    pair_labels = [
-        1.0
-        if (
-            int(subset) in strict_pair_targets
-            if strict_pair_targets is not None
-            else _birthset_subset_inside_any_gold(subset, gold_local_subsets)
-        )
-        else 0.0
-        for subset in pair_subsets
-    ]
+    if binary_pair_mode:
+        pair_labels = [
+            1.0 if int(subset) in gold_local_subsets else 0.0
+            for subset in pair_subsets
+        ]
+    else:
+        pair_labels = [
+            1.0
+            if (
+                int(subset) in strict_pair_targets
+                if strict_pair_targets is not None
+                else _birthset_subset_inside_any_gold(subset, gold_local_subsets)
+            )
+            else 0.0
+            for subset in pair_subsets
+        ]
 
-    if strict_pair_targets is not None:
+    if binary_pair_mode:
+        positive_pair_subsets = [
+            subset for subset in pair_subsets if int(subset) in gold_local_subsets
+        ]
+    elif strict_pair_targets is not None:
         positive_pair_subsets = [
             subset for subset in pair_subsets if int(subset) in strict_pair_targets
         ]
@@ -730,7 +754,7 @@ def _birthset_precompute_group(
     expansion_add_indices = None
     expansion_subsets = None
     expansion_labels = None
-    if not bool(proposal_train_topk):
+    if (not bool(binary_pair_mode)) and (not bool(proposal_train_topk)):
         (
             expansion_seed_pairs,
             expansion_add_indices,
@@ -785,16 +809,49 @@ def _birthset_precompute_group(
         "gold_local_subsets": gold_local_subsets,
         "candidate_info": {
             "candidates": candidates,
+            "candidate_local_subsets": [
+                int(item["local_subset"])
+                for item in candidates
+            ],
+            "candidate_split_masks": [
+                int(item["split_mask"])
+                for item in candidates
+            ],
             "candidate_component_indices": [
                 list(item.get("component_indices", []))
                 for item in candidates
             ],
+            "candidate_component_counts": [
+                len(list(item.get("component_indices", [])))
+                for item in candidates
+            ],
+            "flat_candidate_component_indices": [
+                int(component_idx)
+                for item in candidates
+                for component_idx in list(item.get("component_indices", []))
+            ],
+            "flat_candidate_ids": [
+                int(candidate_idx)
+                for candidate_idx, item in enumerate(candidates)
+                for _component_idx in list(item.get("component_indices", []))
+            ],
             "candidate_labels": candidate_labels,
+            "candidate_positive_count": int(
+                sum(1 for value in candidate_labels if float(value) > 0.5)
+            ),
             "full_mask": int(full_mask),
             "gold_mismatches": int(gold_mismatches),
             "pre_gold_target_count": int(pre_gold_target_count),
             "pre_gold_target_hits": int(pre_gold_target_hits),
             "static_pair_triple_candidates": bool(use_static_pair_triple_candidates),
+            "binary_pair_mode": bool(binary_pair_mode),
+            "gold_nonbinary_count": int(
+                sum(
+                    1
+                    for subset in gold_local_subsets
+                    if _birthset_local_subset_size(subset) != 2
+                )
+            ),
         },
         "proposal": {
             "pair_subsets": pair_subsets,
@@ -811,16 +868,343 @@ def _birthset_precompute_group(
             "order_slices": order_slices,
             "positive_pair_count": int(len(positive_pair_subsets)),
             "train_topk_dynamic": bool(proposal_train_topk),
+            "binary_pair_mode": bool(binary_pair_mode),
         },
         "required_splits": int(
-            _birthset_num_required_splits_for_group(G, component_masks, full_mask)
+            len(gold_local_subsets)
+            if binary_pair_mode
+            else _birthset_num_required_splits_for_group(G, component_masks, full_mask)
         ),
+    }
+
+
+def _birthset_frontier_precompute_group(
+    sample: Dict[str, Any],
+    component_masks: List[int],
+    raw_events: List[Dict[str, Any]],
+    *,
+    max_candidates_per_polytomy: int,
+) -> Optional[Dict[str, Any]]:
+    component_masks = [int(mask) for mask in component_masks]
+    G = len(component_masks)
+    if G <= 2:
+        return None
+
+    gold_by_level: List[List[Tuple[int, int]]] = []
+    gold_splits_all: List[int] = []
+    gold_local_all: List[int] = []
+    gold_mismatches = 0
+    for event in raw_events or []:
+        level_targets: List[Tuple[int, int]] = []
+        for label in event.get("labels", []) or []:
+            if not isinstance(label, dict):
+                continue
+            try:
+                result_split = int(label.get("result_split", 0))
+            except Exception:
+                continue
+            local_subset = _birthset_local_subset_for_components(
+                result_split,
+                component_masks,
+            )
+            if local_subset is None:
+                continue
+            if not _birthset_valid_local_subset(local_subset, G):
+                gold_mismatches += 1
+                continue
+            level_targets.append((result_split, int(local_subset)))
+            gold_splits_all.append(int(result_split))
+            gold_local_all.append(int(local_subset))
+        if level_targets:
+            gold_by_level.append(level_targets)
+    if not gold_by_level:
+        return None
+
+    gold_splits = sorted({int(split) for split in gold_splits_all})
+    gold_local_subsets = sorted({int(mask) for mask in gold_local_all})
+    num_leaves = _birthset_num_leaves_for_precompute(
+        sample,
+        component_masks,
+        gold_splits,
+    )
+    full_mask = _birthset_full_mask_for_num_leaves(num_leaves)
+    max_bit_length = max(
+        [int(full_mask).bit_length()]
+        + [int(mask).bit_length() for mask in component_masks]
+        + [int(mask).bit_length() for mask in gold_splits]
+    )
+    if max_bit_length > int(full_mask).bit_length():
+        full_mask = (1 << int(max_bit_length)) - 1
+
+    candidates: List[Dict[str, Any]] = []
+    candidate_labels: List[float] = []
+    candidate_local_subsets_seen = set()
+    active_fronts = [1 << int(idx) for idx in range(G)]
+    pre_gold_target_count = len({int(mask) for mask in gold_local_subsets})
+
+    max_candidates = int(max_candidates_per_polytomy)
+    for level_idx, level_targets in enumerate(gold_by_level):
+        level_positive_subsets = set(
+            int(mask) for _split, mask in level_targets
+        )
+        level_records: List[Dict[str, Any]] = []
+        level_record_subsets = set()
+        for left_front_idx in range(len(active_fronts)):
+            for right_front_idx in range(left_front_idx + 1, len(active_fronts)):
+                local_subset = int(active_fronts[left_front_idx]) | int(
+                    active_fronts[right_front_idx]
+                )
+                if not _birthset_valid_local_subset(local_subset, G):
+                    continue
+                split_mask = _birthset_local_subset_to_split(
+                    local_subset,
+                    component_masks,
+                )
+                if not _birthset_valid_rooted_split(split_mask, full_mask):
+                    continue
+                if (
+                    max_candidates > 0
+                    and len(candidates) + len(level_records) >= max_candidates
+                    and int(local_subset) not in level_positive_subsets
+                ):
+                    continue
+                record = _birthset_candidate_record(
+                    local_subset,
+                    component_masks,
+                    f"frontier_level_{int(level_idx)}",
+                )
+                level_records.append(record)
+                level_record_subsets.add(int(local_subset))
+                candidate_local_subsets_seen.add(int(local_subset))
+
+        for positive_subset in sorted(level_positive_subsets):
+            if int(positive_subset) in level_record_subsets:
+                continue
+            record = _birthset_candidate_record(
+                int(positive_subset),
+                component_masks,
+                f"frontier_gold_level_{int(level_idx)}",
+            )
+            level_records.append(record)
+            level_record_subsets.add(int(positive_subset))
+            candidate_local_subsets_seen.add(int(positive_subset))
+
+        for record in level_records:
+            local_subset = int(record["local_subset"])
+            candidates.append(record)
+            candidate_labels.append(
+                1.0 if local_subset in level_positive_subsets else 0.0
+            )
+
+        used_front_indices = set()
+        merged_fronts: List[int] = []
+        for positive_subset in sorted(
+            level_positive_subsets,
+            key=lambda subset: (_birthset_local_subset_size(subset), int(subset)),
+        ):
+            member_indices = []
+            member_union = 0
+            clean_match = True
+            for front_idx, front in enumerate(active_fronts):
+                front = int(front)
+                overlap = front & int(positive_subset)
+                if not overlap:
+                    continue
+                if int(front_idx) in used_front_indices or overlap != front:
+                    clean_match = False
+                    break
+                member_indices.append(int(front_idx))
+                member_union |= front
+            if (
+                not clean_match
+                or int(member_union) != int(positive_subset)
+                or len(member_indices) < 2
+            ):
+                gold_mismatches += 1
+                continue
+            used_front_indices.update(member_indices)
+            merged_fronts.append(int(positive_subset))
+
+        if used_front_indices:
+            active_fronts = [
+                int(front)
+                for idx, front in enumerate(active_fronts)
+                if int(idx) not in used_front_indices
+            ] + merged_fronts
+
+    if not candidates:
+        return None
+
+    pre_gold_target_hits = len(
+        {
+            int(local_subset)
+            for local_subset in {int(mask) for mask in gold_local_subsets}
+            if int(local_subset) in candidate_local_subsets_seen
+        }
+    )
+    candidate_component_indices = [
+        list(item.get("component_indices", [])) for item in candidates
+    ]
+    return {
+        "components": tuple(component_masks),
+        "gold_splits": gold_splits,
+        "gold_local_subsets": gold_local_subsets,
+        "candidate_info": {
+            "candidates": candidates,
+            "candidate_local_subsets": [
+                int(item["local_subset"]) for item in candidates
+            ],
+            "candidate_split_masks": [
+                int(item["split_mask"]) for item in candidates
+            ],
+            "candidate_component_indices": candidate_component_indices,
+            "candidate_component_counts": [
+                len(indices) for indices in candidate_component_indices
+            ],
+            "flat_candidate_component_indices": [
+                int(component_idx)
+                for indices in candidate_component_indices
+                for component_idx in indices
+            ],
+            "flat_candidate_ids": [
+                int(candidate_idx)
+                for candidate_idx, indices in enumerate(candidate_component_indices)
+                for _component_idx in indices
+            ],
+            "candidate_labels": candidate_labels,
+            "candidate_positive_count": int(
+                sum(1 for value in candidate_labels if float(value) > 0.5)
+            ),
+            "full_mask": int(full_mask),
+            "gold_mismatches": int(gold_mismatches),
+            "pre_gold_target_count": int(pre_gold_target_count),
+            "pre_gold_target_hits": int(pre_gold_target_hits),
+            "frontier_level_mode": True,
+            "frontier_num_levels": int(len(gold_by_level)),
+        },
+        "proposal": {
+            "pair_subsets": [],
+            "pair_indices": [],
+            "pair_labels": [],
+            "strict_pair_targets": [],
+            "gold_local_subsets": gold_local_subsets,
+            "expansion_seed_pairs": None,
+            "expansion_seed_pair_indices": None,
+            "expansion_add_indices": None,
+            "expansion_subsets": None,
+            "expansion_labels": None,
+            "order_candidate_subsets": [],
+            "order_slices": [],
+            "positive_pair_count": 0,
+            "train_topk_dynamic": False,
+            "frontier_level_mode": True,
+        },
+        "required_splits": int(len(gold_local_subsets)),
+    }
+
+
+def _birthset_frontier_precompute_sample(
+    sample: Dict[str, Any],
+    *,
+    max_candidates_per_polytomy: int,
+) -> Optional[Dict[str, Any]]:
+    raw_events = sample.get("frontier_raw_events")
+    if not isinstance(raw_events, list) or not raw_events:
+        return None
+    boundary_newick = (
+        sample.get("newick")
+        or sample.get("autoregressive_newick")
+        or sample.get("newick_tree")
+    )
+    if not boundary_newick:
+        return None
+    try:
+        groups = [
+            tuple(int(component) for component in group)
+            for group in get_structural_polytomy_groups_from_newick(str(boundary_newick))
+            if len(group) > 2
+        ]
+    except Exception:
+        return None
+    if not groups:
+        return None
+
+    groups_by_components = {}
+    for components in groups:
+        group = _birthset_frontier_precompute_group(
+            sample,
+            list(components),
+            raw_events,
+            max_candidates_per_polytomy=max_candidates_per_polytomy,
+        )
+        if group is None:
+            component_masks = [int(mask) for mask in components]
+            num_leaves = _birthset_num_leaves_for_precompute(
+                sample,
+                component_masks,
+                [],
+            )
+            full_mask = _birthset_full_mask_for_num_leaves(num_leaves)
+            max_bit_length = max(
+                [int(full_mask).bit_length()]
+                + [int(mask).bit_length() for mask in component_masks]
+            )
+            if max_bit_length > int(full_mask).bit_length():
+                full_mask = (1 << int(max_bit_length)) - 1
+            group = {
+                "components": tuple(component_masks),
+                "gold_splits": [],
+                "gold_local_subsets": [],
+                "candidate_info": {
+                    "candidates": [],
+                    "candidate_local_subsets": [],
+                    "candidate_split_masks": [],
+                    "candidate_component_indices": [],
+                    "candidate_component_counts": [],
+                    "flat_candidate_component_indices": [],
+                    "flat_candidate_ids": [],
+                    "candidate_labels": [],
+                    "candidate_positive_count": 0,
+                    "full_mask": int(full_mask),
+                    "gold_mismatches": 0,
+                    "pre_gold_target_count": 0,
+                    "pre_gold_target_hits": 0,
+                    "frontier_level_mode": True,
+                    "frontier_num_levels": 0,
+                },
+                "proposal": {
+                    "pair_subsets": [],
+                    "pair_indices": [],
+                    "pair_labels": [],
+                    "strict_pair_targets": [],
+                    "gold_local_subsets": [],
+                    "expansion_seed_pairs": None,
+                    "expansion_seed_pair_indices": None,
+                    "expansion_add_indices": None,
+                    "expansion_subsets": None,
+                    "expansion_labels": None,
+                    "order_candidate_subsets": [],
+                    "order_slices": [],
+                    "positive_pair_count": 0,
+                    "train_topk_dynamic": False,
+                    "frontier_level_mode": True,
+                },
+                "required_splits": 0,
+            }
+        groups_by_components[components] = group
+    if not groups_by_components:
+        return None
+    return {
+        "groups_by_components": groups_by_components,
+        "num_groups": int(len(groups_by_components)),
+        "frontier_level_mode": True,
     }
 
 
 def _birthset_precompute_sample(
     sample: Dict[str, Any],
     *,
+    binary_pair_mode: bool,
     use_small_polytomy_enumeration: bool,
     use_static_pair_triple_candidates: bool,
     max_enum_components: int,
@@ -831,6 +1215,14 @@ def _birthset_precompute_sample(
     proposal_order_weight: float,
     proposal_train_topk: bool,
 ) -> Optional[Dict[str, Any]]:
+    if sample.get("frontier_raw_events"):
+        frontier_precomputed = _birthset_frontier_precompute_sample(
+            sample,
+            max_candidates_per_polytomy=max_candidates_per_polytomy,
+        )
+        if frontier_precomputed is not None:
+            return frontier_precomputed
+
     labels = sample.get("labels") or sample.get("autoregressive_labels")
     if not labels:
         return None
@@ -872,6 +1264,7 @@ def _birthset_precompute_sample(
             sample,
             list(components),
             targets,
+            binary_pair_mode=binary_pair_mode,
             use_small_polytomy_enumeration=use_small_polytomy_enumeration,
             use_static_pair_triple_candidates=use_static_pair_triple_candidates,
             max_enum_components=max_enum_components,
@@ -1307,6 +1700,7 @@ class TreeDataset(Dataset):
         overfit_split_multi_subset_events: bool = False,
         overfit_full_path_control_mode: bool = False,
         overfit_full_path_control_birthset_boundary_labels: bool = False,
+        overfit_full_path_control_frontier_level_labels: bool = False,
         overfit_full_path_control_seed: int = 42,
         overfit_full_path_control_use_discrete_phase_time: bool = False,
         overfit_full_path_control_terminal_label_mode: str = "phase_start",
@@ -1316,6 +1710,8 @@ class TreeDataset(Dataset):
         overfit_full_path_control_extra_velocity_samples_json_paths: Optional[List[str]] = None,
         overfit_full_path_control_extra_velocity_samples_json_paths_by_dataset_id: Optional[Any] = None,
         full_path_preparse_structural_trees: bool = False,
+        full_path_preload_control_samples: bool = False,
+        full_path_preload_control_samples_max_rows: int = 0,
         overfit_oracle_prefix_start_prob: float = 0.0,
         overfit_oracle_prefix_max_fraction: float = 0.5,
         overfit_fixed_pair_group_by_json_metadata: bool = False,
@@ -1451,6 +1847,13 @@ class TreeDataset(Dataset):
         )
         self.full_path_preparse_structural_trees = bool(
             full_path_preparse_structural_trees
+        )
+        self.full_path_preload_control_samples = bool(
+            full_path_preload_control_samples
+        )
+        self.full_path_preload_control_samples_max_rows = max(
+            0,
+            int(full_path_preload_control_samples_max_rows or 0),
         )
         self.overfit_full_path_control_extra_velocity_samples = (
             _load_full_path_control_extra_velocity_samples(
@@ -1598,6 +2001,9 @@ class TreeDataset(Dataset):
         self.overfit_full_path_control_birthset_boundary_labels = bool(
             overfit_full_path_control_birthset_boundary_labels
         )
+        self.overfit_full_path_control_frontier_level_labels = bool(
+            overfit_full_path_control_frontier_level_labels
+        )
         self.size_detector = SizeDetector()
         # State tracker for adaptive batching (index, subtree_size, num_subtrees)
         # Default initialization
@@ -1630,6 +2036,12 @@ class TreeDataset(Dataset):
             Tuple[str, str, str],
             Dict[str, Any],
         ] = {}
+        self._cached_translate_map_by_tree_path: Dict[str, Dict[str, str]] = {}
+        self._preloaded_full_path_control_items: List[Dict[str, Any]] = []
+        self._preloaded_full_path_control_items_by_dataset_id: Dict[
+            str,
+            List[Dict[str, Any]],
+        ] = {}
         self.same_dataset_batch_size = 0
         self.same_dataset_batch_seed = 0
         self.random_tree = None
@@ -1655,6 +2067,10 @@ class TreeDataset(Dataset):
             self.freeze_full_path_control_pair_bank(
                 int(self.overfit_virtual_epoch_size),
                 int(self.overfit_full_path_control_seed),
+            )
+        if self.full_path_preload_control_samples:
+            self.preload_full_path_control_training_material(
+                max_rows=self.full_path_preload_control_samples_max_rows
             )
 
     def _coerce_bank_item(
@@ -1883,6 +2299,31 @@ class TreeDataset(Dataset):
         if chosen_start_item is None or chosen_target_item is None:
             return None
 
+        selection = self._overfit_fixed_pair_bank_selection_from_items(
+            chosen_start_item,
+            chosen_target_item,
+        )
+        if allow_oracle_prefix:
+            chosen_start_tree = str(chosen_start_item["tree"])
+            chosen_target_tree = str(chosen_target_item["tree"])
+            oracle_prefix_candidates = self._oracle_prefix_candidates(
+                chosen_start_tree,
+                chosen_target_tree,
+            )
+            if oracle_prefix_candidates:
+                oracle_start_tree = random.choice(oracle_prefix_candidates)
+                selection["forced_start_tree_newick"] = str(oracle_start_tree)
+                selection["oracle_prefix_start_tree"] = str(oracle_start_tree)
+                selection["oracle_prefix_base_start_tree"] = str(chosen_start_tree)
+                selection["oracle_prefix_target_tree"] = str(chosen_target_tree)
+
+        return selection
+
+    def _overfit_fixed_pair_bank_selection_from_items(
+        self,
+        chosen_start_item: Dict[str, Any],
+        chosen_target_item: Dict[str, Any],
+    ) -> Dict[str, Any]:
         chosen_start_tree = str(chosen_start_item["tree"])
         chosen_target_tree = str(chosen_target_item["tree"])
         start_payload = chosen_start_item.get("payload") or {}
@@ -1920,19 +2361,54 @@ class TreeDataset(Dataset):
         if item_dataset_id is not None:
             selection["dataset_id"] = str(item_dataset_id).upper()
 
-        if allow_oracle_prefix:
-            oracle_prefix_candidates = self._oracle_prefix_candidates(
-                chosen_start_tree,
-                chosen_target_tree,
-            )
-            if oracle_prefix_candidates:
-                oracle_start_tree = random.choice(oracle_prefix_candidates)
-                selection["forced_start_tree_newick"] = str(oracle_start_tree)
-                selection["oracle_prefix_start_tree"] = str(oracle_start_tree)
-                selection["oracle_prefix_base_start_tree"] = str(chosen_start_tree)
-                selection["oracle_prefix_target_tree"] = str(chosen_target_tree)
-
         return selection
+
+    def _iter_overfit_fixed_pair_bank_selections_for_preload(
+        self,
+    ) -> List[Dict[str, Any]]:
+        if not self.overfit_fixed_pair:
+            return []
+        if not self.overfit_fixed_pair_start_tree_bank_items:
+            return []
+        if not self.overfit_fixed_pair_target_tree_bank_items:
+            return []
+
+        selections: List[Dict[str, Any]] = []
+        if self.overfit_fixed_pair_group_by_json_metadata:
+            group_keys = sorted(
+                set(self._overfit_fixed_pair_start_tree_groups.keys())
+                & set(self._overfit_fixed_pair_target_tree_groups.keys())
+            )
+            for group_key in group_keys:
+                start_items = self._overfit_fixed_pair_start_tree_groups[group_key]
+                target_items = self._overfit_fixed_pair_target_tree_groups[group_key]
+                for start_item in start_items:
+                    for target_item in target_items:
+                        selections.append(
+                            self._overfit_fixed_pair_bank_selection_from_items(
+                                start_item,
+                                target_item,
+                            )
+                        )
+            return selections
+
+        if (
+            len(self.overfit_fixed_pair_start_tree_bank_items)
+            == len(self.overfit_fixed_pair_target_tree_bank_items)
+        ):
+            for start_item, target_item in zip(
+                self.overfit_fixed_pair_start_tree_bank_items,
+                self.overfit_fixed_pair_target_tree_bank_items,
+            ):
+                selections.append(
+                    self._overfit_fixed_pair_bank_selection_from_items(
+                        start_item,
+                        target_item,
+                    )
+                )
+            return selections
+
+        return []
 
     def freeze_full_path_control_pair_bank(
         self,
@@ -1987,6 +2463,275 @@ class TreeDataset(Dataset):
             )
         self._frozen_full_path_control_selections = [dict(x) for x in selections]
         return [dict(x) for x in selections]
+
+    def _overfit_bank_pair_cache_key(
+        self,
+        start_tree_newick: str,
+        target_tree_newick: str,
+    ) -> Tuple[Any, ...]:
+        return (
+            str(start_tree_newick),
+            str(target_tree_newick),
+            int(self.overfit_boundary_prefix_k),
+            int(self.overfit_start_boundary_prefix_k),
+            int(self.overfit_event_prefix_count),
+            bool(self.overfit_split_multi_subset_events),
+        )
+
+    def _build_overfit_fixed_pair_from_selection(
+        self,
+        selection: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        start_tree = str(selection["forced_start_tree_newick"])
+        target_tree = str(selection["forced_target_tree_newick"])
+        cache_key = self._overfit_bank_pair_cache_key(start_tree, target_tree)
+        cached_pair = self._cached_overfit_bank_pairs_by_key.get(cache_key)
+        if cached_pair is None:
+            effective_target_tree = self.resolve_training_target_tree(
+                start_tree,
+                target_tree,
+                base_start_tree_newick=start_tree,
+            )
+            boundary_paths = return_tree_boundary_merge_paths(
+                start_tree,
+                effective_target_tree,
+                legacy_training_semantics=False,
+            )
+            final_labels = return_sampled_tree_boundary_decisions(
+                start_tree,
+                effective_target_tree,
+                split_multi_label_events=self.overfit_split_multi_subset_events,
+                legacy_training_semantics=False,
+            )
+            cached_pair = {
+                "base_random_tree": start_tree,
+                "random_tree": start_tree,
+                "effective_target_tree": effective_target_tree,
+                "boundary_paths": boundary_paths,
+                "final_labels": final_labels,
+            }
+            self._cached_overfit_bank_pairs_by_key[cache_key] = dict(cached_pair)
+
+        pair = dict(cached_pair)
+        pair["bank_group_key"] = selection.get("bank_group_key")
+        if selection.get("source_group_key") is not None:
+            pair["source_group_key"] = selection.get("source_group_key")
+        if selection.get("dataset_id") is not None:
+            pair["dataset_id"] = selection.get("dataset_id")
+        if "oracle_prefix_start_tree" in selection:
+            pair["oracle_prefix_start_tree"] = selection["oracle_prefix_start_tree"]
+            pair["oracle_prefix_base_start_tree"] = selection[
+                "oracle_prefix_base_start_tree"
+            ]
+            pair["oracle_prefix_target_tree"] = selection[
+                "oracle_prefix_target_tree"
+            ]
+        return pair
+
+    def _translate_map_for_meta(self, meta: Dict[str, Any]) -> Dict[str, str]:
+        tree_paths = meta.get("tree_paths") or []
+        if not tree_paths:
+            return {}
+        path = str(tree_paths[0])
+        cached = self._cached_translate_map_by_tree_path.get(path)
+        if cached is not None:
+            return cached
+        mapping = self.parse_translate_block(path)
+        self._cached_translate_map_by_tree_path[path] = dict(mapping)
+        return mapping
+
+    @staticmethod
+    def _selection_original_labels(selection: Dict[str, Any]) -> List[str]:
+        selected_original_labels = selection.get("selected_original_labels")
+        if selected_original_labels:
+            return [str(label) for label in selected_original_labels]
+        target_tree = str(selection.get("forced_target_tree_newick", ""))
+        if not target_tree:
+            return []
+        try:
+            target_obj = EteTree(target_tree, format=1)
+            return [
+                str(leaf.name)
+                for leaf in sorted(
+                    target_obj.get_leaves(),
+                    key=lambda leaf: _numeric_name_sort_key(leaf.name),
+                )
+            ]
+        except Exception:
+            return []
+
+    def _build_preloaded_full_path_control_item(
+        self,
+        selection: Dict[str, Any],
+        meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        seqs, _taxa_order = self._sequences_for_meta(meta)
+        translate_map = self._translate_map_for_meta(meta)
+        selected_original_labels = self._selection_original_labels(selection)
+        if not selected_original_labels:
+            raise ValueError(
+                "Cannot preload full-path control item without selected leaf labels."
+            )
+
+        new_seqs: Dict[str, str] = {}
+        original_names_map: Dict[str, str] = {}
+        seq_ordering_map: Dict[str, str] = {}
+        for idx, original_node_name in enumerate(selected_original_labels):
+            original_node_name = str(original_node_name)
+            taxon_name = translate_map.get(original_node_name, original_node_name)
+            new_idx_str = str(idx)
+            new_seqs[new_idx_str] = seqs.get(taxon_name, "")
+            original_names_map[new_idx_str] = taxon_name
+            seq_ordering_map[original_node_name] = new_idx_str
+
+        selected_sequences = [
+            new_seqs.get(str(idx), "") for idx in range(len(selected_original_labels))
+        ]
+        selected_sequence_names = [
+            str(original_names_map.get(str(idx), idx))
+            for idx in range(len(selected_original_labels))
+        ]
+
+        pair = self._build_overfit_fixed_pair_from_selection(selection)
+        pair["name_mapping"] = original_names_map
+        pair["selected_sequences"] = list(selected_sequences)
+        pair["selected_sequence_names"] = list(selected_sequence_names)
+        sample_dataset_id = str(pair.get("dataset_id", meta["id"])).upper()
+        full_path_groups = self._attach_batch_metadata_to_full_path_samples(
+            self._build_full_path_control_samples(pair),
+            dataset_id=sample_dataset_id,
+            sample_id=meta["id"],
+            num_to_name=original_names_map,
+            seq_ordering_map=seq_ordering_map,
+            selected_sequences=selected_sequences,
+            selected_sequence_names=selected_sequence_names,
+        )
+
+        velocity_samples, autoregressive_samples, terminal_samples = full_path_groups
+        first_velocity = velocity_samples[0] if velocity_samples else {}
+        first_ar = autoregressive_samples[0] if autoregressive_samples else {}
+        sample = {
+            "id": meta["id"],
+            "nexus_path": meta["nexus_path"],
+            "tree_paths": meta["tree_paths"],
+            "sequences": new_seqs,
+            "taxa_order": list(new_seqs.keys()),
+            "start_tree": pair["random_tree"],
+            "newick_tree": first_velocity.get("newick_tree", pair["random_tree"]),
+            "target_tree": pair["effective_target_tree"],
+            "fixed_pair_num_events": int(len(pair.get("final_labels") or [])),
+            "velocity": first_velocity.get("velocity", {}),
+            "velocity_next_boundary_tree": first_velocity.get(
+                "velocity_next_boundary_tree"
+            ),
+            "timepoint": float(first_velocity.get("timepoint", 0.0)),
+            "autoregressive_newick": first_ar.get(
+                "newick",
+                first_velocity.get("velocity_next_boundary_tree", pair["random_tree"]),
+            ),
+            "autoregressive_labels": first_ar.get("labels", []),
+            "autoregressive_stop_after_merge": bool(
+                first_ar.get("stop_after_merge", False)
+            ),
+            "autoregressive_event_index": -1,
+            "autoregressive_newick_time": float(first_ar.get("time", 0.0)),
+            "num_to_name": original_names_map,
+            "seq_ordering_map": seq_ordering_map,
+            "selected_sequences": list(selected_sequences),
+            "selected_sequence_names": list(selected_sequence_names),
+            "dataset_id": sample_dataset_id,
+            "full_path_velocity_samples": velocity_samples,
+            "full_path_autoregressive_samples": autoregressive_samples,
+            "full_path_terminal_samples": terminal_samples,
+            "_full_path_control_mode": True,
+        }
+        if pair.get("bank_group_key") is not None:
+            sample["bank_group_key"] = pair["bank_group_key"]
+        if pair.get("source_group_key") is not None:
+            sample["source_group_key"] = pair["source_group_key"]
+        return sample
+
+    def preload_full_path_control_training_material(
+        self,
+        *,
+        max_rows: int = 0,
+    ) -> int:
+        if self.validation or not self.overfit_full_path_control_mode:
+            return 0
+        selections = self._iter_overfit_fixed_pair_bank_selections_for_preload()
+        if max_rows and len(selections) > int(max_rows):
+            selections = selections[: int(max_rows)]
+        if not selections:
+            print(
+                "Full-path control preload requested, but no fixed-pair bank "
+                "selections were available."
+            )
+            return 0
+
+        meta_by_id = {
+            str(meta.get("id", "")).upper(): meta
+            for meta in self._index
+        }
+        fallback_meta = self._index[0] if self._index else None
+        start_time = time.perf_counter()
+        preloaded_items: List[Dict[str, Any]] = []
+        by_dataset_id: Dict[str, List[Dict[str, Any]]] = {}
+        for row_idx, selection in enumerate(selections):
+            dataset_id = str(selection.get("dataset_id", "")).upper()
+            meta = meta_by_id.get(dataset_id, fallback_meta)
+            if meta is None:
+                raise RuntimeError(
+                    "Cannot preload full-path control samples without dataset metadata."
+                )
+            item = self._build_preloaded_full_path_control_item(selection, meta)
+            preloaded_items.append(item)
+            by_dataset_id.setdefault(str(item["dataset_id"]).upper(), []).append(item)
+            if (row_idx + 1) % 100 == 0 or (row_idx + 1) == len(selections):
+                elapsed = time.perf_counter() - start_time
+                print(
+                    "Preloaded full-path control training material: "
+                    f"{row_idx + 1}/{len(selections)} rows in {elapsed:.1f}s"
+                )
+
+        self._preloaded_full_path_control_items = preloaded_items
+        self._preloaded_full_path_control_items_by_dataset_id = by_dataset_id
+        elapsed = time.perf_counter() - start_time
+        print(
+            "Finished full-path control training-material preload: "
+            f"{len(preloaded_items)} rows, "
+            f"{len(self._cached_overfit_bank_pairs_by_key)} pair cache entries, "
+            f"{len(self._cached_full_path_control_samples_by_key)} sample cache entries "
+            f"in {elapsed:.1f}s"
+        )
+        return len(preloaded_items)
+
+    def _select_preloaded_full_path_control_item(
+        self,
+        requested_index: int,
+    ) -> Dict[str, Any]:
+        all_items = self._preloaded_full_path_control_items
+        if not all_items:
+            raise IndexError("No preloaded full-path control items are available.")
+
+        same_dataset_batch_size = int(
+            getattr(self, "same_dataset_batch_size", 0) or 0
+        )
+        if same_dataset_batch_size > 1 and len(self._index) > 0:
+            group_code = int(requested_index) // same_dataset_batch_size
+            dataset_index = group_code % len(self._index)
+            group_id = group_code // len(self._index)
+            path_slot = int(requested_index) % same_dataset_batch_size
+            dataset_id = str(self._index[dataset_index].get("id", "")).upper()
+            dataset_items = (
+                self._preloaded_full_path_control_items_by_dataset_id.get(dataset_id)
+                or all_items
+            )
+            item_index = (
+                group_id * same_dataset_batch_size + path_slot
+            ) % len(dataset_items)
+            return dict(dataset_items[item_index])
+
+        return dict(all_items[int(requested_index) % len(all_items)])
 
     def set_overfit_fixed_pair_best_start_tree(
         self,
@@ -2334,6 +3079,37 @@ class TreeDataset(Dataset):
                     path.get("births", []),
                 )
                 boundary_events = [] if birthset_event is None else [birthset_event]
+            elif self.overfit_full_path_control_frontier_level_labels:
+                filtered_events = [
+                    {
+                        "newick": str(event["newick"]),
+                        "labels": [
+                            label
+                            for label in event.get("labels", [])
+                            if len(label.get("components", [])) >= 2
+                            and len(label.get("merge_indices", [])) >= 2
+                        ],
+                    }
+                    for event in path.get("events", [])
+                ]
+                filtered_events = [
+                    event for event in filtered_events if event.get("labels")
+                ]
+                frontier_labels = [
+                    label
+                    for event in filtered_events
+                    for label in event.get("labels", [])
+                ]
+                boundary_events = []
+                if frontier_labels:
+                    boundary_events.append(
+                        {
+                            "newick": str(path["start_newick"]),
+                            "labels": list(frontier_labels),
+                            "frontier_raw_events": filtered_events,
+                            "stop_after_merge": True,
+                        }
+                    )
             else:
                 boundary_events = []
                 for event in path.get("events", []):
@@ -2361,6 +3137,7 @@ class TreeDataset(Dataset):
                         "stop_after_merge": bool(
                             event.get("stop_after_merge", False)
                         ),
+                        "frontier_raw_events": event.get("frontier_raw_events"),
                         "time": boundary_time,
                         "num_leaves": event_num_leaves,
                     })
@@ -2784,6 +3561,11 @@ class TreeDataset(Dataset):
         self, index: int, preset_subtree_size: Optional[int] = None
     ) -> Dict[str, Any]:  # Required for torch Dataset
         requested_index = int(index)
+        if (
+            preset_subtree_size is None
+            and self._preloaded_full_path_control_items
+        ):
+            return self._select_preloaded_full_path_control_item(requested_index)
         same_dataset_batch_size = int(getattr(self, "same_dataset_batch_size", 0) or 0)
         if same_dataset_batch_size > 1 and len(self._index) > 0:
             group_code = requested_index // same_dataset_batch_size
@@ -4474,6 +5256,38 @@ class SameDatasetBatchSampler(Sampler[List[int]]):
         return int(self.num_batches)
 
 
+class PrecollatedBatchDataset(Dataset):
+    """Dataset wrapper that returns fully materialized training batches."""
+
+    def __init__(
+        self,
+        batches: List[Dict[str, Any]],
+        *,
+        virtual_epoch_size: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.batches = list(batches)
+        self.virtual_epoch_size = (
+            int(virtual_epoch_size)
+            if virtual_epoch_size is not None and int(virtual_epoch_size) > 0
+            else len(self.batches)
+        )
+        self.seed = 0 if seed is None else int(seed)
+
+    def __len__(self) -> int:
+        return int(self.virtual_epoch_size)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        if not self.batches:
+            raise IndexError("No pre-collated batches are available.")
+        # Deterministic pseudo-random indexing avoids constructing a giant shuffled
+        # index list for long virtual epochs.
+        batch_index = (int(index) * 1103515245 + 12345 + self.seed) % len(
+            self.batches
+        )
+        return self.batches[int(batch_index)]
+
+
 class PhylaDataModule(pl.LightningDataModule):
     """PyTorch Lightning DataModule for managing TreeDataset splits.
 
@@ -4495,6 +5309,10 @@ class PhylaDataModule(pl.LightningDataModule):
         self.batch_size = config["data"]["batch_size"]
         self.num_workers = config["data"]["num_workers"]
         self.pin_memory = config["data"]["pin_memory"]
+        self.persistent_workers = bool(
+            config["data"].get("persistent_workers", False)
+        )
+        self.prefetch_factor = config["data"].get("prefetch_factor")
         self.loader_seed = config["data"].get(
             "loader_seed",
             config.get("trainer", {}).get("seed"),
@@ -4520,6 +5338,37 @@ class PhylaDataModule(pl.LightningDataModule):
         self.full_path_birthset_static_pair_triple_candidates = bool(
             config["data"].get("full_path_birthset_static_pair_triple_candidates", True)
         )
+        self.full_path_birthset_binary_pair_mode = bool(
+            config["data"].get(
+                "full_path_birthset_binary_pair_mode",
+                config.get("trainer", {}).get(
+                    "birthset_binary_pair_mode",
+                    (config.get("birthset") or {}).get("binary_pair_mode", False),
+                ),
+            )
+        )
+        self.full_path_preload_collated_batches = bool(
+            config["data"].get("full_path_preload_collated_batches", False)
+        )
+        self.full_path_preload_collated_batches_max_batches = max(
+            0,
+            int(config["data"].get("full_path_preload_collated_batches_max_batches", 0) or 0),
+        )
+        configured_virtual_batches = config["data"].get(
+            "full_path_preload_collated_virtual_epoch_size"
+        )
+        if configured_virtual_batches is None:
+            configured_virtual_batches = config.get("trainer", {}).get(
+                "limit_train_batches"
+            )
+        self.full_path_preload_collated_virtual_epoch_size = (
+            int(configured_virtual_batches)
+            if configured_virtual_batches is not None
+            and int(configured_virtual_batches) > 0
+            else None
+        )
+        self._precollated_train_batches: List[Dict[str, Any]] = []
+        self._precollated_train_dataset: Optional[PrecollatedBatchDataset] = None
         trainer_cfg = config.get("trainer", {})
         self.birthset_use_small_polytomy_enumeration = bool(
             trainer_cfg.get("birthset_use_small_polytomy_enumeration", True)
@@ -4730,6 +5579,9 @@ class PhylaDataModule(pl.LightningDataModule):
             overfit_full_path_control_birthset_boundary_labels=config["data"].get(
                 "overfit_full_path_control_birthset_boundary_labels", False
             ),
+            overfit_full_path_control_frontier_level_labels=config["data"].get(
+                "overfit_full_path_control_frontier_level_labels", False
+            ),
             overfit_full_path_control_seed=config["data"].get(
                 "overfit_full_path_control_seed", 42
             ),
@@ -4757,6 +5609,12 @@ class PhylaDataModule(pl.LightningDataModule):
             ),
             full_path_preparse_structural_trees=config["data"].get(
                 "full_path_preparse_structural_trees", False
+            ),
+            full_path_preload_control_samples=config["data"].get(
+                "full_path_preload_control_samples", False
+            ),
+            full_path_preload_control_samples_max_rows=config["data"].get(
+                "full_path_preload_control_samples_max_rows", 0
             ),
             overfit_oracle_prefix_start_prob=config["data"].get(
                 "overfit_oracle_prefix_start_prob",
@@ -4850,6 +5708,9 @@ class PhylaDataModule(pl.LightningDataModule):
             ),
             overfit_full_path_control_birthset_boundary_labels=config["data"].get(
                 "overfit_full_path_control_birthset_boundary_labels", False
+            ),
+            overfit_full_path_control_frontier_level_labels=config["data"].get(
+                "overfit_full_path_control_frontier_level_labels", False
             ),
             overfit_full_path_control_seed=config["data"].get(
                 "overfit_full_path_control_seed", 42
@@ -4983,6 +5844,8 @@ class PhylaDataModule(pl.LightningDataModule):
             config["data"].get("use_historical_collate", False)
         )
         self.msa_distance = True
+        if self.full_path_preload_collated_batches:
+            self._preload_full_path_collated_training_batches()
 
     @property
     def chosen_tree(self):
@@ -5006,11 +5869,138 @@ class PhylaDataModule(pl.LightningDataModule):
     def __getitem__(self, *args, **kwargs):
         return self.dataset_train.__getitem__(*args, **kwargs)
 
+    def _preload_full_path_collated_training_batches(self) -> int:
+        if not getattr(self.dataset_train, "_preloaded_full_path_control_items", None):
+            raise RuntimeError(
+                "full_path_preload_collated_batches requires "
+                "data.full_path_preload_control_samples=true so the fixed-bank "
+                "entries are available before collate prebuild."
+            )
+
+        start_time = time.perf_counter()
+        items_by_dataset_id: Dict[str, List[Dict[str, Any]]] = {}
+        for item in self.dataset_train._preloaded_full_path_control_items:
+            dataset_id = str(item.get("dataset_id", item.get("id", ""))).upper()
+            items_by_dataset_id.setdefault(dataset_id, []).append(item)
+
+        prebuilt: List[Dict[str, Any]] = []
+        batch_size = max(1, int(self.batch_size))
+        max_batches = int(self.full_path_preload_collated_batches_max_batches)
+        built_since_log = 0
+        for dataset_id in sorted(items_by_dataset_id):
+            items = items_by_dataset_id[dataset_id]
+            if not items:
+                continue
+            num_batches = int(math.ceil(len(items) / float(batch_size)))
+            for batch_idx in range(num_batches):
+                batch_start_time = time.perf_counter()
+                batch_items = [
+                    items[(batch_idx * batch_size + slot) % len(items)]
+                    for slot in range(batch_size)
+                ]
+                collated = self.collate_fn([dict(item) for item in batch_items])
+                if collated is None:
+                    continue
+                prebuilt.append(collated)
+                built_since_log += 1
+                if built_since_log >= 1:
+                    elapsed = time.perf_counter() - start_time
+                    batch_elapsed = time.perf_counter() - batch_start_time
+                    velocity_count = 0
+                    autoregressive_count = 0
+                    raw_graph_count = 0
+                    raw_node_shape = None
+                    raw_graph_batch = collated.get(
+                        "full_path_joint_tokenizer_raw_graph_batch"
+                    )
+                    if not isinstance(raw_graph_batch, dict):
+                        for sub_batch_key in (
+                            "full_path_velocity_batch",
+                            "full_path_autoregressive_batch",
+                        ):
+                            sub_batch = collated.get(sub_batch_key)
+                            if isinstance(sub_batch, dict) and isinstance(
+                                sub_batch.get("_joint_tokenizer_raw_graph_batch"),
+                                dict,
+                            ):
+                                raw_graph_batch = sub_batch[
+                                    "_joint_tokenizer_raw_graph_batch"
+                                ]
+                                break
+                    if isinstance(raw_graph_batch, dict):
+                        velocity_count = int(raw_graph_batch.get("velocity_count", 0))
+                        autoregressive_count = int(
+                            raw_graph_batch.get("autoregressive_count", 0)
+                        )
+                        try:
+                            raw_graph_count = int(raw_graph_batch["node_num"].shape[0])
+                            raw_node_shape = tuple(raw_graph_batch["node_data"].shape)
+                        except Exception:
+                            raw_graph_count = velocity_count + autoregressive_count
+                    print(
+                        "Pre-collated full-path training batch: "
+                        f"{len(prebuilt)} built "
+                        f"(dataset={dataset_id}, local_batch={batch_idx + 1}/{num_batches}, "
+                        f"batch_size={batch_size}, batch_time={batch_elapsed:.1f}s, "
+                        f"elapsed={elapsed:.1f}s, "
+                        f"velocity_states={velocity_count}, "
+                        f"autoregressive_states={autoregressive_count}, "
+                        f"raw_graphs={raw_graph_count}, "
+                        f"raw_node_shape={raw_node_shape})"
+                    )
+                    built_since_log = 0
+                if max_batches and len(prebuilt) >= max_batches:
+                    break
+            if max_batches and len(prebuilt) >= max_batches:
+                break
+
+        if not prebuilt:
+            raise RuntimeError("No pre-collated full-path training batches were built.")
+
+        self._precollated_train_batches = prebuilt
+        virtual_epoch_size = (
+            self.full_path_preload_collated_virtual_epoch_size
+            or self.same_dataset_batches_per_epoch
+            or len(prebuilt)
+        )
+        self._precollated_train_dataset = PrecollatedBatchDataset(
+            prebuilt,
+            virtual_epoch_size=int(virtual_epoch_size),
+            seed=self.loader_seed,
+        )
+        elapsed = time.perf_counter() - start_time
+        print(
+            "Finished full-path pre-collated batch preload: "
+            f"{len(prebuilt)} batches from "
+            f"{sum(len(v) for v in items_by_dataset_id.values())} cached entries "
+            f"in {elapsed:.1f}s"
+        )
+        return len(prebuilt)
+
     def train_dataloader(self) -> DataLoader:
+        if self._precollated_train_dataset is not None:
+            return DataLoader(
+                self._precollated_train_dataset,
+                batch_size=None,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+                collate_fn=lambda batch: batch,
+            )
+
         generator = None
         if self.loader_seed is not None:
             generator = torch.Generator()
             generator.manual_seed(int(self.loader_seed))
+        loader_kwargs = {
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "collate_fn": self.collate_fn,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["persistent_workers"] = self.persistent_workers
+            if self.prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = int(self.prefetch_factor)
         if self.same_dataset_batch:
             return DataLoader(
                 self.dataset_train,
@@ -5021,18 +6011,14 @@ class PhylaDataModule(pl.LightningDataModule):
                     seed=self.loader_seed,
                     shuffle=True,
                 ),
-                num_workers=self.num_workers,
-                pin_memory=self.pin_memory,
-                collate_fn=self.collate_fn,
+                **loader_kwargs,
             )
         return DataLoader(
             self.dataset_train,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            collate_fn=self.collate_fn,
             generator=generator,
+            **loader_kwargs,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -5609,6 +6595,7 @@ class PhylaDataModule(pl.LightningDataModule):
                 continue
             precomputed = _birthset_precompute_sample(
                 sample,
+                binary_pair_mode=self.full_path_birthset_binary_pair_mode,
                 use_small_polytomy_enumeration=self.birthset_use_small_polytomy_enumeration,
                 use_static_pair_triple_candidates=(
                     self.full_path_birthset_static_pair_triple_candidates

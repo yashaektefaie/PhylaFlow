@@ -6403,6 +6403,11 @@ def _discrete_phase_rollout(
         collapse_mask = predicted_first_mask.copy()
         if np.any(collapse_mask):
             L_new[collapse_mask] = 0.0
+        collapsed_splits_this_boundary = [
+            int(masks[i])
+            for i, on in enumerate(collapse_mask.tolist())
+            if bool(on)
+        ]
         blocked = supervised_mask & (~collapse_mask)
         if np.any(blocked):
             L_new[blocked] = np.maximum(L_new[blocked], eps_len * 10.0)
@@ -6447,6 +6452,8 @@ def _discrete_phase_rollout(
         )
         birthset_polytomy_unrooted_ok = topology_decoder_mode in {
             "birthset",
+            "birthset_binary",
+            "birthset_frontier",
             "birthset_with_ar_fallback",
         }
         while (
@@ -6485,7 +6492,13 @@ def _discrete_phase_rollout(
                 tokenized=tokenized_trees,
             )
             use_birthset_decoder = (
-                topology_decoder_mode in {"birthset", "birthset_with_ar_fallback"}
+                topology_decoder_mode
+                in {
+                    "birthset",
+                    "birthset_binary",
+                    "birthset_frontier",
+                    "birthset_with_ar_fallback",
+                }
                 and not birthset_attempted_this_boundary
             )
             if use_birthset_decoder:
@@ -6534,6 +6547,7 @@ def _discrete_phase_rollout(
                         logit_outputs,
                         td_ar.keys(),
                         n_ar,
+                        blocked_splits=collapsed_splits_this_boundary,
                     )
                 finally:
                     if previous_oracle_target_tree is None:
@@ -6655,7 +6669,13 @@ def _discrete_phase_rollout(
                     phase_exhausted = True
                     break
             if (
-                topology_decoder_mode in {"birthset", "birthset_with_ar_fallback"}
+                topology_decoder_mode
+                in {
+                    "birthset",
+                    "birthset_binary",
+                    "birthset_frontier",
+                    "birthset_with_ar_fallback",
+                }
                 and birthset_attempted_this_boundary
                 and not birthset_allows_ar_fallback
             ):
@@ -7091,6 +7111,7 @@ def _discrete_phase_rollout_batched_birthset(
 
         boundary_indices = []
         boundary_newicks = []
+        boundary_collapsed_splits = []
         for local_idx, tree_idx in enumerate(active):
             td, n_leaves, mapping = _tree_to_model_split_lengths_from_batched_tokenized(
                 tokenized,
@@ -7188,6 +7209,11 @@ def _discrete_phase_rollout_batched_birthset(
             collapse_mask = predicted_first_mask.copy()
             if np.any(collapse_mask):
                 lengths_new[collapse_mask] = 0.0
+            collapsed_splits_this_boundary = [
+                int(masks[i])
+                for i, on in enumerate(collapse_mask.tolist())
+                if bool(on)
+            ]
             blocked = supervised_mask & (~collapse_mask)
             if np.any(blocked):
                 lengths_new[blocked] = np.maximum(
@@ -7232,13 +7258,19 @@ def _discrete_phase_rollout_batched_birthset(
             ):
                 boundary_indices.append(tree_idx)
                 boundary_newicks.append(current_newicks[tree_idx])
+                boundary_collapsed_splits.append(collapsed_splits_this_boundary)
 
         if boundary_indices:
             unique_boundary_map = {}
             unique_boundary_indices = []
             unique_boundary_newicks = []
+            unique_boundary_collapsed_splits = []
             boundary_unique_ids = []
-            for tree_idx, boundary_newick in zip(boundary_indices, boundary_newicks):
+            for tree_idx, boundary_newick, collapsed_splits in zip(
+                boundary_indices,
+                boundary_newicks,
+                boundary_collapsed_splits,
+            ):
                 case_value = None
                 if rollout_case_indices is not None:
                     case_value = int(rollout_case_indices[int(tree_idx)].item())
@@ -7254,6 +7286,9 @@ def _discrete_phase_rollout_batched_birthset(
                     unique_boundary_map[key] = unique_id
                     unique_boundary_indices.append(int(tree_idx))
                     unique_boundary_newicks.append(str(boundary_newick))
+                    unique_boundary_collapsed_splits.append(
+                        [int(split) for split in collapsed_splits]
+                    )
                 boundary_unique_ids.append(int(unique_id))
 
             tokenized_boundary = _tokenize_trees_with_structural_cache(
@@ -7336,6 +7371,7 @@ def _discrete_phase_rollout_batched_birthset(
                     logit_outputs_by_local_tree[unique_id],
                     td_ar.keys(),
                     n_ar,
+                    blocked_splits=unique_boundary_collapsed_splits[unique_id],
                 )
                 plans_by_unique.append(
                     {
@@ -7505,6 +7541,7 @@ class TrainingModule(LightningModule):
         birthset_use_small_polytomy_enumeration: bool = True,
         birthset_use_pair_prefix_candidates: bool = False,
         birthset_use_component_phyla_conditioning: bool = False,
+        birthset_binary_pair_mode: bool = False,
         birthset_oracle_target_candidates_use_at_sampling: bool = False,
         birthset_oracle_cardinality_use_at_sampling: bool = False,
         birthset_pair_prefix_top_pairs: int = 64,
@@ -7919,7 +7956,13 @@ class TrainingModule(LightningModule):
                 f"Invalid autoregressive_target_mode={autoregressive_target_mode!r}. "
                 f"Expected one of {sorted(valid_autoregressive_target_modes)}."
             )
-        valid_topology_decoders = {"ar", "birthset", "birthset_with_ar_fallback"}
+        valid_topology_decoders = {
+            "ar",
+            "birthset",
+            "birthset_binary",
+            "birthset_frontier",
+            "birthset_with_ar_fallback",
+        }
         topology_decoder = str(topology_decoder or "ar").lower()
         if topology_decoder not in valid_topology_decoders:
             raise ValueError(
@@ -8364,6 +8407,7 @@ class TrainingModule(LightningModule):
         self.birthset_use_component_phyla_conditioning = bool(
             birthset_use_component_phyla_conditioning
         )
+        self.birthset_binary_pair_mode = bool(birthset_binary_pair_mode)
         self.birthset_oracle_target_candidates_use_at_sampling = bool(
             birthset_oracle_target_candidates_use_at_sampling
         )
@@ -8395,7 +8439,12 @@ class TrainingModule(LightningModule):
         self.birthset_split_bank = set()
         self.birthset_topology_head = None
         self.birthset_proposal_head = None
-        if self.topology_decoder in {"birthset", "birthset_with_ar_fallback"}:
+        if self.topology_decoder in {
+            "birthset",
+            "birthset_binary",
+            "birthset_frontier",
+            "birthset_with_ar_fallback",
+        }:
             birthset_component_phyla_dim = (
                 int(getattr(self.model, "phyla_dim", 0))
                 if self.birthset_use_component_phyla_conditioning
@@ -8409,8 +8458,10 @@ class TrainingModule(LightningModule):
                 max_components_norm=max(16, int(self.model.embed_dim)),
                 component_phyla_dim=birthset_component_phyla_dim,
             )
-            if self.birthset_use_pair_prefix_candidates or (
+            if (not self.birthset_binary_pair_mode) and (
+                self.birthset_use_pair_prefix_candidates or (
                 float(self.birthset_lambda_proposal) > 0.0
+                )
             ):
                 self.birthset_proposal_head = BirthSetTopologyHead(
                     int(self.model.embed_dim),
@@ -15709,6 +15760,12 @@ class TrainingModule(LightningModule):
                 int(token_count),
                 timing_text,
             )
+            print(
+                "ENCODE_ONCE_PROFILE "
+                f"step={int(getattr(self, 'stepper', 0) or 0)} "
+                f"batch={int(batch_count)} tokens={int(token_count)} {timing_text}",
+                flush=True,
+            )
         return {
             "encoded": x,
             "leaf_mask": leaf_mask,
@@ -16029,7 +16086,13 @@ class TrainingModule(LightningModule):
                 "_cached_autoregressive_group_splits"
             ),
             autoregressive_return_head_outputs=not (
-                self.topology_decoder in {"birthset", "birthset_with_ar_fallback"}
+                self.topology_decoder
+                in {
+                    "birthset",
+                    "birthset_binary",
+                    "birthset_frontier",
+                    "birthset_with_ar_fallback",
+                }
             ),
             autoregressive_case_indices=autoregressive_batch.get(
                 "_autoregressive_case_indices"
@@ -16068,6 +16131,15 @@ class TrainingModule(LightningModule):
                 int(combined_batch_size),
                 int(combined_tokens),
                 timing_text,
+            )
+            print(
+                "JOINT_FORWARD_PROFILE "
+                f"step={int(getattr(self, 'stepper', 0) or 0)} "
+                f"velocity_batch={int(velocity_batch_size)} "
+                f"autoregressive_batch={int(autoregressive_batch_size)} "
+                f"combined_batch={int(combined_batch_size)} "
+                f"tokens={int(combined_tokens)} {timing_text}",
+                flush=True,
             )
         return {
             "velocity_batch": velocity_batch,
@@ -16737,6 +16809,57 @@ class TrainingModule(LightningModule):
         for local_idx, record_idx in enumerate(valid_record_ids):
             losses_by_record[int(record_idx)] = grouped_losses[int(local_idx)]
         return losses_by_record
+
+    def _birthset_flat_bce_losses(
+        self,
+        flat_logits,
+        flat_labels,
+        flat_group_ids,
+        num_groups,
+        *,
+        positive_weight,
+    ):
+        if flat_logits is None or int(flat_logits.numel()) <= 0:
+            return None
+        num_groups = int(num_groups)
+        if num_groups <= 0:
+            return None
+        flat_labels = flat_labels.to(device=flat_logits.device, dtype=flat_logits.dtype)
+        flat_group_ids = flat_group_ids.to(device=flat_logits.device, dtype=torch.long)
+        group_counts = flat_logits.new_zeros((num_groups,))
+        group_counts.index_add_(0, flat_group_ids, torch.ones_like(flat_logits))
+        positives = flat_logits.new_zeros((num_groups,))
+        positives.index_add_(0, flat_group_ids, flat_labels)
+        negatives = (group_counts - positives).clamp(min=1.0)
+        positives = positives.clamp(min=1.0)
+        if isinstance(positive_weight, str) and positive_weight.lower() == "auto":
+            pos_weight_by_group = (negatives / positives).detach()
+        else:
+            try:
+                pos_weight_by_group = flat_logits.new_full(
+                    (num_groups,),
+                    float(positive_weight),
+                )
+            except Exception:
+                pos_weight_by_group = flat_logits.new_ones((num_groups,))
+        weights = torch.where(
+            flat_labels > 0.5,
+            pos_weight_by_group[flat_group_ids],
+            flat_logits.new_tensor(1.0),
+        )
+        flat_losses = (
+            F.binary_cross_entropy_with_logits(
+                flat_logits,
+                flat_labels,
+                reduction="none",
+            )
+            * weights
+        )
+        return self._birthset_segment_mean(
+            flat_losses,
+            flat_group_ids,
+            num_groups,
+        )
 
     def _birthset_positive_weight(self, labels):
         value = self.birthset_pos_weight
@@ -17677,6 +17800,7 @@ class TrainingModule(LightningModule):
         k,
         existing_splits,
         full_mask,
+        blocked_splits=None,
     ):
         if int(k) <= 0 or not candidates:
             return []
@@ -17687,6 +17811,7 @@ class TrainingModule(LightningModule):
                 k,
                 existing_splits,
                 full_mask,
+                blocked_splits=blocked_splits,
             )
         ordered_ids = sorted(
             range(len(candidates)),
@@ -17702,6 +17827,11 @@ class TrainingModule(LightningModule):
             for split in existing_splits
             if _birthset_valid_rooted_split(split, full_mask)
         }
+        blocked_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in (blocked_splits or [])
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
         for idx in ordered_ids:
             if len(selected) >= int(k):
                 break
@@ -17712,7 +17842,11 @@ class TrainingModule(LightningModule):
             if not _birthset_valid_rooted_split(split, full_mask):
                 continue
             split_key = _birthset_canonical_unrooted_split(split, full_mask)
-            if split_key in existing_keys or split_key in selected_keys:
+            if (
+                split_key in existing_keys
+                or split_key in selected_keys
+                or split_key in blocked_keys
+            ):
                 continue
             if not all(
                 _birthset_rooted_splits_compatible(split, other, full_mask)
@@ -17738,6 +17872,7 @@ class TrainingModule(LightningModule):
         k,
         existing_splits,
         full_mask,
+        blocked_splits=None,
     ):
         ordered_ids = sorted(
             range(len(candidates)),
@@ -17748,6 +17883,11 @@ class TrainingModule(LightningModule):
         existing_keys = {
             _birthset_canonical_unrooted_split(split, full_mask)
             for split in existing_splits
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
+        blocked_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in (blocked_splits or [])
             if _birthset_valid_rooted_split(split, full_mask)
         }
         beam = [([], set(), set(), 0.0)]
@@ -17764,7 +17904,11 @@ class TrainingModule(LightningModule):
                 if not _birthset_valid_rooted_split(split, full_mask):
                     continue
                 split_key = _birthset_canonical_unrooted_split(split, full_mask)
-                if split_key in existing_keys or split_key in selected_keys:
+                if (
+                    split_key in existing_keys
+                    or split_key in selected_keys
+                    or split_key in blocked_keys
+                ):
                     continue
                 if not all(
                     _birthset_rooted_splits_compatible(split, other, full_mask)
@@ -17864,6 +18008,713 @@ class TrainingModule(LightningModule):
             selected_masks.add(split)
             selected_keys.add(split_key)
         return completed
+
+    def _birthset_binary_completion(
+        self,
+        selected,
+        component_masks,
+        full_mask,
+        k,
+        existing_splits,
+    ):
+        if len(selected) >= int(k):
+            return selected
+        component_masks = [int(mask) for mask in component_masks]
+        G = len(component_masks)
+        if G <= 3:
+            return selected
+        all_local = (1 << int(G)) - 1
+        existing_splits = {int(split) for split in existing_splits}
+        existing_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in existing_splits
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
+        completed = list(selected)
+        selected_masks = {int(item["split_mask"]) for item in completed}
+        selected_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in selected_masks
+        }
+
+        def _popcount(mask):
+            return int(int(mask).bit_count())
+
+        def _split_mask(local_subset):
+            return _birthset_local_subset_to_split(int(local_subset), component_masks)
+
+        def _is_usable(local_subset):
+            local_subset = int(local_subset) & int(all_local)
+            if not _birthset_valid_local_subset(local_subset, G):
+                return False
+            split = int(_split_mask(local_subset))
+            if split in existing_splits or split in selected_masks:
+                return False
+            if not _birthset_valid_rooted_split(split, full_mask):
+                return False
+            split_key = _birthset_canonical_unrooted_split(split, full_mask)
+            if split_key in existing_keys or split_key in selected_keys:
+                return False
+            if not all(
+                _birthset_rooted_splits_compatible(split, other, full_mask)
+                for other in existing_splits
+            ):
+                return False
+            if not all(
+                _birthset_rooted_splits_compatible(split, other, full_mask)
+                for other in selected_masks
+            ):
+                return False
+            return True
+
+        def _add_split(local_subset, source):
+            local_subset = int(local_subset) & int(all_local)
+            if not _is_usable(local_subset):
+                return False
+            split = int(_split_mask(local_subset))
+            item = _birthset_candidate_record(local_subset, component_masks, source)
+            item["score"] = float("-inf")
+            completed.append(item)
+            selected_masks.add(split)
+            selected_keys.add(_birthset_canonical_unrooted_split(split, full_mask))
+            return True
+
+        clusters = [int(all_local)]
+
+        def _apply_existing_local_split(local_subset):
+            local_subset = int(local_subset) & int(all_local)
+            if local_subset == 0 or local_subset == all_local:
+                return False
+            complement = int(all_local ^ local_subset)
+            for cluster_idx, cluster in enumerate(list(clusters)):
+                cluster = int(cluster)
+                side = None
+                if (local_subset & ~cluster) == 0 and local_subset not in (0, cluster):
+                    side = local_subset
+                elif (complement & ~cluster) == 0 and complement not in (0, cluster):
+                    side = complement
+                if side is None:
+                    continue
+                other = int(cluster ^ side)
+                if other == 0:
+                    continue
+                clusters[cluster_idx : cluster_idx + 1] = [int(side), int(other)]
+                return True
+            return False
+
+        pending = [
+            int(item.get("local_subset", 0))
+            for item in completed
+            if item.get("local_subset") is not None
+        ]
+        while pending:
+            next_pending = []
+            changed = False
+            for local_subset in pending:
+                if _apply_existing_local_split(local_subset):
+                    changed = True
+                else:
+                    next_pending.append(int(local_subset))
+            if not changed:
+                break
+            pending = next_pending
+
+        def _cluster_indices(cluster):
+            return [idx for idx in range(G) if (int(cluster) >> int(idx)) & 1]
+
+        def _candidate_sides_for_cluster(cluster):
+            cluster = int(cluster)
+            size = _popcount(cluster)
+            if cluster == all_local:
+                if size < 4:
+                    return []
+                min_other = 2
+            else:
+                if size < 3:
+                    return []
+                min_other = 1
+            indices = _cluster_indices(cluster)
+            preferred = max(2, size // 2)
+            preferred = min(preferred, size - int(min_other))
+            sides = []
+            for side_size in [preferred, 2, max(2, size - int(min_other))]:
+                if side_size < 2 or size - side_size < int(min_other):
+                    continue
+                local_subset = 0
+                for idx in indices[: int(side_size)]:
+                    local_subset |= 1 << int(idx)
+                sides.append(int(local_subset))
+            if size <= 12:
+                for side_size in range(2, size - int(min_other) + 1):
+                    for combo in itertools.combinations(indices, side_size):
+                        local_subset = 0
+                        for idx in combo:
+                            local_subset |= 1 << int(idx)
+                        sides.append(int(local_subset))
+            else:
+                for left_pos in range(0, size - 1):
+                    for right_pos in range(left_pos + 1, size):
+                        local_subset = (
+                            (1 << int(indices[left_pos]))
+                            | (1 << int(indices[right_pos]))
+                        )
+                        sides.append(int(local_subset))
+            seen = set()
+            unique = []
+            for side in sides:
+                side = int(side)
+                if side in seen:
+                    continue
+                seen.add(side)
+                unique.append(side)
+            unique.sort(
+                key=lambda side: (
+                    abs(_popcount(side) - (_popcount(cluster) / 2.0)),
+                    _popcount(side),
+                    int(side),
+                )
+            )
+            return unique
+
+        while len(completed) < int(k):
+            splittable = [
+                int(cluster)
+                for cluster in clusters
+                if (cluster == all_local and _popcount(cluster) >= 4)
+                or (cluster != all_local and _popcount(cluster) >= 3)
+            ]
+            if not splittable:
+                break
+            splittable.sort(key=lambda cluster: (_popcount(cluster), int(cluster)), reverse=True)
+            made_progress = False
+            for cluster in splittable:
+                for side in _candidate_sides_for_cluster(cluster):
+                    if (side & ~cluster) != 0:
+                        continue
+                    other = int(cluster ^ side)
+                    if other == 0:
+                        continue
+                    if _add_split(side, "binary_completion"):
+                        clusters.remove(cluster)
+                        clusters.extend([int(side), int(other)])
+                        made_progress = True
+                        break
+                if made_progress or len(completed) >= int(k):
+                    break
+            if not made_progress:
+                break
+        return completed
+
+    def _plan_birthset_binary_boundary_splits(
+        self,
+        logit_outputs,
+        existing_splits,
+        num_leaves,
+    ):
+        if self.birthset_topology_head is None:
+            return {
+                "selected": [],
+                "metrics": {"num_underresolved_polytomies": 1.0},
+            }
+        full_mask = _birthset_full_mask(num_leaves)
+        max_bit_length = int(full_mask).bit_length()
+        for output in logit_outputs or []:
+            for split in output.get("splits_represented", []) or []:
+                max_bit_length = max(max_bit_length, int(split).bit_length())
+        for split in existing_splits or []:
+            max_bit_length = max(max_bit_length, int(split).bit_length())
+        if max_bit_length > int(full_mask).bit_length():
+            full_mask = (1 << int(max_bit_length)) - 1
+
+        existing_splits = {int(split) for split in existing_splits}
+        planned_existing = set(existing_splits)
+        existing_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in existing_splits
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
+        planned_keys = set(existing_keys)
+        states = []
+        for group in logit_outputs or []:
+            component_masks = [int(split) for split in group["splits_represented"]]
+            G = len(component_masks)
+            if G <= 3:
+                continue
+            group_embeddings = group["group_embeddings"]
+            component_phyla_embeddings = (
+                group.get("component_phyla_embeddings")
+                if self.birthset_use_component_phyla_conditioning
+                else None
+            )
+            states.append(
+                {
+                    "component_masks": component_masks,
+                    "active_masks": list(component_masks),
+                    "active_embeddings": group_embeddings,
+                    "active_phyla": component_phyla_embeddings,
+                    "active_weights": group_embeddings.new_ones((G,)),
+                    "context": group.get("graph_context"),
+                    "selected": [],
+                    "required": max(G - 3, 0),
+                }
+            )
+
+        metrics = {
+            "num_polytomies": float(len(states)),
+            "num_candidate_splits": 0.0,
+            "num_selected_birth_splits": 0.0,
+            "num_required_birth_splits": float(
+                sum(int(state["required"]) for state in states)
+            ),
+            "num_default_required_birth_splits": float(
+                sum(int(state["required"]) for state in states)
+            ),
+            "fraction_resolved_by_birthset": 0.0,
+            "num_underresolved_polytomies": 0.0,
+            "num_empty_candidate_polytomies": 0.0,
+            "num_transformer_forwards": 1.0,
+            "binary_pair_mode": 1.0,
+            "binary_rounds": 0.0,
+        }
+        if not states:
+            return {"selected": [], "metrics": metrics}
+
+        max_rounds = max(int(state["required"]) for state in states)
+        for _round_idx in range(max_rounds):
+            active_state_ids = [
+                idx
+                for idx, state in enumerate(states)
+                if len(state["active_masks"]) > 3
+                and len(state["selected"]) < int(state["required"])
+            ]
+            if not active_state_ids:
+                break
+
+            component_embeddings_list = []
+            component_phyla_embeddings_list = []
+            contexts = []
+            candidate_counts = []
+            candidate_group_ids = []
+            candidate_component_counts = []
+            flat_candidate_ids = []
+            flat_component_group_ids = []
+            flat_component_local_indices = []
+            pair_indices_by_record = []
+            candidate_base = 0
+            for record_idx, state_idx in enumerate(active_state_ids):
+                state = states[state_idx]
+                G_active = len(state["active_masks"])
+                component_embeddings_list.append(state["active_embeddings"])
+                component_phyla_embeddings_list.append(state["active_phyla"])
+                contexts.append(state.get("context"))
+                pair_indices = []
+                for left_idx in range(G_active):
+                    for right_idx in range(left_idx + 1, G_active):
+                        pair_indices.append((int(left_idx), int(right_idx)))
+                pair_count = len(pair_indices)
+                pair_indices_by_record.append(pair_indices)
+                candidate_counts.append(int(pair_count))
+                candidate_group_ids.extend(
+                    [int(record_idx) for _ in range(int(pair_count))]
+                )
+                candidate_component_counts.extend([2 for _ in range(int(pair_count))])
+                for local_candidate_idx, (left_idx, right_idx) in enumerate(pair_indices):
+                    candidate_id = int(candidate_base) + int(local_candidate_idx)
+                    flat_candidate_ids.extend([candidate_id, candidate_id])
+                    flat_component_group_ids.extend([int(record_idx), int(record_idx)])
+                    flat_component_local_indices.extend([int(left_idx), int(right_idx)])
+                candidate_base += int(pair_count)
+
+            metrics["num_candidate_splits"] += float(candidate_base)
+            if candidate_base <= 0:
+                metrics["num_empty_candidate_polytomies"] += float(
+                    len(active_state_ids)
+                )
+                break
+
+            with torch.inference_mode():
+                logits_by_record = self.birthset_topology_head.score_many_packed(
+                    component_embeddings_list,
+                    candidate_counts,
+                    candidate_group_ids,
+                    candidate_component_counts,
+                    flat_candidate_ids,
+                    flat_component_group_ids,
+                    flat_component_local_indices,
+                    contexts=contexts,
+                    component_phyla_embeddings_list=component_phyla_embeddings_list,
+                )
+            metrics["binary_rounds"] += 1.0
+
+            for record_idx, state_idx in enumerate(active_state_ids):
+                state = states[state_idx]
+                logits = logits_by_record[int(record_idx)]
+                pair_indices = pair_indices_by_record[int(record_idx)]
+                if logits is None or int(logits.numel()) != len(pair_indices):
+                    continue
+                ordered = torch.argsort(logits.detach(), descending=True).tolist()
+                chosen = None
+                for candidate_idx in ordered:
+                    left_idx, right_idx = pair_indices[int(candidate_idx)]
+                    split = int(state["active_masks"][left_idx]) | int(
+                        state["active_masks"][right_idx]
+                    )
+                    if split in planned_existing:
+                        continue
+                    if not _birthset_valid_rooted_split(split, full_mask):
+                        continue
+                    split_key = _birthset_canonical_unrooted_split(split, full_mask)
+                    if split_key in planned_keys:
+                        continue
+                    if not all(
+                        _birthset_rooted_splits_compatible(split, other, full_mask)
+                        for other in planned_existing
+                    ):
+                        continue
+                    chosen = (left_idx, right_idx, split, float(logits[candidate_idx].detach().cpu().item()))
+                    break
+                if chosen is None:
+                    continue
+
+                left_idx, right_idx, split, score = chosen
+                item = {
+                    "local_subset": (1 << int(left_idx)) | (1 << int(right_idx)),
+                    "component_indices": [int(left_idx), int(right_idx)],
+                    "split_mask": int(split),
+                    "source": "binary_greedy",
+                    "size": 2,
+                    "score": score,
+                }
+                state["selected"].append(item)
+                planned_existing.add(int(split))
+                planned_keys.add(_birthset_canonical_unrooted_split(split, full_mask))
+
+                keep_indices = [
+                    idx
+                    for idx in range(len(state["active_masks"]))
+                    if idx not in {int(left_idx), int(right_idx)}
+                ]
+                left_weight = state["active_weights"][int(left_idx)]
+                right_weight = state["active_weights"][int(right_idx)]
+                merged_weight = left_weight + right_weight
+                merged_embedding = (
+                    state["active_embeddings"][int(left_idx)] * left_weight
+                    + state["active_embeddings"][int(right_idx)] * right_weight
+                ) / merged_weight.clamp(min=1.0)
+                next_embeddings = [
+                    state["active_embeddings"][idx] for idx in keep_indices
+                ] + [merged_embedding]
+                state["active_embeddings"] = torch.stack(next_embeddings, dim=0)
+                state["active_weights"] = torch.cat(
+                    [
+                        state["active_weights"][
+                            torch.tensor(
+                                keep_indices,
+                                device=state["active_weights"].device,
+                                dtype=torch.long,
+                            )
+                        ],
+                        merged_weight.reshape(1),
+                    ],
+                    dim=0,
+                )
+                if state["active_phyla"] is not None:
+                    merged_phyla = (
+                        state["active_phyla"][int(left_idx)] * left_weight
+                        + state["active_phyla"][int(right_idx)] * right_weight
+                    ) / merged_weight.clamp(min=1.0)
+                    next_phyla = [state["active_phyla"][idx] for idx in keep_indices] + [
+                        merged_phyla
+                    ]
+                    state["active_phyla"] = torch.stack(next_phyla, dim=0)
+                state["active_masks"] = [
+                    state["active_masks"][idx] for idx in keep_indices
+                ] + [int(split)]
+
+        selected_all = []
+        resolved_count = 0
+        for state in states:
+            selected_all.extend(state["selected"])
+            if len(state["selected"]) >= int(state["required"]):
+                resolved_count += 1
+            else:
+                metrics["num_underresolved_polytomies"] += 1.0
+        metrics["num_selected_birth_splits"] = float(len(selected_all))
+        if metrics["num_polytomies"] > 0.0:
+            metrics["fraction_resolved_by_birthset"] = (
+                float(resolved_count) / metrics["num_polytomies"]
+            )
+        return {"selected": selected_all, "metrics": metrics}
+
+    def _plan_birthset_frontier_boundary_splits(
+        self,
+        logit_outputs,
+        existing_splits,
+        num_leaves,
+        blocked_splits=None,
+    ):
+        if self.birthset_topology_head is None:
+            return {
+                "selected": [],
+                "metrics": {"num_underresolved_polytomies": 1.0},
+            }
+        full_mask = _birthset_full_mask(num_leaves)
+        max_bit_length = int(full_mask).bit_length()
+        for output in logit_outputs or []:
+            for split in output.get("splits_represented", []) or []:
+                max_bit_length = max(max_bit_length, int(split).bit_length())
+        for split in existing_splits or []:
+            max_bit_length = max(max_bit_length, int(split).bit_length())
+        if max_bit_length > int(full_mask).bit_length():
+            full_mask = (1 << int(max_bit_length)) - 1
+
+        existing_splits = {int(split) for split in existing_splits}
+        planned_existing = set(existing_splits)
+        planned_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in existing_splits
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
+        blocked_keys = {
+            _birthset_canonical_unrooted_split(split, full_mask)
+            for split in (blocked_splits or [])
+            if _birthset_valid_rooted_split(split, full_mask)
+        }
+        states = []
+        for group in logit_outputs or []:
+            component_masks = [int(split) for split in group["splits_represented"]]
+            G = len(component_masks)
+            if G <= 2:
+                continue
+            required = self._birthset_num_required_splits(
+                G,
+                component_masks=component_masks,
+                full_mask=full_mask,
+            )
+            if required <= 0:
+                continue
+            states.append(
+                {
+                    "component_masks": component_masks,
+                    "active_fronts": [1 << int(idx) for idx in range(G)],
+                    "group_embeddings": group["group_embeddings"],
+                    "active_phyla": (
+                        group.get("component_phyla_embeddings")
+                        if self.birthset_use_component_phyla_conditioning
+                        else None
+                    ),
+                    "context": group.get("graph_context"),
+                    "selected": [],
+                    "required": int(required),
+                    "target_active_count": max(int(G) - int(required), 1),
+                }
+            )
+
+        metrics = {
+            "num_polytomies": float(len(states)),
+            "num_candidate_splits": 0.0,
+            "num_selected_birth_splits": 0.0,
+            "num_required_birth_splits": float(
+                sum(int(state["required"]) for state in states)
+            ),
+            "num_default_required_birth_splits": float(
+                sum(int(state["required"]) for state in states)
+            ),
+            "fraction_resolved_by_birthset": 0.0,
+            "num_underresolved_polytomies": 0.0,
+            "num_empty_candidate_polytomies": 0.0,
+            "num_transformer_forwards": 1.0,
+            "frontier_levels": 0.0,
+        }
+        if not states:
+            return {"selected": [], "metrics": metrics}
+
+        selected_keys = set()
+        max_levels = max(max(1, int(state["required"])) for state in states)
+        for _level_idx in range(max_levels):
+            active_state_ids = [
+                idx
+                for idx, state in enumerate(states)
+                if len(state["selected"]) < int(state["required"])
+                and len(state["active_fronts"]) > int(state["target_active_count"])
+            ]
+            if not active_state_ids:
+                break
+
+            component_embeddings_list = []
+            component_phyla_embeddings_list = []
+            contexts = []
+            candidate_counts = []
+            candidate_group_ids = []
+            candidate_component_counts = []
+            flat_candidate_ids = []
+            flat_component_group_ids = []
+            flat_component_local_indices = []
+            candidate_meta_by_record = []
+            candidate_base = 0
+            for record_idx, state_idx in enumerate(active_state_ids):
+                state = states[state_idx]
+                active_fronts = [int(front) for front in state["active_fronts"]]
+                component_embeddings_list.append(state["group_embeddings"])
+                component_phyla_embeddings_list.append(state["active_phyla"])
+                contexts.append(state.get("context"))
+                record_meta = []
+                for left_front_idx in range(len(active_fronts)):
+                    for right_front_idx in range(left_front_idx + 1, len(active_fronts)):
+                        local_subset = int(active_fronts[left_front_idx]) | int(
+                            active_fronts[right_front_idx]
+                        )
+                        if not _birthset_valid_local_subset(
+                            local_subset,
+                            len(state["component_masks"]),
+                        ):
+                            continue
+                        split = _birthset_local_subset_to_split(
+                            local_subset,
+                            state["component_masks"],
+                        )
+                        if not _birthset_valid_rooted_split(split, full_mask):
+                            continue
+                        component_indices = _birthset_local_subset_indices(
+                            local_subset,
+                            len(state["component_masks"]),
+                        )
+                        record_meta.append(
+                            (
+                                int(left_front_idx),
+                                int(right_front_idx),
+                                int(local_subset),
+                                int(split),
+                                component_indices,
+                            )
+                        )
+                candidate_counts.append(len(record_meta))
+                candidate_group_ids.extend(
+                    [int(record_idx) for _ in range(len(record_meta))]
+                )
+                for local_candidate_idx, meta in enumerate(record_meta):
+                    component_indices = list(meta[4])
+                    candidate_component_counts.append(len(component_indices))
+                    candidate_id = int(candidate_base) + int(local_candidate_idx)
+                    for component_idx in component_indices:
+                        flat_candidate_ids.append(candidate_id)
+                        flat_component_group_ids.append(int(record_idx))
+                        flat_component_local_indices.append(int(component_idx))
+                candidate_meta_by_record.append(record_meta)
+                candidate_base += len(record_meta)
+
+            metrics["num_candidate_splits"] += float(candidate_base)
+            if candidate_base <= 0:
+                metrics["num_empty_candidate_polytomies"] += float(
+                    len(active_state_ids)
+                )
+                break
+
+            with torch.inference_mode():
+                logits_by_record = self.birthset_topology_head.score_many_packed(
+                    component_embeddings_list,
+                    candidate_counts,
+                    candidate_group_ids,
+                    candidate_component_counts,
+                    flat_candidate_ids,
+                    flat_component_group_ids,
+                    flat_component_local_indices,
+                    contexts=contexts,
+                    component_phyla_embeddings_list=component_phyla_embeddings_list,
+                )
+            metrics["frontier_levels"] += 1.0
+
+            any_selected = False
+            for record_idx, state_idx in enumerate(active_state_ids):
+                state = states[state_idx]
+                logits = logits_by_record[int(record_idx)]
+                record_meta = candidate_meta_by_record[int(record_idx)]
+                if logits is None or int(logits.numel()) != len(record_meta):
+                    continue
+                ordered = torch.argsort(logits.detach(), descending=True).tolist()
+                used_fronts = set()
+                selected_this_level = []
+                for candidate_idx in ordered:
+                    if len(state["selected"]) + len(selected_this_level) >= int(
+                        state["required"]
+                    ):
+                        break
+                    (
+                        left_front_idx,
+                        right_front_idx,
+                        local_subset,
+                        split,
+                        component_indices,
+                    ) = record_meta[int(candidate_idx)]
+                    if left_front_idx in used_fronts or right_front_idx in used_fronts:
+                        continue
+                    if split in planned_existing:
+                        continue
+                    split_key = _birthset_canonical_unrooted_split(split, full_mask)
+                    if (
+                        split_key in planned_keys
+                        or split_key in selected_keys
+                        or split_key in blocked_keys
+                    ):
+                        continue
+                    if not all(
+                        _birthset_rooted_splits_compatible(split, other, full_mask)
+                        for other in planned_existing
+                    ):
+                        continue
+                    item = {
+                        "local_subset": int(local_subset),
+                        "component_indices": [int(idx) for idx in component_indices],
+                        "split_mask": int(split),
+                        "source": "frontier",
+                        "size": len(component_indices),
+                        "score": float(logits[int(candidate_idx)].detach().cpu().item()),
+                    }
+                    selected_this_level.append(
+                        (int(left_front_idx), int(right_front_idx), int(local_subset), item)
+                    )
+                    used_fronts.add(int(left_front_idx))
+                    used_fronts.add(int(right_front_idx))
+                    planned_existing.add(int(split))
+                    planned_keys.add(split_key)
+                    selected_keys.add(split_key)
+
+                if not selected_this_level:
+                    continue
+                any_selected = True
+                selected_front_ids = {
+                    int(left_idx)
+                    for left_idx, _right_idx, _subset, _item in selected_this_level
+                } | {
+                    int(right_idx)
+                    for _left_idx, right_idx, _subset, _item in selected_this_level
+                }
+                next_fronts = [
+                    int(front)
+                    for idx, front in enumerate(state["active_fronts"])
+                    if int(idx) not in selected_front_ids
+                ]
+                for _left_idx, _right_idx, local_subset, item in selected_this_level:
+                    next_fronts.append(int(local_subset))
+                    state["selected"].append(item)
+                state["active_fronts"] = next_fronts
+            if not any_selected:
+                break
+
+        selected_all = []
+        resolved_count = 0
+        for state in states:
+            selected_all.extend(state["selected"])
+            if len(state["selected"]) >= int(state["required"]):
+                resolved_count += 1
+            else:
+                metrics["num_underresolved_polytomies"] += 1.0
+        metrics["num_selected_birth_splits"] = float(len(selected_all))
+        if metrics["num_polytomies"] > 0.0:
+            metrics["fraction_resolved_by_birthset"] = (
+                float(resolved_count) / metrics["num_polytomies"]
+            )
+        return {"selected": selected_all, "metrics": metrics}
 
     def _birthset_precomputed_group_for(
         self,
@@ -18009,21 +18860,7 @@ class TrainingModule(LightningModule):
                 if self.birthset_use_component_phyla_conditioning
                 else None
             )
-            group_targets = label_targets_by_batch[batch_index].get(
-                tuple(component_masks),
-                [],
-            )
-            gold_splits = sorted({int(split) for split, _ in group_targets})
-            gold_local_subsets = sorted({int(mask) for _, mask in group_targets})
-            for split in gold_splits:
-                found[(batch_index, split)] = True
-
             precomputed_group = self._birthset_precomputed_group_for(
-                batch,
-                batch_index,
-                component_masks,
-            )
-            num_leaves = self._birthset_num_leaves_for_group(
                 batch,
                 batch_index,
                 component_masks,
@@ -18032,51 +18869,229 @@ class TrainingModule(LightningModule):
                 batch,
                 precomputed_group,
             )
-            if candidate_info is None:
-                candidate_info = self._birthset_build_candidates(
-                    component_masks,
-                    num_leaves,
-                    gold_splits=gold_splits,
-                    gold_local_subsets=gold_local_subsets,
-                    component_embeddings=group["group_embeddings"],
-                    component_phyla_embeddings=component_phyla_embeddings,
-                    context=group.get("graph_context"),
-                    train=True,
+            proposal_precomputed = (
+                None if precomputed_group is None else precomputed_group.get("proposal")
+            )
+            fast_precomputed_candidates = (
+                isinstance(candidate_info, dict)
+                and candidate_info.get("candidate_local_subsets") is not None
+                and candidate_info.get("candidate_component_indices") is not None
+                and candidate_info.get("candidate_labels") is not None
+            )
+
+            if fast_precomputed_candidates:
+                local_subsets = candidate_info.get("candidate_local_subsets") or []
+                candidate_component_indices = (
+                    candidate_info.get("candidate_component_indices") or []
                 )
+                label_values = candidate_info.get("candidate_labels") or []
+                candidate_component_counts = (
+                    candidate_info.get("candidate_component_counts") or []
+                )
+                flat_candidate_component_indices = (
+                    candidate_info.get("flat_candidate_component_indices") or []
+                )
+                flat_candidate_ids = candidate_info.get("flat_candidate_ids") or []
+                if not candidate_component_counts:
+                    candidate_component_counts = [
+                        len(indices) for indices in candidate_component_indices
+                    ]
+                if not flat_candidate_component_indices and not flat_candidate_ids:
+                    flat_candidate_component_indices = [
+                        int(component_idx)
+                        for indices in candidate_component_indices
+                        for component_idx in indices
+                    ]
+                    flat_candidate_ids = [
+                        int(candidate_idx)
+                        for candidate_idx, indices in enumerate(
+                            candidate_component_indices
+                        )
+                        for _component_idx in indices
+                    ]
+                if not (
+                    len(local_subsets)
+                    == len(candidate_component_indices)
+                    == len(candidate_component_counts)
+                    == len(label_values)
+                    and len(flat_candidate_component_indices)
+                    == len(flat_candidate_ids)
+                ):
+                    fast_precomputed_candidates = False
+
+            if not fast_precomputed_candidates:
+                group_targets = label_targets_by_batch[batch_index].get(
+                    tuple(component_masks),
+                    [],
+                )
+                gold_splits = sorted({int(split) for split, _ in group_targets})
+                gold_local_subsets = sorted({int(mask) for _, mask in group_targets})
+                for split in gold_splits:
+                    found[(batch_index, split)] = True
+
+                num_leaves = self._birthset_num_leaves_for_group(
+                    batch,
+                    batch_index,
+                    component_masks,
+                )
+                if bool(getattr(self, "birthset_binary_pair_mode", False)):
+                    full_mask = _birthset_full_mask(num_leaves)
+                    max_bit_length = max(
+                        [int(full_mask).bit_length()]
+                        + [int(mask).bit_length() for mask in component_masks]
+                        + [int(mask).bit_length() for mask in gold_splits]
+                    )
+                    if max_bit_length > int(full_mask).bit_length():
+                        full_mask = (1 << int(max_bit_length)) - 1
+                    candidates = []
+                    for left_idx in range(G):
+                        for right_idx in range(left_idx + 1, G):
+                            subset = (1 << int(left_idx)) | (1 << int(right_idx))
+                            if not _birthset_valid_local_subset(subset, G):
+                                continue
+                            candidate = _birthset_candidate_record(
+                                subset,
+                                component_masks,
+                                "binary_pair",
+                            )
+                            if _birthset_valid_rooted_split(
+                                candidate["split_mask"],
+                                full_mask,
+                            ):
+                                candidates.append(candidate)
+                    candidate_info = {
+                        "candidates": candidates,
+                        "candidate_component_indices": [
+                            list(item.get("component_indices", []))
+                            for item in candidates
+                        ],
+                        "full_mask": int(full_mask),
+                        "gold_mismatches": 0,
+                        "pre_gold_target_count": int(len(gold_local_subsets)),
+                        "pre_gold_target_hits": int(
+                            sum(
+                                1
+                                for item in candidates
+                                if int(item["local_subset"]) in gold_local_subsets
+                            )
+                        ),
+                    }
+                else:
+                    candidate_info = self._birthset_build_candidates(
+                        component_masks,
+                        num_leaves,
+                        gold_splits=gold_splits,
+                        gold_local_subsets=gold_local_subsets,
+                        component_embeddings=group["group_embeddings"],
+                        component_phyla_embeddings=component_phyla_embeddings,
+                        context=group.get("graph_context"),
+                        train=True,
+                    )
+                candidates = list(candidate_info.get("candidates") or [])
+                local_subsets = [
+                    int(item["local_subset"])
+                    for item in candidates
+                    if item.get("local_subset") is not None
+                ]
+                candidate_component_indices = [
+                    list(item.get("component_indices", []))
+                    for item in candidates
+                    if item.get("local_subset") is not None
+                ]
+                gold_split_keys = {
+                    _birthset_canonical_unrooted_split(split, int(candidate_info["full_mask"]))
+                    for split in gold_splits
+                }
+                gold_local_keys = {int(mask) for mask in gold_local_subsets}
+                label_values = []
+                for item in candidates:
+                    if item.get("local_subset") is None:
+                        continue
+                    split_key = _birthset_canonical_unrooted_split(
+                        int(item["split_mask"]),
+                        int(candidate_info["full_mask"]),
+                    )
+                    label_values.append(
+                        1.0
+                        if split_key in gold_split_keys
+                        or int(item["local_subset"]) in gold_local_keys
+                        else 0.0
+                    )
+                candidate_component_counts = [
+                    len(indices) for indices in candidate_component_indices
+                ]
+                flat_candidate_component_indices = [
+                    int(component_idx)
+                    for indices in candidate_component_indices
+                    for component_idx in indices
+                ]
+                flat_candidate_ids = [
+                    int(candidate_idx)
+                    for candidate_idx, indices in enumerate(candidate_component_indices)
+                    for _component_idx in indices
+                ]
+            else:
+                gold_splits = [
+                    int(value) for value in precomputed_group.get("gold_splits", [])
+                ] if isinstance(precomputed_group, dict) else []
+                for split in gold_splits:
+                    found[(batch_index, split)] = True
+                gold_local_subsets = [
+                    int(value)
+                    for value in (
+                        precomputed_group.get("gold_local_subsets", [])
+                        if isinstance(precomputed_group, dict)
+                        else []
+                    )
+                ]
+                if not gold_local_subsets and isinstance(proposal_precomputed, dict):
+                    gold_local_subsets = [
+                        int(value)
+                        for value in proposal_precomputed.get("gold_local_subsets", [])
+                    ]
+
             _birthset_profile_mark("candidate_build")
             if candidate_info.get("profile"):
                 candidate_profiles.append(dict(candidate_info["profile"]))
-            candidates = candidate_info["candidates"]
-            full_mask = candidate_info["full_mask"]
-            mismatch_count += int(candidate_info["gold_mismatches"])
-            candidate_counts.append(float(len(candidates)))
-            positive_counts.append(float(len(gold_splits)))
+            full_mask = int(candidate_info["full_mask"])
+            mismatch_count += int(candidate_info.get("gold_mismatches", 0))
+            candidate_counts.append(float(len(local_subsets)))
+            positive_count = candidate_info.get("candidate_positive_count")
+            if positive_count is None:
+                positive_count = sum(1 for value in label_values if value > 0.5)
+            positive_counts.append(float(positive_count))
             required_counts.append(
                 float(
-                    self._birthset_num_required_splits(
+                    precomputed_group.get("required_splits")
+                    if isinstance(precomputed_group, dict)
+                    and precomputed_group.get("required_splits") is not None
+                    else self._birthset_num_required_splits(
                         G,
                         component_masks=component_masks,
                         full_mask=full_mask,
                     )
                 )
             )
-            observed_counts.append(float(len(gold_splits)))
-            if gold_splits:
+            observed_counts.append(
+                float(
+                    len(gold_splits)
+                    or sum(1 for value in label_values if value > 0.5)
+                )
+            )
+            pre_gold_target_count = int(candidate_info.get("pre_gold_target_count", 0))
+            if pre_gold_target_count > 0:
+                pre_gold_recall_values.append(
+                    float(candidate_info.get("pre_gold_target_hits", 0))
+                    / float(pre_gold_target_count)
+                )
+            if not fast_precomputed_candidates and gold_splits:
                 gold_split_keys = {
                     _birthset_canonical_unrooted_split(split, full_mask)
                     for split in gold_splits
                 }
-                pre_gold_target_count = int(
-                    candidate_info.get("pre_gold_target_count", 0)
-                )
-                if pre_gold_target_count > 0:
-                    pre_gold_recall_values.append(
-                        float(candidate_info.get("pre_gold_target_hits", 0))
-                        / float(pre_gold_target_count)
-                    )
                 candidate_split_set = {
                     _birthset_canonical_unrooted_split(item["split_mask"], full_mask)
-                    for item in candidates
+                    for item in candidate_info["candidates"]
                 }
                 recall_values.append(
                     float(
@@ -18085,57 +19100,10 @@ class TrainingModule(LightningModule):
                     / float(len(gold_split_keys))
                 )
 
-            if not candidates:
+            if not local_subsets:
                 no_candidate_count += 1
                 continue
 
-            local_subsets = [int(item["local_subset"]) for item in candidates]
-            candidate_component_indices = candidate_info.get(
-                "candidate_component_indices"
-            )
-            if (
-                candidate_component_indices is None
-                or len(candidate_component_indices) != len(candidates)
-            ):
-                candidate_component_indices = [
-                    list(
-                        item.get(
-                            "component_indices",
-                            _birthset_local_subset_indices(
-                                int(item["local_subset"]),
-                                G,
-                            ),
-                        )
-                    )
-                    for item in candidates
-                ]
-            gold_split_keys = {
-                _birthset_canonical_unrooted_split(split, full_mask)
-                for split in gold_splits
-            }
-            precomputed_candidate_labels = candidate_info.get("candidate_labels")
-            if (
-                precomputed_candidate_labels is not None
-                and len(precomputed_candidate_labels) == len(candidates)
-            ):
-                label_values = [float(value) for value in precomputed_candidate_labels]
-            else:
-                label_values = [
-                    1.0
-                    if (
-                        _birthset_canonical_unrooted_split(
-                            item["split_mask"],
-                            full_mask,
-                        )
-                        in gold_split_keys
-                        or int(item["local_subset"]) in gold_local_subsets
-                    )
-                    else 0.0
-                    for item in candidates
-                ]
-            proposal_precomputed = (
-                None if precomputed_group is None else precomputed_group.get("proposal")
-            )
             proposal_record_index = None
             can_batch_proposal = (
                 self.birthset_proposal_head is not None
@@ -18184,6 +19152,11 @@ class TrainingModule(LightningModule):
                     "context": group.get("graph_context"),
                     "local_subsets": local_subsets,
                     "candidate_component_indices": candidate_component_indices,
+                    "candidate_component_counts": candidate_component_counts,
+                    "flat_candidate_component_indices": (
+                        flat_candidate_component_indices
+                    ),
+                    "flat_candidate_ids": flat_candidate_ids,
                     "label_values": label_values,
                     "gold_local_subsets": gold_local_subsets,
                     "proposal_precomputed": proposal_precomputed,
@@ -18192,20 +19165,101 @@ class TrainingModule(LightningModule):
             )
 
         if topology_records:
-            topology_logits_by_record = self.birthset_topology_head.score_many(
-                [record["component_embeddings"] for record in topology_records],
-                [record["local_subsets"] for record in topology_records],
-                contexts=[record.get("context") for record in topology_records],
-                component_phyla_embeddings_list=[
-                    record.get("component_phyla_embeddings")
-                    for record in topology_records
-                ],
-                candidate_component_indices_list=[
-                    record.get("candidate_component_indices")
-                    for record in topology_records
-                ],
-            )
+            can_score_packed = hasattr(self.birthset_topology_head, "score_many_packed")
+            candidate_counts_by_record = []
+            candidate_group_ids = []
+            candidate_component_counts_flat = []
+            flat_candidate_ids = []
+            flat_component_group_ids = []
+            flat_component_local_indices = []
+            flat_label_values = []
+            candidate_base = 0
+            if can_score_packed:
+                for record_idx, record in enumerate(topology_records):
+                    record_candidate_count = len(record["label_values"])
+                    candidate_counts_by_record.append(int(record_candidate_count))
+                    candidate_group_ids.extend(
+                        [int(record_idx) for _ in range(int(record_candidate_count))]
+                    )
+                    component_counts = record.get("candidate_component_counts")
+                    local_flat_components = record.get(
+                        "flat_candidate_component_indices"
+                    )
+                    local_flat_candidate_ids = record.get("flat_candidate_ids")
+                    if (
+                        component_counts is None
+                        or local_flat_components is None
+                        or local_flat_candidate_ids is None
+                        or len(component_counts) != int(record_candidate_count)
+                        or len(local_flat_components) != len(local_flat_candidate_ids)
+                    ):
+                        can_score_packed = False
+                        break
+                    candidate_component_counts_flat.extend(
+                        int(value) for value in component_counts
+                    )
+                    flat_label_values.extend(float(value) for value in record["label_values"])
+                    flat_candidate_ids.extend(
+                        int(candidate_base) + int(value)
+                        for value in local_flat_candidate_ids
+                    )
+                    flat_component_group_ids.extend(
+                        [int(record_idx) for _ in local_flat_components]
+                    )
+                    flat_component_local_indices.extend(
+                        int(value) for value in local_flat_components
+                    )
+                    candidate_base += int(record_candidate_count)
+
+            if can_score_packed:
+                topology_flat_logits, topology_logits_by_record = (
+                    self.birthset_topology_head.score_many_packed(
+                    [record["component_embeddings"] for record in topology_records],
+                    candidate_counts_by_record,
+                    candidate_group_ids,
+                    candidate_component_counts_flat,
+                    flat_candidate_ids,
+                    flat_component_group_ids,
+                    flat_component_local_indices,
+                    contexts=[record.get("context") for record in topology_records],
+                    component_phyla_embeddings_list=[
+                        record.get("component_phyla_embeddings")
+                        for record in topology_records
+                    ],
+                    return_flat=True,
+                    )
+                )
+                topology_flat_labels = torch.tensor(
+                    flat_label_values,
+                    dtype=torch.float32,
+                    device=topology_flat_logits.device,
+                )
+                topology_flat_group_ids = torch.tensor(
+                    candidate_group_ids,
+                    dtype=torch.long,
+                    device=topology_flat_logits.device,
+                )
+            else:
+                topology_flat_logits = None
+                topology_flat_labels = None
+                topology_flat_group_ids = None
+                topology_logits_by_record = self.birthset_topology_head.score_many(
+                    [record["component_embeddings"] for record in topology_records],
+                    [record["local_subsets"] for record in topology_records],
+                    contexts=[record.get("context") for record in topology_records],
+                    component_phyla_embeddings_list=[
+                        record.get("component_phyla_embeddings")
+                        for record in topology_records
+                    ],
+                    candidate_component_indices_list=[
+                        record.get("candidate_component_indices")
+                        for record in topology_records
+                    ],
+                )
         else:
+            topology_flat_logits = None
+            topology_flat_labels = None
+            topology_flat_group_ids = None
             topology_logits_by_record = []
         _birthset_profile_mark("topology_head_forward")
 
@@ -18218,11 +19272,30 @@ class TrainingModule(LightningModule):
             proposal_profiles.append(dict(batched_proposal_profile))
         _birthset_profile_mark("proposal_loss")
 
-        topology_bce_by_record = self._birthset_grouped_bce_losses(
-            topology_logits_by_record,
-            [record["label_values"] for record in topology_records],
-            positive_weight=self.birthset_pos_weight,
-        )
+        topology_bce_grouped = None
+        if (
+            topology_flat_logits is not None
+            and topology_flat_labels is not None
+            and topology_flat_group_ids is not None
+        ):
+            topology_bce_grouped = self._birthset_flat_bce_losses(
+                topology_flat_logits,
+                topology_flat_labels,
+                topology_flat_group_ids,
+                len(topology_records),
+                positive_weight=self.birthset_pos_weight,
+            )
+        if topology_bce_grouped is not None:
+            topology_bce_by_record = [
+                topology_bce_grouped[int(record_idx)]
+                for record_idx in range(len(topology_records))
+            ]
+        else:
+            topology_bce_by_record = self._birthset_grouped_bce_losses(
+                topology_logits_by_record,
+                [record["label_values"] for record in topology_records],
+                positive_weight=self.birthset_pos_weight,
+            )
         topology_rank_by_record = self._birthset_grouped_rank_losses(
             topology_logits_by_record,
             [record["label_values"] for record in topology_records],
@@ -18566,7 +19639,15 @@ class TrainingModule(LightningModule):
         logit_outputs,
         existing_splits,
         num_leaves,
+        blocked_splits=None,
     ):
+        if self.topology_decoder == "birthset_frontier":
+            return self._plan_birthset_frontier_boundary_splits(
+                logit_outputs,
+                existing_splits,
+                num_leaves,
+                blocked_splits=blocked_splits,
+            )
         if self.birthset_topology_head is None:
             return {
                 "selected": [],
@@ -18650,9 +19731,15 @@ class TrainingModule(LightningModule):
                 1.0 if use_oracle_cardinality else 0.0
             ),
         }
+        def _polytomy_sort_score(output):
+            pred = output.get("polytomy_pred") if isinstance(output, dict) else None
+            if torch.is_tensor(pred):
+                return float(pred.detach().cpu().item())
+            return 0.0
+
         sorted_outputs = sorted(
             logit_outputs,
-            key=lambda output: float(output["polytomy_pred"].detach().cpu().item()),
+            key=_polytomy_sort_score,
             reverse=True,
         )
         resolved_count = 0
@@ -18734,9 +19821,31 @@ class TrainingModule(LightningModule):
             candidates = candidate_info["candidates"]
             metrics["num_candidate_splits"] += float(len(candidates))
             if not candidates:
-                metrics["num_underresolved_polytomies"] += 1.0
-                metrics["num_empty_candidate_polytomies"] += 1.0
-                continue
+                if self.topology_decoder == "birthset_binary":
+                    selected = self._birthset_binary_completion(
+                        [],
+                        component_masks,
+                        full_mask,
+                        required,
+                        planned_existing,
+                    )
+                    metrics["num_selected_birth_splits"] += float(len(selected))
+                    if len(selected) < int(required):
+                        metrics["num_underresolved_polytomies"] += 1.0
+                        metrics["num_empty_candidate_polytomies"] += 1.0
+                    else:
+                        resolved_count += 1
+                    for item in selected:
+                        split = int(item["split_mask"])
+                        if split in planned_existing:
+                            continue
+                        selected_all.append(item)
+                        planned_existing.add(split)
+                    continue
+                else:
+                    metrics["num_underresolved_polytomies"] += 1.0
+                    metrics["num_empty_candidate_polytomies"] += 1.0
+                    continue
             local_subsets = [int(item["local_subset"]) for item in candidates]
             with torch.inference_mode():
                 logits = self.birthset_topology_head(
@@ -18751,12 +19860,24 @@ class TrainingModule(LightningModule):
                 required,
                 planned_existing,
                 full_mask,
+                blocked_splits=blocked_splits,
             )
             if (
                 len(selected) < int(required)
                 and self.birthset_fallback == "balanced_completion"
             ):
                 selected = self._birthset_balanced_completion(
+                    selected,
+                    component_masks,
+                    full_mask,
+                    required,
+                    planned_existing,
+                )
+            if (
+                len(selected) < int(required)
+                and self.topology_decoder == "birthset_binary"
+            ):
+                selected = self._birthset_binary_completion(
                     selected,
                     component_masks,
                     full_mask,
@@ -20827,7 +21948,12 @@ class TrainingModule(LightningModule):
                     ),
                     autoregressive_return_head_outputs=not (
                         self.topology_decoder
-                        in {"birthset", "birthset_with_ar_fallback"}
+                        in {
+                            "birthset",
+                            "birthset_binary",
+                            "birthset_frontier",
+                            "birthset_with_ar_fallback",
+                        }
                     ),
                     autoregressive_case_indices=batch.get("_autoregressive_case_indices"),
                     autoregressive_start_topology_features=batch.get(
@@ -20837,7 +21963,12 @@ class TrainingModule(LightningModule):
             else:
                 all_group_logits = precomputed_outputs
 
-            if self.topology_decoder in {"birthset", "birthset_with_ar_fallback"}:
+            if self.topology_decoder in {
+                "birthset",
+                "birthset_binary",
+                "birthset_frontier",
+                "birthset_with_ar_fallback",
+            }:
                 return self._birthset_step_logs(
                     batch,
                     all_group_logits,
@@ -21609,6 +22740,8 @@ class TrainingModule(LightningModule):
         polytomy_group_cache = {}
         birthset_polytomy_unrooted_ok = self.topology_decoder in {
             "birthset",
+            "birthset_binary",
+            "birthset_frontier",
             "birthset_with_ar_fallback",
         }
 
@@ -22803,6 +23936,13 @@ class TrainingModule(LightningModule):
                             boundary_merge_cap,
                             int(max_autoregressive_merges_per_boundary),
                         )
+                    collapsed_splits_this_boundary = []
+                    if predicted_first_mask is not None:
+                        collapsed_splits_this_boundary = [
+                            int(masks[i])
+                            for i, on in enumerate(predicted_first_mask.tolist())
+                            if bool(on)
+                        ]
                     birthset_attempted_this_boundary = False
                     while (
                         topology_changed
@@ -22923,7 +24063,12 @@ class TrainingModule(LightningModule):
                             )
                             birthset_without_ar_head = (
                                 self.topology_decoder
-                                in {"birthset", "birthset_with_ar_fallback"}
+                                in {
+                                    "birthset",
+                                    "birthset_binary",
+                                    "birthset_frontier",
+                                    "birthset_with_ar_fallback",
+                                }
                                 and not birthset_ar_fallback_for_forward
                             )
                             logit_outputs = self.forward(
@@ -22958,7 +24103,12 @@ class TrainingModule(LightningModule):
                         )
                         use_birthset_decoder = (
                             self.topology_decoder
-                            in {"birthset", "birthset_with_ar_fallback"}
+                            in {
+                                "birthset",
+                                "birthset_binary",
+                                "birthset_frontier",
+                                "birthset_with_ar_fallback",
+                            }
                             and not birthset_attempted_this_boundary
                         )
                         if use_birthset_decoder:
@@ -22967,6 +24117,7 @@ class TrainingModule(LightningModule):
                                 logit_outputs,
                                 td2.keys(),
                                 n_leaves,
+                                blocked_splits=collapsed_splits_this_boundary,
                             )
                             selected_births = list(birthset_plan.get("selected", []))
                             if max_events is not None:
@@ -23577,6 +24728,11 @@ class TrainingModule(LightningModule):
             int(getattr(self, "stepper", 0) or 0),
             timing_text,
         )
+        print(
+            "TRAINING_STEP_PROFILE "
+            f"step={int(getattr(self, 'stepper', 0) or 0)} {timing_text}",
+            flush=True,
+        )
         if logs is None:
             return
         device = getattr(self, "device", torch.device("cpu"))
@@ -23586,6 +24742,16 @@ class TrainingModule(LightningModule):
                 break
         for key, value in timing_items:
             logs[f"profile/{key}_sec"] = torch.tensor(float(value), device=device)
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
+        if isinstance(batch, dict) and (
+            batch.get("_full_path_control_mode", False)
+            or "full_path_velocity_batch" in batch
+            or "full_path_autoregressive_batch" in batch
+            or "full_path_joint_tokenizer_raw_graph_batch" in batch
+        ):
+            return batch
+        return super().transfer_batch_to_device(batch, device, dataloader_idx)
 
     def training_step(self, batch, _):
         # Skip if batch is None (all items failed tokenization in collate_fn)
@@ -24153,7 +25319,12 @@ class TrainingModule(LightningModule):
                     direct_birthset_loss_route = (
                         joint_forward is not None
                         and self.topology_decoder
-                        in {"birthset", "birthset_with_ar_fallback"}
+                        in {
+                            "birthset",
+                            "birthset_binary",
+                            "birthset_frontier",
+                            "birthset_with_ar_fallback",
+                        }
                     )
                     if joint_forward is not None:
                         autoregressive_step_kwargs = {

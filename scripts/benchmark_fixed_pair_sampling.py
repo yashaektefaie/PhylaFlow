@@ -78,9 +78,53 @@ def _load_module(config, checkpoint_path, device):
     }
 
 
-def _fixed_pair(module, train=True):
+def _joint_bank_pair_from_row(row):
+    start_tree = str(row.get("random_tree") or row.get("start_tree"))
+    target_tree = str(row.get("effective_target_tree") or row.get("target_tree"))
+    return {
+        "start_tree": start_tree,
+        "target_tree": target_tree,
+        "bank_group_key": row.get("bank_group_key") or row.get("group_key"),
+        "group_key": row.get("group_key") or row.get("bank_group_key"),
+        "dataset_id": row.get("dataset_id"),
+        "n_leaves": len(EteTree(start_tree, format=1).get_leaves()),
+        "max_events": int(len(row.get("final_labels", []) or []) or 1024),
+        "name_mapping": row.get("name_mapping"),
+        "selected_sequences": row.get("selected_sequences"),
+        "selected_sequence_names": row.get("selected_sequence_names"),
+        "source_bank_index": row.get("source_bank_index"),
+    }
+
+
+def _load_joint_bank_pairs(config, limit, train=True):
+    data_cfg = config.get("data") or {}
+    path = data_cfg.get("overfit_fixed_pair_joint_bank_jsonl_path")
+    if not path:
+        return []
+    path = Path(path)
+    if not path.exists():
+        return []
+    pairs = []
+    with path.open("r", encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            pair = _joint_bank_pair_from_row(row)
+            pair["source_bank_index"] = row.get("source_bank_index", index)
+            pairs.append(pair)
+            if len(pairs) >= int(limit):
+                break
+    return pairs
+
+
+def _fixed_pair(module, config, train=True):
     fixed_pair = module._get_fixed_pair_sampling_details(train=train)
     if fixed_pair is None:
+        pairs = _load_joint_bank_pairs(config, 1, train=train)
+        if pairs:
+            return pairs[0]
         raise RuntimeError("No fixed pair available in the configured dataset.")
     start_tree = fixed_pair.get("random_tree", fixed_pair.get("start_tree"))
     target_tree = fixed_pair.get("effective_target_tree", fixed_pair.get("target_tree"))
@@ -116,6 +160,10 @@ def _case_index_from_group_key(group_key):
 
 
 def _load_json_case_pairs(config, limit):
+    joint_pairs = _load_joint_bank_pairs(config, limit)
+    if joint_pairs:
+        return joint_pairs
+
     data_cfg = config.get("data") or {}
     start_path = data_cfg.get("overfit_fixed_pair_start_tree_json_path")
     target_path = data_cfg.get("overfit_fixed_pair_target_tree_json_path")
@@ -216,8 +264,10 @@ def _expand_fixed_pair_sample_kwargs(module, pair, batch_size, pairs=None):
 def _run_once(module, pair, decoder, fallback, device, batch_size=1, pairs=None, serial=False):
     old_decoder = module.topology_decoder
     old_fallback = module.birthset_fallback
+    old_binary_pair_mode = getattr(module, "birthset_binary_pair_mode", False)
     module.topology_decoder = decoder
     module.birthset_fallback = fallback
+    module.birthset_binary_pair_mode = False
     _sync(device)
     start = time.perf_counter()
     pairs_for_run = list(pairs or [pair])[: max(1, int(batch_size))]
@@ -279,6 +329,7 @@ def _run_once(module, pair, decoder, fallback, device, batch_size=1, pairs=None,
     elapsed = time.perf_counter() - start
     module.topology_decoder = old_decoder
     module.birthset_fallback = old_fallback
+    module.birthset_binary_pair_mode = old_binary_pair_mode
     rf_values = []
     remapped_values = []
     for sampled_tree_raw, target_pair in zip(sampled_trees, pairs_for_run):
@@ -348,7 +399,13 @@ def main():
     parser.add_argument(
         "--decoder",
         action="append",
-        choices=("ar", "birthset", "birthset_with_ar_fallback"),
+        choices=(
+            "ar",
+            "birthset",
+            "birthset_with_ar_fallback",
+            "birthset_binary",
+            "birthset_frontier",
+        ),
         default=None,
     )
     parser.add_argument("--output", default=None)
@@ -360,7 +417,7 @@ def main():
     _set_global_seed((config.get("trainer") or {}).get("seed"))
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     module, load_info = _load_module(config, args.checkpoint, device)
-    pair = _fixed_pair(module, train=True)
+    pair = _fixed_pair(module, config, train=True)
     pairs = None
     if args.distinct_starts:
         pairs = _load_json_case_pairs(config, max(1, int(args.batch_size)))
