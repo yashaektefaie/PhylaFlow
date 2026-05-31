@@ -153,10 +153,13 @@ def _birthset_rooted_splits_compatible(mask_a, mask_b, full_mask):
     full_mask = int(full_mask)
     a = int(mask_a) & full_mask
     b = int(mask_b) & full_mask
+    ac = full_mask ^ a
+    bc = full_mask ^ b
     return (
         (a & b) == 0
-        or (a & ~b & full_mask) == 0
-        or (b & ~a & full_mask) == 0
+        or (a & bc) == 0
+        or (ac & b) == 0
+        or (ac & bc) == 0
     )
 
 

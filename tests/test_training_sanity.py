@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 import itertools
+import importlib.machinery
 from unittest.mock import MagicMock
 from unittest.mock import patch
 import copy
@@ -67,6 +68,15 @@ def _install_deepspeed_stub():
     ds_mod = types.ModuleType("deepspeed")
     ds_ops_mod = types.ModuleType("deepspeed.ops")
     ds_adam_mod = types.ModuleType("deepspeed.ops.adam")
+    ds_mod.__spec__ = importlib.machinery.ModuleSpec("deepspeed", loader=None)
+    ds_ops_mod.__spec__ = importlib.machinery.ModuleSpec(
+        "deepspeed.ops",
+        loader=None,
+    )
+    ds_adam_mod.__spec__ = importlib.machinery.ModuleSpec(
+        "deepspeed.ops.adam",
+        loader=None,
+    )
 
     class FusedAdam(torch.optim.Adam):
         pass
@@ -102,6 +112,7 @@ from run.TrainingModule import (
     _collect_oracle_replay_samples_from_anchors,
     _boundary_event_distribution_loss,
     _boundary_event_precision_margin_loss,
+    _birthset_rooted_splits_compatible,
     _tree_to_model_split_lengths,
     _combine_autoregressive_losses,
     _edge_set_bce_loss,
@@ -874,6 +885,19 @@ def _tensor_to_cpu_for_cuda(self, *args, **kwargs):
 
 
 class TestTrainingSanity(unittest.TestCase):
+    def test_birthset_split_compatibility_checks_complement_intersection(self):
+        full_mask = (1 << 5) - 1
+        left_clade_split = int("00111", 2)
+        right_clade_split = int("11100", 2)
+
+        self.assertTrue(
+            _birthset_rooted_splits_compatible(
+                left_clade_split,
+                right_clade_split,
+                full_mask,
+            )
+        )
+
     def test_combine_autoregressive_losses_respects_polytomy_weight(self):
         merge_loss = torch.tensor(2.0)
         polytomy_loss = torch.tensor(3.0)
